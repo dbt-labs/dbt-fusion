@@ -83,7 +83,9 @@ Releases of various Fusion components will be iterative as each component reache
 
 <details>
   <summary><i>How is dbt Fusion different from dbt Core?</i></summary>
+
   The dbt Fusion engine is a ground-up rewrite of dbt Core, with many additional capabilities.
+
   *Things that are the same:*
   * The YML authoring format including profiles, configuration, seeds, data tests, and unit tests
   * The materialization libraries
