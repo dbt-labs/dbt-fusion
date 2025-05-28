@@ -8,26 +8,26 @@
 
 This repo hosts components of the dbt Fusion engine, the foundation for future innovation in `dbt`. The dbt Fusion engine is written in Rust and is designed for speed, correctness, and has a native understanding of SQL across multiple data warehouse SQL dialects.
 
-> [!IMPORTANT]  
+> [!IMPORTANT]
 > **Note: the dbt Fusion Engine is in Beta!**
-Bugs and missing functionality compared to dbt Core will be resolved continuously in the leadup to a final release (see [this post](https://docs.getdbt.com/blog/fusion-path-to-ga) for more details). 
+Bugs and missing functionality compared to dbt Core will be resolved continuously in the lead-up to a final release (see [this post](https://docs.getdbt.com/blog/fusion-path-to-ga) for more details).
 
-The dbt Fusion engine is a ground up, first principles rewrite of the dbt Core execution engine, built to be interoperable with the standard dbt authoring layer. Fusion enforces some ambiguous areas of the authoring spec more strictly than dbt Core to ensure correctness (for example, dbt Core does not proactively validate most YAML configurations). Many of these discrepancies can be fixed automatically with the [dbt Autofix](https://github.com/dbt-labs/dbt-autofix) tool.
+The dbt Fusion engine is a ground-up, first principles rewrite of the dbt Core execution engine, built to be interoperable with the standard dbt authoring layer. Fusion enforces some ambiguous areas of the authoring spec more strictly than dbt Core to ensure correctness (for example, dbt Core does not proactively validate most YAML configurations). Many of these discrepancies can be fixed automatically with the [dbt Autofix](https://github.com/dbt-labs/dbt-autofix) tool.
 
 Beyond conformance with dbt Core, Fusion also contains new SQL Comprehension capabilities, a language server, modern ADBC drivers for warehouse connections, and more. While dbt Core was written in Python, the dbt Fusion engine is written in Rust, and compiled to a single application binary.
 
-You can install dbt-fusion onto your local machine, a docker container, or a machine in the cloud. It is designed for flexible installation, with no dependencies on other libraries. The only libraries that dbt Fusion will load are it's corresponding database drivers.
+You can install dbt-fusion onto your local machine, a docker container, or a machine in the cloud. It is designed for flexible installation, with no dependencies on other libraries. The only libraries that dbt Fusion will load are its corresponding database drivers.
 
 The dbt Fusion engine is being released to this repository incrementally, so, until this note is removed this repository contains only a subset of the crates that make the core of the engine work. These crates are published incrementally starting on May 28.
 
 ## Getting Started with the dbt Fusion engine
 
-> [!TIP]  
-> You don't have to build this project from source to use the new dbt! We recommend using the precompiled binary with additional capabilities: 
+> [!TIP]
+> You don't have to build this project from source to use the new dbt! We recommend using the precompiled binary with additional capabilities:
 
-There are several ways to get started with Fusion (for more, see dbt Fusion's quickstart documentation [here](https://docs.getdbt.com/guides/fusion?step=1))
-1. **Download dbt the vs-code extension** - For most people the best experience. This will install the dbt fusion CLI and Language Server on your system - see the install guide [here](https://docs.getdbt.com/docs/install-dbt-extension).
-2. **Install Fusion Directly** Install just the fusion CLI with the command below or see dbt's documentation [here](https://docs.getdbt.com/docs/fusion/install-fusion)
+There are several ways to get started with Fusion (for more, see dbt Fusion's quickstart documentation [here](https://docs.getdbt.com/guides/fusion?step=1)):
+1. **Download the dbt VS Code extension** - For most people the best experience. This will install the dbt fusion CLI and Language Server on your system - see the install guide [here](https://docs.getdbt.com/docs/install-dbt-extension).
+2. **Install Fusion Directly** - Install just the fusion CLI with the command below or see dbt's documentation [here](https://docs.getdbt.com/docs/fusion/install-fusion)
 ``` bash
 curl -fsSL https://public.cdn.getdbt.com/fs/install/install.sh | sh -s -- --update
 ```
@@ -35,7 +35,7 @@ curl -fsSL https://public.cdn.getdbt.com/fs/install/install.sh | sh -s -- --upda
 
 
 ### Supported Operating Systems and CPU Microarchitectures
-Fusion & associated drivers are compiled for each CPU microarchitecture and operating system independently. This allows for hardware level optimization.
+Fusion & associated drivers are compiled for each CPU microarchitecture and operating system independently. This allows for hardware-level optimization.
 
 Legend:
 * 🟢 - Supported today
@@ -62,12 +62,12 @@ Legend:
 ### Top Level Components Released to Date
 Releases of various Fusion components will be iterative as each component reaches maturity & readiness for contribution.
 
-- [x] `dbt-jinja` - All Rust extension of mini-jinja to support dbt's jinja functions & other capabilities
+- [x] `dbt-jinja` - A Rust extension of mini-jinja to support dbt's jinja functions & other capabilities
 - [x] `dbt-parser` - Rust parser for dbt projects
 - [x] `dbt-snowflake` - database driver
 - [x] `dbt-schemas` - complete, correct, machine generated json schemas for dbt's authoring surface
 - [ ] `dbt-sql` - ANTLR grammars and generated parsers
-  - [ ] snowflake.g4 
+  - [ ] snowflake.g4
   - [ ] bigquery.g4
   - [ ] redshift.g4
   - [ ] databricks.g4
@@ -76,9 +76,9 @@ Releases of various Fusion components will be iterative as each component reache
 ## FAQ
 
 <details>
-  <summary><i>Can I con contribute to the dbt Fusion engine?</i></summary>
+  <summary><i>Can I contribute to the dbt Fusion engine?</i></summary>
 
-  Yes absolutely!. Please see our contribution guidelines [here](CONTRIBUTING.md)
+  Yes, absolutely! Please see our contribution guidelines [here](CONTRIBUTING.md)
 </details>
 
 <details>
@@ -87,20 +87,20 @@ Releases of various Fusion components will be iterative as each component reache
   *Things that are the same:*
   * The YML authoring format including profiles, configuration, seeds, data tests, and unit tests
   * The materialization libraries
-  * dbt's library managemenet system (although `dbt deps` are installed automatically)
+  * dbt's library management system (although `dbt deps` are installed automatically)
 
   *Additional capabilities provided by Fusion:*
   * All new Arrow Database Connector (ADBC) drivers for faster data transfers and unified connection handling
   * A language server and corresponding VS-Code extension (compatible with Cursor) for ease of development
   * Multi-dialect SQL compilation, validation, & static analysis
-  * Standalone distribution. No JVM, or python required. 
+  * Standalone distribution. No JVM, or Python required.
   * Automatic installation of dependencies, whether that's a dbt package, or database driver
   * dbt code-signed & secure distributions
 </details>
 
 <details>
   <summary><i>This repo doesn't have all of dbt's functionality, when will the rest come?</i></summary>
-  dbt Fusion's source code is being published as components are finalized. Please see the Timeline section above
+  dbt Fusion's source code is being published as components are finalized. Please see the Timeline section above.
 </details>
 
 <details>
@@ -117,7 +117,7 @@ Releases of various Fusion components will be iterative as each component reache
 
 ## Compiling from Source
 
-The primary CLI in this repository is the `dbt-sa-cli`. To compile the CLI, you need the Rust toolchain. 
+The primary CLI in this repository is the `dbt-sa-cli`. To compile the CLI, you need the Rust toolchain.
 
 Let's start with Rust, run the following command to install Rust on your machine:
 
@@ -151,9 +151,9 @@ Options:
 ...
 ```
 
-Cargo is Rust's build system and package manager. If you're familiar with Python, pip would be a sufficient comparison. We'll use cargo to run command to build the local `dbt-sa-cli` binary and run helper scripts via `cargo xtask`. More on that later.
+Cargo is Rust's build system and package manager. If you're familiar with Python, pip would be a sufficient comparison. We'll use cargo to run commands to build the local `dbt-sa-cli` binary and run helper scripts via `cargo xtask`. More on that later.
 
-To build the binary locally, `cd` to the this repo's directory and run:
+To build the binary locally, `cd` to this repo's directory and run:
 
 ```shell
 cargo build
@@ -188,14 +188,14 @@ cd target/debug && pwd
 To run tests, increase the stack size and use nextest.
 
 ```
- RUST_MIN_STACK=8388608 cargo nextest run --no-fail-fast
+RUST_MIN_STACK=8388608 cargo nextest run --no-fail-fast
 ```
 
 # License
-The dbt Fusion engine is a monorepo and contains more than one License. Most code is licensed under ELv2. For more, please see our [licenses](LICENSES.md) section.
+The dbt Fusion engine is a monorepo and contains more than one license. Most code is licensed under ELv2. For more, please see our [licenses](LICENSES.md) section.
 
 # Acknowledgments
-*To the dbt community:* dbt the tool & dbt Labs the company would not be here without the incredible community of authors, contributors, practitioners, and enthusiasts. dbt Fusion is an evolution of that work & stands on the shoulders of what has come before. 
+*To the dbt community:* dbt the tool & dbt Labs the company would not be here without the incredible community of authors, contributors, practitioners, and enthusiasts. dbt Fusion is an evolution of that work & stands on the shoulders of what has come before.
 
 *To the Arrow Community:* dbt Labs is committing fully to the Arrow ecosystem. Fusion exclusively uses the Arrow type system from drivers through adapters into the internals of the compiler & runtime.
 
