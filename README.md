@@ -4,9 +4,9 @@
 
 ---
 
-# dbt F✦SION (BETA)
+# dbt F✦SION engine (BETA)
 
-This repo hosts components of dbt Fusion, a CLI tool-chain that is the future of `dbt`. Fusion is written in Rust and is designed for speed, correctness, and has a native understanding of SQL across multiple data warehouse SQL dialects.
+This repo hosts components of the dbt Fusion engine, a CLI tool-chain that is the future of `dbt`. The dbt Fusion engine is written in Rust and is designed for speed, correctness, and has a native understanding of SQL across multiple data warehouse SQL dialects.
 
 > [!IMPORTANT]  
 > **Note: the dbt Fusion Engine is in Beta!**
@@ -18,9 +18,9 @@ Beyond conformance with dbt Core, Fusion also contains new SQL Comprehension cap
 
 You can install dbt-fusion onto your local machine, a docker container, or a machine in the cloud. It is designed for flexible installation, with no dependencies on other libraries. The only libraries that dbt Fusion will load are it's corresponding database drivers.
 
-dbt Fusion is being released to this repository incrementally, so, until this note is removed this repository contains only a subset of the crates that make the core of the engine work. These crates are published incrementally starting on May 28.
+The dbt Fusion engine is being released to this repository incrementally, so, until this note is removed this repository contains only a subset of the crates that make the core of the engine work. These crates are published incrementally starting on May 28.
 
-## Getting Started with dbt Fusion
+## Getting Started with the dbt Fusion engine
 
 > [!TIP]  
 > You don't have to build this project from source to use the new dbt! We recommend using the precompiled binary with additional capabilities: 
@@ -35,7 +35,7 @@ curl -fsSL https://public.cdn.getdbt.com/fs/install/install.sh | sh -s -- --upda
 
 
 ### Supported Operating Systems and CPU Microarchitectures
-dbt Fusion & associated drivers are compiled for each CPU microarchitecture and operating system independently. This allows for hardware level optimization.
+Fusion & associated drivers are compiled for each CPU microarchitecture and operating system independently. This allows for hardware level optimization.
 
 Legend:
 * 🟢 - Supported today
@@ -51,13 +51,13 @@ Legend:
 ## Timeline
 
 
-| Date       | Milestone                   | Description                                  |
-|------------|-----------------------------|----------------------------------------------|
-| 2025-05-28 | Initial release of Fusion   | Published source code of parser, schemas, dbt-jinja, and Snowflake ADBC driver. |
-| 2025-06-09 | Databricks Adapter release  | Databricks ADBC driver, and adapter for Fusion |
-| 2025-06-25 | BigQuery Adapter release    | BigQuery ADBC driver, and adapter for Fusion |
-| 2025-07-09 | Redshift Adapter release    | Redshift ADBC driver, and adapter for Fusion |
-| 2025-07-18 | ANTLR Grammars release + SQL Parser  | The SQL grammar used by the ANTLR parser generator.  |
+| Target Date | Milestone                   | Description                                  |
+|-------------|-----------------------------|----------------------------------------------|
+| 2025-05-28  | Initial release of Fusion   | Published source code of parser, schemas, dbt-jinja, and Snowflake ADBC driver. |
+| 2025-06-09  | Databricks Adapter release  | Databricks ADBC driver, and adapter for Fusion |
+| 2025-06-25  | BigQuery Adapter release    | BigQuery ADBC driver, and adapter for Fusion |
+| 2025-07-09  | Redshift Adapter release    | Redshift ADBC driver, and adapter for Fusion |
+| 2025-07-18  | ANTLR Grammars release + SQL Parser  | The SQL grammar used by the ANTLR parser generator.  |
 
 ### Top Level Components Released to Date
 Releases of various Fusion components will be iterative as each component reaches maturity & readiness for contribution.
@@ -76,7 +76,7 @@ Releases of various Fusion components will be iterative as each component reache
 ## FAQ
 
 <details>
-  <summary><i>Can I con contribute to dbt Fusion?</i></summary>
+  <summary><i>Can I con contribute to the dbt Fusion engine?</i></summary>
 
   Yes absolutely!. Please see our contribution guidelines [here](CONTRIBUTING.md)
 </details>
@@ -117,7 +117,7 @@ Releases of various Fusion components will be iterative as each component reache
 
 ## Compiling from Source
 
-The primary CLI in this repository is the `dbt-sa-cli`. To compile the CLI, you need the Rust toolchain. 
+The primary cli in this repository is the `dbt-parser`. To compile the CLI, you need the Rust toolchain. 
 
 Let's start with Rust, run the following command to install Rust on your machine:
 
@@ -151,7 +151,7 @@ Options:
 ...
 ```
 
-Cargo is Rust's build system and package manager. If you're familiar with Python, pip would be a sufficient comparison. We'll use cargo to run command to build the local `dbt-sa-cli` binary and run helper scripts via `cargo xtask`. More on that later.
+Cargo is Rust's build system and package manager. If you're familiar with Python, pip would be a sufficient comparison. We'll use cargo to run command to build the local `dbt-parser` binary and run helper scripts via `cargo xtask`. More on that later.
 
 To build the binary locally, `cd` to the this repo's directory and run:
 
@@ -159,10 +159,10 @@ To build the binary locally, `cd` to the this repo's directory and run:
 cargo build
 ```
 
-This will compile our Rust code into the `dbt-sa-cli` binary. After this completes, you should see a new executable in `target/debug/dbt-sa-cli`. You can run this executable by passing the path directly into the CLI, so if you're in the root of this git repo, you can run:
+This will compile our Rust code into the `dbt-parser` binary. After this completes, you should see a new executable in `target/debug/dbt-parser`. You can run this executable by passing the path directly into the CLI, so if you're in the root of this git repo, you can run:
 
 ```shell
-target/debug/dbt-sa-cli
+target/debug/dbt-parser
 ```
 
 If built correctly, you should see output like:
@@ -192,7 +192,7 @@ To run tests, increase the stack size and use nextest.
 ```
 
 # License
-dbt Fusion is a monorepo and contains more than one License. Most code is licensed under ELv2. For more, please see our [licenses](LICENSES.md) section.
+The dbt Fusion engine is a monorepo and contains more than one License. Most code is licensed under ELv2. For more, please see our [licenses](LICENSES.md) section.
 
 # Acknowledgments
 *To the dbt community:* dbt the tool & dbt Labs the company would not be here without the incredible community of authors, contributors, practitioners, and enthusiasts. dbt Fusion is an evolution of that work & stands on the shoulders of what has come before. 
