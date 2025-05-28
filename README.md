@@ -83,17 +83,19 @@ Releases of various Fusion components will be iterative as each component reache
 
 <details>
   <summary><i>How is dbt Fusion different from dbt Core?</i></summary>
+  
   The dbt Fusion engine is a ground-up rewrite of dbt Core, with many additional capabilities.
+
   *Things that are the same:*
   * The YML authoring format including profiles, configuration, seeds, data tests, and unit tests
   * The materialization libraries
-  * dbt's library managemenet system (although `dbt deps` are installed automatically)
+  * dbt's library management system (although `dbt deps` are installed automatically)
 
   *Additional capabilities provided by Fusion:*
   * All new Arrow Database Connector (ADBC) drivers for faster data transfers and unified connection handling
   * A language server and corresponding VS-Code extension (compatible with Cursor) for ease of development
   * Multi-dialect SQL compilation, validation, & static analysis
-  * Standalone distribution. No JVM, or python required. 
+  * Standalone distribution. No JVM, or python required.
   * Automatic installation of dependencies, whether that's a dbt package, or database driver
   * dbt code-signed & secure distributions
 </details>
