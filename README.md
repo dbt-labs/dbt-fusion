@@ -117,7 +117,7 @@ Releases of various Fusion components will be iterative as each component reache
 
 ## Compiling from Source
 
-The primary cli in this repository is the `dbt-parser`. To compile the CLI, you need the Rust toolchain. 
+The primary CLI in this repository is the `dbt-sa-cli`. To compile the CLI, you need the Rust toolchain. 
 
 Let's start with Rust, run the following command to install Rust on your machine:
 
@@ -151,7 +151,7 @@ Options:
 ...
 ```
 
-Cargo is Rust's build system and package manager. If you're familiar with Python, pip would be a sufficient comparison. We'll use cargo to run command to build the local `dbt-parser` binary and run helper scripts via `cargo xtask`. More on that later.
+Cargo is Rust's build system and package manager. If you're familiar with Python, pip would be a sufficient comparison. We'll use cargo to run command to build the local `dbt-sa-cli` binary and run helper scripts via `cargo xtask`. More on that later.
 
 To build the binary locally, `cd` to the this repo's directory and run:
 
@@ -159,10 +159,10 @@ To build the binary locally, `cd` to the this repo's directory and run:
 cargo build
 ```
 
-This will compile our Rust code into the `dbt-parser` binary. After this completes, you should see a new executable in `target/debug/dbt-parser`. You can run this executable by passing the path directly into the CLI, so if you're in the root of this git repo, you can run:
+This will compile our Rust code into the `dbt-sa-cli` binary. After this completes, you should see a new executable in `target/debug/dbt-sa-cli`. You can run this executable by passing the path directly into the CLI, so if you're in the root of this git repo, you can run:
 
 ```shell
-target/debug/dbt-parser
+target/debug/dbt-sa-cli
 ```
 
 If built correctly, you should see output like:
