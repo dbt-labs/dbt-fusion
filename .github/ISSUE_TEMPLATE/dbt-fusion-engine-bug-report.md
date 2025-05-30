@@ -13,8 +13,8 @@ A clear and concise description of what the bug is.
 **What version of dbt Fusion is this bug in? (find out by running `dbt --version`)**
 
 **Is this a discrepancy between the dbt Fusion Engine and dbt Core? Check one.**
-- [] YES
-- [] NO
+- [ ] YES
+- [ ] NO
 
 **To Reproduce**
 Please submit one of the following
@@ -28,6 +28,6 @@ A clear and concise description of what you expected to happen.
 **Screenshots**
 If applicable, add screenshots to help explain your problem.
 
-** Operating System and CPU Type (please complete the following information):**
+**Operating System and CPU Type (please complete the following information):**
 * Mac/Windows/Linux?
 * X86 or ARM?
