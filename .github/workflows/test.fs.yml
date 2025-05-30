@@ -31,7 +31,6 @@ jobs:
 
   test_fs:
     name: "Test Fusion"
-    needs: [check_changes]
     timeout-minutes: 30
     runs-on: ubuntu-latest
     container:
@@ -41,7 +40,7 @@ jobs:
         password: ${{ secrets.FA_ASSISTANT_CI_WORKFLOW_PAT_TOKEN }}
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Configure GitHub auth via ~/.netrc
         run: |
           cat > ~/.netrc <<EOF
