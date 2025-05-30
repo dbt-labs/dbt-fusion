@@ -40,6 +40,8 @@ jobs:
         username: fa-assistant
         password: ${{ secrets.FA_ASSISTANT_CI_WORKFLOW_PAT_TOKEN }}
     steps:
+      - uses: actions/checkout@v4
+      
       - name: Configure GitHub auth via ~/.netrc
         run: |
           cat > ~/.netrc <<EOF
@@ -49,7 +51,6 @@ jobs:
           EOF
 
       - name: Test Fusion
-        uses: actions/checkout@v4
         run: |
           RUST_MIN_STACK="8388608" cargo nextest run
 
