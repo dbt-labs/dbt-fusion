@@ -1,18 +1,8 @@
 name: FS Tests
 
 on:
-  workflow_dispatch:
-  push:
-    branches:
-      # Run CI after merge as well. This detects any logical merge conflicts between PRs.
-      - main
-  workflow_call:
-    secrets:
-      CICD_APP_ID:
-        required: true
-      CICD_APP_PRIVATE_KEY:
-        required: true
   pull_request:
+    types: [opened, reopened, synchronize]
 
 env:
   # Incremental builds only increase overhead in CI environment:
@@ -20,11 +10,8 @@ env:
   CONTINUOUS_INTEGRATION: "yes"
 
 permissions:
-  id-token: write
-  packages: write
   contents: read
-  checks: write
-  issues: read
+  packages: read
 
 # Cancel previous PR builds.
 concurrency:
@@ -40,16 +27,11 @@ concurrency:
     di=${{ github.event_name == 'repository_dispatch' && github.sha || 'NA' }},
   cancel-in-progress: true
 
-defaults:
-  run:
-    shell: bash --noprofile --norc -euo pipefail {0}
-
 jobs:
 
   test_fs:
     name: "Test Fusion"
     needs: [check_changes]
-    if: ${{ github.event_name != 'pull_request' || needs.check_changes.outputs.non_lsp_has_changed == 'true' }}
     timeout-minutes: 30
     runs-on: ubuntu-latest
     container:
