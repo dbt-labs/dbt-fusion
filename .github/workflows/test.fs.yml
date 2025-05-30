@@ -1,0 +1,74 @@
+name: FS Tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      # Run CI after merge as well. This detects any logical merge conflicts between PRs.
+      - main
+  workflow_call:
+    secrets:
+      CICD_APP_ID:
+        required: true
+      CICD_APP_PRIVATE_KEY:
+        required: true
+  pull_request:
+
+env:
+  # Incremental builds only increase overhead in CI environment:
+  CARGO_INCREMENTAL: 0
+  CONTINUOUS_INTEGRATION: "yes"
+
+permissions:
+  id-token: write
+  packages: write
+  contents: read
+  checks: write
+  issues: read
+
+# Cancel previous PR builds.
+concurrency:
+  # For a PR build, only pr_number is filled in, triggering cancellation of previous PR builds.
+  # For a push (to an enabled branch), SHA and branch name are filled in.
+  # For a workflow dispatch, cancellation is based on the commit SHA and dispatch parameters.
+  # The names are abbreviated to keep total output under 400 character limit
+  group: >-
+    wf=${{ github.workflow }},
+    pr=${{ github.event_name == 'pull_request' && github.event.number || 'NA' }},
+    br=${{ github.event_name == 'push' && github.sha || 'NA' }},
+    br=${{ github.event_name == 'push' && github.ref_name || 'NA' }},
+    di=${{ github.event_name == 'repository_dispatch' && github.sha || 'NA' }},
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+
+  test_fs:
+    name: "Test Fusion"
+    needs: [check_changes]
+    if: ${{ github.event_name != 'pull_request' || needs.check_changes.outputs.non_lsp_has_changed == 'true' }}
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/dbt-labs/fs-cli-x86_64:latest-with-datasets
+      credentials:
+        username: fa-assistant
+        password: ${{ secrets.FA_ASSISTANT_CI_WORKFLOW_PAT_TOKEN }}
+    steps:
+      - name: Configure GitHub auth via ~/.netrc
+        run: |
+          cat > ~/.netrc <<EOF
+          machine github.com
+            login fa-assistant
+            password ${{ secrets.FA_ASSISTANT_CI_WORKFLOW_PAT_TOKEN }}
+          EOF
+
+      - name: Test Fusion
+        uses: actions/checkout@v4
+        run: |
+          RUST_MIN_STACK="8388608" cargo nextest run
+
+      
