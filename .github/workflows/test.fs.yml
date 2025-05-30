@@ -37,7 +37,7 @@ jobs:
       image: ghcr.io/dbt-labs/fs-cli-x86_64:latest-with-datasets
       credentials:
         username: fa-assistant
-        password: ${{ secrets.FA_ASSISTANT_CI_WORKFLOW_PAT_TOKEN }}
+        password: ${{ secrets.FA_ASSISTANT_PAT_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -46,7 +46,7 @@ jobs:
           cat > ~/.netrc <<EOF
           machine github.com
             login fa-assistant
-            password ${{ secrets.FA_ASSISTANT_CI_WORKFLOW_PAT_TOKEN }}
+            password ${{ secrets.FA_ASSISTANT_PAT_TOKEN }}
           EOF
 
       - name: Test Fusion
