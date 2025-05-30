@@ -3,6 +3,9 @@ name: Copybara - Auto Public PR Migration
 on:
   pull_request:
     types: [opened, reopened, synchronize]
+    paths-ignore:
+      - '.github/**'
+      - '**/dbt-parser/src/resolver.rs'
 
 permissions:
   contents: read
