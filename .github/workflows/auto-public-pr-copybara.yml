@@ -7,9 +7,11 @@ on:
       - '.github/**'
       - '**/dbt-parser/src/resolver.rs'
 
-permissions:
-  contents: read
-  packages: read
+# ensures that no permissions are granted globally, only to the specific jobs that need them
+permissions: {}
+
+env:
+    CI_LABEL: "ci:approve-public-fork-ci"
 
 jobs:
 

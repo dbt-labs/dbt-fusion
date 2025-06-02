@@ -9,10 +9,12 @@ env:
   CARGO_INCREMENTAL: 0
   CONTINUOUS_INTEGRATION: "yes"
 
-permissions:
-  contents: read
-  packages: read
+# ensures that no permissions are granted globally, only to the specific jobs that need them
+permissions: {}
 
+env:
+    CI_LABEL: "ci:approve-public-fork-ci"
+    
 # Cancel previous PR builds.
 concurrency:
   # For a PR build, only pr_number is filled in, triggering cancellation of previous PR builds.
