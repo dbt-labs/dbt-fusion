@@ -231,7 +231,7 @@ macro_rules! with_recursion_guard {
 impl<'a> Parser<'a> {
     /// Creates a new parser.
     ///
-    /// `in_expr` is necessary to parse within an expression context.  Otherwise
+    /// `in_expr` is necessary to parse within an expression context. Otherwise,
     /// the parser starts out in template context.  This means that when
     /// [`parse`](Self::parse) is to be called, the `in_expr` argument must be
     /// `false` and for [`parse_standalone_expr`](Self::parse_standalone_expr)
@@ -935,11 +935,11 @@ impl<'a> Parser<'a> {
         if RESERVED_NAMES.contains(&id) {
             syntax_error!("cannot assign to reserved variable name {}", id);
         }
-        let mut rv = ast::Expr::Var(ast::Spanned::new(ast::Var { id }, span));
+        let mut rv = ast::Expr::Var(Spanned::new(ast::Var { id }, span));
         if dotted {
             while skip_token!(self, Token::Dot) {
                 let (attr, span) = expect_token!(self, Token::Ident(name) => name, "identifier");
-                rv = ast::Expr::GetAttr(ast::Spanned::new(
+                rv = ast::Expr::GetAttr(Spanned::new(
                     ast::GetAttr {
                         expr: rv,
                         name: attr,
@@ -1585,6 +1585,13 @@ impl<'a> Parser<'a> {
         &mut self,
         end_check: &dyn Fn(&Token) -> bool,
     ) -> Result<Vec<ast::Stmt<'a>>, Error> {
+        with_recursion_guard!(self, self.subparse_internal(end_check))
+    }
+
+    fn subparse_internal(
+        &mut self,
+        end_check: &dyn Fn(&Token) -> bool,
+    ) -> Result<Vec<ast::Stmt<'a>>, Error> {
         let mut rv = Vec::new();
         while let Some((token, span)) = ok!(self.stream.next()) {
             match token {
@@ -1594,6 +1601,7 @@ impl<'a> Parser<'a> {
                 Token::VariableStart => {
                     let expr = ok!(self.parse_expr_or_implied_tuple());
                     expect_token!(self, Token::VariableEnd, "end of variable block");
+                    
                     macro_rules! expand_span {
                         ($expr:expr, $variant:path) => {{
                             let mut spanned = $expr;
