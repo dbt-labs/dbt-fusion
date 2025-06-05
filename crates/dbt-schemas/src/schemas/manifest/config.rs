@@ -93,7 +93,9 @@ pub struct DbtConfig {
     pub initialize: Option<String>,
     pub tmp_relation_type: Option<String>,
     pub query_tag: Option<String>,
+    #[serde(default, deserialize_with = "bool_or_string_bool")]
     pub automatic_clustering: Option<bool>,
+    #[serde(default, deserialize_with = "bool_or_string_bool")]
     pub secure: Option<bool>,
     #[serde(default, deserialize_with = "bool_or_string_bool")]
     pub copy_grants: Option<bool>,
@@ -124,6 +126,7 @@ pub struct DbtConfig {
     pub table_format: Option<String>,
     pub location_root: Option<String>,
     pub tblproperties: Option<BTreeMap<String, Value>>,
+    #[serde(default, deserialize_with = "bool_or_string_bool")]
     pub auto_liquid_cluster: Option<bool>,
     pub buckets: Option<i64>,
     pub clustered_by: Option<String>,
