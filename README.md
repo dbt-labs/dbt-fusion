@@ -44,7 +44,7 @@ Legend:
 | Operating System    | X86-64 | ARM  |
 |-------------------|----------|------|
 | MacOS             |   🟢     |  🟢  |
-| Linux             |   🟢     |  🟡  |
+| Linux             |   🟢     |  🟢  |
 | Windows           |   🟡     |  🟡  |
 
 
