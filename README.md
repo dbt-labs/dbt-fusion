@@ -39,7 +39,7 @@ Fusion & associated drivers are compiled for each CPU microarchitecture and oper
 
 Legend:
 * 🟢 - Supported today
-* 🟡 - Unsupported today, in progress & will be supported by 2025-07-18
+* 🟡 - Unsupported today
 
 | Operating System    | X86-64 | ARM  |
 |-------------------|----------|------|
