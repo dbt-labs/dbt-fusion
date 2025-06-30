@@ -667,7 +667,7 @@ impl LintArgs {
 pub fn lint_warnings_help_text() -> &'static str {
     r#"
 Specify the warnings to apply. Example: `-w warning1 -w warning2`. Later options override former ones.
-   Legend: (*) This warning can be automatically fixed by sdf.
+   Legend: (*) This warning can be automatically fixed by dbtf.
 
 Available Warnings
 * `all`: Turn on all warnings.
@@ -699,7 +699,7 @@ Structure-Specific Warnings:
 * `structure-join-condition-order`: Warn about join condition order.
 * `structure-column-order`: Warn about column order in structures.
 
-More warnings available as part of sdf compile ...
+More warnings available as part of dbtf compile ...
 "#
 }
 
