@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 
-use dbt_common::{fs_err, CodeLocation, ErrorCode, FsError, FsResult};
+use dbt_common::{err, fs_err, CodeLocation, ErrorCode, FsError, FsResult};
 use dbt_frontend_common::Dialect;
 use dbt_serde_yaml::{JsonSchema, Verbatim};
 use hex;
@@ -83,23 +83,28 @@ impl<T: Clone + Merge<T>> Merge<Option<T>> for Option<T> {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, EnumIter, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, EnumIter, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DbtMaterialization {
     View,
     Table,
     Incremental,
-    Snapshot,
     MaterializedView,
     External,
-    Seed,
     Test,
     Ephemeral,
     Unit,
+    Analysis,
     /// only for databricks
     StreamingTable,
     #[serde(untagged)]
     Unknown(String),
+}
+
+impl From<DbtMaterialization> for String {
+    fn from(materialization: DbtMaterialization) -> Self {
+        materialization.to_string()
+    }
 }
 
 impl std::fmt::Display for DbtMaterialization {
@@ -108,17 +113,16 @@ impl std::fmt::Display for DbtMaterialization {
             DbtMaterialization::View => "view",
             DbtMaterialization::Table => "table",
             DbtMaterialization::Incremental => "incremental",
-            DbtMaterialization::Snapshot => "snapshot",
             DbtMaterialization::MaterializedView => "materialized_view",
             DbtMaterialization::External => "external",
-            DbtMaterialization::Seed => "seed",
             DbtMaterialization::Test => "test",
             DbtMaterialization::Ephemeral => "ephemeral",
             DbtMaterialization::Unit => "unit",
             DbtMaterialization::StreamingTable => "streaming_table",
+            DbtMaterialization::Analysis => "analysis",
             DbtMaterialization::Unknown(s) => s.as_str(),
         };
-        write!(f, "{}", materialized_str)
+        write!(f, "{materialized_str}")
     }
 }
 
@@ -131,12 +135,11 @@ impl From<DbtMaterialization> for RelationType {
             DbtMaterialization::MaterializedView => RelationType::MaterializedView,
             DbtMaterialization::Ephemeral => RelationType::Ephemeral,
             DbtMaterialization::External => RelationType::External,
-            DbtMaterialization::Seed => RelationType::External, // TODO Validate this
             DbtMaterialization::Test => RelationType::External, // TODO Validate this
             DbtMaterialization::Incremental => RelationType::External, // TODO Validate this
-            DbtMaterialization::Snapshot => RelationType::External, // TODO Validate this
             DbtMaterialization::Unit => RelationType::External, // TODO Validate this
             DbtMaterialization::StreamingTable => RelationType::StreamingTable,
+            DbtMaterialization::Analysis => RelationType::External, // TODO Validate this
             DbtMaterialization::Unknown(_) => RelationType::External, // TODO Validate this
         }
     }
@@ -252,14 +255,14 @@ impl Serialize for DbtCheckColsSpec {
 }
 
 impl TryFrom<StringOrArrayOfStrings> for DbtCheckColsSpec {
-    type Error = Box<dyn std::error::Error>;
+    type Error = Box<FsError>;
     fn try_from(value: StringOrArrayOfStrings) -> Result<Self, Self::Error> {
         match value {
             StringOrArrayOfStrings::String(all) => {
                 if all == "all" {
                     Ok(DbtCheckColsSpec::All)
                 } else {
-                    Err(format!("Invalid check_cols value: {}", all).into())
+                    err!(ErrorCode::Generic, "Invalid check_cols value: {}", all)
                 }
             }
             StringOrArrayOfStrings::ArrayOfStrings(cols) => Ok(DbtCheckColsSpec::Cols(cols)),
@@ -294,14 +297,13 @@ impl<'de> Deserialize<'de> for DbtCheckColsSpec {
                 }
             }
             _ => Err(serde::de::Error::custom(format!(
-                "Expected a string or array of strings for check_cols, got {:?}",
-                value
+                "Expected a string or array of strings for check_cols, got {value:?}"
             ))),
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, EnumString, Display)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, EnumString, Display, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum DbtBatchSize {
@@ -313,12 +315,19 @@ pub enum DbtBatchSize {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq, JsonSchema)]
 pub struct DbtContract {
-    pub alias_types: Option<bool>,
-    pub enforced: Option<bool>,
+    #[serde(default = "default_alias_types")]
+    pub alias_types: bool,
+    #[serde(default)]
+    pub enforced: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub checksum: Option<Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, EnumString, Display)]
+fn default_alias_types() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, EnumString, Display, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum DbtIncrementalStrategy {
@@ -336,7 +345,7 @@ pub enum DbtIncrementalStrategy {
     Unknown,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(untagged)]
 pub enum DbtUniqueKey {
     Single(String),
@@ -373,7 +382,7 @@ impl From<StringOrArrayOfStrings> for DbtUniqueKey {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum HardDeletes {
     Ignore,
@@ -383,51 +392,16 @@ pub enum HardDeletes {
 
 // Impl try from string
 impl TryFrom<String> for HardDeletes {
-    type Error = Box<dyn std::error::Error>;
+    type Error = Box<FsError>;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
         Ok(match value.as_str() {
             "ignore" => HardDeletes::Ignore,
             "invalidate" => HardDeletes::Invalidate,
             "new_record" => HardDeletes::NewRecord,
-            _ => return Err(format!("Invalid hard_deletes value: {}", value).into()),
+            _ => return err!(ErrorCode::Generic, "Invalid hard_deletes value: {}", value),
         })
     }
-}
-
-#[skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-pub struct DatabricksModelConfig {
-    pub file_format: Option<String>,
-    pub location_root: Option<String>,
-    pub tblproperties: Option<BTreeMap<String, Value>>,
-    // this config is introduced here https://github.com/databricks/dbt-databricks/pull/823
-    pub include_full_name_in_path: Option<bool>,
-    pub liquid_clustered_by: Option<String>,
-    pub auto_liquid_cluster: Option<bool>,
-    pub clustered_by: Option<String>,
-    pub buckets: Option<i64>,
-    pub catalog: Option<String>,
-    pub databricks_tags: Option<BTreeMap<String, Value>>,
-    pub compression: Option<String>,
-    pub databricks_compute: Option<String>,
-}
-
-#[skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-pub struct SnowflakeModelConfig {
-    pub external_volume: Option<String>,
-    pub base_location_root: Option<String>,
-    pub base_location_subpath: Option<String>,
-    pub target_lag: Option<String>,
-    pub snowflake_warehouse: Option<String>,
-    pub refresh_mode: Option<String>,
-    pub initialize: Option<String>,
-    pub tmp_relation_type: Option<String>,
-    pub query_tag: Option<String>,
-    pub automatic_clustering: Option<bool>,
-    pub copy_grants: Option<bool>,
-    pub secure: Option<bool>,
 }
 
 /// Constraints (model level or column level)
@@ -444,9 +418,8 @@ pub struct Constraint {
     /// Only ForeignKey constraints accept: a list columns in that table
     /// containing the corresponding primary or unique key.
     pub to_columns: Option<Vec<String>>,
-    /// model-level only
-    pub columns: Option<Vec<String>>,
     pub warn_unsupported: Option<bool>,
+    pub warn_unenforced: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -727,6 +700,15 @@ pub enum TimeGranularity {
     Year,
 }
 
+#[derive(Default, Deserialize, Serialize, Debug, Clone, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum StoreFailuresAs {
+    #[default]
+    Ephemeral,
+    Table,
+    View,
+}
+
 #[skip_serializing_none]
 #[derive(Deserialize, Serialize, Debug, Clone, JsonSchema)]
 pub struct Versions {
@@ -739,7 +721,7 @@ pub struct Versions {
 /// This function will parse the database, schema, and identifier
 /// according to the dialect and quoting rules.
 pub fn normalize_quoting(
-    quoting: ResolvedQuoting,
+    quoting: &ResolvedQuoting,
     adapter_type: &str,
     database: &str,
     schema: &str,

@@ -1,18 +1,13 @@
+use crate::dialect::Dialect;
+use crate::error::InternalError;
+use crate::utils::{get_version_hash, strip_version_hash};
+use crate::{internal_err, make_internal_err};
+use datafusion::sql::{ResolvedTableReference, TableReference};
+use itertools::Itertools;
 use serde::{de, Deserialize, Deserializer};
-
 use std::path::PathBuf;
 
-use datafusion::sql::{ResolvedTableReference, TableReference};
-use itertools::Itertools as _;
-
-use crate::{
-    dialect::Dialect,
-    error::InternalError,
-    internal_err,
-    utils::{get_version_hash, strip_version_hash},
-};
-
-pub use dbt_frontend_schemas::ident::{Ident, Identifier};
+pub use dbt_ident::{Ident, Identifier};
 
 /// Owned version of [Qualified].
 pub type QualifiedName = Qualified<'static>;
@@ -67,13 +62,13 @@ impl std::fmt::Display for Qualified<'_> {
     /// specific [Dialect].
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Qualified::Bare { table } => write!(f, "{}", table),
-            Qualified::Partial { schema, table } => write!(f, "{}.{}", schema, table),
+            Qualified::Bare { table } => write!(f, "{table}"),
+            Qualified::Partial { schema, table } => write!(f, "{schema}.{table}"),
             Qualified::Full {
                 catalog,
                 schema,
                 table,
-            } => write!(f, "{}.{}.{}", catalog, schema, table),
+            } => write!(f, "{catalog}.{schema}.{table}"),
         }
     }
 }
@@ -81,13 +76,13 @@ impl std::fmt::Display for Qualified<'_> {
 impl std::fmt::Debug for Qualified<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Qualified::Bare { table } => write!(f, "{:?}", table),
-            Qualified::Partial { schema, table } => write!(f, "{:?}.{:?}", schema, table),
+            Qualified::Bare { table } => write!(f, "{table:?}"),
+            Qualified::Partial { schema, table } => write!(f, "{schema:?}.{table:?}"),
             Qualified::Full {
                 catalog,
                 schema,
                 table,
-            } => write!(f, "{:?}.{:?}.{:?}", catalog, schema, table),
+            } => write!(f, "{catalog:?}.{schema:?}.{table:?}"),
         }
     }
 }
@@ -561,7 +556,7 @@ impl FullyQualifiedName {
         let unhashed = strip_version_hash(table.as_ref(), &maybe_version, &hash);
         if let Some(version) = maybe_version {
             Self {
-                table: format!("{}_{}", unhashed, version).into(),
+                table: format!("{unhashed}_{version}").into(),
                 ..self.clone()
             }
         } else {
@@ -815,7 +810,7 @@ impl TryFrom<datafusion::common::Column> for ColumnRef {
         Ok(Self {
             table_name: value
                 .relation
-                .ok_or_else(|| InternalError::new("Invalid column ref: missing relation"))?
+                .ok_or_else(|| make_internal_err!("Invalid column ref: missing relation"))?
                 .try_into()?,
             column: value.name.into(),
         })

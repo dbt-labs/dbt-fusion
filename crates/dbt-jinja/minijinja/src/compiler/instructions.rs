@@ -273,6 +273,7 @@ pub struct Instructions<'source> {
     span_infos: Vec<SpanInfo>,
     name: &'source str,
     source: &'source str,
+    filename: Option<String>,
 }
 
 pub(crate) static EMPTY_INSTRUCTIONS: Instructions<'static> = Instructions {
@@ -282,11 +283,16 @@ pub(crate) static EMPTY_INSTRUCTIONS: Instructions<'static> = Instructions {
     span_infos: Vec::new(),
     name: "<unknown>",
     source: "",
+    filename: None,
 };
 
 impl<'source> Instructions<'source> {
     /// Creates a new instructions object.
-    pub fn new(name: &'source str, source: &'source str) -> Instructions<'source> {
+    pub fn new(
+        name: &'source str,
+        source: &'source str,
+        filename: Option<String>,
+    ) -> Instructions<'source> {
         Instructions {
             instructions: Vec::with_capacity(128),
             line_infos: Vec::with_capacity(128),
@@ -294,12 +300,20 @@ impl<'source> Instructions<'source> {
             span_infos: Vec::with_capacity(128),
             name,
             source,
+            filename,
         }
     }
 
     /// Returns the name of the template.
     pub fn name(&self) -> &'source str {
         self.name
+    }
+
+    /// Returns the filename of the template.
+    pub fn filename(&self) -> String {
+        self.filename
+            .clone()
+            .unwrap_or_else(|| self.name.to_string())
     }
 
     /// Returns the source reference.
@@ -329,7 +343,7 @@ impl<'source> Instructions<'source> {
         let same_loc = self
             .line_infos
             .last()
-            .map_or(false, |last_loc| last_loc.line == line);
+            .is_some_and(|last_loc| last_loc.line == line);
         if !same_loc {
             self.line_infos.push(LineInfo {
                 first_instruction: instr as u32,
@@ -346,7 +360,7 @@ impl<'source> Instructions<'source> {
         // if we follow up to a valid span with no more span, clear it out
         #[cfg(feature = "debug")]
         {
-            if self.span_infos.last().map_or(false, |x| x.span.is_some()) {
+            if self.span_infos.last().is_some_and(|x| x.span.is_some()) {
                 self.span_infos.push(SpanInfo {
                     first_instruction: rv as u32,
                     span: None,
@@ -364,7 +378,7 @@ impl<'source> Instructions<'source> {
             let same_loc = self
                 .span_infos
                 .last()
-                .map_or(false, |last_loc| last_loc.span == Some(span));
+                .is_some_and(|last_loc| last_loc.span == Some(span));
             if !same_loc {
                 self.span_infos.push(SpanInfo {
                     first_instruction: rv as u32,

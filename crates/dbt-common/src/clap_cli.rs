@@ -328,10 +328,6 @@ pub struct CompileArgs {
     #[arg(long, conflicts_with = "select")]
     pub inline: Option<String>,
 
-    /// Limiting number of shown rows. Run with --limit 0 to remove limit [default: 10]
-    #[arg(global = true, long)]
-    pub limit: Option<usize>,
-
     /// Display rows in different formats
     #[arg(global = true, long, aliases = ["format"])]
     pub output: Option<DisplayFormat>,
@@ -356,7 +352,6 @@ impl CompileArgs {
                 "Internal error: Failed to parse wildcard selector '*' for inline compilation.",
             ));
         }
-        eval_args.limit = self.limit.unwrap_or(DEFAULT_LIMIT);
         eval_args.static_analysis = self.static_analysis;
         eval_args.full_refresh = self.full_refresh;
         eval_args.format = self
@@ -438,6 +433,7 @@ impl SourceArgs {
             None,
             None,
             Some(IndirectSelection::default()),
+            None,
         );
         eval_args.phase = Phases::Freshness;
         eval_args.with_refined_node_selectors(Some(predicate))
@@ -467,7 +463,7 @@ pub struct ShowArgs {
     #[arg(long, conflicts_with = "select")]
     pub inline: Option<String>,
 
-    /// Limiting number of shown rows. Run with --limit 0 to remove limit [default: 10]
+    /// Limiting number of shown rows. Run with --limit -1 to remove limit [default: 10]
     #[arg(global = true, long)]
     pub limit: Option<usize>,
 
@@ -497,7 +493,7 @@ impl ShowArgs {
             ClapResourceType::Snapshot,
             ClapResourceType::Seed,
         ];
-        eval_args.limit = self.limit.unwrap_or(DEFAULT_LIMIT);
+        eval_args.limit = self.limit;
         eval_args.static_analysis = self.static_analysis;
         eval_args.format = self
             .output
@@ -622,7 +618,7 @@ impl FromStr for Layout {
                 _ => return Err("Invalid value for commas".into()),
             })),
             "line-length" => Ok(Layout::LineLength(parts.get(1).unwrap().parse().unwrap())),
-            _ => Err(format!("Unknown layout option: {}", s)),
+            _ => Err(format!("Unknown layout option: {s}")),
         }
     }
 }
@@ -792,7 +788,7 @@ impl FromStr for LintWarning {
                         .map(|s| match s.trim().to_lowercase().as_str() {
                             "from" => Ok(SubQueryScope::From),
                             "join" => Ok(SubQueryScope::Join),
-                            _ => Err(format!("Unknown subquery scope: {}", s)),
+                            _ => Err(format!("Unknown subquery scope: {s}")),
                         })
                         .collect::<Result<_, Self::Err>>()?;
 
@@ -806,7 +802,7 @@ impl FromStr for LintWarning {
             }
             "structure-join-condition-order" => Ok(LintWarning::StructureJoinConditionOrder),
             "structure-column-order" => Ok(LintWarning::StructureColumnOrder),
-            _ => Err(format!("Unknown warning option: {}", s)),
+            _ => Err(format!("Unknown warning option: {s}")),
         }
     }
 }
@@ -1001,14 +997,14 @@ impl Capitalization {
                 let mut chars = text.chars();
                 let first = chars.next().unwrap().to_uppercase();
                 let rest = chars.collect::<String>().to_lowercase();
-                format!("{}{}", first, rest)
+                format!("{first}{rest}")
             }
             Capitalization::Snake => text.to_lowercase(),
             Capitalization::Camel => {
                 let mut chars = text.chars();
                 let first = chars.next().unwrap().to_lowercase();
                 let rest = chars.collect::<String>().to_lowercase();
-                format!("{}{}", first, rest)
+                format!("{first}{rest}")
             }
             Capitalization::Consistent => unreachable!(),
             Capitalization::Off => text.to_owned(),
@@ -1294,7 +1290,7 @@ impl From<&BTreeMap<String, Value>> for LinterConfig {
                         .map(|s| match s.trim().to_lowercase().as_str() {
                             "from" => Ok(SubQueryScope::From),
                             "join" => Ok(SubQueryScope::Join),
-                            _ => Err(format!("Unknown subquery scope: {}", s)),
+                            _ => Err(format!("Unknown subquery scope: {s}")),
                         })
                         .collect::<Result<_, _>>()
                         .unwrap();
@@ -1363,7 +1359,7 @@ impl From<&BTreeMap<String, Value>> for LinterConfig {
                         .map(|s| match s.trim().to_lowercase().as_str() {
                             "eq" => Ok(ImplicitConversionOperators::Eq),
                             "in" => Ok(ImplicitConversionOperators::In),
-                            _ => Err(format!("Unknown implicit conversion operator: {}", s)),
+                            _ => Err(format!("Unknown implicit conversion operator: {s}")),
                         })
                         .collect::<Result<_, _>>()
                         .unwrap();
@@ -1865,7 +1861,7 @@ pub struct TestArgs {
     #[arg(long, short = 'i', hide = true)]
     pub interactive: bool,
 
-    /// Limiting number of shown rows. Run with --limit 0 to remove limit [default: 10]
+    /// Limiting number of shown rows. Run with --limit -1 to remove limit [default: 10]
     #[arg(long)]
     pub limit: Option<usize>,
 
@@ -1882,13 +1878,12 @@ impl TestArgs {
     pub fn to_eval_args(&self, arg: SystemArgs, in_dir: &Path, out_dir: &Path) -> EvalArgs {
         let mut eval_args = self.common_args.to_eval_args(arg, in_dir, out_dir);
         eval_args.resource_types = vec![ClapResourceType::Test, ClapResourceType::UnitTest];
-        eval_args.limit = self.limit.unwrap_or(DEFAULT_LIMIT);
         if let Some(output) = &self.output {
             eval_args.format = output.to_string();
         } else {
             eval_args.format = DEFAULT_FORMAT.clone();
         }
-        eval_args.limit = self.limit.unwrap_or(DEFAULT_LIMIT);
+        eval_args.limit = self.limit;
         eval_args.static_analysis = self.static_analysis;
         eval_args.format = self
             .output
@@ -1971,11 +1966,6 @@ pub struct ListArgs {
     #[clap(flatten)]
     pub common_args: CommonArgs,
 
-    /// Limiting number of shown rows. Run with --limit 0 to remove limit [default: 10]
-    // todo: still l;eft to be implemented..
-    #[arg(long, hide = true)]
-    pub limit: Option<usize>,
-
     /// Display rows in different formats, only table and json supported...
     #[arg(global = true, long, aliases = ["format"])]
     pub output: Option<DisplayFormat>,
@@ -1999,7 +1989,6 @@ impl ListArgs {
         if let Some(resource_type) = self.resource_type {
             eval_args.resource_types = vec![resource_type];
         }
-        eval_args.limit = self.limit.unwrap_or(DEFAULT_LIMIT);
         if let Some(output) = &self.output {
             eval_args.format = output.to_string();
         } else {
@@ -2034,10 +2023,6 @@ pub struct RunArgs {
     #[arg(long, default_value = "false", conflicts_with = "force_node_selection")]
     pub no_run_cache: bool,
 
-    /// Limiting number of shown rows. Run with --limit 0 to remove limit [default: 10]
-    #[arg(long)]
-    pub limit: Option<usize>,
-
     /// Display rows in different formats
     #[arg(global = true, long, aliases = ["format"])]
     pub output: Option<DisplayFormat>,
@@ -2069,7 +2054,6 @@ impl RunArgs {
         } else {
             eval_args.resource_types = vec![ClapResourceType::Model];
         }
-        eval_args.limit = self.limit.unwrap_or(DEFAULT_LIMIT);
         eval_args.static_analysis = self.static_analysis;
         eval_args.full_refresh = self.full_refresh;
         eval_args.format = self
@@ -2242,8 +2226,8 @@ pub struct CommonArgs {
     pub quiet: bool,
 
     /// The number of threads to use [Run with --threads 0 to use max_cpu [default: 1]]
-    // has no ENV_VAR
-    #[arg(global = true, long, short = 't')]
+    // has no ENV_VAR, but can be set in profiles.yml
+    #[arg(global = true, long)]
     pub threads: Option<usize>,
 
     /// Overrides threads.
@@ -2593,7 +2577,7 @@ impl CommonArgs {
             vars: self.vars.clone().unwrap_or_default(),
             phase: self.phase.clone().unwrap_or(Phases::All),
             format: DEFAULT_FORMAT.clone(),
-            limit: 10,
+            limit: Some(DEFAULT_LIMIT),
             from_main: false,
             // note: we use
             // - 0 for free threading,
@@ -2632,7 +2616,13 @@ impl CommonArgs {
             warn_error: self.warn_error,
             warn_error_options: self.warn_error_options.clone().unwrap_or_default(),
             version_check: self.version_check,
-            defer: self.defer || !self.no_defer,
+            defer: if self.no_defer {
+                Some(false)
+            } else if self.defer {
+                Some(true)
+            } else {
+                None
+            },
             debug: self.debug,
             log_format_file: self.log_format_file,
             log_format: self.log_format,

@@ -32,7 +32,7 @@ impl Object for RunConfig {
         _state: &State<'_, '_>,
         name: &str,
         args: &[Value],
-        _listener: Rc<dyn RenderingEventListener>,
+        _listeners: &[Rc<dyn RenderingEventListener>],
     ) -> Result<Value, MinijinjaError> {
         match name {
             // At compile time, this will return the value of the config variable if it exists
@@ -109,7 +109,7 @@ impl Object for RunConfig {
             }
             _ => Err(MinijinjaError::new(
                 MinijinjaErrorKind::UnknownMethod("RunConfig".to_string(), name.to_string()),
-                format!("Unknown method on parse: {}", name),
+                format!("Unknown method on parse: {name}"),
             )),
         }
     }

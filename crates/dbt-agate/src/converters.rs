@@ -10,10 +10,15 @@ use arrow::util::display::FormatOptions;
 use arrow_array::{Array, ArrowPrimitiveType, BooleanArray, GenericByteArray, OffsetSizeTrait};
 use arrow_buffer::i256;
 use arrow_schema::ArrowError;
-use chrono::{NaiveDate, NaiveTime};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
+use chrono_tz::Tz;
 use minijinja::Value;
 use minijinja_contrib::modules::py_datetime::date::PyDate;
+use minijinja_contrib::modules::py_datetime::datetime::PyDateTime;
 use minijinja_contrib::modules::py_datetime::time::PyTime;
+use minijinja_contrib::modules::pytz::PytzTimezone;
+use std::str::FromStr;
+use std::sync::Arc;
 
 use crate::decimal::DecimalValue;
 
@@ -191,8 +196,7 @@ impl ArrayConverter for PrimitiveArrayConverter<Date32Type> {
             let naive_date_opt = NaiveDate::from_num_days_from_ce_opt(num_days_from_ce);
             debug_assert!(
                 naive_date_opt.is_some(),
-                "out-of-range date32 value: {}",
-                num_days_from_epoch
+                "out-of-range date32 value: {num_days_from_epoch}"
             );
             match naive_date_opt {
                 Some(naive_date) => Value::from_object(PyDate::new(naive_date)),
@@ -218,8 +222,7 @@ impl ArrayConverter for PrimitiveArrayConverter<Date64Type> {
             let naive_date_opt = NaiveDate::from_num_days_from_ce_opt(num_days_from_ce);
             debug_assert!(
                 naive_date_opt.is_some(),
-                "out-of-range date64 value: {}",
-                num_millis_from_epoch
+                "out-of-range date64 value: {num_millis_from_epoch}"
             );
             match naive_date_opt {
                 Some(naive_date) => Value::from_object(PyDate::new(naive_date)),
@@ -238,8 +241,7 @@ impl ArrayConverter for PrimitiveArrayConverter<Time32SecondType> {
                 let naive_time_opt = NaiveTime::from_num_seconds_from_midnight_opt(seconds, 0);
                 debug_assert!(
                     naive_time_opt.is_some(),
-                    "out-of-range time32 (seconds) value: {}",
-                    seconds
+                    "out-of-range time32 (seconds) value: {seconds}"
                 );
                 naive_time_opt
             });
@@ -262,8 +264,7 @@ impl ArrayConverter for PrimitiveArrayConverter<Time32MillisecondType> {
                 let naive_time_opt = NaiveTime::from_num_seconds_from_midnight_opt(secs, nano);
                 debug_assert!(
                     naive_time_opt.is_some(),
-                    "out-of-range time32 (milliseconds) value: {}",
-                    millis
+                    "out-of-range time32 (milliseconds) value: {millis}"
                 );
                 naive_time_opt
             });
@@ -286,8 +287,7 @@ impl ArrayConverter for PrimitiveArrayConverter<Time64MicrosecondType> {
                 let naive_time_opt = NaiveTime::from_num_seconds_from_midnight_opt(secs, nano);
                 debug_assert!(
                     naive_time_opt.is_some(),
-                    "out-of-range time64 (microseconds) value: {}",
-                    micros
+                    "out-of-range time64 (microseconds) value: {micros}"
                 );
                 naive_time_opt
             });
@@ -310,8 +310,7 @@ impl ArrayConverter for PrimitiveArrayConverter<Time64NanosecondType> {
                 let naive_time_opt = NaiveTime::from_num_seconds_from_midnight_opt(secs, nano_frac);
                 debug_assert!(
                     naive_time_opt.is_some(),
-                    "out-of-range time64 (nanoseconds) value: {}",
-                    nanos
+                    "out-of-range time64 (nanoseconds) value: {nanos}"
                 );
                 naive_time_opt
             });
@@ -322,6 +321,105 @@ impl ArrayConverter for PrimitiveArrayConverter<Time64NanosecondType> {
         } else {
             Value::from(())
         }
+    }
+}
+
+pub struct TimestampArrayConverter<T: ArrowPrimitiveType> {
+    array: PrimitiveArray<T>,
+    tz: Option<Tz>,
+    py_tz: Option<PytzTimezone>,
+}
+
+impl<T: ArrowPrimitiveType<Native = i64>> TimestampArrayConverter<T> {
+    pub fn new(array: PrimitiveArray<T>, maybe_tz_str: Option<Arc<str>>) -> Self {
+        let tz_opt = maybe_tz_str.as_ref().and_then(|tz_str| {
+            let parse_result = Tz::from_str(tz_str);
+            debug_assert!(
+                parse_result.is_ok(),
+                "unexpected timezone string from Arrow {tz_str}: {parse_result:?}"
+            );
+            parse_result.ok()
+        });
+
+        let py_tz_opt = tz_opt.as_ref().map(|tz| PytzTimezone { tz: *tz });
+
+        Self {
+            array,
+            tz: tz_opt,
+            py_tz: py_tz_opt,
+        }
+    }
+
+    fn from_arrow_timestamp(raw: i64, time_unit: TimeUnit) -> Option<NaiveDateTime> {
+        match time_unit {
+            TimeUnit::Second => DateTime::<Utc>::from_timestamp(raw, 0).map(|dt| dt.naive_utc()),
+            TimeUnit::Millisecond => {
+                DateTime::<Utc>::from_timestamp_millis(raw).map(|dt| dt.naive_utc())
+            }
+            TimeUnit::Microsecond => {
+                DateTime::<Utc>::from_timestamp_micros(raw).map(|dt| dt.naive_utc())
+            }
+            TimeUnit::Nanosecond => DateTime::<Utc>::from_timestamp_nanos(raw)
+                .naive_utc()
+                .into(),
+        }
+    }
+
+    fn do_to_value(&self, idx: usize, time_unit: TimeUnit) -> Value {
+        if self.array.is_valid(idx) {
+            let raw = self.array.value(idx);
+
+            let naive = match Self::from_arrow_timestamp(raw, time_unit) {
+                Some(naive) => naive,
+                None => {
+                    // Even when given 64-bits, real-world timestamps won't be
+                    // INT32_MAX (~2 billion) days from UNIX epoch. Even the Python
+                    // standard library limits this to 999_999_999 and most data
+                    // warehouses also have a limit that lets the number of days fit
+                    // in 32-bits.
+                    panic!(
+                        "Timestamp conversion overflow: {raw}{time_unit:?} is out of the valid range."
+                    )
+                }
+            };
+
+            let py_dt = self
+                .tz
+                .map(|tz| tz.from_utc_datetime(&naive))
+                .map(|aware| {
+                    debug_assert!(self.py_tz.is_some(), "py_tz must be some when tz is some");
+                    PyDateTime::new_aware(aware, self.py_tz.clone())
+                })
+                .unwrap_or_else(|| PyDateTime::new_naive(naive));
+
+            Value::from_object(py_dt)
+        } else {
+            Value::from(())
+        }
+    }
+}
+
+impl ArrayConverter for TimestampArrayConverter<TimestampSecondType> {
+    fn to_value(&self, idx: usize) -> Value {
+        self.do_to_value(idx, TimeUnit::Second)
+    }
+}
+
+impl ArrayConverter for TimestampArrayConverter<TimestampMillisecondType> {
+    fn to_value(&self, idx: usize) -> Value {
+        self.do_to_value(idx, TimeUnit::Millisecond)
+    }
+}
+
+impl ArrayConverter for TimestampArrayConverter<TimestampMicrosecondType> {
+    fn to_value(&self, idx: usize) -> Value {
+        self.do_to_value(idx, TimeUnit::Microsecond)
+    }
+}
+
+impl ArrayConverter for TimestampArrayConverter<TimestampNanosecondType> {
+    fn to_value(&self, idx: usize) -> Value {
+        self.do_to_value(idx, TimeUnit::Nanosecond)
     }
 }
 // }}}
@@ -437,7 +535,30 @@ pub fn make_array_converter(array: &dyn Array) -> Result<Box<dyn ArrayConverter>
                 array.as_primitive::<Time64NanosecondType>(),
             ))
         }
-        // TODO: extends type support (e.g. date and time types)
+        DataType::Timestamp(TimeUnit::Second, maybe_tz) => {
+            Box::new(TimestampArrayConverter::<TimestampSecondType>::new(
+                array.as_primitive::<TimestampSecondType>().clone(),
+                maybe_tz.clone(),
+            ))
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, maybe_tz) => {
+            Box::new(TimestampArrayConverter::<TimestampMillisecondType>::new(
+                array.as_primitive::<TimestampMillisecondType>().clone(),
+                maybe_tz.clone(),
+            ))
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, maybe_tz) => {
+            Box::new(TimestampArrayConverter::<TimestampMicrosecondType>::new(
+                array.as_primitive::<TimestampMicrosecondType>().clone(),
+                maybe_tz.clone(),
+            ))
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, maybe_tz) => {
+            Box::new(TimestampArrayConverter::<TimestampNanosecondType>::new(
+                array.as_primitive::<TimestampNanosecondType>().clone(),
+                maybe_tz.clone(),
+            ))
+        }
         _ => {
             // FALLBACK: Turn every Arrow value into a [minijinja::Value] string.
             let format_options = FormatOptions::new().with_null("None");
@@ -459,14 +580,13 @@ mod tests {
     use arrow_array::{
         ArrayRef, Date32Array, Date64Array, Decimal128Array, Decimal256Array, Float64Array,
         Int32Array, Int64Array, StringArray, Time32MillisecondArray, Time32SecondArray,
-        Time64MicrosecondArray, Time64NanosecondArray, UInt64Array,
+        Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt64Array,
     };
     use arrow_buffer::Buffer;
     use arrow_data::decimal::MAX_DECIMAL128_FOR_EACH_PRECISION;
     use arrow_data::ArrayData;
-    use minijinja::listener::DefaultRenderingEventListener;
     use minijinja::Value;
-    use std::rc::Rc;
     use std::sync::Arc;
 
     const MAX_DECIMAL128: i128 = MAX_DECIMAL128_FOR_EACH_PRECISION[38];
@@ -671,20 +791,10 @@ mod tests {
             let date0 = &result[0];
             let date1 = &result[1];
 
-            let res0 = date0.call_method(
-                &state,
-                "strftime",
-                &[Value::from("%Y/%m/%d")],
-                Rc::new(DefaultRenderingEventListener),
-            );
+            let res0 = date0.call_method(&state, "strftime", &[Value::from("%Y/%m/%d")], &[]);
             assert_eq!(res0.unwrap().to_string(), "2025/05/28");
 
-            let res1 = date1.call_method(
-                &state,
-                "strftime",
-                &[Value::from("%Y/%m/%d")],
-                Rc::new(DefaultRenderingEventListener),
-            );
+            let res1 = date1.call_method(&state, "strftime", &[Value::from("%Y/%m/%d")], &[]);
             assert_eq!(res1.unwrap().to_string(), "2025/05/29");
         };
     }
@@ -728,20 +838,12 @@ mod tests {
             let time0 = &result[0];
             let time1 = &result[1];
 
-            let res0 = time0.call_method(
-                &state,
-                "strftime",
-                &[Value::from("h=%H, m=%M, s=%S")],
-                Rc::new(DefaultRenderingEventListener),
-            );
+            let res0 =
+                time0.call_method(&state, "strftime", &[Value::from("h=%H, m=%M, s=%S")], &[]);
             assert_eq!(res0.unwrap().to_string(), "h=13, m=37, s=00");
 
-            let res1 = time1.call_method(
-                &state,
-                "strftime",
-                &[Value::from("h=%H, m=%M, s=%S")],
-                Rc::new(DefaultRenderingEventListener),
-            );
+            let res1 =
+                time1.call_method(&state, "strftime", &[Value::from("h=%H, m=%M, s=%S")], &[]);
             assert_eq!(res1.unwrap().to_string(), "h=23, m=59, s=59");
         };
     }
@@ -764,5 +866,79 @@ mod tests {
     #[test]
     fn test_time64_nanoseconds_values() {
         test_time!(Time64NanosecondType, Time64NanosecondArray);
+    }
+
+    const TEST_TIMESTAMPS: [Option<i64>; 4] = [Some(0), None, Some(123_123_123), Some(-101)];
+    const TEST_TZ_NAME: &str = "America/New_York";
+
+    fn scale_timestamps(input: &[Option<i64>], scale: i64) -> Vec<Option<i64>> {
+        input.iter().map(|opt| opt.map(|s| s * scale)).collect()
+    }
+
+    fn value_from_timestamps_in_secs(s: i64) -> Value {
+        let dt = DateTime::<Utc>::from_timestamp(s, 0).unwrap().naive_utc();
+        Value::from_object(PyDateTime::new_naive(dt))
+    }
+
+    fn tz_aware_value_from_timestamp_in_secs(s: i64, tz: Tz) -> Value {
+        let dt = DateTime::<Utc>::from_timestamp(s, 0).unwrap().naive_utc();
+        let aware = tz.from_utc_datetime(&dt);
+        Value::from_object(PyDateTime::new_aware(aware, Some(PytzTimezone { tz })))
+    }
+
+    macro_rules! assert_timestamp_values {
+        ($array_type:ident, $scale:expr) => {{
+            let tz = Tz::from_str(TEST_TZ_NAME).unwrap();
+
+            let to_strs = |v: &[Value]| v.iter().map(ToString::to_string).collect::<Vec<_>>();
+
+            // === Naive Test ===
+            let input_naive = scale_timestamps(&TEST_TIMESTAMPS, $scale);
+            let array: ArrayRef = Arc::new($array_type::from(input_naive));
+            let result = arrow_to_values(&array).unwrap();
+
+            let expected: Vec<Value> = TEST_TIMESTAMPS
+                .iter()
+                .map(|opt| opt.map_or_else(|| Value::from(()), value_from_timestamps_in_secs))
+                .collect();
+
+            assert_eq!(to_strs(&result), to_strs(&expected));
+
+            // === Aware Test ===
+            let aware_secs: Vec<i64> = TEST_TIMESTAMPS.iter().copied().flatten().collect();
+            let aware_input: Vec<Option<i64>> = aware_secs.iter().copied().map(Some).collect();
+            let input_aware = scale_timestamps(&aware_input, $scale);
+            let array_aware: ArrayRef =
+                Arc::new($array_type::from(input_aware).with_timezone(TEST_TZ_NAME));
+            let result_aware = arrow_to_values(&array_aware).unwrap();
+
+            let expected_aware: Vec<Value> = aware_secs
+                .iter()
+                .copied()
+                .map(|s| tz_aware_value_from_timestamp_in_secs(s, tz))
+                .collect();
+
+            assert_eq!(to_strs(&result_aware), to_strs(&expected_aware));
+        }};
+    }
+
+    #[test]
+    fn test_timestamp_second_values() {
+        assert_timestamp_values!(TimestampSecondArray, 1);
+    }
+
+    #[test]
+    fn test_timestamp_millis_values() {
+        assert_timestamp_values!(TimestampMillisecondArray, 1_000);
+    }
+
+    #[test]
+    fn test_timestamp_micros_values() {
+        assert_timestamp_values!(TimestampMicrosecondArray, 1_000_000);
+    }
+
+    #[test]
+    fn test_timestamp_nanos_values() {
+        assert_timestamp_values!(TimestampNanosecondArray, 1_000_000_000);
     }
 }

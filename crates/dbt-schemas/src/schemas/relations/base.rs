@@ -3,7 +3,7 @@ use crate::dbt_types::RelationType;
 use crate::schemas::common::ResolvedQuoting;
 
 use dbt_common::constants::DBT_CTE_PREFIX;
-use dbt_common::current_function_name;
+use dbt_common::{current_function_name, FsResult};
 use minijinja::arg_utils::{check_num_args, ArgParser};
 use minijinja::{invalid_argument, invalid_argument_inner, jinja_err};
 use minijinja::{Error as MinijinjaError, ErrorKind as MinijinjaErrorKind, State, Value};
@@ -104,6 +104,12 @@ pub trait BaseRelationProperties {
 
     /// quoting character to be used when rendering the relation
     fn quote_character(&self) -> char;
+
+    fn get_database(&self) -> FsResult<String>;
+
+    fn get_schema(&self) -> FsResult<String>;
+
+    fn get_identifier(&self) -> FsResult<String>;
 }
 
 /// Base trait for all fs adapter objects
@@ -464,13 +470,13 @@ pub trait BaseRelation: BaseRelationProperties + Any + Send + Sync + fmt::Debug 
                     let identifier = obj.get_value(&Value::from("identifier".to_string()));
                     (
                         database
-                            .map(|v| v.as_str().unwrap().to_string())
+                            .map(|v| v.as_str().unwrap_or("dummy").to_string())
                             .unwrap_or_else(|| self.database_as_str().unwrap()),
                         schema
-                            .map(|v| v.as_str().unwrap().to_string())
+                            .map(|v| v.as_str().unwrap_or("dummy").to_string())
                             .unwrap_or_else(|| self.schema_as_str().unwrap()),
                         identifier
-                            .map(|v| v.as_str().unwrap().to_string())
+                            .map(|v| v.as_str().unwrap_or("dummy").to_string())
                             .unwrap_or_else(|| self.identifier_as_str().unwrap()),
                     )
                 }
@@ -625,6 +631,18 @@ mod tests {
 
         fn quote_character(&self) -> char {
             '"'
+        }
+
+        fn get_database(&self) -> FsResult<String> {
+            Ok(self.database.clone())
+        }
+
+        fn get_schema(&self) -> FsResult<String> {
+            Ok(self.schema.clone())
+        }
+
+        fn get_identifier(&self) -> FsResult<String> {
+            Ok(self.identifier.clone())
         }
     }
 

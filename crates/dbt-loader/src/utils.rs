@@ -3,7 +3,7 @@ use dbt_common::{
     constants::{DBT_DEPENDENCIES_YML, DBT_PACKAGES_YML},
     err, fs_err, show_warning, stdfs, ErrorCode, FsResult,
 };
-use dbt_jinja_utils::serde::value_from_file;
+use dbt_jinja_utils::serde::{from_yaml_error, value_from_file};
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::Read,
@@ -19,7 +19,7 @@ use dbt_schemas::schemas::{
     profiles::{DbConfig, DbTargets, DbtProfilesIntermediate},
 };
 use fs_deps::utils::get_local_package_full_path;
-use serde::de::DeserializeOwned;
+use serde::{de::DeserializeOwned, Serialize};
 use std::{fs::metadata, io, time::SystemTime};
 
 use walkdir::WalkDir;
@@ -57,7 +57,7 @@ pub fn collect_file_info<P: AsRef<Path>>(
 pub fn indent(data: &str, spaces: usize) -> String {
     let indent = " ".repeat(spaces);
     data.lines()
-        .map(|line| format!("{}{}", indent, line))
+        .map(|line| format!("{indent}{line}"))
         .collect::<Vec<String>>()
         .join("\n")
 }
@@ -83,7 +83,7 @@ pub fn get_db_config(
     // 6. Find the desired target
     let db_config = db_targets.outputs.get(&target_name).ok_or(fs_err!(
         ErrorCode::InvalidConfig,
-        "Could not find target {} in dbt profile.yml",
+        "Could not find target {} in profiles.yml",
         target_name,
     ))?;
     let db_config: DbConfig = serde_json::from_value(db_config.clone())?;
@@ -98,7 +98,7 @@ pub fn get_db_config(
                 db_config
                     .ignored_properties()
                     .keys()
-                    .map(|k| format!("'{}'", k))
+                    .map(|k| format!("'{k}'"))
                     .collect::<Vec<String>>()
                     .join(", ")
             )
@@ -107,44 +107,48 @@ pub fn get_db_config(
     Ok(db_config)
 }
 
-pub fn read_profiles_and_extract_db_config(
+pub fn read_profiles_and_extract_db_config<S: Serialize>(
     io_args: &IoArgs,
     dbt_target_override: &Option<String>,
     jinja_env: &JinjaEnvironment<'static>,
+    ctx: &S,
     profile_str: &str,
     profile_path: PathBuf,
 ) -> Result<(String, DbConfig), Box<dbt_common::FsError>> {
-    // if profile_path is under io_args.in_dir, use the relative path
-    let _maybe_relative_profile_path = if profile_path.starts_with(&io_args.in_dir) {
-        stdfs::diff_paths(&profile_path, &io_args.in_dir)?
-    } else {
-        #[allow(clippy::redundant_clone)]
-        profile_path.clone()
-    };
-
     let prepared_profile_val = value_from_file(Some(io_args), &profile_path)?;
-    let dbt_profiles = dbt_serde_yaml::from_value::<DbtProfilesIntermediate>(prepared_profile_val)?;
+    let dbt_profiles = dbt_serde_yaml::from_value::<DbtProfilesIntermediate>(prepared_profile_val)
+        .map_err(|e| from_yaml_error(e, Some(&profile_path)))?;
     if dbt_profiles.config.is_some() {
         return err!(
             ErrorCode::InvalidConfig,
             "Unexpected 'config' key in dbt profiles.yml"
         );
     }
-    let profile_val = dbt_profiles.profiles.get(profile_str).ok_or(fs_err!(
-        ErrorCode::IoError,
-        "Profile '{}' not found in dbt profiles.yml",
-        profile_str
-    ))?;
-    let db_targets: DbTargets = into_typed_with_jinja(
+
+    // get the profile value
+    let profile_val: &dbt_serde_yaml::Value =
+        dbt_profiles.profiles.get(profile_str).ok_or(fs_err!(
+            ErrorCode::IoError,
+            "Profile '{}' not found in dbt profiles.yml",
+            profile_str
+        ))?;
+
+    // extract just the db_targets value before rendering jinja to avoid rendering unused outputs
+    let db_targets_unrendered = dbt_serde_yaml::from_value::<DbTargets>(profile_val.clone())
+        .map_err(|e| from_yaml_error(e, Some(&profile_path)))?;
+
+    // render the jinja to get the target name in case the user uses an an env_var jinja expression here
+    let profile_target = into_typed_with_jinja(
         Some(io_args),
-        profile_val.clone(),
+        db_targets_unrendered.default_target.clone().into(),
         true,
         jinja_env,
-        &(),
-        None,
+        &ctx,
+        &[],
     )?;
+
     let target = match dbt_target_override {
-        Some(target) => db_targets
+        Some(target) => db_targets_unrendered
             .outputs
             .keys()
             .any(|t| t == target)
@@ -154,9 +158,33 @@ pub fn read_profiles_and_extract_db_config(
                 "Target '{}' not found in dbt profiles.yml",
                 target
             ))?,
-        None => db_targets.default_target.clone(),
+        None => profile_target,
     };
-    let db_config = get_db_config(io_args, db_targets, Some(target.clone()))?;
+
+    // filter the db_targets to only include the target we want to use
+    let db_targets_filtered = DbTargets {
+        default_target: db_targets_unrendered.default_target.clone(),
+        outputs: db_targets_unrendered
+            .outputs
+            .iter()
+            .filter(|(k, _)| *k == &target)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    };
+
+    // render just the target output we want to use
+    let db_targets_rendered = into_typed_with_jinja(
+        Some(io_args),
+        dbt_serde_yaml::to_value(&db_targets_filtered)
+            .map_err(|e| from_yaml_error(e, Some(&profile_path)))?,
+        true,
+        jinja_env,
+        &(),
+        &[],
+    )?;
+
+    let db_config = get_db_config(io_args, db_targets_rendered, Some(target.clone()))?;
+
     Ok((target, db_config))
 }
 

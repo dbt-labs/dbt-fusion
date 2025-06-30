@@ -225,7 +225,7 @@ pub use crate::value::object::{
 
 #[macro_use]
 mod type_erase;
-mod argtypes;
+pub(crate) mod argtypes;
 #[cfg(feature = "deserialization")]
 mod deserialize;
 pub(crate) mod merge_object;
@@ -285,7 +285,7 @@ thread_local! {
     // This should be an AtomicU64 but sadly 32bit targets do not necessarily have
     // AtomicU64 available.
     static LAST_VALUE_HANDLE: Cell<u32> = const { Cell::new(0) };
-    static VALUE_HANDLES: RefCell<BTreeMap<u32, Value>> = RefCell::new(BTreeMap::new());
+    static VALUE_HANDLES: RefCell<BTreeMap<u32, Value>> = const {RefCell::new(BTreeMap::new())};
 }
 
 /// Function that returns true when serialization for [`Value`] is taking place.
@@ -473,10 +473,10 @@ impl fmt::Debug for ValueRepr {
             ValueRepr::I64(val) => fmt::Debug::fmt(val, f),
             ValueRepr::F64(val) => fmt::Debug::fmt(val, f),
             ValueRepr::None => f.write_str("none"),
-            ValueRepr::Invalid(ref val) => write!(f, "<invalid value: {}>", val),
+            ValueRepr::Invalid(ref val) => write!(f, "<invalid value: {val}>"),
             ValueRepr::U128(val) => fmt::Debug::fmt(&{ val.0 }, f),
             ValueRepr::I128(val) => fmt::Debug::fmt(&{ val.0 }, f),
-            ValueRepr::String(val, _) => write!(f, "'{}'", val),
+            ValueRepr::String(val, _) => write!(f, "'{val}'"),
             ValueRepr::SmallStr(val) => write!(f, "'{}'", val.as_str()),
             ValueRepr::Bytes(val) => {
                 write!(f, "b'")?;
@@ -559,7 +559,7 @@ impl PartialEq for Value {
                                     need_length_fallback = false;
                                 }
                                 let mut a_count = 0;
-                                if !a.try_iter_pairs().map_or(false, |mut ak| {
+                                if !a.try_iter_pairs().is_some_and(|mut ak| {
                                     ak.all(|(k, v1)| {
                                         a_count += 1;
                                         b.get_value(&k) == Some(v1)
@@ -689,7 +689,7 @@ impl fmt::Display for Value {
                 }
             }
             ValueRepr::None => f.write_str("none"),
-            ValueRepr::Invalid(ref val) => write!(f, "<invalid value: {}>", val),
+            ValueRepr::Invalid(ref val) => write!(f, "<invalid value: {val}>"),
             ValueRepr::I128(val) => write!(f, "{}", { val.0 }),
             ValueRepr::String(val, _) => write!(f, "{val}"),
             ValueRepr::SmallStr(val) => write!(f, "{}", val.as_str()),
@@ -1558,10 +1558,10 @@ impl Value {
         &self,
         state: &State,
         args: &[Value],
-        listener: Rc<dyn RenderingEventListener>,
+        listeners: &[Rc<dyn RenderingEventListener>],
     ) -> Result<Value, Error> {
         if let ValueRepr::Object(ref dy) = self.0 {
-            dy.call(state, args, listener)
+            dy.call(state, args, listeners)
         } else if self.is_undefined() {
             state.undefined_behavior().handle_undefined(None)
         } else {
@@ -1581,9 +1581,9 @@ impl Value {
         state: &State,
         name: &str,
         args: &[Value],
-        listener: Rc<dyn RenderingEventListener>,
+        listeners: &[Rc<dyn RenderingEventListener>],
     ) -> Result<Value, Error> {
-        match self._call_method(state, name, args, listener) {
+        match self._call_method(state, name, args, listeners) {
             Ok(rv) => Ok(rv),
             Err(mut err) => {
                 if let ErrorKind::UnknownMethod(_caller, _method_name) = err.kind() {
@@ -1624,10 +1624,10 @@ impl Value {
         state: &State,
         name: &str,
         args: &[Value],
-        listener: Rc<dyn RenderingEventListener>,
+        listeners: &[Rc<dyn RenderingEventListener>],
     ) -> Result<Value, Error> {
         if let Some(object) = self.as_object() {
-            object.call_method(state, name, args, listener)
+            object.call_method(state, name, args, listeners)
         } else {
             Err(Error::from(ErrorKind::UnknownMethod(
                 "Value".to_string(),

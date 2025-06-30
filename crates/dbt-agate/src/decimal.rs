@@ -128,7 +128,7 @@ impl<T: DecimalType> fmt::Debug for DecimalValue<T> {
         // TODO: use default context to align with Python's decimal module formatting
         let _ = &DEFAULT_CONTEXT;
         let text = T::format_decimal(self.value, self.precision, self.scale);
-        write!(f, "{}", text)
+        write!(f, "{text}")
     }
 }
 
@@ -146,10 +146,10 @@ impl<T: DecimalType> Object for DecimalValue<T> {
         state: &minijinja::State<'_, '_>,
         method: &str,
         args: &[Value],
-        listener: std::rc::Rc<dyn minijinja::listener::RenderingEventListener>,
+        listeners: &[std::rc::Rc<dyn minijinja::listener::RenderingEventListener>],
     ) -> Result<Value, MinijinjaError> {
         if let Some(value) = self.get_value(&Value::from(method)) {
-            return value.call(state, args, listener);
+            return value.call(state, args, listeners);
         }
 
         // TODO: implement decimal methods

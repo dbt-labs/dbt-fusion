@@ -7,33 +7,39 @@ use std::{
 
 use dashmap::DashMap;
 use dbt_common::serde_utils::convert_json_to_dash_map;
-use dbt_fusion_adapter::adapters::{load_store::ResultStore, relation_object::create_relation};
+use dbt_fusion_adapter::{load_store::ResultStore, relation_object::create_relation};
 use dbt_schemas::schemas::{
-    common::ResolvedQuoting, manifest::CommonAttributes, relations::base::BaseRelation,
+    common::ResolvedQuoting, relations::base::BaseRelation, CommonAttributes, NodeBaseAttributes,
 };
+use dbt_schemas::state::{DbtRuntimeConfig, RefsAndSourcesTracker};
 use minijinja::{
     constants::{TARGET_PACKAGE_NAME, TARGET_UNIQUE_ID},
     Value as MinijinjaValue,
 };
-use serde::Serialize;
+use serde_json::Value;
 
 use crate::phases::MacroLookupContext;
 
+use super::super::compile_and_run_context::RefFunction;
 use super::compile_config::CompileConfig;
 
 /// Build a compile model context
 /// Returns a context and the current relation
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
-pub fn build_compile_node_context<S: Serialize>(
+pub fn build_compile_node_context(
     model: &MinijinjaValue,
     common_attr: &CommonAttributes,
+    base_attr: &NodeBaseAttributes,
     alias: &str,
-    config: &S,
+    config: &Value,
     quoting: ResolvedQuoting,
     adapter_type: &str,
     base_context: &BTreeMap<String, MinijinjaValue>,
     root_project_name: &str,
     packages: BTreeSet<String>,
+    refs_and_sources: Arc<dyn RefsAndSourcesTracker>,
+    runtime_config: Arc<DbtRuntimeConfig>,
+    skip_ref_validation: bool,
 ) -> (
     BTreeMap<String, MinijinjaValue>,
     Arc<dyn BaseRelation>,
@@ -73,9 +79,7 @@ pub fn build_compile_node_context<S: Serialize>(
     );
     ctx.insert("identifier".to_owned(), MinijinjaValue::from(alias));
 
-    let config_map = Arc::new(convert_json_to_dash_map(
-        serde_json::to_value(config).unwrap(),
-    ));
+    let config_map = Arc::new(convert_json_to_dash_map(config.clone()));
     let compile_config = CompileConfig {
         config: config_map.clone(),
     };
@@ -88,6 +92,22 @@ pub fn build_compile_node_context<S: Serialize>(
         "config".to_string(),
         MinijinjaValue::from_object(compile_config),
     );
+
+    // Create validated ref function with dependency checking
+    let allowed_dependencies: Arc<BTreeSet<String>> =
+        Arc::new(base_attr.depends_on.nodes.iter().cloned().collect());
+
+    let ref_function = RefFunction::new_with_validation(
+        refs_and_sources.clone(),
+        common_attr.package_name.clone(),
+        runtime_config,
+        allowed_dependencies,
+        skip_ref_validation,
+    );
+
+    let ref_value = MinijinjaValue::from_object(ref_function);
+    ctx.insert("ref".to_string(), ref_value.clone());
+    base_builtins.insert("ref".to_string(), ref_value);
 
     // Register builtins as a global
     ctx.insert(

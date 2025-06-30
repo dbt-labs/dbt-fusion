@@ -15,8 +15,8 @@ use crate::constants::{
 };
 use crate::error::{attach_basic_debug_info, Error, ErrorKind};
 use crate::expression::Expression;
-use crate::listener::{DefaultRenderingEventListener, RenderingEventListener};
-use crate::output::{MacroSpans, Output};
+use crate::listener::RenderingEventListener;
+use crate::output::Output;
 use crate::template::{CompiledTemplate, CompiledTemplateRef, Template, TemplateConfig};
 use crate::utils::{AutoEscape, BTreeMapKeysDebug, UndefinedBehavior};
 use crate::value::mutable_map::MutableMap;
@@ -177,12 +177,18 @@ impl<'source> Environment<'source> {
     /// the parameters are actually [`Cow`].  This method fails if the template has a syntax error.
     #[cfg(feature = "loader")]
     #[cfg_attr(docsrs, doc(cfg(feature = "loader")))]
-    pub fn add_template_owned<N, S>(&mut self, name: N, source: S) -> Result<(), Error>
+    pub fn add_template_owned<N, S>(
+        &mut self,
+        name: N,
+        source: S,
+        filename: Option<String>,
+    ) -> Result<(), Error>
     where
         N: Into<Cow<'source, str>>,
         S: Into<Cow<'source, str>>,
     {
-        self.templates.insert_cow(name.into(), source.into())
+        self.templates
+            .insert_cow(name.into(), source.into(), filename)
     }
 
     /// Register a template loader as source of templates.
@@ -416,6 +422,7 @@ impl<'source> Environment<'source> {
                 name,
                 source,
                 &self.templates.template_config,
+                None,
             )))),
         ))
     }
@@ -455,10 +462,9 @@ impl<'source> Environment<'source> {
         name: &str,
         source: &str,
         ctx: S,
-        listener: Option<Rc<dyn RenderingEventListener>>,
-    ) -> Result<(String, MacroSpans), Error> {
-        let listener = listener.unwrap_or_else(|| Rc::new(DefaultRenderingEventListener));
-        ok!(self.template_from_named_str(name, source)).render(ctx, listener)
+        listeners: &[Rc<dyn RenderingEventListener>],
+    ) -> Result<String, Error> {
+        ok!(self.template_from_named_str(name, source)).render(ctx, listeners)
     }
 
     /// Parses and renders a template from a string in one go.
@@ -475,12 +481,11 @@ impl<'source> Environment<'source> {
         &self,
         source: &str,
         ctx: S,
-        listener: Option<Rc<dyn RenderingEventListener>>,
-    ) -> Result<(String, MacroSpans), Error> {
+        listeners: &[Rc<dyn RenderingEventListener>],
+    ) -> Result<String, Error> {
         // reduce total amount of code falling under mono morphization into
         // this function, and share the rest in _eval.
-        let listener = listener.unwrap_or_else(|| Rc::new(DefaultRenderingEventListener));
-        ok!(self.template_from_str(source)).render(ctx, listener)
+        ok!(self.template_from_str(source)).render(ctx, listeners)
     }
 
     /// Sets a new function to select the default auto escaping.

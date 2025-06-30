@@ -11,7 +11,7 @@ use dbt_jinja_utils::phases::parse::init::initialize_parse_jinja_environment;
 use dbt_jinja_utils::refs_and_sources::{resolve_dependencies, RefsAndSources};
 use dbt_schemas::dbt_utils::resolve_package_quoting;
 use dbt_schemas::schemas::macros::build_macro_units;
-use dbt_schemas::schemas::manifest::{InternalDbtNode, Nodes};
+use dbt_schemas::schemas::{InternalDbtNode, Nodes};
 
 use dbt_jinja_utils::jinja_environment::JinjaEnvironment;
 use dbt_schemas::state::RenderResults;
@@ -73,7 +73,7 @@ pub async fn resolve(
                 // This is a temporary solution, for a feature that is supposed to be
                 // deprecated in the future
                 .chain(&package.snapshot_files)
-                .collect(),
+                .collect::<Vec<_>>(),
         )?;
         macros.macros.extend(resolved_macros);
         let docs_macros = resolve_docs_macros(&package.docs_files)?;
@@ -115,22 +115,20 @@ pub async fn resolve(
             .iter()
             .map(|p| p.dbt_project.name.clone())
             .collect(),
+        arg.io.clone(),
     )?;
 
     // Compute final selectors
     let resolved_selectors = resolve_final_selectors(root_project_name, &jinja_env, arg)?;
+    // dbg!(&resolved_selectors);
 
     // Create a map to store full runtime configs for ALL packages
     let mut all_runtime_configs: BTreeMap<String, Arc<DbtRuntimeConfig>> = BTreeMap::new();
 
     let mut nodes = Nodes::default();
     let mut disabled_nodes = Nodes::default();
-    let root_project_configs = build_root_project_configs(
-        &arg.io,
-        dbt_state.root_project(),
-        root_project_quoting,
-        &jinja_env,
-    )?;
+    let root_project_configs =
+        build_root_project_configs(&arg.io, dbt_state.root_project(), root_project_quoting)?;
     let root_project_configs = Arc::new(root_project_configs);
 
     // Process packages in topological order

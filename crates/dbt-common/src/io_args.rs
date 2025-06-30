@@ -107,17 +107,21 @@ impl IoArgs {
     /// This function takes an artifact path, which may either be a workspace
     /// resource, or some generated temp location, and returns a path to its
     /// corresponding location in the workspace
-    ///
-    /// FIXME: this is really a hack, the proper thing to do is to have a
-    /// semantic representation for each artifact that can generate workspace or
-    /// temporary paths
-    pub fn map_to_workspace_path(&self, path: &Path) -> PathBuf {
-        let special_component_idx = path.components().position(|c| {
-            c.as_os_str() == DBT_GENERIC_TESTS_DIR_NAME || c.as_os_str() == DBT_SNAPSHOTS_DIR_NAME
-        });
-        if let Some(idx) = special_component_idx {
-            self.out_dir
-                .join(path.components().skip(idx).collect::<PathBuf>())
+    pub fn map_to_workspace_path(&self, path: &Path, resource_type: &str) -> PathBuf {
+        if resource_type == "unit_test" || resource_type == "snapshot" {
+            let special_component_idx = path.components().position(|c| {
+                c.as_os_str() == DBT_GENERIC_TESTS_DIR_NAME
+                    || c.as_os_str() == DBT_SNAPSHOTS_DIR_NAME
+            });
+            if let Some(idx) = special_component_idx {
+                // FIXME: this is really a hack, the proper thing to do is to have a
+                // semantic representation for each artifact that can generate workspace or
+                // temporary paths
+                self.out_dir
+                    .join(path.components().skip(idx).collect::<PathBuf>())
+            } else {
+                self.out_dir.join(path)
+            }
         } else {
             self.in_dir.join(path)
         }
@@ -161,8 +165,8 @@ pub struct EvalArgs {
     pub phase: Phases,
     // Display rows in different formats, this is .to_string on DisplayFormat; we use a string here to break dep. cycle
     pub format: String,
-    /// Limiting number of shown rows. Run with --limit 0 to remove limit
-    pub limit: usize,
+    /// Limiting number of shown rows. None means no limit, run with --limit -1 to remove limit
+    pub limit: Option<usize>,
     /// called as bin or as library
     pub from_main: bool,
     /// The number of threads to use
@@ -224,7 +228,7 @@ pub struct EvalArgs {
     pub warn_error: bool,
     pub warn_error_options: BTreeMap<String, Value>,
     pub version_check: bool,
-    pub defer: bool,
+    pub defer: Option<bool>,
     pub fail_fast: bool,
     pub empty: bool,
     pub full_refresh: bool,
@@ -344,7 +348,7 @@ impl Display for ClapResourceType {
             ClapResourceType::Test => "test",
             ClapResourceType::UnitTest => "unit_test",
         };
-        write!(f, "{}", s)
+        write!(f, "{s}")
     }
 }
 
@@ -502,7 +506,7 @@ impl FromStr for RunCacheMode {
             "noop" => Ok(RunCacheMode::Noop),
             "read-write" => Ok(RunCacheMode::ReadWrite),
             "write-only" => Ok(RunCacheMode::WriteOnly),
-            _ => Err(format!("Invalid RunCacheMode: {}", s)),
+            _ => Err(format!("Invalid RunCacheMode: {s}")),
         }
     }
 }
@@ -572,8 +576,7 @@ pub fn check_selector(selector: &str) -> Result<String, String> {
 pub fn check_target(filename: &str) -> Result<String, String> {
     let path = Path::new(filename);
     let err = Err(format!(
-        "Input file '{}' must have .sql, or .yml extension",
-        filename
+        "Input file '{filename}' must have .sql, or .yml extension"
     ));
     // TODO check that this test is universal for all inputs...
     if path.is_dir() {
@@ -602,33 +605,35 @@ pub fn check_var(vars: &str) -> Result<BTreeMap<String, Value>, String> {
     let yaml_str = if vars.trim().starts_with('{') {
         vars.to_string()
     } else {
-        // Handle multiple key-value pairs separated by spaces
-        let pairs: Vec<&str> = vars.split_whitespace().collect();
-        let mut formatted_pairs = Vec::new();
-
-        for pair in pairs {
-            if pair.matches(':').count() != 1 {
-                return Err(format!(
-                    "Invalid key-value pair: '{}'. Expected format: 'key:value'.",
-                    pair
-                ));
-            }
-            formatted_pairs.push(pair);
+        // Handle single key-value pair separated by a colon
+        if vars.trim().matches(':').count() != 1 {
+            return Err(format!(
+                "Invalid key-value pair: '{vars}'. Expected format: 'key: value'."
+            ));
         }
-
-        // Wrap the pairs in curly braces
-        format!("{{{}}}", formatted_pairs.join(", "))
+        vars.to_string()
     };
 
     // Try parsing as YAML first
-    match dbt_serde_yaml::from_str(&yaml_str) {
-        Ok(btree) => Ok(btree),
+    match dbt_serde_yaml::from_str::<BTreeMap<String, Value>>(&yaml_str) {
+        Ok(btree) => {
+            // Disallow the '{key:value}' format for flow-style YAML syntax
+            // to prevent key:value: None interpretation: https://stackoverflow.com/a/70909331
+            for key in btree.keys() {
+                if key.contains(':') {
+                    return Err(format!(
+                        "Invalid key-value pair: '{key}'. Value must start with a space after colon."
+                    ));
+                }
+            }
+            Ok(btree)
+        }
         Err(_) => {
             // If YAML parsing fails, try JSON
             match serde_json::from_str(&yaml_str) {
                 Ok(btree) => Ok(btree),
                 Err(_) => Err(
-                    "Invalid YAML/JSON format. Expected format: 'key:value' or '{key: value, ..}'. Note both argument forms must be just one shell token"
+                    "Invalid YAML/JSON format. Expected format: 'key: value' or '{key: value, ..}'. Note both argument forms must be just one shell token"
                         .to_string(),
                 ),
             }
@@ -667,6 +672,64 @@ pub fn check_env_var(vars: &str) -> Result<HashMap<String, String>, String> {
             }
         } else {
             Err("Value must be a .yml file or a yml string like so: '{ dialect: trino }'".into())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_check_single_var() {
+        let result = check_var("key: value").unwrap();
+        let expected_result = BTreeMap::from([(
+            "key".to_string(),
+            dbt_serde_yaml::from_str("value").unwrap(),
+        )]);
+
+        assert_eq!(result, expected_result);
+    }
+
+    #[test]
+    fn test_check_single_bracket_var() {
+        let result = check_var("{key: value}").unwrap();
+        let expected_result = BTreeMap::from([(
+            "key".to_string(),
+            dbt_serde_yaml::from_str("value").unwrap(),
+        )]);
+
+        assert_eq!(result, expected_result);
+    }
+
+    #[test]
+    fn test_check_multiple_bracket_var() {
+        let result = check_var("{key: value, key2: value2}").unwrap();
+        let expected_result = BTreeMap::from([
+            (
+                "key".to_string(),
+                dbt_serde_yaml::from_str("value").unwrap(),
+            ),
+            (
+                "key2".to_string(),
+                dbt_serde_yaml::from_str("value2").unwrap(),
+            ),
+        ]);
+
+        assert_eq!(result, expected_result);
+    }
+
+    #[test]
+    fn test_check_var_invalid() {
+        let invalid_vars = vec![
+            "key",                    // Missing colon
+            "key:value",              // Missing space after colon
+            "key: value:with:colons", // Value with colons
+            "{key:value}",            // Flow-style YAML syntax without space after colon
+        ];
+
+        for var in invalid_vars {
+            assert!(check_var(var).is_err(), "Should have failed: {var}");
         }
     }
 }

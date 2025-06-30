@@ -20,6 +20,7 @@ mod vec_of_rows;
 
 pub use column::Column;
 pub use columns::Columns;
+pub use print_table::print_table;
 pub use row::Row;
 pub use rows::Rows;
 pub use table::AgateTable;
@@ -83,7 +84,7 @@ impl fmt::Display for Tuple {
         write!(f, "(")?;
         for i in 0..self.len() {
             let value = self.get(i as isize).unwrap();
-            write!(f, "{}, ", value)?;
+            write!(f, "{value}, ")?;
         }
         write!(f, ")")
     }
@@ -116,7 +117,7 @@ impl Object for Tuple {
         state: &State,
         name: &str,
         args: &[Value],
-        listener: Rc<dyn RenderingEventListener>,
+        listeners: &[Rc<dyn RenderingEventListener>],
     ) -> Result<Value, MinijinjaError> {
         match name {
             "count" => {
@@ -151,7 +152,7 @@ impl Object for Tuple {
                     Ok(Value::from(idx))
                 }
             }
-            _ => Object::call_method(self, state, name, args, listener),
+            _ => Object::call_method(self, state, name, args, listeners),
         }
     }
 
@@ -297,7 +298,7 @@ impl fmt::Display for OrderedDict {
         for i in 0..len {
             let key = self.keys.get(i as isize).unwrap();
             let value = self.values.get(i as isize).unwrap();
-            write!(f, "{}: {}", key, value)?;
+            write!(f, "{key}: {value}")?;
             if i < len - 1 {
                 write!(f, ", ")?;
             }
@@ -389,7 +390,7 @@ pub trait MappedSequence {
         state: &State,
         name: &str,
         args: &[Value],
-        listener: Rc<dyn RenderingEventListener>,
+        listeners: &[Rc<dyn RenderingEventListener>],
     ) -> Result<Value, MinijinjaError> {
         match name {
             // MappedSequence methods
@@ -446,7 +447,7 @@ pub trait MappedSequence {
             }
             _ => {
                 if let Some(value) = self.get_value(&Value::from(name)) {
-                    return value.call(state, args, listener);
+                    return value.call(state, args, listeners);
                 }
                 Err(MinijinjaError::from(ErrorKind::UnknownMethod(
                     "MappedSequence".to_string(),
@@ -470,7 +471,7 @@ pub trait MappedSequence {
         write!(f, "<agate.{}: (", self.type_name())?;
         for i in 0..len.min(5) {
             if let Some(value) = values.get(i as isize) {
-                write!(f, "{}", value)?;
+                write!(f, "{value}")?;
                 if i < len - 1 {
                     write!(f, ", ")?;
                 }

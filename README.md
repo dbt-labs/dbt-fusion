@@ -10,6 +10,7 @@ This repo hosts components of the dbt Fusion engine, the foundation for future i
 
 > [!IMPORTANT]  
 > **Note: the dbt Fusion Engine is in Beta!**
+
 Bugs and missing functionality compared to dbt Core will be resolved continuously in the leadup to a final release (more info: [the dbt Fusion Engine: the Path to GA](https://docs.getdbt.com/blog/dbt-fusion-engine-path-to-ga)). 
 
 The dbt Fusion engine is a ground up, first principles rewrite of the dbt Core execution engine, built to be interoperable with the standard dbt authoring layer. Fusion enforces some ambiguous areas of the authoring spec more strictly than dbt Core to ensure correctness (for example, dbt Core does not proactively validate most YAML configurations). Many of these discrepancies can be fixed automatically with the [dbt Autofix](https://github.com/dbt-labs/dbt-autofix) tool.
@@ -41,25 +42,24 @@ Fusion & associated drivers are compiled for each CPU microarchitecture and oper
 
 Legend:
 * 🟢 - Supported today
-* 🟡 - Unsupported today, in progress & will be supported by 2025-07-18
+* 🟡 - Unsupported today
 
 | Operating System    | X86-64 | ARM  |
 |-------------------|----------|------|
 | MacOS             |   🟢     |  🟢  |
-| Linux             |   🟢     |  🟡  |
+| Linux             |   🟢     |  🟢  |
 | Windows           |   🟡     |  🟡  |
 
 
 ## Timeline
 
-
-| Target Date | Milestone                           | Description                                                                     |
-|-------------|-------------------------------------|---------------------------------------------------------------------------------|
-| 2025-05-28  | Initial release of Fusion           | Published source code of parser, schemas, dbt-jinja, and Snowflake ADBC driver. |
-| 2025-06-09  | Databricks Adapter release          | Databricks ADBC driver, and adapter for Fusion                                  |
-| 2025-06-25  | BigQuery Adapter release            | BigQuery ADBC driver, and adapter for Fusion                                    |
-| 2025-07-09  | Redshift Adapter release            | Redshift ADBC driver, and adapter for Fusion                                    |
-| 2025-07-18  | ANTLR Grammars release + SQL Parser | The SQL grammar used by the ANTLR parser generator.                             |
+| Target Date | Milestone                   | Description                                  |
+|-------------|-----------------------------|----------------------------------------------|
+| 2025-05-28  | Initial release of Fusion   | Published source code of parser, schemas, dbt-jinja, and Snowflake ADBC driver. |
+| 2025-06-09  | Databricks Adapter release  | Databricks ADBC driver, and adapter for Fusion |
+| 2025-06-30  | BigQuery Adapter release    | BigQuery ADBC driver, and adapter for Fusion |
+| 2025-07-31  | Redshift Adapter release    | Redshift ADBC driver, and adapter for Fusion |
+| 2025-08-30  | ANTLR Grammars release + SQL Parser  | The SQL grammar used by the ANTLR parser generator.  |
 
 ### Top Level Components Released to Date
 Releases of various Fusion components will be iterative as each component reaches maturity & readiness for contribution.

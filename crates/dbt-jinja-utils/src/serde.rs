@@ -50,19 +50,32 @@
 //!   `__` (e.g. `__additional_properties__`) -- all such named fields are
 //!   flattened by `dbt_serde_yaml`, just as if they were annotated with
 //!   `#[serde(flatten)]`. **NOTE** structs containing such fields will not
-//!  serialize correctly with default serde serializers -- if you ever need to
-//!  (re)serialize structs containing such fields, say into a
-//!  `minijinja::Value`, serialize them to a `yaml::Value` *first*, then
-//!  serialize the `yaml::Value` to the target format.
+//!   serialize correctly with default serde serializers -- if you ever need to
+//!   (re)serialize structs containing such fields, say into a
+//!   `minijinja::Value`, serialize them to a `yaml::Value` *first*, then
+//!   serialize the `yaml::Value` to the target format.
+//!
+//! * `#[serde(untagged)]` also does not work with types that contain
+//!   `Verbatim<T>` or `flatten_dunder` fields. For the specific use case of
+//!   error recovery during deserialization, use the
+//!   `dbt_serde_yaml::ShouldBe<T>` wrapper type instead (see type documentation
+//!   for more details). More generally, however, `#[serde(untagged)]` should
+//!   *only* be used on simple enums (i.e. those without deep-nested structs),
+//!   as it introduces backtracking during deserialization, which can lead to
+//!   super-linear deserialization time on large inputs.
 
-use std::{path::Path, rc::Rc, sync::LazyLock};
+use std::{
+    path::{Path, PathBuf},
+    rc::Rc,
+    sync::LazyLock,
+};
 
 use dbt_common::{
-    fs_err, io_args::IoArgs, io_utils::try_read_yml_to_str, show_warning,
-    show_warning_soon_to_be_error, stdfs, ErrorCode, FsError, FsResult,
+    fs_err, io_args::IoArgs, io_utils::try_read_yml_to_str, show_error,
+    show_warning_soon_to_be_error, CodeLocation, ErrorCode, FsError, FsResult,
 };
 use dbt_serde_yaml::Value;
-use minijinja::listener::{DefaultRenderingEventListener, RenderingEventListener};
+use minijinja::listener::RenderingEventListener;
 use regex::Regex;
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -133,8 +146,7 @@ fn value_from_str(
     input: &str,
     error_display_path: Option<&Path>,
 ) -> FsResult<Value> {
-    let _f =
-        dbt_serde_yaml::with_filename(error_display_path.and_then(|p| stdfs::canonicalize(p).ok()));
+    let _f = dbt_serde_yaml::with_filename(error_display_path.map(PathBuf::from));
 
     // replace tabs with spaces
     // trim beginning whitespace for the first line with content
@@ -143,24 +155,30 @@ fn value_from_str(
     let mut value = Value::from_str(&input, |path, key, existing_key| {
         let key_repr = dbt_serde_yaml::to_string(&key).unwrap_or_else(|_| "<opaque>".to_string());
         if let Some(io_args) = io_args {
-            show_warning!(
-                io_args,
-                fs_err!(
-                    code => ErrorCode::DuplicateConfigKey,
-                    loc => key.span(),
-                    "Duplicate key `{}`. This key overwrites a previous definition of the same key \
-                     at line {} column {}. YAML path: `{}`.",
-                    key_repr.trim(),
-                    existing_key.span().start.line,
-                    existing_key.span().start.column,
-                    path
-                )
+            let duplicate_key_error = fs_err!(
+                code => ErrorCode::DuplicateConfigKey,
+                loc => key.span(),
+                "Duplicate key `{}`. This key overwrites a previous definition of the same key \
+                 at line {} column {}. YAML path: `{}`.",
+                key_repr.trim(),
+                existing_key.span().start.line,
+                existing_key.span().start.column,
+                path
             );
+
+            if std::env::var("_DBT_FUSION_STRICT_MODE").is_ok() {
+                show_error!(io_args, duplicate_key_error);
+            } else {
+                show_warning_soon_to_be_error!(io_args, duplicate_key_error);
+            }
         }
         // last key wins:
         dbt_serde_yaml::mapping::DuplicateKey::Overwrite
-    })?;
-    value.apply_merge()?;
+    })
+    .map_err(|e| from_yaml_error(e, error_display_path))?;
+    value
+        .apply_merge()
+        .map_err(|e| from_yaml_error(e, error_display_path))?;
 
     Ok(value)
 }
@@ -173,18 +191,22 @@ pub fn into_typed_with_jinja<T, S>(
     should_render_secrets: bool,
     env: &JinjaEnvironment<'static>,
     ctx: &S,
-    listener: Option<Rc<dyn RenderingEventListener>>,
+    listeners: &[Rc<dyn RenderingEventListener>],
 ) -> FsResult<T>
 where
     T: DeserializeOwned,
     S: Serialize,
 {
     let (res, errors) =
-        into_typed_with_jinja_error(value, should_render_secrets, env, ctx, listener)?;
+        into_typed_with_jinja_error(value, should_render_secrets, env, ctx, listeners)?;
 
     if let Some(io_args) = io_args {
         for error in errors {
-            show_warning_soon_to_be_error!(io_args, error);
+            if std::env::var("_DBT_FUSION_STRICT_MODE").is_ok() {
+                show_error!(io_args, error);
+            } else {
+                show_warning_soon_to_be_error!(io_args, error);
+            }
         }
     }
 
@@ -198,25 +220,19 @@ pub fn into_typed_with_jinja_error<T, S>(
     should_render_secrets: bool,
     env: &JinjaEnvironment<'static>,
     ctx: &S,
-    listener: Option<Rc<dyn RenderingEventListener>>,
+    listeners: &[Rc<dyn RenderingEventListener>],
 ) -> FsResult<(T, Vec<FsError>)>
 where
     T: DeserializeOwned,
     S: Serialize,
 {
-    let jinja_renderer = |value: Value| match value {
+    let jinja_renderer = |value: &Value| match value {
         Value::String(s, span) => {
-            let expanded = render_jinja_str(
-                &s,
-                should_render_secrets,
-                env,
-                ctx,
-                listener.as_ref().map(|l| l.clone()),
-            )
-            .map_err(|e| e.with_location(span.clone()))?;
-            Ok(expanded.with_span(span))
+            let expanded = render_jinja_str(s, should_render_secrets, env, ctx, listeners)
+                .map_err(|e| e.with_location(span.clone()))?;
+            Ok(Some(expanded.with_span(span.clone())))
         }
-        _ => Ok(value),
+        _ => Ok(None),
     };
 
     into_typed_internal(value, jinja_renderer)
@@ -228,13 +244,17 @@ where
     T: DeserializeOwned,
 {
     // Use the identity transform for the 'raw' version of this function.
-    let expand_jinja = |value: Value| Ok(value);
+    let expand_jinja = |_: &Value| Ok(None);
 
     let (res, errors) = into_typed_internal(value, expand_jinja)?;
 
     if let Some(io_args) = io_args {
         for error in errors {
-            show_warning_soon_to_be_error!(io_args, error);
+            if std::env::var("_DBT_FUSION_STRICT_MODE").is_ok() {
+                show_error!(io_args, error);
+            } else {
+                show_warning_soon_to_be_error!(io_args, error);
+            }
         }
     }
 
@@ -244,11 +264,11 @@ where
 fn into_typed_internal<T, F>(value: Value, transform: F) -> FsResult<(T, Vec<FsError>)>
 where
     T: DeserializeOwned,
-    F: FnMut(Value) -> Result<Value, Box<dyn std::error::Error + 'static + Send + Sync>>,
+    F: FnMut(&Value) -> Result<Option<Value>, Box<dyn std::error::Error + 'static + Send + Sync>>,
 {
     let mut warnings: Vec<FsError> = Vec::new();
-    let warn_unused_keys = |path: dbt_serde_yaml::path::Path, key: Value, _| {
-        let key_repr = dbt_serde_yaml::to_string(&key).unwrap_or_else(|_| "<opaque>".to_string());
+    let warn_unused_keys = |path: dbt_serde_yaml::path::Path, key: &Value, _: &Value| {
+        let key_repr = dbt_serde_yaml::to_string(key).unwrap_or_else(|_| "<opaque>".to_string());
         warnings.push(*fs_err!(
             code => ErrorCode::UnusedConfigKey,
             loc => key.span(),
@@ -256,7 +276,9 @@ where
         ))
     };
 
-    let res = value.into_typed(warn_unused_keys, transform)?;
+    let res = value
+        .into_typed(warn_unused_keys, transform)
+        .map_err(|e| from_yaml_error(e, None))?;
     Ok((res, warnings))
 }
 
@@ -266,15 +288,19 @@ fn render_jinja_str<S: Serialize>(
     should_render_secrets: bool,
     env: &JinjaEnvironment,
     ctx: &S,
-    listener: Option<Rc<dyn RenderingEventListener>>,
+    listeners: &[Rc<dyn RenderingEventListener>],
 ) -> FsResult<Value> {
     if check_single_expression_without_whitepsace_control(s) {
         let compiled = env.compile_expression(&s[2..s.len() - 2])?;
-        let eval = compiled.eval(
-            ctx,
-            listener.unwrap_or_else(|| Rc::new(DefaultRenderingEventListener)),
-        )?;
-        let val = dbt_serde_yaml::to_value(eval)?;
+        let eval = compiled.eval(ctx, listeners)?;
+        let val = dbt_serde_yaml::to_value(eval).map_err(|e| {
+            from_yaml_error(
+                e,
+                // The caller will attach the error location using the span in the
+                // `Value` object, if available:
+                None,
+            )
+        })?;
         let val = match val {
             Value::String(s, span) if should_render_secrets => {
                 Value::string(render_secrets(s)?).with_span(span)
@@ -284,7 +310,7 @@ fn render_jinja_str<S: Serialize>(
         Ok(val)
     // Otherwise, process the entire string through Jinja
     } else {
-        let (compiled, _) = env.render_str(s, ctx, listener)?;
+        let compiled = env.render_str(s, ctx, listeners)?;
         let compiled = if should_render_secrets {
             render_secrets(compiled)?
         } else {
@@ -302,7 +328,7 @@ pub fn from_yaml_jinja<T, S: Serialize>(
     should_render_secrets: bool,
     env: &JinjaEnvironment<'static>,
     ctx: &S,
-    listener: Option<Rc<dyn RenderingEventListener>>,
+    listeners: &[Rc<dyn RenderingEventListener>],
     error_display_path: Option<&Path>,
 ) -> FsResult<T>
 where
@@ -314,7 +340,7 @@ where
         should_render_secrets,
         env,
         ctx,
-        listener,
+        listeners,
     )
 }
 
@@ -348,6 +374,29 @@ pub fn check_single_expression_without_whitepsace_control(input: &str) -> bool {
         && input.starts_with("{{")
         && input.ends_with("}}")
         && { RE_SIMPLE_EXPR.is_match(input) }
+}
+
+/// Converts a `dbt_serde_yaml::Error` into a `FsError`, attaching the error location
+pub fn from_yaml_error(err: dbt_serde_yaml::Error, filename: Option<&Path>) -> Box<FsError> {
+    let msg = err.display_no_mark().to_string();
+    let location = err
+        .span()
+        .map_or_else(CodeLocation::default, CodeLocation::from);
+    let location = if let Some(filename) = filename {
+        location.with_file(filename)
+    } else {
+        location
+    };
+
+    if let Some(err) = err.into_external() {
+        if let Ok(err) = err.downcast::<FsError>() {
+            // These are errors raised from our own callbacks:
+            return err;
+        }
+    }
+    FsError::new(ErrorCode::SerializationError, format!("YAML error: {msg}"))
+        .with_location(location)
+        .into()
 }
 
 #[cfg(test)]

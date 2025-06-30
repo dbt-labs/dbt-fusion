@@ -7,6 +7,7 @@ use dbt_common::err;
 use dbt_common::error::AbstractLocation;
 use dbt_common::fs_err;
 use dbt_common::io_args::IoArgs;
+use dbt_common::io_args::StaticAnalysisKind;
 use dbt_common::CodeLocation;
 use dbt_common::ErrorCode;
 use dbt_common::FsResult;
@@ -15,21 +16,20 @@ use dbt_jinja_utils::phases::parse::build_resolve_model_context;
 use dbt_jinja_utils::phases::parse::render_extract_ref_or_source_expr;
 use dbt_jinja_utils::phases::parse::sql_resource::SqlResource;
 use dbt_jinja_utils::serde::into_typed_with_jinja;
-use dbt_schemas::project_configs::ProjectConfigs;
 use dbt_schemas::schemas::common::DbtChecksum;
 use dbt_schemas::schemas::common::DbtMaterialization;
 use dbt_schemas::schemas::common::DbtQuoting;
 use dbt_schemas::schemas::common::Expect;
 use dbt_schemas::schemas::common::Given;
 use dbt_schemas::schemas::common::NodeDependsOn;
-use dbt_schemas::schemas::manifest::CommonAttributes;
-use dbt_schemas::schemas::manifest::NodeBaseAttributes;
-use dbt_schemas::schemas::manifest::{DbtConfig, DbtUnitTest};
 use dbt_schemas::schemas::packages::DeprecatedDbtPackageLock;
 use dbt_schemas::schemas::project::DbtProject;
+use dbt_schemas::schemas::project::DefaultTo;
+use dbt_schemas::schemas::project::UnitTestConfig;
 use dbt_schemas::schemas::properties::UnitTestProperties;
 use dbt_schemas::schemas::ref_and_source::DbtRef;
 use dbt_schemas::schemas::ref_and_source::DbtSourceWrapper;
+use dbt_schemas::schemas::{CommonAttributes, DbtUnitTest, NodeBaseAttributes};
 use dbt_schemas::state::DbtPackage;
 use dbt_schemas::state::DbtRuntimeConfig;
 use dbt_schemas::state::ResourcePathKind;
@@ -64,14 +64,11 @@ pub fn resolve_unit_tests(
     let mut disabled_unit_tests: BTreeMap<String, Arc<DbtUnitTest>> = BTreeMap::new();
     let local_project_config = init_project_config(
         io_args,
-        package_quoting,
-        &package
-            .dbt_project
-            .unit_tests
-            .as_ref()
-            .map(ProjectConfigs::UnitTestConfigs),
-        jinja_env,
-        base_ctx,
+        &package.dbt_project.unit_tests,
+        UnitTestConfig {
+            enabled: Some(true),
+            ..Default::default()
+        },
     )?;
 
     for (unit_test_name, mpe) in unit_test_properties.into_iter() {
@@ -81,7 +78,7 @@ pub fn resolve_unit_tests(
             false,
             jinja_env,
             base_ctx,
-            None,
+            &[],
         )?;
         // todo: Unit test should have a database and schema,
         //    derived from the underlying model, correct?
@@ -111,21 +108,15 @@ pub fn resolve_unit_tests(
             .get_config_for_path(&mpe.relative_path, package_name, &[])
             .clone();
         project_config.default_to(global_config);
-        let mut properties_config = if let Some(properties) = &unit_test.config {
-            let mut properties_config: DbtConfig = properties.try_into()?;
+        let properties_config = if let Some(properties) = &unit_test.config {
+            let mut properties_config: UnitTestConfig = properties.clone();
             properties_config.default_to(&project_config);
             properties_config
         } else {
             project_config
         };
 
-        let enabled = properties_config.is_enabled();
-
-        properties_config.expected_rows = unit_test
-            .expect
-            .rows
-            .as_ref()
-            .map(|rows| serde_json::to_value(rows).expect("Failed to serialize rows"));
+        let enabled = properties_config.get_enabled().unwrap_or(true);
 
         // todo: generalize given input format, according to https://docs.getdbt.com/docs/build/unit-tests
 
@@ -139,17 +130,13 @@ pub fn resolve_unit_tests(
             location: Some(CodeLocation::default()),
         });
 
-        if properties_config.materialized.is_none() {
-            properties_config.materialized = Some(DbtMaterialization::View);
-        }
-
         let mut dependent_sources = vec![];
         // Process unit test given inputs to extract ref nodes
         for given_group in unit_test.given.iter() {
             for g in given_group.iter() {
                 let input = &g.input;
                 if input.contains("ref") || input.contains("source") {
-                    let sql_resources: Arc<Mutex<Vec<SqlResource>>> =
+                    let sql_resources: Arc<Mutex<Vec<SqlResource<UnitTestConfig>>>> =
                         Arc::new(Mutex::new(Vec::new()));
                     let mut resolve_model_context = base_ctx.clone();
                     resolve_model_context.extend(build_resolve_model_context(
@@ -223,9 +210,18 @@ pub fn resolve_unit_tests(
             expect: unit_test.expect.clone(),
             versions: None,
             version: None,
-            // todo: columns code gen missing
-            config: properties_config,
             overrides: None,
+            tags: properties_config
+                .tags
+                .clone()
+                .map(|tags| tags.into())
+                .unwrap_or_default(),
+            meta: properties_config.meta.clone().unwrap_or_default(),
+            quoting: package_quoting.try_into()?,
+            static_analysis: properties_config
+                .static_analysis
+                .unwrap_or(StaticAnalysisKind::On),
+            deprecated_config: properties_config,
         };
 
         // Check if this model has versions
@@ -271,7 +267,7 @@ pub fn resolve_unit_tests(
                     .expect("Version should exist in lookup");
 
                 let mut versioned_test = base_unit_test.clone();
-                versioned_test.common_attr.unique_id = format!("{}.v{}", base_unique_id, version);
+                versioned_test.common_attr.unique_id = format!("{base_unique_id}.v{version}");
                 versioned_test.version = Some(version.clone().into());
                 versioned_test.base_attr.depends_on.nodes = vec![versioned_model_id.clone()];
                 versioned_test.base_attr.depends_on.nodes_with_ref_location =

@@ -15,13 +15,14 @@ use dbt_common::io_args::{
     check_selector, check_var, ClapResourceType, DisplayFormat, EvalArgs, IoArgs, JsonSchemaTypes,
     Phases, ShowOptions, SystemArgs,
 };
+use dbt_common::row_limit::RowLimit;
 
 use clap::arg;
 use clap::{Parser, Subcommand};
 
 use dbt_common::node_selector::{parse_model_specifiers, IndirectSelection};
 
-const DEFAULT_LIMIT: usize = 10;
+const DEFAULT_LIMIT: &str = "10";
 static DEFAULT_FORMAT: LazyLock<String> = LazyLock::new(|| DisplayFormat::Table.to_string());
 
 // defined in pretty string, but copied here to avoid cycle...
@@ -122,10 +123,9 @@ pub struct ListArgs {
     #[clap(flatten)]
     pub common_args: CommonArgs,
 
-    /// Limiting number of shown rows. Run with --limit 0 to remove limit [default: 10]
-    // todo: still left to be implemented
-    #[arg(long, hide = true)]
-    pub limit: Option<usize>,
+    /// Limiting number of shown rows. Run with --limit -1 to remove limit [default: 10]
+    #[arg(long, default_value=DEFAULT_LIMIT, allow_hyphen_values = true, hide = true)]
+    pub limit: RowLimit,
 
     /// Display rows in different formats, only table and json supported...
     #[arg(global = true, long, aliases = ["format"])]
@@ -168,7 +168,7 @@ pub struct ManArgs {
 pub struct CommonArgs {
     /// The target to execute
     //  has no ENV_VAR euivalent
-    #[arg(global = true, long)]
+    #[arg(global = true, long, short = 't')]
     pub target: Option<String>,
 
     /// The directory to load the dbt project from
@@ -218,9 +218,9 @@ pub struct CommonArgs {
     #[arg(global = true, long, env = "DBT_QUIET", short = 'q')]
     pub quiet: bool,
 
-    /// The number of threads to use [Run with --threads 0 to use max_cpu [default: 1]]
-    // has no ENV_VAR
-    #[arg(global = true, long, short = 't')]
+    /// The number of threads to use [Run with --threads 0 to use max_cpu [default: max_cpu]]
+    // has no ENV_VAR, but can be set in profiles.yml
+    #[arg(global = true, long)]
     pub threads: Option<usize>,
 
     /// Overrides threads.
@@ -357,7 +357,7 @@ impl ListArgs {
         if let Some(resource_type) = self.resource_type {
             eval_args.resource_types = vec![resource_type];
         }
-        eval_args.limit = self.limit.unwrap_or(DEFAULT_LIMIT);
+        eval_args.limit = self.limit.into();
         if let Some(output) = &self.output {
             eval_args.format = output.to_string();
         } else {
@@ -410,8 +410,7 @@ impl InitArgs {
 pub fn check_target(filename: &str) -> Result<String, String> {
     let path = Path::new(filename);
     let err = Err(format!(
-        "Input file '{}' must have .sql, or .yml extension",
-        filename
+        "Input file '{filename}' must have .sql, or .yml extension"
     ));
     // TODO check that this test is universal for all inputs...
     if path.is_dir() {
@@ -488,7 +487,7 @@ impl CommonArgs {
             vars: self.vars.clone().unwrap_or_default(),
             phase: Phases::All,
             format: DEFAULT_FORMAT.clone(),
-            limit: 10,
+            limit: Some(10),
             debug: self.debug,
             num_threads: if self.single_threaded {
                 Some(1)

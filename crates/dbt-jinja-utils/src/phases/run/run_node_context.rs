@@ -16,9 +16,9 @@ use dbt_common::serde_utils::convert_json_to_map;
 use dbt_common::show_warning;
 use dbt_common::tokiofs;
 use dbt_common::ErrorCode;
-use dbt_fusion_adapter::adapters::load_store::ResultStore;
-use dbt_fusion_adapter::adapters::relation_object::create_relation;
-use dbt_schemas::schemas::{common::ResolvedQuoting, manifest::CommonAttributes};
+use dbt_fusion_adapter::load_store::ResultStore;
+use dbt_fusion_adapter::relation_object::create_relation;
+use dbt_schemas::schemas::{common::ResolvedQuoting, CommonAttributes};
 use minijinja::listener::RenderingEventListener;
 use minijinja::State;
 use minijinja::{value::Object, Error, ErrorKind, Value as MinijinjaValue};
@@ -37,7 +37,7 @@ async fn extend_with_model_context<S: Serialize>(
     common_attr: &CommonAttributes,
     alias: &str,
     quoting: ResolvedQuoting,
-    config: &S,
+    deprecated_config: &S,
     adapter_type: &str,
     io_args: &IoArgs,
     resource_type: &str,
@@ -69,7 +69,7 @@ async fn extend_with_model_context<S: Serialize>(
         MinijinjaValue::from(common_attr.name.clone()),
     );
 
-    let config_json = serde_json::to_value(config).expect("Failed to serialize object");
+    let config_json = serde_json::to_value(deprecated_config).expect("Failed to serialize object");
 
     if let Some(pre_hook) = config_json.get("pre_hook") {
         let values: Vec<HookConfig> = match pre_hook {
@@ -198,7 +198,7 @@ pub async fn build_run_node_context<S: Serialize>(
     common_attr: &CommonAttributes,
     alias: &str,
     quoting: ResolvedQuoting,
-    config: &S,
+    deprecated_config: &S,
     adapter_type: &str,
     agate_table: Option<AgateTable>,
     base_context: &BTreeMap<String, MinijinjaValue>,
@@ -223,7 +223,7 @@ pub async fn build_run_node_context<S: Serialize>(
         common_attr,
         alias,
         quoting,
-        config,
+        deprecated_config,
         adapter_type,
         io_args,
         resource_type,
@@ -301,7 +301,7 @@ fn parse_hook_item(item: &Value) -> Option<HookConfig> {
             Some(HookConfig { sql, transaction })
         }
         _ => {
-            eprintln!("Pre hook unknown type: {:?}", item);
+            eprintln!("Pre hook unknown type: {item:?}");
             None
         }
     }
@@ -345,7 +345,7 @@ impl Object for WriteConfig {
         self: &Arc<Self>,
         _state: &State<'_, '_>,
         args: &[MinijinjaValue],
-        _listener: Rc<dyn RenderingEventListener>,
+        _listeners: &[Rc<dyn RenderingEventListener>],
     ) -> Result<MinijinjaValue, Error> {
         if args.is_empty() {
             return Err(Error::new(
@@ -377,7 +377,7 @@ impl Object for WriteConfig {
             Err(e) => {
                 return Err(Error::new(
                     ErrorKind::InvalidOperation,
-                    format!("Failed to write file: {}", e),
+                    format!("Failed to write file: {e}"),
                 ));
             }
         }
@@ -406,7 +406,7 @@ fn write_file(
     // Construct build path - simple implementation
     let build_path = target_path
         .join(DBT_RUN_DIR_NAME)
-        .join(format!("{}.sql", model_name));
+        .join(format!("{model_name}.sql"));
     let full_path = if build_path.is_absolute() {
         build_path
     } else {

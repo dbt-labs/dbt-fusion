@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use dbt_serde_yaml::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::stdfs;
@@ -7,7 +8,7 @@ use crate::stdfs;
 use super::preprocessor_location;
 
 /// Represents a concrete location in some source file.
-#[derive(Clone, Default, Debug, Eq, PartialEq, Serialize, Deserialize, Hash)]
+#[derive(Clone, Default, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, JsonSchema)]
 pub struct CodeLocation {
     pub line: usize,
     pub col: usize,
@@ -168,7 +169,7 @@ impl std::fmt::Display for CodeLocation {
             write!(f, "{}:{}:{}", relative_path.display(), self.line, self.col)?;
         }
         if let Some(expanded) = &self.expanded {
-            write!(f, " ({})", expanded)?;
+            write!(f, " ({expanded})")?;
         }
         Ok(())
     }

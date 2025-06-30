@@ -7,30 +7,9 @@ use minijinja::{
 };
 use minijinja::{Error as MinijinjaError, ErrorKind as MinijinjaErrorKind, State};
 use serde::{Deserialize, Serialize};
-use serde_with::skip_serializing_none;
-use std::{collections::BTreeMap, rc::Rc, sync::Arc};
+use std::{rc::Rc, sync::Arc};
 
 use crate::schemas::columns::base::StdColumn;
-
-#[skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-pub struct BigQueryModelConfig {
-    pub partition_by: Option<BigqueryPartitionConfigLegacy>,
-    pub cluster_by: Option<BigqueryClusterConfig>,
-    pub hours_to_expiration: Option<u64>,
-    pub labels: Option<BTreeMap<String, String>>,
-    pub labels_from_meta: Option<bool>,
-    pub kms_key_name: Option<String>,
-    #[serde(default)]
-    pub require_partition_filter: bool,
-    pub partition_expiration_days: Option<u64>,
-    pub grant_access_to: Option<Vec<GrantAccessToTarget>>,
-    pub partitions: Option<Vec<String>>,
-    pub enable_refresh: Option<bool>,
-    pub refresh_interval_minutes: Option<u64>,
-    pub description: Option<String>,
-    pub max_staleness: Option<String>,
-}
 
 /// dbt-core allows either of the variants for the `partition_by` in the model config
 /// but the bigquery-adapter throws RunTime error
@@ -204,7 +183,7 @@ impl BigqueryPartitionConfig {
         };
 
         let column = if let Some(alias) = &alias {
-            format!("{}.{}", alias, column)
+            format!("{alias}.{column}")
         } else {
             column
         };
@@ -266,7 +245,7 @@ impl Object for BigqueryPartitionConfig {
         _state: &State,
         name: &str,
         args: &[MinijinjaValue],
-        _listener: Rc<dyn RenderingEventListener>,
+        _listeners: &[Rc<dyn RenderingEventListener>],
     ) -> Result<MinijinjaValue, MinijinjaError> {
         match name {
             "data_type_for_partition" => self.data_type_for_partition(),
@@ -275,7 +254,7 @@ impl Object for BigqueryPartitionConfig {
             "render_wrapped" => self.render_wrapped(args),
             _ => Err(MinijinjaError::new(
                 MinijinjaErrorKind::InvalidOperation,
-                format!("Unknown method on PartitionConfig object: '{}'", name),
+                format!("Unknown method on PartitionConfig object: '{name}'"),
             )),
         }
     }

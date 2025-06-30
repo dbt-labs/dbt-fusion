@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_with::skip_serializing_none;
 
-use crate::schemas::{manifest::DbtConfig, ref_and_source::DbtRef};
+use crate::schemas::ref_and_source::DbtRef;
 
 use super::common::DbtOwner;
 
@@ -22,7 +22,6 @@ pub struct DbtExposure {
     pub description: String,
     pub label: Option<String>,
     pub maturity: Option<String>,
-    pub config: DbtConfig,
     pub unrendered_config: BTreeMap<String, Value>,
     pub url: Option<String>,
     pub depends_on: ExposureDependsOn,
