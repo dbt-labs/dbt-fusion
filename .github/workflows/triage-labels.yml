@@ -21,6 +21,8 @@ defaults:
 jobs:
   triage_label:
     runs-on: ubuntu-latest
+    env: 
+      test: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Setup tmate session
         uses: mxschmitt/action-tmate@v3
