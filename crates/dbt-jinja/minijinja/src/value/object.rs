@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::error::{Error, ErrorKind};
 use crate::listener::RenderingEventListener;
-use crate::value::{intern, intern_into_value, Value};
+use crate::value::{intern, intern_into_value, Value, ValueRepr};
 use crate::vm::State;
 
 /// A trait that represents a dynamic object.
@@ -1189,7 +1189,7 @@ pub mod mutable_vec {
         match args {
             [value] => {
                 vec.push(value.clone());
-                Ok(Value::from_dyn_object(vec.clone()))
+                Ok(ValueRepr::None.into())
             }
             _ if args.len() > 1 => Err(Error::new(
                 ErrorKind::TooManyArguments,

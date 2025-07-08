@@ -71,7 +71,7 @@ fn test_sort_different_types() {
     insta::assert_debug_snapshot!(&v, @r"
     [
         undefined,
-        none,
+        None,
         false,
         true,
         -inf,
@@ -376,7 +376,7 @@ fn test_mutable_vec_in_set_stmt() {
     let rv = minijinja::render!(
         in env,
         "{% set my_arr = [1, 2, 3] %}
-         {% for v in my_arr %}{% set my_arr = my_arr.append(v) %}{% endfor %}
+         {% for v in my_arr %}{% do my_arr.append(v) %}{% endfor %}
          {{ my_arr }}",
     );
     assert_snapshot!(rv, @"[1, 2, 3, 1, 2, 3]");
@@ -390,6 +390,13 @@ fn test_mutable_vec_in_set_stmt() {
          {{ arr3 }}",
     );
     assert_snapshot!(rv, @"[1, 2, 3, 4, 5, 1, 2, 3]");
+
+    let rv = minijinja::render!(
+        in env,
+        "{% set my_arr = ['x'] %}
+         {{ my_arr.append('y') }}",
+    );
+    assert_snapshot!(rv, @"None");
 }
 
 #[test]
@@ -1380,7 +1387,7 @@ fn test_sorting() {
     assert_debug_snapshot!(&values, @r"
     [
         undefined,
-        none,
+        None,
         false,
         true,
         -inf,
