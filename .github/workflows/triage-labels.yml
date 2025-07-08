@@ -20,5 +20,7 @@ defaults:
 
 jobs:
   triage_label:
-    - name: Setup tmate session
-      uses: mxschmitt/action-tmate@v3
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup tmate session
+        uses: mxschmitt/action-tmate@v3
