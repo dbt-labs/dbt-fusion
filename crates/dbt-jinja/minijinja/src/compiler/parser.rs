@@ -1627,6 +1627,7 @@ impl<'a> Parser<'a> {
                 Token::VariableStart => {
                     let expr = ok!(self.parse_expr_or_implied_tuple());
                     expect_token!(self, Token::VariableEnd, "end of variable block");
+                    
                     macro_rules! expand_span {
                         ($expr:expr, $variant:path) => {{
                             let mut spanned = $expr;
