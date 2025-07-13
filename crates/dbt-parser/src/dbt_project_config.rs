@@ -7,15 +7,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use dbt_common::{
-    fs_err, io_args::IoArgs, show_error, show_warning_soon_to_be_error, ErrorCode, FsResult,
-};
+use dbt_common::{fs_err, io_args::IoArgs, show_error, ErrorCode, FsResult};
 use dbt_schemas::schemas::project::{
     DataTestConfig, DefaultTo, IterChildren, ModelConfig, SeedConfig, SnapshotConfig, SourceConfig,
     UnitTestConfig,
 };
 use dbt_schemas::schemas::{common::DbtQuoting, project::DbtProject};
-use dbt_serde_yaml::ShouldBe;
+use dbt_serde_yaml::{ShouldBe, WhyNot};
 
 /// Used to deserialize the top-level `dbt_project.yml` configuration
 /// for `models`, `data_tests`, `seeds` etc..
@@ -115,17 +113,17 @@ pub fn recur_build_dbt_project_config<T: DefaultTo<T>, S: Into<T> + IterChildren
         };
         let child_config_variant = match maybe_child_config_variant {
             ShouldBe::AndIs(config) => config,
-            ShouldBe::ButIsnt { raw, .. } => {
+            ShouldBe::ButIsnt { raw, why_not } => {
+                let error_msg = match why_not {
+                    WhyNot::Custom(message) => message,
+                    WhyNot::Original(error) => &error.display_no_mark().to_string(),
+                };
                 let err = fs_err!(
-                    code => ErrorCode::UnusedConfigKey,
+                    code => ErrorCode::SerializationError,
                     loc => raw.as_ref().map(|r| r.span()).unwrap_or_default(),
-                    "Ignored unexpected key `{:?}`. YAML path: `{}`.", key.trim(), key_path
+                    "Failed to parse `{key_path}`: {error_msg}"
                 );
-                if std::env::var("_DBT_FUSION_STRICT_MODE").is_ok() {
-                    show_error!(io, err);
-                } else {
-                    show_warning_soon_to_be_error!(io, err);
-                }
+                show_error!(io, err);
                 continue;
             }
         };
