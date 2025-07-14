@@ -8,18 +8,8 @@
 All [ADBC (Arrow Database Connectivity)](https://arrow.apache.org/adbc/) drivers
 (shared libraries) are loaded dynamically.
 
-(Note: all script samples assume the current working directory is the root of
-the workspace)
-
-~Run this to download the ADBC drivers (before we have an even more automated solution).~
-
-```
-./scripts/install_xdbc_drivers.sh
-```
-
-UPDATE: we now automatically download the ADBC drivers from the dbt when dbt
-needs to connect to a data warehouse. The script stil exists in case we need
-to download drivers manually again.
+Drivers are automatically downloaded from the dbt CDN when dbt needs to connect to a
+data warehouse.
 
 [ODBC](https://en.wikipedia.org/wiki/Open_Database_Connectivity) drivers are
 also loaded dynamically, but should be installed on the system.
@@ -150,3 +140,17 @@ WARNING: BigQuery ADBC driver is being loaded from /Users/felipe/code/fs/lib in 
 When you're done with your changes, open a PR against [](https://github.com/dbt-labs/arrow-adbc),
 after review and merge, trigger an `ADBC Release` workflow in the `fs`
 repository and bump the driver version in `fs`.
+
+### Using the REPL
+
+We expose a basic REPL that is tightly coupled with the drivers in order to execute queries against and enable a tighter feedback loop.
+
+To invoke this REPL (for Databricks):
+
+```bash
+$ cargo xtask xdbc-repl --backend databricks
+```
+
+The backend argument can take multiple arguments and supports inputs such as `snowflake` or `bigquery`.
+
+Follow the prompts within the REPL for features such as executing queries, inspect schemas, and check `RecordBatch` objects extracted from the `RecordBatchReader`.

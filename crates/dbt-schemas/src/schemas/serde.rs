@@ -1,7 +1,11 @@
 use std::collections::{BTreeMap, HashMap};
 
 use dbt_serde_yaml::JsonSchema;
-use serde::{self, de::DeserializeOwned, Deserialize, Deserializer, Serialize};
+use serde::{
+    self,
+    de::{self, DeserializeOwned},
+    Deserialize, Deserializer, Serialize,
+};
 use serde_json::Value;
 
 pub fn default_type<'de, D>(deserializer: D) -> Result<Option<BTreeMap<String, Value>>, D::Error>
@@ -12,7 +16,7 @@ where
     match value {
         Value::Object(map) => Ok(Some(map.into_iter().collect())),
         Value::Null => Ok(None),
-        _ => Err(serde::de::Error::custom("expected an object or null")),
+        _ => Err(de::Error::custom("expected an object or null")),
     }
 }
 
@@ -30,7 +34,7 @@ where
         )),
         Value::String(s) => Ok(Some(vec![s])),
         Value::Null => Ok(None),
-        _ => Err(serde::de::Error::custom(
+        _ => Err(de::Error::custom(
             "expected a string, an array of strings, or null",
         )),
     }
@@ -88,7 +92,7 @@ pub fn try_string_to_type<T: DeserializeOwned>(
 ) -> Result<Option<T>, Box<dyn std::error::Error>> {
     if let Some(value) = value {
         Ok(Some(
-            serde_json::from_str(&format!("\"{}\"", value))
+            serde_json::from_str(&format!("\"{value}\""))
                 .map_err(|e| format!("Error parsing from_str '{value}': {e}"))?,
         ))
     } else {
@@ -112,8 +116,8 @@ impl Default for StringOrInteger {
 impl std::fmt::Display for StringOrInteger {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            StringOrInteger::String(s) => write!(f, "{}", s),
-            StringOrInteger::Integer(i) => write!(f, "{}", i),
+            StringOrInteger::String(s) => write!(f, "{s}"),
+            StringOrInteger::Integer(i) => write!(f, "{i}"),
         }
     }
 }
@@ -166,12 +170,33 @@ impl From<StringOrArrayOfStrings> for Vec<String> {
     }
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone, JsonSchema)]
-#[serde(untagged)]
-pub enum BooleanOrJinjaString {
-    JinjaString(String),
-    Boolean(bool),
+impl PartialEq for StringOrArrayOfStrings {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (StringOrArrayOfStrings::String(s1), StringOrArrayOfStrings::String(s2)) => s1 == s2,
+            (
+                StringOrArrayOfStrings::ArrayOfStrings(a1),
+                StringOrArrayOfStrings::ArrayOfStrings(a2),
+            ) => a1 == a2,
+            (StringOrArrayOfStrings::String(s), StringOrArrayOfStrings::ArrayOfStrings(a)) => {
+                if a.len() == 1 {
+                    a[0] == *s
+                } else {
+                    false
+                }
+            }
+            (StringOrArrayOfStrings::ArrayOfStrings(a), StringOrArrayOfStrings::String(s)) => {
+                if a.len() == 1 {
+                    a[0] == *s
+                } else {
+                    false
+                }
+            }
+        }
+    }
 }
+
+impl Eq for StringOrArrayOfStrings {}
 
 #[derive(Deserialize, Serialize, Debug, Clone, JsonSchema)]
 #[serde(untagged)]
@@ -183,8 +208,8 @@ pub enum FloatOrString {
 impl std::fmt::Display for FloatOrString {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FloatOrString::Number(n) => write!(f, "{}", n),
-            FloatOrString::String(s) => write!(f, "{}", s),
+            FloatOrString::Number(n) => write!(f, "{n}"),
+            FloatOrString::String(s) => write!(f, "{s}"),
         }
     }
 }

@@ -1,7 +1,7 @@
 use crate::dbt_project_config::{init_project_config, RootProjectConfigs};
 use crate::utils::{
     get_node_fqn, register_duplicate_resource, trigger_duplicate_errors,
-    update_node_relation_components,
+    update_node_relation_components, RelationComponents,
 };
 use dbt_common::io_args::IoArgs;
 use dbt_common::{fs_err, show_error, stdfs, ErrorCode, FsResult};
@@ -9,12 +9,13 @@ use dbt_frontend_common::Dialect;
 use dbt_jinja_utils::jinja_environment::JinjaEnvironment;
 use dbt_jinja_utils::refs_and_sources::RefsAndSources;
 use dbt_jinja_utils::serde::into_typed_with_jinja;
-use dbt_schemas::project_configs::ProjectConfigs;
+use dbt_schemas::dbt_utils::validate_delimeter;
 use dbt_schemas::schemas::common::{DbtChecksum, DbtMaterialization, DbtQuoting, NodeDependsOn};
 use dbt_schemas::schemas::dbt_column::process_columns;
-use dbt_schemas::schemas::manifest::{CommonAttributes, DbtConfig, DbtSeed, NodeBaseAttributes};
-use dbt_schemas::schemas::project::DbtProject;
+use dbt_schemas::schemas::project::DefaultTo;
+use dbt_schemas::schemas::project::{DbtProject, SeedConfig};
 use dbt_schemas::schemas::properties::SeedProperties;
+use dbt_schemas::schemas::{CommonAttributes, DbtSeed, DbtSeedAttr, NodeBaseAttributes};
 use dbt_schemas::state::{DbtAsset, DbtPackage};
 use dbt_schemas::state::{ModelStatus, RefsAndSourcesTracker};
 use minijinja::value::Value as MinijinjaValue;
@@ -46,14 +47,12 @@ pub fn resolve_seeds(
     let mut disabled_seeds: HashMap<String, Arc<DbtSeed>> = HashMap::new();
     let local_project_config = init_project_config(
         io_args,
-        package_quoting,
-        &package
-            .dbt_project
-            .seeds
-            .as_ref()
-            .map(ProjectConfigs::SeedConfigs),
-        jinja_env,
-        base_ctx,
+        &package.dbt_project.seeds,
+        SeedConfig {
+            enabled: Some(true),
+            quoting: Some(package_quoting),
+            ..Default::default()
+        },
     )?;
 
     // TODO: update this to be relative of the root project
@@ -61,7 +60,7 @@ pub fn resolve_seeds(
     for seed_file in package.seed_files.iter() {
         // Validate that path extension is one of csv, parquet, or json
         let path = seed_file.path.clone();
-        let path_extension = path.extension().unwrap_or_default();
+        let path_extension = path.extension().unwrap_or_default().to_ascii_lowercase();
         if path_extension != "csv" && path_extension != "parquet" && path_extension != "json" {
             continue;
         }
@@ -76,7 +75,7 @@ pub fn resolve_seeds(
         } else {
             path.file_stem().unwrap().to_str().unwrap()
         };
-        let unique_id = format!("seed.{}.{}", package_name, seed_name);
+        let unique_id = format!("seed.{package_name}.{seed_name}");
 
         let fqn = get_node_fqn(package_name, path.to_owned(), vec![seed_name.to_owned()]);
 
@@ -92,7 +91,7 @@ pub fn resolve_seeds(
                     false,
                     jinja_env,
                     base_ctx,
-                    None,
+                    &[],
                 )?,
                 Some(mpe.relative_path.clone()),
             )
@@ -100,16 +99,26 @@ pub fn resolve_seeds(
             (SeedProperties::empty(seed_name.to_owned()), None)
         };
 
-        let project_config = local_project_config.get_config_for_path(&path, package_name);
+        let project_config = local_project_config.get_config_for_path(
+            &path,
+            package_name,
+            &package
+                .dbt_project
+                .seed_paths
+                .as_ref()
+                .unwrap_or(&vec![])
+                .clone(),
+        );
         let mut properties_config = if let Some(properties) = &seed.config {
-            let mut properties_config: DbtConfig = properties.try_into()?;
+            let mut properties_config: SeedConfig = properties.clone();
             properties_config.default_to(project_config);
             properties_config
         } else {
             project_config.clone()
         };
+
         // normalize column_types to uppercase if it is snowflake
-        if adapter_type == "snowflake" {
+        if adapter_type == "snowflake" || adapter_type == "replay" {
             if let Some(column_types) = &properties_config.column_types {
                 let column_types = column_types
                     .iter()
@@ -137,24 +146,34 @@ pub fn resolve_seeds(
         if package_name != root_project.name {
             let mut root_config = root_project_configs
                 .seeds
-                .get_config_for_path(&path, package_name)
+                .get_config_for_path(
+                    &path,
+                    package_name,
+                    &package
+                        .dbt_project
+                        .seed_paths
+                        .as_ref()
+                        .unwrap_or(&vec!["seeds".to_string()])
+                        .clone(),
+                )
                 .clone();
             root_config.default_to(&properties_config);
             properties_config = root_config;
         }
 
-        let is_enabled = properties_config.is_enabled();
+        let is_enabled = properties_config.get_enabled().unwrap_or(true);
 
-        let columns = process_columns(seed.columns.as_ref(), &properties_config)?;
-        if properties_config.materialized.is_none() {
-            properties_config.materialized = Some(DbtMaterialization::Table);
-        }
+        let columns = process_columns(
+            seed.columns.as_ref(),
+            properties_config.meta.clone(),
+            properties_config.tags.clone().map(|tags| tags.into()),
+        )?;
+
+        validate_delimeter(&properties_config.delimiter)?;
 
         // Create initial seed with default values
         let mut dbt_seed = DbtSeed {
             common_attr: CommonAttributes {
-                database: database.to_string(), // will be updated below
-                schema: schema.to_string(),     // will be updated below
                 name: seed_name.to_owned(),
                 package_name: package_name.to_owned(),
                 path: path.to_owned(),
@@ -162,33 +181,56 @@ pub fn resolve_seeds(
                     seed_file.base_path.join(&path),
                     &io_args.in_dir,
                 )?,
+                checksum: DbtChecksum::hash(
+                    std::fs::read(seed_file.base_path.join(&path))
+                        .map_err(|e| {
+                            fs_err!(ErrorCode::IoError, "Failed to read seed file: {}", e)
+                        })?
+                        .as_slice(),
+                ),
                 patch_path,
                 unique_id: unique_id.clone(),
                 fqn,
                 description: seed.description.clone(),
+                raw_code: None,
+                language: None,
+                tags: properties_config
+                    .tags
+                    .clone()
+                    .map(|tags| tags.into())
+                    .unwrap_or_default(),
+                meta: properties_config.meta.clone().unwrap_or_default(),
             },
             base_attr: NodeBaseAttributes {
-                alias: "".to_owned(), // will be updated below
-                checksum: DbtChecksum::hash(
-                    &String::from_utf8(std::fs::read(seed_file.base_path.join(&path)).map_err(
-                        |e| fs_err!(ErrorCode::IoError, "Failed to read seed file: {}", e),
-                    )?)
-                    .map_err(|e| {
-                        fs_err!(ErrorCode::IoError, "Invalid UTF-8 in seed file: {}", e)
-                    })?,
-                ),
-                relation_name: None, // will be updated below
+                database: database.to_string(), // will be updated below
+                schema: schema.to_string(),     // will be updated below
+                alias: "".to_owned(),           // will be updated below
+                relation_name: None,            // will be updated below
                 columns,
-                build_path: None,
-                created_at: None,
                 depends_on: NodeDependsOn::default(),
-                raw_code: None,
-                unrendered_config: BTreeMap::new(),
+                quoting: properties_config
+                    .quoting
+                    .expect("quoting is required")
+                    .try_into()
+                    .expect("quoting is required"),
+                materialized: DbtMaterialization::Table,
                 ..Default::default()
             },
-            config: properties_config.clone(),
+            seed_attr: DbtSeedAttr {
+                quote_columns: properties_config.quote_columns.unwrap_or(false),
+                column_types: properties_config.column_types.clone(),
+                delimiter: properties_config.delimiter.clone().map(|d| d.into_inner()),
+                root_path: Some(seed_file.base_path.clone()),
+            },
             other: BTreeMap::new(),
-            root_path: Some(seed_file.base_path.clone()),
+            deprecated_config: properties_config.clone(),
+        };
+
+        let components = RelationComponents {
+            database: properties_config.database.clone(),
+            schema: properties_config.schema.clone(),
+            alias: properties_config.alias.clone(),
+            store_failures: None,
         };
 
         update_node_relation_components(
@@ -197,7 +239,7 @@ pub fn resolve_seeds(
             &root_project.name,
             package_name,
             base_ctx,
-            &properties_config,
+            &components,
             adapter_type,
         )?;
 
@@ -217,8 +259,12 @@ pub fn resolve_seeds(
         match status {
             ModelStatus::Enabled => {
                 seeds.insert(unique_id, Arc::new(dbt_seed));
-                seed.as_testable()
-                    .persist(package_name, &io_args.out_dir, collected_tests)?;
+                seed.as_testable().persist(
+                    package_name,
+                    &io_args.out_dir,
+                    collected_tests,
+                    adapter_type,
+                )?;
             }
             ModelStatus::Disabled => {
                 disabled_seeds.insert(unique_id, Arc::new(dbt_seed));

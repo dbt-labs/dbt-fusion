@@ -3,25 +3,24 @@
 #[cfg(test)]
 #[allow(clippy::module_inception)]
 mod tests {
-    use dbt_common::FsResult;
+    use dbt_common::{io_args::IoArgs, FsResult};
     use dbt_frontend_common::error::CodeLocation;
-    use dbt_fusion_adapter::adapters::parse::adapter::create_parse_adapter;
+    use dbt_fusion_adapter::parse::adapter::create_parse_adapter;
     use dbt_jinja_utils::invocation_args::InvocationArgs;
     use dbt_jinja_utils::jinja_environment::JinjaEnvironment;
+    use dbt_jinja_utils::listener::DefaultListenerFactory;
     use dbt_jinja_utils::phases::parse::build_resolve_model_context;
     use dbt_jinja_utils::phases::parse::init::initialize_parse_jinja_environment;
     use dbt_jinja_utils::phases::parse::sql_resource::SqlResource;
     use dbt_jinja_utils::utils::render_sql;
-    use dbt_schemas::schemas::manifest::DbtConfig;
     use dbt_schemas::schemas::profiles::{DbConfig, PostgresDbConfig};
+    use dbt_schemas::schemas::project::{DefaultTo, ModelConfig};
     use dbt_schemas::schemas::relations::DEFAULT_DBT_QUOTING;
     use dbt_schemas::schemas::serde::StringOrInteger;
     use dbt_schemas::state::DbtRuntimeConfig;
     use minijinja::constants::TARGET_PACKAGE_NAME;
     use minijinja::machinery::Span;
-    use minijinja::{
-        listener::DefaultRenderingEventListener, machinery::make_macro_spans, AutoEscape, Error,
-    };
+    use minijinja::{AutoEscape, Error};
     use minijinja::{Environment, Output, OutputTracker, Value};
 
     use crate::utils::{get_node_fqn, parse_macro_statements};
@@ -32,11 +31,11 @@ mod tests {
     use std::path::Path;
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
-    use std::{collections::BTreeMap, path::PathBuf, rc::Rc};
+    use std::{collections::BTreeMap, path::PathBuf};
 
-    fn create_resolve_model_context(
-        init_config: &DbtConfig,
-        sql_resources: &Arc<Mutex<Vec<SqlResource>>>,
+    fn create_resolve_model_context<T: DefaultTo<T> + 'static>(
+        init_config: &T,
+        sql_resources: &Arc<Mutex<Vec<SqlResource<T>>>>,
     ) -> BTreeMap<String, Value> {
         let mut context = build_resolve_model_context(
             init_config,
@@ -50,6 +49,7 @@ mod tests {
                 vec!["my_model".to_string()],
             ),
             "common",
+            "test",
             DEFAULT_DBT_QUOTING,
             Arc::new(DbtRuntimeConfig::default()),
             sql_resources.clone(),
@@ -61,10 +61,10 @@ mod tests {
 
     fn setup_test_env() -> (
         JinjaEnvironment<'static>,
-        Arc<Mutex<Vec<SqlResource>>>,
-        DbtConfig,
+        Arc<Mutex<Vec<SqlResource<ModelConfig>>>>,
+        ModelConfig,
     ) {
-        let init_config = DbtConfig {
+        let init_config = ModelConfig {
             alias: Some("alias".to_string()),
             ..Default::default()
         };
@@ -95,6 +95,7 @@ mod tests {
             tz_now,
             &invocation_args,
             BTreeSet::from(["common".to_string()]),
+            IoArgs::default(),
         )
         .unwrap();
 
@@ -111,11 +112,11 @@ mod tests {
             let resolve_model_context = create_resolve_model_context(&init_config, &sql_resources);
             let sql = "SELECT * FROM {{ ref('my_table') }};";
 
-            let (rendered, _) = render_sql(
+            let rendered = render_sql(
                 sql,
                 &env,
-                resolve_model_context,
-                None,
+                &resolve_model_context,
+                &DefaultListenerFactory::default(),
                 &PathBuf::from("test"),
             )
             .unwrap();
@@ -149,8 +150,14 @@ mod tests {
             let resolve_model_scope = create_resolve_model_context(&init_config, &sql_resources);
             let sql = "SELECT * FROM {{ source('my_schema', 'my_table') }};";
 
-            let (rendered, _) =
-                render_sql(sql, &env, resolve_model_scope, None, &PathBuf::from("test")).unwrap();
+            let rendered = render_sql(
+                sql,
+                &env,
+                &resolve_model_scope,
+                &DefaultListenerFactory::default(),
+                &PathBuf::from("test"),
+            )
+            .unwrap();
 
             let sql_resources_locked = sql_resources.lock().unwrap().clone();
 
@@ -180,8 +187,14 @@ mod tests {
             let resolve_model_scope = create_resolve_model_context(&init_config, &sql_resources);
             let sql = "{{ metric('metric') }} {{ metric('metric_package', 'metric_two') }}";
 
-            let (rendered, _) =
-                render_sql(sql, &env, resolve_model_scope, None, &PathBuf::from("test")).unwrap();
+            let rendered = render_sql(
+                sql,
+                &env,
+                &resolve_model_scope,
+                &DefaultListenerFactory::default(),
+                &PathBuf::from("test"),
+            )
+            .unwrap();
 
             let sql_resources_locked = sql_resources.lock().unwrap().clone();
 
@@ -215,8 +228,14 @@ mod tests {
             )
         }}
         "#;
-            let (rendered, _) =
-                render_sql(sql, &env, resolve_model_scope, None, &PathBuf::from("test")).unwrap();
+            let rendered = render_sql(
+                sql,
+                &env,
+                &resolve_model_scope,
+                &DefaultListenerFactory::default(),
+                &PathBuf::from("test"),
+            )
+            .unwrap();
 
             assert_eq!(rendered.trim(), "");
 
@@ -225,7 +244,7 @@ mod tests {
                 map.insert("schema".to_string(), Value::from("my_schema"));
                 map.insert("alias".to_string(), Value::from("my_aliassuffix"));
                 map.insert("materialized".to_string(), Value::from("view"));
-                map.insert("enabled".to_string(), Value::from("true")); // this gets inhertied from the global config which is true if not specified (important that this is not overridden)
+                map.insert("enabled".to_string(), Value::from(true)); // this gets inhertied from the global config which is true if not specified (important that this is not overridden)
                 let config = serde_json::from_value(serde_json::to_value(map).unwrap()).unwrap();
                 SqlResource::Config(config)
             };
@@ -265,7 +284,6 @@ mod tests {
             let current_location = output_tracker.location.clone();
             let mut output = Output::with_write(&mut output_tracker);
 
-            let mut macro_spans = make_macro_spans();
             vm.eval(
                 instructions,
                 root,
@@ -273,8 +291,7 @@ mod tests {
                 &mut output,
                 current_location,
                 AutoEscape::None,
-                &mut macro_spans,
-                Rc::new(DefaultRenderingEventListener),
+                &[],
             )?;
             Ok(rv)
         }
@@ -291,8 +308,14 @@ mod tests {
         {{ parsed['abc'] }}
         "#;
 
-        let (rendered, _) =
-            render_sql(sql, &env, BTreeMap::new(), None, &PathBuf::from("test")).unwrap();
+        let rendered = render_sql(
+            sql,
+            &env,
+            &BTreeMap::new(),
+            &DefaultListenerFactory::default(),
+            &PathBuf::from("test"),
+        )
+        .unwrap();
 
         assert_eq!(rendered.trim(), "123");
     }
@@ -307,8 +330,14 @@ mod tests {
         {{ json_str }}
         "#;
 
-        let (rendered, _) =
-            render_sql(sql, &env, BTreeMap::new(), None, &PathBuf::from("test")).unwrap();
+        let rendered = render_sql(
+            sql,
+            &env,
+            &BTreeMap::new(),
+            &DefaultListenerFactory::default(),
+            &PathBuf::from("test"),
+        )
+        .unwrap();
 
         let rendered = rendered.trim().replace(" ", "").replace("\n", "");
         assert_eq!(rendered, r#"{"abc":123,"def":456}"#);
@@ -324,8 +353,14 @@ mod tests {
         {{ json_str }}
         "#;
 
-        let (rendered, _) =
-            render_sql(sql, &env, BTreeMap::new(), None, &PathBuf::from("test")).unwrap();
+        let rendered = render_sql(
+            sql,
+            &env,
+            &BTreeMap::new(),
+            &DefaultListenerFactory::default(),
+            &PathBuf::from("test"),
+        )
+        .unwrap();
 
         let rendered = rendered.trim().replace(" ", "").replace("\n", "");
         assert_eq!(rendered, r#"{"abc":123,"def":456}"#);
@@ -341,8 +376,14 @@ mod tests {
         {{ json_str }}
         "#;
 
-        let (rendered, _) =
-            render_sql(sql, &env, BTreeMap::new(), None, &PathBuf::from("test")).unwrap();
+        let rendered = render_sql(
+            sql,
+            &env,
+            &BTreeMap::new(),
+            &DefaultListenerFactory::default(),
+            &PathBuf::from("test"),
+        )
+        .unwrap();
 
         assert_eq!(rendered.trim(), r#"{"default": true}"#);
     }
@@ -361,8 +402,14 @@ mod tests {
         {{ my_dict['dogs'] | join(", ") }}
         "#;
 
-        let (rendered, _) =
-            render_sql(sql, &env, BTreeMap::new(), None, &PathBuf::from("test")).unwrap();
+        let rendered = render_sql(
+            sql,
+            &env,
+            &BTreeMap::new(),
+            &DefaultListenerFactory::default(),
+            &PathBuf::from("test"),
+        )
+        .unwrap();
 
         assert_eq!(rendered.trim(), "good, bad");
     }
@@ -378,8 +425,14 @@ mod tests {
         "#;
 
         // Render the snippet
-        let (rendered, _) =
-            render_sql(sql, &env, BTreeMap::new(), None, &PathBuf::from("test")).unwrap();
+        let rendered = render_sql(
+            sql,
+            &env,
+            &BTreeMap::new(),
+            &DefaultListenerFactory::default(),
+            &PathBuf::from("test"),
+        )
+        .unwrap();
 
         let trimmed = rendered.trim().replace('\n', " ").replace('\r', "");
         assert!(trimmed.contains("abc: 123"));
@@ -396,8 +449,14 @@ mod tests {
         {{ my_set | join(", ") }}
         "#;
 
-        let (rendered, _) =
-            render_sql(sql, &env, BTreeMap::new(), None, &PathBuf::from("test")).unwrap();
+        let rendered = render_sql(
+            sql,
+            &env,
+            &BTreeMap::new(),
+            &DefaultListenerFactory::default(),
+            &PathBuf::from("test"),
+        )
+        .unwrap();
 
         let trimmed = rendered.trim();
         assert!(
@@ -418,8 +477,8 @@ mod tests {
         let result = render_sql(
             sql_error,
             &env,
-            BTreeMap::new(),
-            None,
+            &BTreeMap::new(),
+            &DefaultListenerFactory::default(),
             &PathBuf::from("test"),
         );
 
@@ -435,8 +494,14 @@ mod tests {
         {{ local_md5(value) }}
         "#;
 
-        let (rendered, _) =
-            render_sql(sql, &env, BTreeMap::new(), None, &PathBuf::from("test")).unwrap();
+        let rendered = render_sql(
+            sql,
+            &env,
+            &BTreeMap::new(),
+            &DefaultListenerFactory::default(),
+            &PathBuf::from("test"),
+        )
+        .unwrap();
 
         assert_eq!(rendered.trim(), "5eb63bbbe01eeed093cb22bb8f5acdc3");
     }
@@ -604,7 +669,7 @@ mod tests {
         "#;
 
         let result = parse_macro_statements(sql, &PathBuf::from("test.sql"), &["macro"]);
-        println!("result: {:?}", result);
+        println!("result: {result:?}");
         assert!(result.is_err());
     }
 
@@ -677,8 +742,14 @@ mod tests {
         {{ tojson(my_dict, sort_keys=true) }}
         "#;
 
-        let (rendered, _) =
-            render_sql(sql, &env, BTreeMap::new(), None, &PathBuf::from("test")).unwrap();
+        let rendered = render_sql(
+            sql,
+            &env,
+            &BTreeMap::new(),
+            &DefaultListenerFactory::default(),
+            &PathBuf::from("test"),
+        )
+        .unwrap();
 
         let rendered = rendered.trim().replace(" ", "").replace("\n", "");
         assert_eq!(rendered, r#"{"a":1,"b":2,"c":5,"d":4}"#);
@@ -779,7 +850,7 @@ mod tests {
     "#;
 
         let res = parse_macro_statements(sql, Path::new("test.sql"), &["docs"]);
-        println!("res: {:?}", res);
+        println!("res: {res:?}");
         assert!(res.is_err());
     }
 }

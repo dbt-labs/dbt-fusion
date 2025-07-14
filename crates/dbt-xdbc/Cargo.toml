@@ -19,16 +19,17 @@ workspace = true
 default = []
 odbc = ["odbc-sys"]
 xdbc-fuzzying = []
+repl = ["dialoguer", "clap", "dbt-common"]
 
 [dependencies]
 adbc-core = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
+atomic-wait = { version = "1.1.0" }
 base64 = { workspace = true }
 chrono = { workspace = true }
 dirs = { workspace = true }
 futures = { workspace = true }
-futures-util = { workspace = true }
 getrandom = "0.2.15"
 http = { workspace = true }
 ini = { workspace = true }
@@ -49,3 +50,22 @@ zstd-safe = { workspace = true }
 
 [dev-dependencies]
 test-with = { version = "0.14.7", default-features = false }
+
+[[bin]]
+name = "dbt-xdbc-repl"
+path = "src/bin/repl.rs"
+required-features = ["repl"]
+
+[dependencies.dbt-common]
+optional = true
+path = "../dbt-common"
+
+[dependencies.dialoguer]
+features = ["history"]
+optional = true
+version = "0.11.0"
+
+[dependencies.clap]
+features = ["derive"]
+optional = true
+version = "4.4"

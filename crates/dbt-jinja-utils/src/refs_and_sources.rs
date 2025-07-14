@@ -7,13 +7,12 @@ use std::{
 use dbt_common::{
     err, io_args::IoArgs, show_error, unexpected_err, CodeLocation, ErrorCode, FsResult,
 };
-use dbt_fusion_adapter::adapters::utils::create_relation;
+use dbt_fusion_adapter::relation_object::create_relation_from_node;
 use dbt_schemas::{
-    dbt_types::RelationType,
     schemas::{
         common::DbtQuoting,
-        manifest::{DbtSource, InternalDbtNode, Nodes},
         ref_and_source::{DbtRef, DbtSourceWrapper},
+        DbtSource, InternalDbtNodeAttributes, Nodes,
     },
     state::{ModelStatus, RefsAndSourcesTracker},
 };
@@ -99,7 +98,7 @@ impl RefsAndSourcesTracker for RefsAndSources {
     /// Insert or overwrite a ref from a node into the refs map
     fn insert_ref(
         &mut self,
-        node: &dyn InternalDbtNode,
+        node: &dyn InternalDbtNodeAttributes,
         adapter_type: &str,
         status: ModelStatus,
         override_existing: bool,
@@ -113,21 +112,7 @@ impl RefsAndSourcesTracker for RefsAndSources {
         } else {
             (None, None)
         };
-        let dbt_config = node.get_dbt_config();
-        let dbt_quoting = dbt_config
-            .quoting
-            .expect("quoting should be set in dbt_config");
-        let relation = create_relation(
-            adapter_type.to_string(),
-            node.common().database.clone(),
-            node.common().schema.clone(),
-            Some(node.base().alias),
-            dbt_config.materialized.map(RelationType::from),
-            dbt_quoting
-                .try_into()
-                .expect("quoting should be resolved at this point"),
-        )?
-        .as_value();
+        let relation = create_relation_from_node(adapter_type.to_string(), node)?.as_value();
         if maybe_version == maybe_latest_version {
             // Lookup by ref name
             let ref_entry = self.refs.entry(model_name.clone()).or_default();
@@ -144,7 +129,7 @@ impl RefsAndSourcesTracker for RefsAndSources {
             // Lookup by package and ref name
             let package_ref_entry = self
                 .refs
-                .entry(format!("{}.{}", package_name, model_name))
+                .entry(format!("{package_name}.{model_name}"))
                 .or_default();
             if override_existing {
                 if let Some(existing) = package_ref_entry
@@ -162,7 +147,7 @@ impl RefsAndSourcesTracker for RefsAndSources {
 
         // All other entries are versioned, if one exists
         if let Some(version) = maybe_version {
-            let model_name_with_version = format!("{}.v{}", model_name, version);
+            let model_name_with_version = format!("{model_name}.v{version}");
 
             // Lookup by ref name (optional version)
             let versioned_ref_entry = self
@@ -184,7 +169,7 @@ impl RefsAndSourcesTracker for RefsAndSources {
 
             let package_versioned_ref_entry = self
                 .refs
-                .entry(format!("{}.{}", package_name, model_name_with_version))
+                .entry(format!("{package_name}.{model_name_with_version}"))
                 .or_default();
             if override_existing {
                 if let Some(existing) = package_versioned_ref_entry
@@ -213,24 +198,12 @@ impl RefsAndSourcesTracker for RefsAndSources {
         adapter_type: &str,
         status: ModelStatus,
     ) -> FsResult<()> {
-        let dbt_quoting = source
-            .config
-            .quoting
-            .expect("quoting should be set in dbt_config");
-        let relation = create_relation(
-            adapter_type.to_string(),
-            source.common_attr.database.clone(),
-            source.common_attr.schema.clone(),
-            Some(source.identifier.clone()),
-            None,
-            dbt_quoting.try_into()?,
-        )?
-        .as_value();
+        let relation = create_relation_from_node(adapter_type.to_string(), source)?.as_value();
 
         self.sources
             .entry(format!(
                 "{}.{}.{}",
-                package_name, source.source_name, source.common_attr.name
+                package_name, source.source_attr.source_name, source.common_attr.name
             ))
             .or_default()
             .push((
@@ -241,7 +214,7 @@ impl RefsAndSourcesTracker for RefsAndSources {
         self.sources
             .entry(format!(
                 "{}.{}",
-                source.source_name, source.common_attr.name
+                source.source_attr.source_name, source.common_attr.name
             ))
             .or_default()
             .push((source.common_attr.unique_id.clone(), relation, status));
@@ -281,7 +254,7 @@ impl RefsAndSourcesTracker for RefsAndSources {
             name,
             version
                 .as_ref()
-                .map(|v| format!(".v{}", v))
+                .map(|v| format!(".v{v}"))
                 .unwrap_or_default()
         );
         let mut enabled_ref: Option<(String, MinijinjaValue, ModelStatus)> = None;
@@ -317,7 +290,7 @@ impl RefsAndSourcesTracker for RefsAndSources {
                             "Found ambiguous ref('{}') pointing to multiple nodes: [{}]",
                             ref_name,
                             res.iter()
-                                .map(|(r, _, _)| format!("'{}'", r))
+                                .map(|(r, _, _)| format!("'{r}'"))
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         );
@@ -357,8 +330,8 @@ impl RefsAndSourcesTracker for RefsAndSources {
         table_name: &str,
     ) -> FsResult<(String, MinijinjaValue, ModelStatus)> {
         // This might not be correct if there is overlap in source names amongst projects
-        let source_table_name = format!("{}.{}", source_name, table_name);
-        let project_source_name = format!("{}.{}", package_name, source_table_name);
+        let source_table_name = format!("{source_name}.{table_name}");
+        let project_source_name = format!("{package_name}.{source_table_name}");
         if let Some(res) = self.sources.get(&project_source_name) {
             if res.len() != 1 {
                 return unexpected_err!("There should only be one entry for {project_source_name}");
@@ -392,7 +365,7 @@ impl RefsAndSourcesTracker for RefsAndSources {
                     "Found ambiguous source('{}') pointing to multiple nodes: [{}]",
                     source_table_name,
                     res.iter()
-                        .map(|(r, _, _)| format!("'{}'", r))
+                        .map(|(r, _, _)| format!("'{r}'"))
                         .collect::<Vec<_>>()
                         .join(", ")
                 )
@@ -426,82 +399,80 @@ pub fn resolve_dependencies(
         let is_test = node.is_test();
 
         let node_base = node.base_mut();
-        if let Some(node_base) = node_base {
-            let mut has_disabled_dependency = false;
 
-            // Check refs
-            let node_package_name_value = &Some(node_package_name.clone());
-            for DbtRef {
-                name,
+        let mut has_disabled_dependency = false;
+
+        // Check refs
+        let node_package_name_value = &Some(node_package_name.clone());
+        for DbtRef {
+            name,
+            package,
+            version,
+            location,
+        } in node_base.refs.iter()
+        {
+            let location = if let Some(location) = location {
+                location.clone().with_file(&node_path)
+            } else {
+                CodeLocation::default()
+            };
+            match refs_and_sources.lookup_ref(
                 package,
-                version,
-                location,
-            } in node_base.refs.iter()
-            {
-                let location = if let Some(location) = location {
-                    location.clone().with_file(&node_path)
-                } else {
-                    CodeLocation::default()
-                };
-                match refs_and_sources.lookup_ref(
-                    package,
-                    name,
-                    &version.as_ref().map(|v| v.to_string()),
-                    node_package_name_value,
-                ) {
-                    Ok((dependency_id, _, _)) => {
-                        node_base.depends_on.nodes.push(dependency_id.clone());
-                        node_base
-                            .depends_on
-                            .nodes_with_ref_location
-                            .push((dependency_id, location));
+                name,
+                &version.as_ref().map(|v| v.to_string()),
+                node_package_name_value,
+            ) {
+                Ok((dependency_id, _, _)) => {
+                    node_base.depends_on.nodes.push(dependency_id.clone());
+                    node_base
+                        .depends_on
+                        .nodes_with_ref_location
+                        .push((dependency_id, location));
+                }
+                Err(e) => {
+                    // Check if this is a disabled dependency error
+                    if is_test && e.code == ErrorCode::DisabledDependency {
+                        has_disabled_dependency = true;
+                    } else {
+                        show_error!(io, e.with_location(location));
                     }
-                    Err(e) => {
-                        // Check if this is a disabled dependency error
-                        if is_test && e.code == ErrorCode::DisabledDependency {
-                            has_disabled_dependency = true;
-                        } else {
-                            show_error!(io, e.with_location(location));
-                        }
+                }
+            };
+        }
+
+        // Check sources
+        for DbtSourceWrapper { source, location } in node_base.sources.iter() {
+            // Source is &Vec<String> (first two elements are source and table)
+            let source_name = source[0].clone();
+            let table_name = source[1].clone();
+
+            let location = if let Some(location) = location {
+                location.clone().with_file(&node_path)
+            } else {
+                CodeLocation::default()
+            };
+
+            match refs_and_sources.lookup_source(&node_package_name, &source_name, &table_name) {
+                Ok((dependency_id, _, _)) => {
+                    node_base.depends_on.nodes.push(dependency_id.clone());
+                    node_base
+                        .depends_on
+                        .nodes_with_ref_location
+                        .push((dependency_id, location));
+                }
+                Err(e) => {
+                    // Check if this is a disabled dependency error
+                    if is_test && e.code == ErrorCode::DisabledDependency {
+                        has_disabled_dependency = true;
+                    } else {
+                        show_error!(io, e.with_location(location));
                     }
-                };
-            }
+                }
+            };
+        }
 
-            // Check sources
-            for DbtSourceWrapper { source, location } in node_base.sources.iter() {
-                // Source is &Vec<String> (first two elements are source and table)
-                let source_name = source[0].clone();
-                let table_name = source[1].clone();
-
-                let location = if let Some(location) = location {
-                    location.clone().with_file(&node_path)
-                } else {
-                    CodeLocation::default()
-                };
-
-                match refs_and_sources.lookup_source(&node_package_name, &source_name, &table_name)
-                {
-                    Ok((dependency_id, _, _)) => {
-                        node_base.depends_on.nodes.push(dependency_id.clone());
-                        node_base
-                            .depends_on
-                            .nodes_with_ref_location
-                            .push((dependency_id, location));
-                    }
-                    Err(e) => {
-                        // Check if this is a disabled dependency error
-                        if is_test && e.code == ErrorCode::DisabledDependency {
-                            has_disabled_dependency = true;
-                        } else {
-                            show_error!(io, e.with_location(location));
-                        }
-                    }
-                };
-            }
-
-            if is_test && has_disabled_dependency {
-                tests_to_disable.push(node_unique_id);
-            }
+        if is_test && has_disabled_dependency {
+            tests_to_disable.push(node_unique_id);
         }
     }
 

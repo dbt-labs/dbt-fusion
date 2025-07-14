@@ -30,7 +30,8 @@ use crate::connection::OdbcConnection;
 #[cfg(feature = "odbc")]
 use crate::odbc::OdbcEnv;
 use crate::{
-    connection::AdbcConnection, snowflake, str_from_sqlstate, Backend, Connection, Semaphore,
+    connection::AdbcConnection, semaphore::Semaphore, snowflake, str_from_sqlstate, Backend,
+    Connection,
 };
 
 mod builder;
@@ -177,7 +178,7 @@ impl TokenRefresher {
             &account
         );
 
-        let encoded_creds = BASE64_ENGINE.encode(format!("{}:{}", client_id, client_secret));
+        let encoded_creds = BASE64_ENGINE.encode(format!("{client_id}:{client_secret}"));
 
         TokenRefresher {
             http_agent,
@@ -239,7 +240,7 @@ impl TokenRefresher {
             .read_json::<RefreshResponse>()
             .map_err(|e| {
                 Error::with_message_and_status(
-                    format!("Failed parse payload of auth token request: {}", e),
+                    format!("Failed parse payload of auth token request: {e}"),
                     Status::InvalidData,
                 )
             })?;
@@ -688,7 +689,7 @@ impl Database for OdbcDatabase {
             OptionValue::String(s) => Ok(s.to_owned()),
             OptionValue::Int(i) => Ok(i.to_string()),
             _ => Err(Error::with_message_and_status(
-                format!("invalid option value type for ODBC driver: {:?}", v),
+                format!("invalid option value type for ODBC driver: {v:?}"),
                 Status::InvalidArguments,
             )),
         };
@@ -697,7 +698,7 @@ impl Database for OdbcDatabase {
                 (OptionConnection::Other(k), v) => {
                     let s = opt_value_as_string(v)?;
                     // TODO(felipecrv): implement escaping for ODBC option values
-                    conn_string.push_str(&format!("{}={};", k, s));
+                    conn_string.push_str(&format!("{k}={s};"));
                     Ok(())
                 }
                 _ => unimplemented!(),

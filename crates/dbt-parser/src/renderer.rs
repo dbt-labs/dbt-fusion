@@ -4,11 +4,13 @@ use crate::resolve::resolve_properties::MinimalPropertiesEntry;
 use crate::sql_file_info::SqlFileInfo;
 use crate::utils::{get_node_fqn, register_duplicate_resource, trigger_duplicate_errors};
 use dbt_common::constants::PARSING;
+use dbt_common::io_args::IoArgs;
 use dbt_common::tokiofs::read_to_string;
 use dbt_common::{
     fs_err, show_error, show_progress, show_warning_soon_to_be_error, ErrorCode, FsError, FsResult,
 };
 use dbt_jinja_utils::jinja_environment::JinjaEnvironment;
+use dbt_jinja_utils::listener::{DefaultListenerFactory, ListenerFactory};
 use dbt_jinja_utils::phases::build_compile_and_run_base_context;
 use dbt_jinja_utils::phases::compile::build_compile_node_context;
 use dbt_jinja_utils::phases::parse::build_resolve_model_context;
@@ -17,51 +19,51 @@ use dbt_jinja_utils::refs_and_sources::RefsAndSources;
 use dbt_jinja_utils::serde::into_typed_with_jinja_error;
 use dbt_jinja_utils::silence_base_context;
 use dbt_jinja_utils::utils::render_sql;
-use dbt_schemas::schemas::common::{DbtChecksum, DbtQuoting};
-use dbt_schemas::schemas::manifest::{
-    DbtConfig, DbtModel, InternalDbtNode, IntrospectionKind, ManifestModelConfig, Nodes,
-};
-use dbt_schemas::schemas::properties::TryBuildConfig;
+use dbt_schemas::schemas::common::{DbtChecksum, DbtQuoting, Hooks};
+use dbt_schemas::schemas::project::DefaultTo;
+use dbt_schemas::schemas::properties::GetConfig;
+use dbt_schemas::schemas::InternalDbtNodeAttributes;
+use dbt_schemas::schemas::{DbtModel, InternalDbtNode, IntrospectionKind, Nodes};
 use dbt_schemas::state::{DbtAsset, DbtRuntimeConfig, ModelStatus};
+
 use minijinja::constants::{TARGET_PACKAGE_NAME, TARGET_UNIQUE_ID};
-use minijinja::{ErrorKind as MinijinjaErrorKind, MacroSpans, Value as MinijinjaValue};
-use serde::de::DeserializeOwned;
+use minijinja::{MacroSpans, Value as MinijinjaValue};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{self, AtomicBool};
 use std::sync::{Arc, Mutex};
 
 use crate::args::ResolveArgs;
-use dbt_common::fsinfo;
+use dbt_common::{fsinfo, show_warning};
 
 /// Represents the result of rendering a single SQL file
 #[derive(Debug)]
-pub struct SqlFileRenderResult<T> {
+pub struct SqlFileRenderResult<T: DefaultTo<T>, S> {
     /// The asset that was rendered
     pub asset: DbtAsset,
     /// The status of the model
     pub status: ModelStatus,
     /// The file info for the rendered SQL file
-    pub sql_file_info: SqlFileInfo,
+    pub sql_file_info: SqlFileInfo<T>,
     /// The rendered SQL
     pub rendered_sql: String,
     /// The macro spans for the rendered SQL
     pub macro_spans: MacroSpans,
     /// The properties for the model
-    pub properties: Option<T>,
+    pub properties: Option<S>,
     /// The path to the properties file that defines this model
     pub patch_path: Option<PathBuf>,
 }
 
 /// Extracts model and version configuration from node properties
-fn extract_model_and_version_config<T: TryBuildConfig + DeserializeOwned + std::fmt::Debug>(
+fn extract_model_and_version_config<T: DefaultTo<T>, S: GetConfig<T>>(
     ref_name: &str,
     mpe: &mut MinimalPropertiesEntry,
     duplicate_errors: &mut Vec<FsError>,
     arg: &ResolveArgs,
     jinja_env: &JinjaEnvironment<'static>,
     base_ctx: &BTreeMap<String, MinijinjaValue>,
-) -> FsResult<(Option<T>, Option<DbtConfig>)> {
+) -> FsResult<(Option<S>, Option<T>)> {
     if !mpe.duplicate_paths.is_empty() {
         register_duplicate_resource(mpe, ref_name, "model", duplicate_errors);
         return Ok((None, None));
@@ -75,35 +77,35 @@ fn extract_model_and_version_config<T: TryBuildConfig + DeserializeOwned + std::
     let schema_value = std::mem::replace(&mut mpe.schema_value, dbt_serde_yaml::Value::null());
 
     let (maybe_model, errors) =
-        into_typed_with_jinja_error::<T, _>(schema_value, false, jinja_env, base_ctx, None)?;
+        into_typed_with_jinja_error::<S, _>(schema_value, false, jinja_env, base_ctx, &[])?;
 
     for error in errors {
-        let context = format!(
-            "While parsing {} config: {}",
-            T::resource_name(),
-            error.context
-        );
+        let context = format!("While parsing config: {}", error.context);
         let error = error.with_context(context);
-        show_warning_soon_to_be_error!(arg.io, error);
+        if std::env::var("_DBT_FUSION_STRICT_MODE").is_ok() {
+            show_error!(arg.io, error);
+        } else {
+            show_warning_soon_to_be_error!(arg.io, error);
+        }
     }
     let maybe_version_config = if let Some(version_info) = mpe.version_info.as_ref() {
         if let Some(version_config) = version_info.version_config.as_ref() {
-            let (version_config, errors) = into_typed_with_jinja_error::<DbtConfig, _>(
+            let (version_config, errors) = into_typed_with_jinja_error::<T, _>(
                 version_config.clone(),
                 false,
                 jinja_env,
                 base_ctx,
-                None,
+                &[],
             )?;
 
             for error in errors {
-                let context = format!(
-                    "While parsing {} version config: {}",
-                    T::resource_name(),
-                    error.context
-                );
+                let context = format!("While parsing version config: {}", error.context);
                 let error = error.with_context(context);
-                show_warning_soon_to_be_error!(arg.io, error);
+                if std::env::var("_DBT_FUSION_STRICT_MODE").is_ok() {
+                    show_error!(arg.io, error);
+                } else {
+                    show_warning_soon_to_be_error!(arg.io, error);
+                }
             }
 
             Some(version_config)
@@ -120,7 +122,8 @@ fn extract_model_and_version_config<T: TryBuildConfig + DeserializeOwned + std::
 #[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub async fn render_unresolved_sql_files_sequentially<
-    T: TryBuildConfig + DeserializeOwned + Send + Clone + 'static + std::fmt::Debug,
+    T: DefaultTo<T> + 'static,
+    S: GetConfig<T>,
 >(
     arg: &ResolveArgs,
     model_sql_files: &[DbtAsset],
@@ -133,10 +136,11 @@ pub async fn render_unresolved_sql_files_sequentially<
     base_ctx: &BTreeMap<String, MinijinjaValue>,
     node_properties: &mut BTreeMap<String, MinimalPropertiesEntry>,
     root_project_name: &str,
-    root_project_config: &DbtProjectConfig,
-    local_project_config: &DbtProjectConfig,
+    root_project_config: &DbtProjectConfig<T>,
+    local_project_config: &DbtProjectConfig<T>,
     runtime_config: Arc<DbtRuntimeConfig>,
-) -> FsResult<Vec<SqlFileRenderResult<T>>> {
+    resource_paths: &[String],
+) -> FsResult<Vec<SqlFileRenderResult<T, S>>> {
     let mut model_sql_resources_map = Vec::new();
     let mut duplicate_errors = Vec::new();
 
@@ -150,7 +154,7 @@ pub async fn render_unresolved_sql_files_sequentially<
         let ref_name = dbt_asset.path.file_stem().unwrap().to_str().unwrap();
         let (maybe_model, maybe_version_config) = {
             if let Some(mpe) = node_properties.get_mut(ref_name) {
-                extract_model_and_version_config::<T>(
+                extract_model_and_version_config::<T, S>(
                     ref_name,
                     mpe,
                     &mut duplicate_errors,
@@ -160,7 +164,7 @@ pub async fn render_unresolved_sql_files_sequentially<
                 )
                 .map_err(|e| *e)?
             } else {
-                (None::<T>, None::<DbtConfig>)
+                (None::<S>, None::<T>)
             }
         };
 
@@ -169,9 +173,9 @@ pub async fn render_unresolved_sql_files_sequentially<
         }
 
         let project_config =
-            local_project_config.get_config_for_path(&dbt_asset.path, package_name);
-        let properties_config: DbtConfig = if let Some(model) = &maybe_model {
-            if let Some(mut properties_config) = model.try_build_config().map_err(|e| *e)? {
+            local_project_config.get_config_for_path(&dbt_asset.path, package_name, resource_paths);
+        let properties_config: T = if let Some(model) = &maybe_model {
+            if let Some(mut properties_config) = model.get_config().cloned() {
                 properties_config.default_to(project_config);
                 properties_config
             } else {
@@ -180,7 +184,7 @@ pub async fn render_unresolved_sql_files_sequentially<
         } else {
             project_config.clone()
         };
-        let properties_config: DbtConfig = if let Some(mut version_config) = maybe_version_config {
+        let properties_config: T = if let Some(mut version_config) = maybe_version_config {
             version_config.default_to(&properties_config);
             version_config
         } else {
@@ -213,6 +217,7 @@ pub async fn render_unresolved_sql_files_sequentially<
                 vec![model_name.clone()],
             ),
             package_name,
+            root_project_name,
             package_quoting,
             runtime_config.clone(),
             sql_resources.clone(),
@@ -227,13 +232,20 @@ pub async fn render_unresolved_sql_files_sequentially<
             arg.io,
             fsinfo!(PARSING.into(), display_path.display().to_string())
         );
-        match render_sql(&sql, jinja_env, resolve_model_context, None, &display_path) {
-            Ok((rendered_sql_except_refs_and_sources, macro_spans)) => {
+        let listener_factory = DefaultListenerFactory::default();
+        match render_sql(
+            &sql,
+            jinja_env,
+            &resolve_model_context,
+            &listener_factory,
+            &display_path,
+        ) {
+            Ok(rendered_sql_except_refs_and_sources) => {
                 let sql_resources_cloned = sql_resources.clone();
 
                 if root_project_name != package_name {
-                    let root_config: DbtConfig = root_project_config
-                        .get_config_for_path(&dbt_asset.path, package_name)
+                    let root_config = root_project_config
+                        .get_config_for_path(&dbt_asset.path, package_name, resource_paths)
                         .clone();
                     sql_resources_cloned
                         .lock()
@@ -241,15 +253,36 @@ pub async fn render_unresolved_sql_files_sequentially<
                         .push(SqlResource::Config(Box::new(root_config.clone())));
                 }
 
-                let sql_resources_locked = sql_resources_cloned.lock().unwrap().clone();
+                // Get config from current resources to use for hook rendering
+                let temp_sql_file_info = {
+                    let sql_resources_locked = sql_resources_cloned.lock().unwrap();
+                    SqlFileInfo::from_sql_resources(
+                        sql_resources_locked.clone(),
+                        DbtChecksum::hash(sql.as_bytes()),
+                        execute_exists.load(atomic::Ordering::Relaxed),
+                    )
+                };
+
+                // Collect dependencies from pre and post hooks (adds to same sql_resources)
+                collect_hook_dependencies_from_config(
+                    &*temp_sql_file_info.config,
+                    jinja_env,
+                    &display_path, // path to sql file, might not be path to hooks
+                    arg.io.clone(),
+                    &resolve_model_context,
+                )?;
+
+                // Create final sql_file_info with all dependencies (main SQL + hooks)
+                let sql_resources_locked = sql_resources_cloned.lock().unwrap();
                 let sql_file_info = SqlFileInfo::from_sql_resources(
                     sql_resources_locked.clone(),
-                    DbtChecksum::hash(&sql),
+                    DbtChecksum::hash(sql.as_bytes()),
                     execute_exists.load(atomic::Ordering::Relaxed),
                 );
-                let model_config = ManifestModelConfig::from(*sql_file_info.config.clone());
-                let status = if model_config
-                    .enabled
+
+                let status = if sql_file_info
+                    .config
+                    .get_enabled()
                     .expect("model config should be set by now")
                 {
                     ModelStatus::Enabled
@@ -261,7 +294,7 @@ pub async fn render_unresolved_sql_files_sequentially<
                     asset: dbt_asset.clone(),
                     sql_file_info,
                     rendered_sql: rendered_sql_except_refs_and_sources,
-                    macro_spans,
+                    macro_spans: listener_factory.drain_macro_spans(&display_path),
                     properties: maybe_model,
                     status,
                     patch_path: node_properties
@@ -275,31 +308,25 @@ pub async fn render_unresolved_sql_files_sequentially<
                 let sql_resources_locked = sql_resources_cloned.lock().unwrap().clone();
                 let sql_file_info = SqlFileInfo::from_sql_resources(
                     sql_resources_locked.clone(),
-                    DbtChecksum::hash(&sql),
+                    DbtChecksum::hash(sql.as_bytes()),
                     execute_exists.load(atomic::Ordering::Relaxed),
                 );
-                match err.kind() {
-                    MinijinjaErrorKind::DisabledModel => {
+                match err.code {
+                    ErrorCode::DisabledModel => {
                         status = ModelStatus::Disabled;
                     }
-                    MinijinjaErrorKind::SyntaxError => {
+                    ErrorCode::MacroSyntaxError => {
                         status = ModelStatus::ParsingFailed;
-                        show_error!(
-                            arg.io,
-                            FsError::from(err).with_location(dbt_asset.path.clone())
-                        );
+                        show_error!(arg.io, err.with_location(dbt_asset.path.clone()));
                     }
                     _ => {
-                        let model_config = ManifestModelConfig::from(*sql_file_info.config.clone());
-                        if model_config
-                            .enabled
+                        if sql_file_info
+                            .config
+                            .get_enabled()
                             .expect("model config should be set by now")
                         {
                             status = ModelStatus::ParsingFailed;
-                            show_error!(
-                                arg.io,
-                                FsError::from(err).with_location(dbt_asset.path.clone())
-                            );
+                            show_error!(arg.io, err.with_location(dbt_asset.path.clone()));
                         } else {
                             status = ModelStatus::Disabled;
                         }
@@ -328,9 +355,7 @@ pub async fn render_unresolved_sql_files_sequentially<
 /// iterate over all the sql files passed in, generate the local config, initailize the sql render env, and render the sql
 /// and return the sql resources (deps) found while rendering the files
 #[allow(clippy::too_many_arguments)]
-pub async fn render_unresolved_sql_files<
-    T: TryBuildConfig + DeserializeOwned + Send + Clone + 'static + std::fmt::Debug,
->(
+pub async fn render_unresolved_sql_files<T: DefaultTo<T> + 'static, S: GetConfig<T> + 'static>(
     arg: &ResolveArgs,
     model_sql_files: &[DbtAsset],
     package_name: &str,
@@ -342,10 +367,11 @@ pub async fn render_unresolved_sql_files<
     base_ctx: &BTreeMap<String, MinijinjaValue>,
     node_properties: &mut BTreeMap<String, MinimalPropertiesEntry>,
     root_project_name: &str,
-    root_project_config: &DbtProjectConfig,
-    local_project_config: &DbtProjectConfig,
+    root_project_config: &DbtProjectConfig<T>,
+    local_project_config: &DbtProjectConfig<T>,
     runtime_config: Arc<DbtRuntimeConfig>,
-) -> FsResult<Vec<SqlFileRenderResult<T>>> {
+    resource_paths: &[String],
+) -> FsResult<Vec<SqlFileRenderResult<T, S>>> {
     let mut model_sql_resources_map = Vec::new();
     let mut duplicate_errors = Vec::new();
 
@@ -369,16 +395,14 @@ pub async fn render_unresolved_sql_files<
             root_project_config,
             local_project_config,
             runtime_config,
+            resource_paths,
         )
         .await;
     }
-    // this code is io bound. So split the work between min(4, max_cpus) threads
     let max_concurrency = arg
         .num_threads
-        .unwrap_or(4)
-        .min(16)
-        .min(model_sql_files.len())
-        .max(1);
+        .filter(|&n| n != 0)
+        .unwrap_or_else(|| std::cmp::max(1, num_cpus::get()));
 
     let chunk_size = model_sql_files.len().div_ceil(max_concurrency);
     // Partition the workload and node_properties into chunks
@@ -408,12 +432,13 @@ pub async fn render_unresolved_sql_files<
         let base_ctx = base_ctx.clone();
         let local_project_config = local_project_config.clone();
         let runtime_config = runtime_config.clone();
+        let resource_paths = resource_paths.to_vec();
 
         let root_project_name = root_project_name.to_owned();
         // TODO: a potentially expensive clone. Arc this
         let root_project_config = root_project_config.to_owned();
         tasks.push(tokio::spawn(async move {
-            let mut local_results: Vec<SqlFileRenderResult<T>> = Vec::new();
+            let mut local_results: Vec<SqlFileRenderResult<T, S>> = Vec::new();
             let mut local_duplicate_errors: Vec<FsError> = Vec::new();
 
             for dbt_asset in chunk {
@@ -423,7 +448,7 @@ pub async fn render_unresolved_sql_files<
                 let ref_name = dbt_asset.path.file_stem().unwrap().to_str().unwrap();
                 let (maybe_model, maybe_version_config) = {
                     if let Some(mpe) = chunk_node_properties.get_mut(ref_name) {
-                        extract_model_and_version_config::<T>(
+                        extract_model_and_version_config::<T, S>(
                             ref_name,
                             mpe,
                             &mut local_duplicate_errors,
@@ -433,7 +458,7 @@ pub async fn render_unresolved_sql_files<
                         )
                         .map_err(|e| *e)?
                     } else {
-                        (None::<T>, None::<DbtConfig>)
+                        (None::<S>, None::<T>)
                     }
                 };
 
@@ -444,10 +469,13 @@ pub async fn render_unresolved_sql_files<
                     continue;
                 }
 
-                let project_config =
-                    local_project_config.get_config_for_path(&dbt_asset.path, &package_name);
-                let properties_config: DbtConfig = if let Some(model) = &maybe_model {
-                    if let Some(mut properties_config) = model.try_build_config().map_err(|e| *e)? {
+                let project_config = local_project_config.get_config_for_path(
+                    &dbt_asset.path,
+                    &package_name,
+                    &resource_paths,
+                );
+                let properties_config: T = if let Some(model) = &maybe_model {
+                    if let Some(mut properties_config) = model.get_config().cloned() {
                         properties_config.default_to(project_config);
                         properties_config
                     } else {
@@ -456,13 +484,12 @@ pub async fn render_unresolved_sql_files<
                 } else {
                     project_config.clone()
                 };
-                let properties_config: DbtConfig =
-                    if let Some(mut version_config) = maybe_version_config {
-                        version_config.default_to(&properties_config);
-                        version_config
-                    } else {
-                        properties_config
-                    };
+                let properties_config: T = if let Some(mut version_config) = maybe_version_config {
+                    version_config.default_to(&properties_config);
+                    version_config
+                } else {
+                    properties_config
+                };
                 let model_name = dbt_asset
                     .path
                     .file_stem()
@@ -491,6 +518,7 @@ pub async fn render_unresolved_sql_files<
                         vec![model_name.clone()],
                     ),
                     &package_name,
+                    &root_project_name,
                     package_quoting,
                     runtime_config.clone(),
                     sql_resources.clone(),
@@ -505,13 +533,24 @@ pub async fn render_unresolved_sql_files<
                     arg.io,
                     fsinfo!(PARSING.into(), display_path.display().to_string())
                 );
-                match render_sql(&sql, &jinja_env, resolve_model_context, None, &display_path) {
-                    Ok((rendered_sql_except_refs_and_sources, macro_spans)) => {
+                let listener_factory = DefaultListenerFactory::default();
+                match render_sql(
+                    &sql,
+                    &jinja_env,
+                    &resolve_model_context,
+                    &listener_factory,
+                    &display_path,
+                ) {
+                    Ok(rendered_sql_except_refs_and_sources) => {
                         let sql_resources_cloned = sql_resources.clone();
 
                         if root_project_name != package_name {
-                            let root_config: DbtConfig = root_project_config
-                                .get_config_for_path(&dbt_asset.path, &package_name)
+                            let root_config: T = root_project_config
+                                .get_config_for_path(
+                                    &dbt_asset.path,
+                                    &package_name,
+                                    &resource_paths,
+                                )
                                 .clone();
                             sql_resources_cloned
                                 .lock()
@@ -519,16 +558,38 @@ pub async fn render_unresolved_sql_files<
                                 .insert(0, SqlResource::Config(Box::new(root_config.clone())));
                         }
 
+                        // Get config from current resources to use for hook rendering
+                        let temp_sql_file_info = {
+                            let sql_resources_locked = sql_resources_cloned.lock().unwrap().clone();
+                            SqlFileInfo::from_sql_resources(
+                                sql_resources_locked.clone(),
+                                DbtChecksum::hash(sql.as_bytes()),
+                                execute_exists.load(atomic::Ordering::Relaxed),
+                            )
+                        };
+
+                        // Collect dependencies from pre and post hooks (adds to same sql_resources)
+                        collect_hook_dependencies_from_config(
+                            &*temp_sql_file_info.config,
+                            &jinja_env,
+                            &display_path, // path to sql file, might not be path to hooks
+                            arg.io.clone(),
+                            &resolve_model_context,
+                        )
+                        .map_err(|e| *e)?;
+
+                        // Create final sql_file_info with all dependencies (main SQL + hooks)
                         let sql_resources_locked = sql_resources_cloned.lock().unwrap().clone();
                         let sql_file_info = SqlFileInfo::from_sql_resources(
                             sql_resources_locked.clone(),
-                            DbtChecksum::hash(&sql),
+                            DbtChecksum::hash(sql.as_bytes()),
                             execute_exists.load(atomic::Ordering::Relaxed),
                         );
+
                         // check the model config to see if it is enabled
-                        let model_config = ManifestModelConfig::from(*sql_file_info.config.clone());
-                        let status = if model_config
-                            .enabled
+                        let status = if sql_file_info
+                            .config
+                            .get_enabled()
                             .expect("model config should be set by now")
                         {
                             ModelStatus::Enabled
@@ -540,7 +601,7 @@ pub async fn render_unresolved_sql_files<
                             asset: dbt_asset.clone(),
                             sql_file_info,
                             rendered_sql: rendered_sql_except_refs_and_sources,
-                            macro_spans,
+                            macro_spans: listener_factory.drain_macro_spans(&display_path),
                             properties: maybe_model,
                             status,
                             patch_path: chunk_node_properties
@@ -554,34 +615,27 @@ pub async fn render_unresolved_sql_files<
                         let sql_resources_locked = sql_resources_cloned.lock().unwrap().clone();
                         let sql_file_info = SqlFileInfo::from_sql_resources(
                             sql_resources_locked.clone(),
-                            DbtChecksum::hash(&sql),
+                            DbtChecksum::hash(sql.as_bytes()),
                             execute_exists.load(atomic::Ordering::Relaxed),
                         );
-                        match err.kind() {
+                        match err.code {
                             // Model is disabled and template compiles
-                            MinijinjaErrorKind::DisabledModel => {
+                            ErrorCode::DisabledModel => {
                                 status = ModelStatus::Disabled;
                             }
                             // Template is invalid
-                            MinijinjaErrorKind::SyntaxError => {
+                            ErrorCode::MacroSyntaxError => {
                                 status = ModelStatus::ParsingFailed;
-                                show_error!(
-                                    arg.io,
-                                    FsError::from(err).with_location(dbt_asset.path.clone())
-                                );
+                                show_error!(arg.io, err.with_location(dbt_asset.path.clone()));
                             }
                             _ => {
-                                let model_config =
-                                    ManifestModelConfig::from(*sql_file_info.config.clone());
-                                if model_config
-                                    .enabled
+                                if sql_file_info
+                                    .config
+                                    .get_enabled()
                                     .expect("model config should be set by now")
                                 {
                                     status = ModelStatus::ParsingFailed;
-                                    show_error!(
-                                        arg.io,
-                                        FsError::from(err).with_location(dbt_asset.path.clone())
-                                    );
+                                    show_error!(arg.io, err.with_location(dbt_asset.path.clone()));
                                 } else {
                                     // Model is disabled and template fails to compile for a non-syntax/non-disabled error
                                     status = ModelStatus::Disabled;
@@ -647,6 +701,7 @@ pub async fn collect_adapter_identifiers_detect_unsafe(
     jinja_env: &JinjaEnvironment<'static>,
     adapter_type: &str,
     package_name: &str,
+    root_project_name: &str,
     runtime_config: Arc<DbtRuntimeConfig>,
 ) -> FsResult<()> {
     if models.is_empty() {
@@ -660,10 +715,8 @@ pub async fn collect_adapter_identifiers_detect_unsafe(
 
     let max_concurrency = arg
         .num_threads
-        .unwrap_or(4)
-        .min(16)
-        .min(model_vec.len())
-        .max(1);
+        .filter(|&n| n != 0)
+        .unwrap_or_else(|| std::cmp::max(1, num_cpus::get()));
     let chunk_size = model_vec.len().div_ceil(max_concurrency);
 
     let parse_adapter = jinja_env
@@ -679,6 +732,7 @@ pub async fn collect_adapter_identifiers_detect_unsafe(
             jinja_env,
             adapter_type,
             package_name,
+            root_project_name,
             runtime_config,
             parse_adapter,
             chunk_size,
@@ -692,6 +746,7 @@ pub async fn collect_adapter_identifiers_detect_unsafe(
             jinja_env,
             adapter_type,
             package_name,
+            root_project_name,
             runtime_config,
             parse_adapter,
             chunk_size,
@@ -703,7 +758,7 @@ pub async fn collect_adapter_identifiers_detect_unsafe(
     for unsafe_id in all_unsafe_ids {
         if let Some(arc_model) = models.get_mut(&unsafe_id) {
             let model = Arc::make_mut(arc_model);
-            model.set_detected_introspection(Some(IntrospectionKind::Execute));
+            model.set_detected_introspection(IntrospectionKind::Execute);
         }
     }
 
@@ -719,15 +774,16 @@ async fn process_model_chunk_for_unsafe_detection(
     jinja_env: JinjaEnvironment<'static>,
     adapter_type: String,
     package_name: String,
+    root_project_name: String,
     runtime_config: Arc<DbtRuntimeConfig>,
-    parse_adapter: Arc<dbt_fusion_adapter::adapters::ParseAdapter>,
+    parse_adapter: Arc<dbt_fusion_adapter::ParseAdapter>,
 ) -> FsResult<Vec<String>> {
     let mut unsafe_ids = Vec::new();
     let mut render_base_context = build_compile_and_run_base_context(
         Arc::new(refs_and_sources.clone()),
         &package_name,
         &Nodes::default(),
-        runtime_config,
+        runtime_config.clone(),
     );
     silence_base_context(&mut render_base_context);
 
@@ -738,7 +794,6 @@ async fn process_model_chunk_for_unsafe_detection(
         let absolute_path = arg.io.in_dir.join(&model.common().original_file_path);
         let sql = read_to_string(&absolute_path).await?;
 
-        let config = model.get_dbt_config();
         render_base_context.insert(
             TARGET_PACKAGE_NAME.to_string(),
             MinijinjaValue::from(model.common().package_name.clone()),
@@ -748,26 +803,18 @@ async fn process_model_chunk_for_unsafe_detection(
             MinijinjaValue::from(model.common().unique_id.clone()),
         );
 
-        let quoting = match config.quoting.unwrap().try_into() {
-            Ok(q) => q,
-            Err(_) => {
-                show_error!(
-                    arg.io,
-                    fs_err!(ErrorCode::Generic, "")
-                        .with_location(model.common().original_file_path.clone())
-                );
-                return Ok(unsafe_ids);
-            }
-        };
-
         let (render_resolved_context, _, _) = build_compile_node_context(
             &MinijinjaValue::from_serialize(model.serialize()),
             model.common(),
-            model.base().alias.as_str(),
-            &config,
-            quoting,
+            model.base(),
+            &model.serialized_config(),
             &adapter_type,
             &render_base_context,
+            &root_project_name,
+            runtime_config.dependencies.keys().cloned().collect(),
+            Arc::new(refs_and_sources.clone()),
+            runtime_config.clone(),
+            true,
         );
         let display_path = if arg
             .io
@@ -779,11 +826,12 @@ async fn process_model_chunk_for_unsafe_detection(
         } else {
             arg.io.in_dir.join(&model.common().original_file_path)
         };
+        // TODO: Potentially catch rendering warning on second pass and notify user / add file as unsafe by default
         let _res = render_sql(
             &sql,
             &jinja_env,
-            render_resolved_context,
-            None,
+            &render_resolved_context,
+            &DefaultListenerFactory::default(),
             &display_path,
         );
         if parse_adapter
@@ -805,8 +853,9 @@ async fn collect_adapter_identifiers_sequential(
     jinja_env: &JinjaEnvironment<'static>,
     adapter_type: &str,
     package_name: &str,
+    root_project_name: &str,
     runtime_config: Arc<DbtRuntimeConfig>,
-    parse_adapter: Arc<dbt_fusion_adapter::adapters::ParseAdapter>,
+    parse_adapter: Arc<dbt_fusion_adapter::ParseAdapter>,
     chunk_size: usize,
 ) -> FsResult<Vec<String>> {
     let mut all_unsafe_ids = Vec::new();
@@ -820,6 +869,7 @@ async fn collect_adapter_identifiers_sequential(
             jinja_env.clone(),
             adapter_type.to_string(),
             package_name.to_string(),
+            root_project_name.to_string(),
             runtime_config.clone(),
             parse_adapter.clone(),
         )
@@ -839,8 +889,9 @@ async fn collect_adapter_identifiers_parallel(
     jinja_env: &JinjaEnvironment<'static>,
     adapter_type: &str,
     package_name: &str,
+    root_project_name: &str,
     runtime_config: Arc<DbtRuntimeConfig>,
-    parse_adapter: Arc<dbt_fusion_adapter::adapters::ParseAdapter>,
+    parse_adapter: Arc<dbt_fusion_adapter::ParseAdapter>,
     chunk_size: usize,
 ) -> FsResult<Vec<String>> {
     let mut tasks = Vec::new();
@@ -852,6 +903,7 @@ async fn collect_adapter_identifiers_parallel(
         let jinja_env = jinja_env.clone();
         let adapter_type = adapter_type.to_string();
         let package_name = package_name.to_string();
+        let root_project_name = root_project_name.to_string();
         let runtime_config = runtime_config.clone();
         let parse_adapter = parse_adapter.clone();
 
@@ -863,6 +915,7 @@ async fn collect_adapter_identifiers_parallel(
                 jinja_env,
                 adapter_type,
                 package_name,
+                root_project_name,
                 runtime_config,
                 parse_adapter,
             )
@@ -884,4 +937,100 @@ async fn collect_adapter_identifiers_parallel(
     }
 
     Ok(all_unsafe_ids)
+}
+
+/// Collect refs and sources from pre and post hooks in any resource config
+/// by rendering them into the existing sql_resources collection
+///
+/// This function works generically for all resource types (models, snapshots, seeds, etc.)
+/// and should only be called when the main resource has been successfully rendered to ensure
+/// we have a reliable config and context.
+///
+/// Uses the real file path for error reporting rather than virtual paths.
+#[allow(clippy::too_many_arguments)]
+pub fn collect_hook_dependencies_from_config<T: DefaultTo<T> + 'static>(
+    config: &T,
+    jinja_env: &JinjaEnvironment<'static>,
+    resource_path: &std::path::Path,
+    io: IoArgs,
+    hook_context: &BTreeMap<String, MinijinjaValue>,
+) -> FsResult<()> {
+    // Helper function to extract SQL strings from hooks
+    // Note: YAML span information is available in the original Verbatim<Option<Hooks>> wrapper
+    // but is not accessible once converted to DbtConfig. To preserve spans, we would need to:
+    // 1. Pass the original Verbatim wrappers to this function
+    // 2. Use dbt_serde_yaml APIs to extract span information from the Value objects
+    // 3. Update the schema definitions to expose span access methods
+    let extract_hook_sqls = |hooks: &Hooks| -> Vec<String> {
+        match hooks {
+            Hooks::String(sql) => vec![sql.clone()],
+            Hooks::ArrayOfStrings(sqls) => sqls.clone(),
+            Hooks::HookConfig(hook_config) => {
+                if let Some(sql) = &hook_config.sql {
+                    vec![sql.clone()]
+                } else {
+                    vec![]
+                }
+            }
+            Hooks::HookConfigArray(hook_configs) => hook_configs
+                .iter()
+                .filter_map(|config| config.sql.clone())
+                .collect(),
+        }
+    };
+
+    // Helper function to render hook SQL and collect dependencies into the shared sql_resources
+    let render_hook_for_deps = |sql: &str| -> FsResult<()> {
+        let listener_factory = DefaultListenerFactory::default();
+
+        match render_sql(
+            sql,
+            jinja_env,
+            hook_context,
+            &listener_factory,
+            resource_path,
+        ) {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                // Log hook rendering error with clear context but don't fail the build
+                // Question (Ani): What should we do if a hook fails to render?
+                show_warning!(
+                    io,
+                    fs_err!(
+                        ErrorCode::Generic,
+                        "Hook failed to render: {}",
+                        err.to_string()
+                    )
+                    .with_location(resource_path.to_path_buf())
+                );
+                Ok(()) // Return Ok to avoid breaking the build
+            }
+        }
+    };
+
+    // Process pre-hooks
+    if let Some(pre_hooks) = config.get_pre_hook() {
+        let hook_sqls = extract_hook_sqls(pre_hooks);
+        for sql in hook_sqls.iter() {
+            if sql.trim().is_empty() {
+                continue;
+            }
+
+            render_hook_for_deps(sql)?;
+        }
+    }
+
+    // Process post-hooks
+    if let Some(post_hooks) = config.get_post_hook() {
+        let hook_sqls = extract_hook_sqls(post_hooks);
+        for sql in hook_sqls.iter() {
+            if sql.trim().is_empty() {
+                continue;
+            }
+
+            render_hook_for_deps(sql)?;
+        }
+    }
+
+    Ok(())
 }

@@ -1,4 +1,4 @@
-use std::any::Any;
+use crate::schemas::columns::utils::downcast_value_to_base_column;
 
 use dbt_adapter_proc_macros::{BaseColumnObject, StaticBaseColumnObject};
 use dbt_common::current_function_name;
@@ -9,9 +9,10 @@ use minijinja::{Error as MinijinjaError, ErrorKind, Value};
 use regex;
 use serde::{Deserialize, Serialize};
 
-use super::utils::downcast_value_to_base_column;
+use std::any::Any;
 
 /// Trait for static methods on relations
+// TODO: Make this trait generic and put Snowflake specific implementations into Snowflake
 pub trait StaticBaseColumn {
     /// Create a new column from the given arguments
     fn try_new(
@@ -39,15 +40,13 @@ pub trait StaticBaseColumn {
         Self::try_new(name, dtype, char_size, numeric_precision, numeric_scale)
     }
 
-    /// Translate the column type to a Snowflake type
+    /// Translate the column type
     fn translate_type(args: &[Value]) -> Result<Value, MinijinjaError> {
         let mut args = ArgParser::new(args, None);
         let column_type: String = args.get("dtype")?;
-        match column_type.to_lowercase().as_str() {
-            "string" => Ok(Value::from("TEXT")),
-            _ => Ok(Value::from(column_type)),
-        }
+        Ok(Value::from(column_type))
     }
+
     /// Whether the column is a numeric type
     fn numeric_type(args: &[Value]) -> Result<Value, MinijinjaError> {
         let mut args: ArgParser = ArgParser::new(args, None);
@@ -56,7 +55,7 @@ pub trait StaticBaseColumn {
         let scale: Option<i64> = args.get("scale").ok();
 
         match (precision, scale) {
-            (Some(p), Some(s)) => Ok(Value::from(format!("{}({},{})", dtype, p, s))),
+            (Some(p), Some(s)) => Ok(Value::from(format!("{dtype}({p},{s})"))),
             _ => Ok(Value::from(dtype)),
         }
     }
@@ -88,6 +87,18 @@ pub trait StaticBaseColumn {
             numeric_precision,
             numeric_scale,
         }))
+    }
+
+    fn format_add_column_list(_args: &[Value]) -> Result<Value, MinijinjaError> {
+        unimplemented!("Only available for Databricks")
+    }
+
+    fn format_remove_column_list(_args: &[Value]) -> Result<Value, MinijinjaError> {
+        unimplemented!("Only available for Databricks")
+    }
+
+    fn get_name(_args: &[Value]) -> Result<Value, MinijinjaError> {
+        unimplemented!("Only available for Databricks")
     }
 }
 
@@ -194,7 +205,7 @@ pub trait BaseColumn: BaseColumnProperties + Any + Send + Sync {
 
     /// https://github.com/dbt-labs/dbt-adapters/blob/main/dbt-adapters/src/dbt/adapters/base/column.py#L104-L105
     fn string_type(&self, size: u32) -> String {
-        format!("character varying({})", size)
+        format!("character varying({size})")
     }
 
     fn quoted(&self) -> Value {
@@ -309,7 +320,7 @@ impl BaseColumnProperties for StdColumn {
 
 /// https://github.com/dbt-labs/dbt-adapters/blob/main/dbt-adapters/src/dbt/adapters/base/column.py#L104-L105
 pub fn string_type(size: u32) -> String {
-    format!("character varying({})", size)
+    format!("character varying({size})")
 }
 
 pub struct SnowflakeColumnTypeParsed {
@@ -358,8 +369,7 @@ pub fn parse_snowflake_raw_data_type(
         MinijinjaError::new(
             ErrorKind::InvalidArgument,
             format!(
-                "Could not interpret data_type \"{}\": could not convert \"{}\" to an integer",
-                raw_data_type, name
+                "Could not interpret data_type \"{raw_data_type}\": could not convert \"{name}\" to an integer"
             ),
         )
     };

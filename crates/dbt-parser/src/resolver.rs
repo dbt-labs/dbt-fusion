@@ -1,9 +1,9 @@
 //! Module containing the entrypoint for the resolve phase.
-use dbt_common::constants::DBT_GENERIC_TESTS_DIR_NAME;
+use dbt_common::constants::{DBT_GENERIC_TESTS_DIR_NAME, RESOLVING};
 use dbt_common::once_cell_vars::DISPATCH_CONFIG;
 #[allow(unused_imports)]
 use dbt_common::FsError;
-use dbt_common::{err, fs_err, show_error, ErrorCode, FsResult};
+use dbt_common::{err, fs_err, show_error, with_progress, ErrorCode, FsResult};
 use dbt_common::{show_warning, stdfs};
 use dbt_jinja_utils::invocation_args::InvocationArgs;
 use dbt_jinja_utils::phases::parse::build_resolve_context;
@@ -11,7 +11,7 @@ use dbt_jinja_utils::phases::parse::init::initialize_parse_jinja_environment;
 use dbt_jinja_utils::refs_and_sources::{resolve_dependencies, RefsAndSources};
 use dbt_schemas::dbt_utils::resolve_package_quoting;
 use dbt_schemas::schemas::macros::build_macro_units;
-use dbt_schemas::schemas::manifest::{InternalDbtNode, Nodes};
+use dbt_schemas::schemas::{InternalDbtNode, Nodes};
 
 use dbt_jinja_utils::jinja_environment::JinjaEnvironment;
 use dbt_schemas::state::RenderResults;
@@ -53,6 +53,8 @@ pub async fn resolve(
     invocation_args: &InvocationArgs,
     dbt_state: Arc<DbtState>,
 ) -> FsResult<(ResolverState, JinjaEnvironment<'static>)> {
+    let _pb = with_progress!(arg.io, spinner => RESOLVING);
+
     // Get the root project name
     let root_project_name = dbt_state.root_project_name();
     let adapter_type = dbt_state.dbt_profile.db_config.adapter_type();
@@ -71,7 +73,7 @@ pub async fn resolve(
                 // This is a temporary solution, for a feature that is supposed to be
                 // deprecated in the future
                 .chain(&package.snapshot_files)
-                .collect(),
+                .collect::<Vec<_>>(),
         )?;
         macros.macros.extend(resolved_macros);
         let docs_macros = resolve_docs_macros(&package.docs_files)?;
@@ -80,11 +82,7 @@ pub async fn resolve(
 
     let mut operations = Operations::default();
     for package in &dbt_state.packages {
-        let (on_run_start, on_run_end) = resolve_operations(
-            &dbt_state.dbt_profile.database,
-            &dbt_state.dbt_profile.schema,
-            &package.dbt_project,
-        );
+        let (on_run_start, on_run_end) = resolve_operations(&package.dbt_project);
         operations.on_run_start.extend(on_run_start);
         operations.on_run_end.extend(on_run_end);
     }
@@ -113,22 +111,20 @@ pub async fn resolve(
             .iter()
             .map(|p| p.dbt_project.name.clone())
             .collect(),
+        arg.io.clone(),
     )?;
 
     // Compute final selectors
     let resolved_selectors = resolve_final_selectors(root_project_name, &jinja_env, arg)?;
+    // dbg!(&resolved_selectors);
 
     // Create a map to store full runtime configs for ALL packages
     let mut all_runtime_configs: BTreeMap<String, Arc<DbtRuntimeConfig>> = BTreeMap::new();
 
     let mut nodes = Nodes::default();
     let mut disabled_nodes = Nodes::default();
-    let root_project_configs = build_root_project_configs(
-        &arg.io,
-        dbt_state.root_project(),
-        root_project_quoting,
-        &jinja_env,
-    )?;
+    let root_project_configs =
+        build_root_project_configs(&arg.io, dbt_state.root_project(), root_project_quoting)?;
     let root_project_configs = Arc::new(root_project_configs);
 
     // Process packages in topological order
@@ -387,7 +383,7 @@ pub async fn resolve_inner(
         adapter_type,
         jinja_env,
         &base_ctx,
-        runtime_config,
+        runtime_config.clone(),
         &collected_tests,
     )
     .await?;
@@ -399,14 +395,15 @@ pub async fn resolve_inner(
         min_properties.unit_tests,
         package,
         package_quoting,
+        dbt_state.root_project(),
         root_project_configs,
-        database,
-        schema,
         adapter_type,
         package_name,
         jinja_env,
         &base_ctx,
         &min_properties.models,
+        runtime_config,
+        &nodes.models,
     )?;
     nodes.unit_tests.extend(unit_tests);
     disabled_nodes.unit_tests.extend(disabled_unit_tests);

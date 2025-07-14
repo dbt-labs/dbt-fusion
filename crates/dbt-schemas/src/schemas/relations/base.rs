@@ -2,15 +2,11 @@
 use crate::dbt_types::RelationType;
 use crate::schemas::common::ResolvedQuoting;
 
-use dbt_adapter_proc_macros::BaseRelationObject;
 use dbt_common::constants::DBT_CTE_PREFIX;
-use dbt_common::current_function_name;
+use dbt_common::{current_function_name, FsResult};
 use minijinja::arg_utils::{check_num_args, ArgParser};
 use minijinja::{invalid_argument, invalid_argument_inner, jinja_err};
-use minijinja::{
-    value::{Enumerator, ValueKind},
-    Error as MinijinjaError, ErrorKind as MinijinjaErrorKind, State, Value,
-};
+use minijinja::{Error as MinijinjaError, ErrorKind as MinijinjaErrorKind, State, Value};
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString};
 
@@ -19,8 +15,6 @@ use std::any::Any;
 use std::collections::BTreeMap;
 use std::option::Option;
 use std::sync::Arc;
-
-use super::DEFAULT_RESOLVED_QUOTING;
 
 /// A pattern to match relations
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -110,6 +104,12 @@ pub trait BaseRelationProperties {
 
     /// quoting character to be used when rendering the relation
     fn quote_character(&self) -> char;
+
+    fn get_database(&self) -> FsResult<String>;
+
+    fn get_schema(&self) -> FsResult<String>;
+
+    fn get_identifier(&self) -> FsResult<String>;
 }
 
 /// Base trait for all fs adapter objects
@@ -306,8 +306,8 @@ pub trait BaseRelation: BaseRelationProperties + Any + Send + Sync + fmt::Debug 
 
         Ok(self
             .create_relation(
-                database.unwrap_or(self.database().as_str().unwrap().to_string()),
-                schema.unwrap_or(self.schema().as_str().unwrap().to_string()),
+                Some(database.unwrap_or(self.database().as_str().unwrap().to_string())),
+                Some(schema.unwrap_or(self.schema().as_str().unwrap().to_string())),
                 Some(identifier.unwrap_or(self.identifier().as_str().unwrap().to_string())),
                 self.relation_type(),
                 self.quote_policy(),
@@ -420,8 +420,8 @@ pub trait BaseRelation: BaseRelationProperties + Any + Send + Sync + fmt::Debug 
     fn without_identifier(&self, _args: &[Value]) -> Result<Value, MinijinjaError> {
         let result = self
             .create_relation(
-                self.database().as_str().unwrap().to_string(),
-                self.schema().as_str().unwrap().to_string(),
+                Some(self.database().as_str().unwrap().to_string()),
+                Some(self.schema().as_str().unwrap().to_string()),
                 None,
                 self.relation_type(),
                 self.quote_policy(),
@@ -465,27 +465,59 @@ pub trait BaseRelation: BaseRelationProperties + Any + Send + Sync + fmt::Debug 
         let (database, schema, identifier) = match path {
             Some(val) => match val.as_object() {
                 Some(obj) => {
-                    let database = obj.get_value(&Value::from("database".to_string()));
-                    let schema = obj.get_value(&Value::from("schema".to_string()));
-                    let identifier = obj.get_value(&Value::from("identifier".to_string()));
-                    (
-                        database
-                            .map(|v| v.as_str().unwrap().to_string())
-                            .unwrap_or_else(|| self.database_as_str().unwrap()),
-                        schema
-                            .map(|v| v.as_str().unwrap().to_string())
-                            .unwrap_or_else(|| self.schema_as_str().unwrap()),
-                        identifier
-                            .map(|v| v.as_str().unwrap().to_string())
-                            .unwrap_or_else(|| self.identifier_as_str().unwrap()),
-                    )
+                    let database_value = obj.get_value(&Value::from("database"));
+                    let schema_value = obj.get_value(&Value::from("schema"));
+                    let identifier_value = obj.get_value(&Value::from("identifier"));
+
+                    // Differentiate between "not provided" vs "provided but none"
+                    let database = match database_value {
+                        None => {
+                            // Case 1: 'database' key was never provided in path
+                            Some(self.database_as_str().unwrap())
+                        }
+                        Some(val) if val.is_none() => {
+                            // Case 2: 'database' key was provided but set to none
+                            None
+                        }
+                        Some(val) => {
+                            // Case 3: 'database' key was provided with an actual value
+                            Some(
+                                val.as_str()
+                                    .map(|s| s.to_string())
+                                    .unwrap_or_else(|| self.database_as_str().unwrap()),
+                            )
+                        }
+                    };
+
+                    // Similar logic for schema
+                    let schema = match schema_value {
+                        None => Some(self.schema_as_str().unwrap()), // Key not provided
+                        Some(val) if val.is_none() => None,          // Key provided but none
+                        Some(val) => Some(
+                            val.as_str()
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| self.schema_as_str().unwrap()),
+                        ),
+                    };
+
+                    let identifier = match identifier_value {
+                        None => Some(self.identifier_as_str().unwrap()), // Key not provided
+                        Some(val) if val.is_none() => Some(self.identifier_as_str().unwrap()), // Key provided but none
+                        Some(val) => Some(
+                            val.as_str()
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| self.identifier_as_str().unwrap()),
+                        ),
+                    };
+
+                    (database, schema, identifier)
                 }
                 None => return invalid_argument!("incorrect 'path' value for incorporate"),
             },
             None => (
-                self.database_as_str()?,
-                self.schema_as_str()?,
-                self.identifier_as_str()?,
+                Some(self.database_as_str()?),
+                Some(self.schema_as_str()?),
+                Some(self.identifier_as_str()?),
             ),
         };
 
@@ -501,7 +533,7 @@ pub trait BaseRelation: BaseRelationProperties + Any + Send + Sync + fmt::Debug 
             .create_relation(
                 database,
                 schema,
-                Some(identifier),
+                identifier,
                 relation_type,
                 self.quote_policy(),
             )?
@@ -519,18 +551,15 @@ pub trait BaseRelation: BaseRelationProperties + Any + Send + Sync + fmt::Debug 
     /// * [`BaseRelation::incorporate`] - Clones a relation incorporating new path components
     fn create_relation(
         &self,
-        database: String,
-        schema: String,
+        database: Option<String>,
+        schema: Option<String>,
         identifier: Option<String>,
         relation_type: Option<RelationType>,
         quote_policy: Policy,
     ) -> Result<Arc<dyn BaseRelation>, MinijinjaError>;
 
     /// reference: https://github.com/dbt-labs/dbt-adapters/blob/main/dbt-adapters/src/dbt/adapters/base/relation.py#L183-L184
-    fn information_schema(&self, args: &[Value]) -> Result<Value, MinijinjaError>
-    where
-        Self: Sized,
-    {
+    fn information_schema(&self, args: &[Value]) -> Result<Value, MinijinjaError> {
         let mut args = ArgParser::new(args, None);
         check_num_args(current_function_name!(), &args, 0, 1)?;
 
@@ -540,9 +569,14 @@ pub trait BaseRelation: BaseRelationProperties + Any + Send + Sync + fmt::Debug 
             None => return invalid_argument!("view_name must exist"),
         };
 
-        let result = InformationSchema::try_from_relation(self, view_name)?;
-        Ok(Value::from_object(result))
+        self.information_schema_inner(self.database_as_str().ok(), view_name)
     }
+
+    fn information_schema_inner(
+        &self,
+        database: Option<String>,
+        view_name: &str,
+    ) -> Result<Value, MinijinjaError>;
 
     /// needs_to_drop
     fn needs_to_drop(&self, _args: &[Value]) -> Result<Value, MinijinjaError> {
@@ -603,174 +637,6 @@ pub trait BaseRelation: BaseRelationProperties + Any + Send + Sync + fmt::Debug 
     }
 }
 
-/// Trait for static methods on relations
-pub trait StaticBaseRelation {
-    /// Create a new relation from the given arguments
-    fn try_new(
-        database: Option<String>,
-        schema: Option<String>,
-        identifier: Option<String>,
-        relation_type: Option<RelationType>,
-        custom_quoting: ResolvedQuoting,
-    ) -> Result<Value, MinijinjaError>;
-
-    fn get_adapter_type() -> String;
-
-    /// Create a new relation from the given arguments
-    /// impl for api.Relation.create
-    fn create(args: &[Value]) -> Result<Value, MinijinjaError> {
-        let mut args = ArgParser::new(args, None);
-        let database: Option<String> = args.get("database").ok();
-        let schema: Option<String> = args.get("schema").ok();
-        let identifier: Option<String> = args.get("identifier").ok();
-        let relation_type: Option<String> = args.get("type").ok();
-
-        Self::try_new(
-            database,
-            schema,
-            identifier,
-            relation_type.map(|s| RelationType::from(s.as_str())),
-            DEFAULT_RESOLVED_QUOTING,
-        )
-    }
-
-    /// Get the SCD arguments for the relation
-    fn scd_args(args: &[Value]) -> Vec<String> {
-        let mut args = ArgParser::new(args, None);
-        let primary_key: Value = args.get("primary_key").unwrap();
-        let updated_at: String = args.get("updated_at").unwrap();
-        let mut scd_args = vec![];
-        // Check if minijinja value is a vector
-        match primary_key.kind() {
-            ValueKind::Seq => {
-                scd_args.extend(
-                    primary_key
-                        .as_object()
-                        .unwrap()
-                        .downcast_ref::<Vec<String>>()
-                        .unwrap()
-                        .iter()
-                        .map(|s| s.to_string()),
-                );
-            }
-            ValueKind::String => {
-                scd_args.push(primary_key.as_str().unwrap().to_string());
-            }
-            _ => {
-                panic!("Invalid primary key type");
-            }
-        }
-        scd_args.push(updated_at);
-        scd_args
-    }
-}
-
-#[derive(Clone, Debug, Default, BaseRelationObject)]
-pub struct InformationSchema {
-    pub database: Option<String>,
-    pub schema: String,
-    pub identifier: Option<String>,
-    // quote_policy
-}
-
-impl InformationSchema {
-    fn try_from_relation(
-        base_relation: &dyn BaseRelation,
-        information_schema_view: &str,
-    ) -> Result<Self, MinijinjaError> {
-        // Create the InformationSchema object with the database name as none if it is an empty string
-        let relation_database = base_relation.database_as_str().ok();
-        Ok(Self {
-            database: if relation_database.is_some() && relation_database.clone().unwrap() == "" {
-                None
-            } else {
-                relation_database
-            },
-            schema: "INFORMATION_SCHEMA".to_string(),
-            identifier: Some(information_schema_view.to_string()),
-        })
-    }
-}
-
-impl BaseRelationProperties for InformationSchema {
-    fn include_policy(&self) -> Policy {
-        unimplemented!("InformationSchema");
-    }
-
-    fn quote_policy(&self) -> Policy {
-        unimplemented!("InformationSchema");
-    }
-
-    fn quote_character(&self) -> char {
-        unimplemented!("InformationSchema");
-    }
-}
-
-impl BaseRelation for InformationSchema {
-    fn as_any(&self) -> &dyn Any {
-        unimplemented!()
-    }
-
-    fn create_from(&self, _state: &State, _args: &[Value]) -> Result<Value, MinijinjaError> {
-        unimplemented!()
-    }
-
-    fn database(&self) -> Value {
-        Value::from(self.database.clone())
-    }
-
-    fn schema(&self) -> Value {
-        Value::from(self.schema.clone())
-    }
-
-    fn identifier(&self) -> Value {
-        Value::from(self.identifier.clone())
-    }
-
-    fn adapter_type(&self) -> Option<String> {
-        unimplemented!()
-    }
-
-    fn as_value(&self) -> Value {
-        Value::from_object(self.clone())
-    }
-
-    fn include_inner(&self, _args: Policy) -> Result<Value, MinijinjaError> {
-        unimplemented!("InformationSchema")
-    }
-
-    fn render_self(&self) -> Result<Value, MinijinjaError> {
-        let result = match (&self.database, &self.identifier) {
-            (Some(database), Some(identifier)) => {
-                format!("{}.{}.{}", database, &self.schema, identifier)
-            }
-            (Some(database), None) => format!("{}.{}", database, &self.schema),
-            (None, Some(identifier)) => format!("{}.{}", &self.schema, identifier),
-            (None, None) => self.schema.to_string(),
-        };
-        Ok(Value::from(result))
-    }
-
-    fn is_hive_metastore(&self) -> Value {
-        unimplemented!("InformationSchema")
-    }
-
-    fn normalize_component(&self, _component: &str) -> String {
-        unimplemented!("InformationSchema")
-    }
-
-    fn create_relation(
-        &self,
-        _database: String,
-        _schema: String,
-        _identifier: Option<String>,
-        _relation_type: Option<RelationType>,
-        _quote_policy: Policy,
-    ) -> Result<Arc<dyn BaseRelation>, MinijinjaError> {
-        unimplemented!("InformationSchema")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use minijinja::value::Kwargs;
@@ -797,6 +663,18 @@ mod tests {
 
         fn quote_character(&self) -> char {
             '"'
+        }
+
+        fn get_database(&self) -> FsResult<String> {
+            Ok(self.database.clone())
+        }
+
+        fn get_schema(&self) -> FsResult<String> {
+            Ok(self.schema.clone())
+        }
+
+        fn get_identifier(&self) -> FsResult<String> {
+            Ok(self.identifier.clone())
         }
     }
 
@@ -847,13 +725,21 @@ mod tests {
 
         fn create_relation(
             &self,
-            _database: String,
-            _schema: String,
+            _database: Option<String>,
+            _schema: Option<String>,
             _identifier: Option<String>,
             _relation_type: Option<RelationType>,
             _quote_policy: Policy,
         ) -> Result<Arc<dyn BaseRelation>, MinijinjaError> {
             unimplemented!()
+        }
+
+        fn information_schema_inner(
+            &self,
+            _database: Option<String>,
+            _view_name: &str,
+        ) -> Result<Value, MinijinjaError> {
+            unimplemented!("InformationSchema")
         }
     }
 

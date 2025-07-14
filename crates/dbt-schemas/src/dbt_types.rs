@@ -3,7 +3,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 /// Enum representing different types of relations.
-#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RelationType {
     /// An enum for table relations.
@@ -23,6 +23,8 @@ pub enum RelationType {
     PointerTable,
     /// An enum for a dynamic table (snowflake only)
     DynamicTable,
+    /// An enum for a delta table type that supports streaming or incremental data processing (databricks only)
+    StreamingTable,
 }
 
 impl RelationType {
@@ -35,7 +37,7 @@ impl RelationType {
             "VIEW" => RelationType::View,
             "MATERIALIZED VIEW" => RelationType::MaterializedView,
             "EXTERNAL" => RelationType::External,
-            _ => panic!("unknown table type: {}", table_type),
+            _ => panic!("unknown table type: {table_type}"),
         }
     }
 }
@@ -52,8 +54,9 @@ impl fmt::Display for RelationType {
             RelationType::Ephemeral => "ephemeral",
             RelationType::PointerTable => "pointer_table",
             RelationType::DynamicTable => "dynamic_table",
+            RelationType::StreamingTable => "streaming_table",
         };
-        write!(f, "{}", s)
+        write!(f, "{s}")
     }
 }
 
@@ -67,7 +70,8 @@ impl From<&str> for RelationType {
             "ephemeral" => RelationType::Ephemeral,
             "external" => RelationType::External,
             "dynamic_table" => RelationType::DynamicTable,
-            _ => panic!("Invalid relation type: {}", s),
+            "streaming_table" => RelationType::StreamingTable,
+            _ => panic!("Invalid relation type: {s}"),
         }
     }
 }

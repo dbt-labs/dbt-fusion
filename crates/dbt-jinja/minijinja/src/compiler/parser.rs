@@ -1,6 +1,7 @@
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
+use std::sync::LazyLock;
 
 use crate::compiler::ast::{self, Comment, MacroKind, Spanned};
 use crate::compiler::lexer::{Tokenizer, WhitespaceConfig};
@@ -13,6 +14,28 @@ const MAX_RECURSION: usize = 100;
 const RESERVED_NAMES: [&str; 8] = [
     "true", "True", "false", "False", "none", "None", "loop", "self",
 ];
+
+#[allow(clippy::incompatible_msrv)]
+static ENDBLOCK_IDENT: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
+    let mut m = HashSet::new();
+    m.insert("endfor");
+    m.insert("endwith");
+    m.insert("endset");
+    m.insert("endblock");
+    m.insert("endautoescape");
+    m.insert("endfilter");
+    m.insert("endmacro");
+    m.insert("endcall");
+    m.insert("endtest");
+    m.insert("endsnapshot");
+    m.insert("enddocs");
+    m.insert("endmaterialization");
+    // 'If' statement related idents
+    m.insert("endif");
+    m.insert("else");
+    m.insert("elif");
+    m
+});
 
 fn unexpected<D: fmt::Display>(unexpected: D, expected: &str) -> Error {
     Error::new(
@@ -171,6 +194,7 @@ pub struct Parser<'a> {
     blocks: BTreeSet<&'a str>,
     depth: usize,
     string_interner: HashMap<String, &'a str>,
+    ignore_unknown_stmts: bool,
 }
 
 macro_rules! binop {
@@ -231,7 +255,7 @@ macro_rules! with_recursion_guard {
 impl<'a> Parser<'a> {
     /// Creates a new parser.
     ///
-    /// `in_expr` is necessary to parse within an expression context.  Otherwise
+    /// `in_expr` is necessary to parse within an expression context. Otherwise,
     /// the parser starts out in template context.  This means that when
     /// [`parse`](Self::parse) is to be called, the `in_expr` argument must be
     /// `false` and for [`parse_standalone_expr`](Self::parse_standalone_expr)
@@ -250,6 +274,7 @@ impl<'a> Parser<'a> {
             blocks: BTreeSet::new(),
             depth: 0,
             string_interner: HashMap::new(),
+            ignore_unknown_stmts: false,
         }
     }
 
@@ -887,14 +912,11 @@ impl<'a> Parser<'a> {
             )),
             #[cfg(feature = "macros")]
             "materialization" => {
-                let (macro_, maybe_adapter) = ok!(self.parse_materialization());
+                let (macro_, adapter) = ok!(self.parse_materialization());
                 ast::Stmt::Macro((
                     respan!(macro_),
                     MacroKind::Materialization,
-                    BTreeMap::from([(
-                        "adapter".to_string(),
-                        Value::from(maybe_adapter.unwrap_or("default".to_string())),
-                    )]),
+                    BTreeMap::from([("adapter".to_string(), Value::from(adapter))]),
                 ))
             }
             #[cfg(feature = "macros")]
@@ -926,7 +948,15 @@ impl<'a> Parser<'a> {
                     self.stream.expand_span(span),
                 ))
             }
-            name => syntax_error!("unknown statement {}", name),
+            name => {
+                if self.ignore_unknown_stmts {
+                    // If we ignore unknown statements, we just skip them.
+                    self.skip_until_block_end()?;
+                    ast::Stmt::Comment(Spanned::new(ast::Comment, self.stream.expand_span(span)))
+                } else {
+                    syntax_error!("unknown statement {}", name);
+                }
+            }
         })
     }
 
@@ -935,11 +965,11 @@ impl<'a> Parser<'a> {
         if RESERVED_NAMES.contains(&id) {
             syntax_error!("cannot assign to reserved variable name {}", id);
         }
-        let mut rv = ast::Expr::Var(ast::Spanned::new(ast::Var { id }, span));
+        let mut rv = ast::Expr::Var(Spanned::new(ast::Var { id }, span));
         if dotted {
             while skip_token!(self, Token::Dot) {
                 let (attr, span) = expect_token!(self, Token::Ident(name) => name, "identifier");
-                rv = ast::Expr::GetAttr(ast::Spanned::new(
+                rv = ast::Expr::GetAttr(Spanned::new(
                     ast::GetAttr {
                         expr: rv,
                         name: attr,
@@ -1322,18 +1352,19 @@ impl<'a> Parser<'a> {
 
     /// reference: https://docs.getdbt.com/guides/create-new-materializations?step=2
     /// syntax: {% materialization [materialization name], ["specified adapter" | default] %}
+    ///
+    /// Returns the adapter name parsed from the macro definition
     #[cfg(feature = "macros")]
     fn parse_materialization_adapter_languages(
         &mut self,
-        adapter: &mut Option<String>,
         supported_languages: &mut Option<ast::Expr<'a>>,
-    ) -> Result<(), Error> {
+    ) -> Result<String, Error> {
+        let mut ret = "default".to_string();
         loop {
             // First check if ',' is specified
             if skip_token!(self, Token::Comma) {
                 // Check if default is specified
                 if matches_token!(self, Token::Ident("default")) {
-                    *adapter = Some("default".to_string());
                     skip_token!(self, Token::Ident("default"));
                     break;
                 }
@@ -1342,7 +1373,7 @@ impl<'a> Parser<'a> {
                 if skip_token!(self, Token::Ident("adapter")) {
                     expect_token!(self, Token::Assign, "`=`");
                     let (adapter_name, _) = expect_token!(self, Token::Str(name) => name, "str");
-                    *adapter = Some(adapter_name.to_string());
+                    ret = adapter_name.to_string();
                 // Else, check if default expression is specified (i.e. {% materialization mat_name, default %})
                 } else if skip_token!(self, Token::Ident("supported_languages")) {
                     expect_token!(self, Token::Assign, "`=`");
@@ -1354,7 +1385,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        Ok(())
+        Ok(ret)
     }
 
     #[cfg(feature = "macros")]
@@ -1496,7 +1527,7 @@ impl<'a> Parser<'a> {
     fn parse_test(&mut self) -> Result<ast::Macro<'a>, Error> {
         let (name, _) = expect_token!(self, Token::Ident(name) => name, "identifier");
         // Assuming self has access to an arena or string interner
-        let macro_name = self.intern_string(&format!("test_{}", name));
+        let macro_name = self.intern_string(&format!("test_{name}"));
         expect_token!(self, Token::ParenOpen, "`(`");
         let mut args = Vec::new();
         let mut defaults = Vec::new();
@@ -1508,7 +1539,7 @@ impl<'a> Parser<'a> {
     fn parse_snapshot(&mut self) -> Result<ast::Macro<'a>, Error> {
         let (name, _) = expect_token!(self, Token::Ident(name) => name, "identifier");
         // Assuming self has access to an arena or string interner
-        let macro_name = self.intern_string(&format!("snapshot_{}", name));
+        let macro_name = self.intern_string(&format!("snapshot_{name}"));
         self.parse_snapshot_or_call_block_body(Some(macro_name))
     }
 
@@ -1537,17 +1568,12 @@ impl<'a> Parser<'a> {
     }
 
     #[cfg(feature = "macros")]
-    fn parse_materialization(&mut self) -> Result<(ast::Macro<'a>, Option<String>), Error> {
+    fn parse_materialization(&mut self) -> Result<(ast::Macro<'a>, String), Error> {
         let (name, _) = expect_token!(self, Token::Ident(name) => name, "identifier");
-        let mut adapter = None;
         let mut supported_languages = None;
-        ok!(self.parse_materialization_adapter_languages(&mut adapter, &mut supported_languages));
-        let macro_name = self.intern_string(&format!(
-            "materialization_{}_{}",
-            name,
-            // TODO: This can be cleaned up to add better error messages for miss-formatted materialization macros
-            adapter.as_deref().unwrap_or("default")
-        ));
+        let adapter = ok!(self.parse_materialization_adapter_languages(&mut supported_languages));
+        // TODO: This can be cleaned up to add better error messages for miss-formatted materialization macros
+        let macro_name = self.intern_string(&materialization_macro_name(name, &adapter));
         Ok((
             ok!(self.parse_materialization_or_call_block_body(Some(macro_name))),
             adapter,
@@ -1582,6 +1608,13 @@ impl<'a> Parser<'a> {
     }
 
     fn subparse(
+        &mut self,
+        end_check: &dyn Fn(&Token) -> bool,
+    ) -> Result<Vec<ast::Stmt<'a>>, Error> {
+        with_recursion_guard!(self, self.subparse_internal(end_check))
+    }
+
+    fn subparse_internal(
         &mut self,
         end_check: &dyn Fn(&Token) -> bool,
     ) -> Result<Vec<ast::Stmt<'a>>, Error> {
@@ -1710,9 +1743,13 @@ impl<'a> Parser<'a> {
                     if let Token::Ident(ident) = tok {
                         if statement_type.contains(ident) {
                             rv.push(ok!(self.parse_stmt()));
+                        } else if ENDBLOCK_IDENT.contains(ident) {
+                            syntax_error!("unexpected '{}' end of block identifier", ident);
                         } else {
-                            // Skip until we find the end of this block
-                            self.skip_until_block_end()?;
+                            // Skip until we find the end of this block ignoring any and all errors
+                            self.ignore_unknown_stmts = true;
+                            let _ = self.parse_stmt();
+                            self.ignore_unknown_stmts = false;
                         }
                     } else {
                         // Skip non-identifier tokens
@@ -1764,4 +1801,8 @@ pub fn parse_expr(source: &str) -> Result<ast::Expr<'_>, Error> {
         Default::default(),
     )
     .parse_standalone_expr()
+}
+
+pub fn materialization_macro_name<N: fmt::Display>(name: N, adapter: &str) -> String {
+    format!("materialization_{name}_{adapter}")
 }

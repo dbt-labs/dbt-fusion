@@ -1,6 +1,7 @@
 use crate::schemas::common::TimeGranularity;
-use crate::schemas::serde::StringOrArrayOfStrings;
+use crate::schemas::project::MetricConfig;
 use dbt_serde_yaml::JsonSchema;
+use dbt_serde_yaml::UntaggedEnumDeserialize;
 use dbt_serde_yaml::Verbatim;
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
@@ -15,11 +16,11 @@ pub struct MetricsProperties {
     pub type_: MetricType,
     pub type_params: MetricTypeParams,
     pub description: Option<String>,
-    pub config: Option<MetricsPropertiesConfig>,
+    pub config: Option<MetricConfig>,
     pub filter: Option<String>,
     pub time_granularity: Option<TimeGranularity>,
     // Flattened field:
-    pub __additional_properties__: Verbatim<BTreeMap<String, dbt_serde_yaml::Value>>,
+    pub __unused__: Verbatim<BTreeMap<String, dbt_serde_yaml::Value>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, JsonSchema)]
@@ -32,7 +33,7 @@ pub enum MetricType {
     Conversion,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone, JsonSchema)]
+#[derive(UntaggedEnumDeserialize, Serialize, Debug, Clone, JsonSchema)]
 #[serde(untagged)]
 pub enum StringOrMetricInputMeasure {
     String(String),
@@ -46,21 +47,12 @@ pub struct MetricTypeParams {
     #[serde(default)]
     pub input_measures: Vec<MetricInputMeasure>,
     pub numerator: Option<MetricInput>,
-    pub denominator: Option<MetricInput>,
+    pub denominator: Option<StringOrMetricInputMeasure>,
     pub expr: Option<String>,
-    pub window: Option<MetricTimeWindow>,
+    pub window: Option<String>,
     pub metrics: Option<Vec<MetricInput>>,
     pub conversion_type_params: Option<ConversionTypeParams>,
     pub cumulative_type_params: Option<CumulativeTypeParams>,
-}
-
-#[skip_serializing_none]
-#[derive(Deserialize, Serialize, Debug, Clone, JsonSchema)]
-pub struct MetricsPropertiesConfig {
-    pub enabled: Option<bool>,
-    pub meta: Option<BTreeMap<String, serde_json::Value>>,
-    pub tags: Option<StringOrArrayOfStrings>,
-    pub group: Option<String>,
 }
 
 #[skip_serializing_none]
@@ -69,7 +61,7 @@ pub struct MetricInputMeasure {
     pub name: String,
     pub filter: Option<WhereFilterIntersection>,
     pub alias: Option<String>,
-    pub join_to_timepine: Option<bool>,
+    pub join_to_timespine: Option<bool>,
     pub fill_nulls_with: Option<i32>,
 }
 
@@ -95,13 +87,13 @@ pub struct ConversionTypeParams {
     pub conversion_measure: MetricInputMeasure,
     pub entity: String,
     pub calculation: ConversionCalculationType,
-    pub window: Option<MetricTimeWindow>,
+    pub window: Option<String>,
     pub constant_properties: Option<Vec<ConstantPropertyInput>>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, JsonSchema)]
 pub struct CumulativeTypeParams {
-    pub window: Option<MetricTimeWindow>,
+    pub window: Option<String>,
     pub grain_to_date: Option<String>,
     pub period_agg: PeriodAggregationType,
 }

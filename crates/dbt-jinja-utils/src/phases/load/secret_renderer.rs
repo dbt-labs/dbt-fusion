@@ -1,5 +1,6 @@
 //! This module contains the logic for rendering secrets in the dbt project.
 
+use dbt_common::{fs_err, ErrorCode, FsResult};
 use regex::Regex;
 
 use crate::utils::{DBT_INTERNAL_ENV_VAR_PREFIX, ENV_VARS, SECRET_ENV_VAR_PREFIX};
@@ -26,7 +27,7 @@ pub fn secret_context_env_var_fn(
                 } else if var_name.starts_with(DBT_INTERNAL_ENV_VAR_PREFIX) {
                     return Err(minijinja::Error::new(
                         minijinja::ErrorKind::InvalidOperation,
-                        format!("'env_var': environment variable '{}' is reserved", var_name),
+                        format!("'env_var': environment variable '{var_name}' is reserved"),
                     ));
                 }
                 // Otherwise store and return the actual value
@@ -40,7 +41,7 @@ pub fn secret_context_env_var_fn(
                 } else {
                     Err(minijinja::Error::new(
                         minijinja::ErrorKind::InvalidOperation,
-                        format!("'env_var': environment variable '{}' not found", var_name),
+                        format!("'env_var': environment variable '{var_name}' not found"),
                     ))
                 }
             }
@@ -49,7 +50,7 @@ pub fn secret_context_env_var_fn(
 }
 
 /// Renders actual secrets that have been rendered with placeholders
-pub fn render_secrets(rendered_str: String) -> Result<String, minijinja::Error> {
+pub fn render_secrets(rendered_str: String) -> FsResult<String> {
     if rendered_str.contains(SECRET_ENV_VAR_PREFIX) {
         // Create a regex that matches the entire placeholder pattern
         let pattern = SECRET_PLACEHOLDER
@@ -69,9 +70,10 @@ pub fn render_secrets(rendered_str: String) -> Result<String, minijinja::Error> 
                     result = result.replace(full_match, &value);
                 }
                 Err(_) => {
-                    return Err(minijinja::Error::new(
-                        minijinja::ErrorKind::InvalidOperation,
-                        format!("Environment variable '{}' not found", var_name),
+                    return Err(fs_err!(
+                        ErrorCode::InvalidConfig,
+                        "Environment variable '{}' not found",
+                        var_name
                     ));
                 }
             }

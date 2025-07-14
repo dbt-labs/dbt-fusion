@@ -1,10 +1,13 @@
 mod steps;
 
+mod add_package;
 mod github_client;
 mod hub_client;
 pub mod package_listing;
 pub mod private_package;
 pub mod semver;
+mod tarball;
+mod tarball_client;
 pub mod types;
 pub mod utils;
 
@@ -22,17 +25,25 @@ use steps::{
     compute_package_lock, install_packages, load_dbt_packages, try_load_valid_dbt_packages_lock,
 };
 
+#[allow(clippy::cognitive_complexity)]
 /// Loads and installs packages, and returns the packages lock and the dependencies map
 pub async fn get_or_install_packages(
     io: &IoArgs,
     env: &mut JinjaEnvironment<'static>,
     packages_install_path: &Path,
     install_deps: bool,
+    add_package: Option<String>,
     vars: BTreeMap<String, dbt_serde_yaml::Value>,
 ) -> FsResult<(DbtPackagesLock, Vec<UpstreamProject>)> {
     let mut hub_registry = HubClient::new(DBT_HUB_URL);
 
     let package_render_scope = RenderSecretScope::new(env, vars);
+
+    // Add package first if specified, then load the package definition
+    if let Some(add_package) = add_package {
+        add_package::add_package(&add_package, &io.in_dir)?;
+    }
+
     let (package_def, package_yml_name) = load_dbt_packages(io, &io.in_dir)?;
 
     // Store projects for later use if package_def exists

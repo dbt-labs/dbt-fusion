@@ -8,6 +8,7 @@ use std::{env, io};
 use adbc_core::error::{Error, Status};
 use percent_encoding::AsciiSet;
 use sha2::{Digest, Sha256};
+use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
 
 use crate::checksums::SORTED_CDN_DRIVER_CHECKSUMS;
 use crate::{
@@ -44,14 +45,14 @@ pub enum InstallError {
 impl fmt::Display for InstallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            InstallError::Http(error) => write!(f, "HTTP error: {}", error),
-            InstallError::GetRandom(error) => write!(f, "getrandom error: {}", error),
+            InstallError::Http(error) => write!(f, "HTTP error: {error}"),
+            InstallError::GetRandom(error) => write!(f, "getrandom error: {error}"),
             InstallError::DetermineCacheDir => write!(f, "Unable to determine cache directory for ADBC driver installation in this platform."),
 
-            InstallError::Io(error) => write!(f, "IO error: {}", error),
+            InstallError::Io(error) => write!(f, "IO error: {error}"),
             InstallError::ZstdDecompress(code) => {
                 let msg = zstd_safe::get_error_name(*code);
-                write!(f, "Decompression error: {}", msg)
+                write!(f, "Decompression error: {msg}")
             }
             InstallError::CreateDir(error, path_buf) => {
                 write!(
@@ -62,14 +63,13 @@ impl fmt::Display for InstallError {
                 )
             }
             InstallError::CreateFIle(error, path_buf) => write!(f, "Unable to create file {}: {}", path_buf.display(), error),
-            InstallError::WriteFile(error) => write!(f, "Unable to write file: {}", error),
-            InstallError::SyncFile(error) => write!(f, "Unable to sync file: {}", error),
-            InstallError::RenameFile(error) => write!(f, "Unable to rename file: {}", error),
+            InstallError::WriteFile(error) => write!(f, "Unable to write file: {error}"),
+            InstallError::SyncFile(error) => write!(f, "Unable to sync file: {error}"),
+            InstallError::RenameFile(error) => write!(f, "Unable to rename file: {error}"),
             InstallError::ChecksumMismatch(expected, got, url) => {
                 write!(
                     f,
-                    "SHA-256 checksum mismatch: expected {}, got {} (URL: {})",
-                    expected, got, url
+                    "SHA-256 checksum mismatch: expected {expected}, got {got} (URL: {url})"
                 )
             }
         }
@@ -157,7 +157,7 @@ impl InstallError {
             InstallError::RenameFile(_) => Status::IO,
             InstallError::ChecksumMismatch(_, _, _) => Status::InvalidData,
         };
-        let message = format!("Driver installation error: {}", self);
+        let message = format!("Driver installation error: {self}");
         Error::with_message_and_status(message, status)
     }
 }
@@ -371,10 +371,20 @@ pub fn download_zst_driver_file<P: AsRef<Path>>(
     );
 
     // Configure the HTTP agent
-    let http_config = ureq::Agent::config_builder()
-        .timeout_global(Some(DRIVER_DOWNLOAD_TIMEOUT))
-        .build();
-    let http_agent = ureq::Agent::new_with_config(http_config);
+    let http_agent = {
+        // Use Rustls as the TLS provider but on the OS for the root certificates.
+        //
+        // [1]: https://github.com/dbt-labs/dbt-fusion/issues/147
+        let tls_config = TlsConfig::builder()
+            .provider(TlsProvider::Rustls)
+            .root_certs(RootCerts::PlatformVerifier)
+            .build();
+        let http_config = ureq::Agent::config_builder()
+            .tls_config(tls_config)
+            .timeout_global(Some(DRIVER_DOWNLOAD_TIMEOUT))
+            .build();
+        ureq::Agent::new_with_config(http_config)
+    };
 
     let mut response = http_agent.get(url).call().map_err(InstallError::Http)?;
 
@@ -610,10 +620,7 @@ mod tests {
                         find_expected_checksum_internal(backend, version, target_os, arch);
                     assert!(
                         checksum.is_some(),
-                        "Missing checksum for backend: {}, version: {}, target_os: {}",
-                        backend,
-                        version,
-                        target_os
+                        "Missing checksum for backend: {backend}, version: {version}, target_os: {target_os}"
                     );
                 }
             }

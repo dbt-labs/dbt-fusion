@@ -33,7 +33,6 @@ pub mod query_ctx;
 pub use query_ctx::QueryCtx;
 
 pub mod semaphore;
-pub use semaphore::Semaphore;
 
 #[cfg(feature = "odbc")]
 pub(crate) mod odbc;
@@ -52,6 +51,10 @@ pub mod databricks;
 pub mod redshift;
 pub mod snowflake;
 
+// REPL for ADBC drivers
+#[cfg(feature = "repl")]
+pub mod repl;
+
 /// Interpret the SQLSTATE [1] 5-char ASCII string as a Rust string.
 ///
 /// [1] https://en.wikipedia.org/wiki/SQLSTATE
@@ -62,14 +65,14 @@ pub fn str_from_sqlstate(sqlstate: &[c_char; 5]) -> &str {
     // [1] https://github.com/apache/arrow-adbc/pull/1725#discussion_r1567531539
     let unsigned: &[u8; 5] = unsafe { std::mem::transmute(sqlstate) };
     let res = std::str::from_utf8(unsigned);
-    debug_assert!(res.is_ok(), "SQLSTATE is not valid ASCII: {:?}", sqlstate);
+    debug_assert!(res.is_ok(), "SQLSTATE is not valid ASCII: {sqlstate:?}");
     res.unwrap_or("")
 }
 
-pub const SNOWFLAKE_DRIVER_VERSION: &str = "0.18.0+dbt0.0.7";
-pub const BIGQUERY_DRIVER_VERSION: &str = "0.18.0+dbt0.0.3";
+pub const SNOWFLAKE_DRIVER_VERSION: &str = "0.18.0+dbt0.0.8";
+pub const BIGQUERY_DRIVER_VERSION: &str = "0.18.0+dbt0.0.9";
 pub const POSTGRES_DRIVER_VERSION: &str = "0.18.0+dbt0.0.2";
-pub const DATABRICKS_DRIVER_VERSION: &str = "0.18.0+dbt0.0.5";
+pub const DATABRICKS_DRIVER_VERSION: &str = "0.18.0+dbt0.0.6";
 
 pub use install::pre_install_driver;
 

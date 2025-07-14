@@ -10,7 +10,7 @@ use std::{
 use crate::schemas::{
     common::{DbtQuoting, ResolvedQuoting},
     macros::{DbtDocsMacro, DbtMacro},
-    manifest::{DbtOperation, DbtSource, InternalDbtNode, Nodes},
+    manifest::DbtOperation,
     profiles::DbConfig,
     project::{
         DbtProject, ProjectDataTestConfig, ProjectModelConfig, ProjectSeedConfig,
@@ -19,9 +19,11 @@ use crate::schemas::{
     relations::base::{BaseRelation, RelationPattern},
     selectors::ResolvedSelector,
     serde::{FloatOrString, StringOrArrayOfStrings},
+    DbtSource, InternalDbtNodeAttributes, Nodes,
 };
 use chrono::{DateTime, Local, Utc};
-use dbt_common::{serde_utils::convert_json_to_map, FsResult};
+use dbt_common::{fs_err, serde_utils::convert_json_to_map, ErrorCode, FsResult};
+use minijinja::compiler::parser::materialization_macro_name;
 use minijinja::{value::Object, MacroSpans, Value as MinijinjaValue};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -54,7 +56,7 @@ impl fmt::Display for ResourcePathKind {
             ResourcePathKind::ProjectPaths => "project paths",
             ResourcePathKind::ProfilePaths => "profile paths",
         };
-        write!(f, "{}", kind_str)
+        write!(f, "{kind_str}")
     }
 }
 
@@ -179,7 +181,7 @@ impl fmt::Display for DbtState {
 
             for (path_kind, paths) in sorted_paths {
                 if !paths.is_empty() {
-                    writeln!(f, "  {}:", path_kind)?;
+                    writeln!(f, "  {path_kind}:")?;
                     for (path, system_time) in paths {
                         let datetime: DateTime<Local> = DateTime::from(*system_time);
                         writeln!(
@@ -200,7 +202,7 @@ pub trait RefsAndSourcesTracker: fmt::Debug + Send + Sync {
     fn as_any(&self) -> &dyn Any;
     fn insert_ref(
         &mut self,
-        node: &dyn InternalDbtNode,
+        node: &dyn InternalDbtNodeAttributes,
         adapter_type: &str,
         model_status: ModelStatus,
         overwrite: bool,
@@ -257,6 +259,36 @@ pub struct ResolverState {
     pub resolved_selectors: ResolvedSelector,
     pub root_project_quoting: ResolvedQuoting,
 }
+
+impl ResolverState {
+    // TODO: support finding custom materialization https://github.com/dbt-labs/fs/issues/2736
+    // a few details is here https://github.com/dbt-labs/fs/pull/3967#discussion_r2153355927
+    pub fn find_materialization_macro_name(
+        &self,
+        materialization: impl fmt::Display,
+        adapter: &str,
+    ) -> FsResult<String> {
+        let adapter_package = format!("dbt_{adapter}");
+        for package in [&adapter_package, "dbt"] {
+            for adapter in [adapter, "default"] {
+                if let Some(macro_) = self.macros.macros.values().find(|m| {
+                    m.name == materialization_macro_name(&materialization, adapter)
+                        && m.package_name == package
+                }) {
+                    return Ok(format!("{}.{}", package, macro_.name));
+                }
+            }
+        }
+
+        Err(fs_err!(
+            ErrorCode::Unexpected,
+            "Materialization macro not found for materialization: {}, adapter: {}",
+            materialization,
+            adapter
+        ))
+    }
+}
+
 impl fmt::Display for ResolverState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -402,7 +434,12 @@ impl DbtRuntimeConfig {
                 .unwrap_or_default(),
             docs_paths: package.dbt_project.docs_paths.clone().unwrap_or_default(),
             asset_paths: package.dbt_project.asset_paths.clone().unwrap_or_default(),
-            target_path: package.dbt_project.target_path.clone().unwrap_or_default(),
+            target_path: package
+                .dbt_project
+                .target_path
+                .clone()
+                .unwrap_or_default()
+                .to_string(),
             snapshot_paths: package
                 .dbt_project
                 .snapshot_paths
@@ -413,7 +450,12 @@ impl DbtRuntimeConfig {
                 .clean_targets
                 .clone()
                 .unwrap_or_default(),
-            log_path: package.dbt_project.log_path.clone().unwrap_or_default(),
+            log_path: package
+                .dbt_project
+                .log_path
+                .clone()
+                .unwrap_or_default()
+                .to_string(),
             packages_install_path: package
                 .dbt_project
                 .packages_install_path
@@ -462,7 +504,6 @@ impl DbtRuntimeConfig {
                     .clone(),
             );
         }
-        // dbg!(&runtime_config);
         runtime_config
     }
 

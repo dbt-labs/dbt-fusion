@@ -4,6 +4,7 @@ use crate::schemas::relations::DEFAULT_DATABRICKS_DATABASE;
 use crate::schemas::serde::{StringOrInteger, StringOrMap};
 
 use dbt_serde_yaml::JsonSchema;
+use merge::Merge;
 use serde_derive::Deserialize;
 use serde_derive::Serialize;
 
@@ -32,6 +33,7 @@ pub struct DbtProfiles {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type")]
 #[serde(rename_all = "lowercase")]
+#[allow(clippy::large_enum_variant)]
 pub enum DbConfig {
     Redshift(RedshiftDbConfig),
     Snowflake(SnowflakeDbConfig),
@@ -293,7 +295,7 @@ impl DbConfig {
                 let json = serde_json::to_value(config).unwrap();
                 serde_json::from_value(json).expect("Failed to deserialize Databricks config")
             }
-            _ => panic!("Unsupported database type: {:?}", self),
+            _ => panic!("Unsupported database type: {self:?}"),
         }
     }
 
@@ -360,7 +362,7 @@ impl std::str::FromStr for Execute {
         match s {
             "remote" => Ok(Execute::Remote),
             "local" => Ok(Execute::Local),
-            _ => Err(format!("Invalid execute mode: {}", s)),
+            _ => Err(format!("Invalid execute mode: {s}")),
         }
     }
 }
@@ -383,8 +385,22 @@ fn default_target() -> String {
     "default".to_string()
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, JsonSchema)]
+/// Extend merge_strategies from `merge` crate
+mod merge_strategies_extend {
+    pub fn overwrite_always<T>(left: &mut T, right: T) {
+        *left = right;
+    }
+
+    pub fn overwrite_option<T>(left: &mut Option<T>, right: Option<T>) {
+        if left.is_none() {
+            *left = right;
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, JsonSchema, Merge)]
 #[serde(rename_all = "snake_case")]
+#[merge(strategy = merge_strategies_extend::overwrite_option)]
 pub struct RedshiftDbConfig {
     // Configuration Parameters
     pub port: Option<StringOrInteger>, // Setting as Option but required as of dbt 1.7.1
@@ -410,10 +426,12 @@ pub struct RedshiftDbConfig {
     pub region: Option<String>,
     pub threads: Option<StringOrInteger>,
     #[serde(flatten)]
+    #[merge(strategy = merge_strategies_extend::overwrite_always)]
     pub ignored_properties: HashMap<String, serde_json::Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, JsonSchema, Merge)]
+#[merge(strategy = merge_strategies_extend::overwrite_option)]
 #[serde(rename_all = "snake_case")]
 pub struct SnowflakeDbConfig {
     // Configuration Parameters
@@ -461,6 +479,7 @@ pub struct SnowflakeDbConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_type: Option<String>,
     #[serde(default, skip_serializing_if = "Execute::is_default")]
+    #[merge(strategy = merge_strategies_extend::overwrite_always)]
     pub execute: Execute,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oauth_client_id: Option<String>,
@@ -469,10 +488,12 @@ pub struct SnowflakeDbConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
     #[serde(flatten)]
+    #[merge(strategy = merge_strategies_extend::overwrite_always)]
     pub ignored_properties: HashMap<String, serde_json::Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, JsonSchema, Merge)]
+#[merge(strategy = merge_strategies_extend::overwrite_option)]
 #[serde(rename_all = "snake_case")]
 pub struct PostgresDbConfig {
     // Configuration Parameters
@@ -511,10 +532,12 @@ pub struct PostgresDbConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
     #[serde(flatten)]
+    #[merge(strategy = merge_strategies_extend::overwrite_always)]
     pub ignored_properties: HashMap<String, serde_json::Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, Merge)]
+#[merge(strategy = merge_strategies_extend::overwrite_option)]
 #[serde(rename_all = "snake_case")]
 pub struct BigqueryDbConfig {
     pub threads: Option<StringOrInteger>,
@@ -540,11 +563,25 @@ pub struct BigqueryDbConfig {
     pub scopes: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keyfile_json: Option<StringOrMap>,
+    pub execution_project: Option<String>,
+    pub compute_region: Option<String>,
+    pub dataproc_batch: Option<String>,
+    pub dataproc_cluster_name: Option<String>,
+    pub dataproc_region: Option<String>,
+    pub gcs_bucket: Option<String>,
+    pub job_creation_timeout_seconds: Option<String>,
+    pub job_execution_timeout_seconds: Option<String>,
+    pub job_retries: Option<i64>,
+    pub job_retry_deadline_seconds: Option<String>,
+    pub target_name: Option<String>,
+
     #[serde(flatten)]
+    #[merge(strategy = merge_strategies_extend::overwrite_always)]
     pub ignored_properties: HashMap<String, serde_json::Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, Merge)]
+#[merge(strategy = merge_strategies_extend::overwrite_option)]
 #[serde(rename_all = "snake_case")]
 pub struct TrinoDbConfig {
     // Configuration Parameters
@@ -557,20 +594,25 @@ pub struct TrinoDbConfig {
     pub password: Option<String>,
     pub role: Option<String>,
     #[serde(flatten)]
+    #[merge(strategy = merge_strategies_extend::overwrite_always)]
     pub ignored_properties: HashMap<String, serde_json::Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, Merge)]
+#[merge(strategy = merge_strategies_extend::overwrite_option)]
 #[serde(rename_all = "snake_case")]
 pub struct DatafusionDbConfig {
     pub database: Option<String>,
     pub schema: Option<String>,
+    #[merge(strategy = merge_strategies_extend::overwrite_always)]
     pub execute: Execute,
     #[serde(flatten)]
+    #[merge(strategy = merge_strategies_extend::overwrite_always)]
     pub ignored_properties: HashMap<String, serde_json::Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, JsonSchema, Merge)]
+#[merge(strategy = merge_strategies_extend::overwrite_option)]
 #[serde(rename_all = "snake_case")]
 pub struct DatabricksDbConfig {
     #[serde(alias = "catalog", default = "default_databricks_database")]
@@ -583,9 +625,12 @@ pub struct DatabricksDbConfig {
     pub client_secret: Option<String>,
     pub oauth_redirect_url: Option<String>,
     pub oauth_scopes: Option<Vec<String>>,
+    #[merge(strategy = merge_strategies_extend::overwrite_always)]
     pub session_properties: Option<HashMap<String, serde_json::Value>>,
+    #[merge(strategy = merge_strategies_extend::overwrite_always)]
     pub connection_parameters: Option<HashMap<String, serde_json::Value>>,
     pub auth_type: Option<String>,
+    #[merge(strategy = merge_strategies_extend::overwrite_always)]
     pub compute: Option<HashMap<String, serde_json::Value>>,
     pub connect_retries: Option<i32>,
     pub connect_timeout: Option<i32>,
@@ -593,6 +638,7 @@ pub struct DatabricksDbConfig {
     pub connect_max_idle: Option<i32>,
     pub threads: Option<StringOrInteger>,
     #[serde(flatten)]
+    #[merge(strategy = merge_strategies_extend::overwrite_always)]
     pub ignored_properties: HashMap<String, serde_json::Value>,
 }
 
@@ -603,6 +649,7 @@ fn default_databricks_database() -> Option<String> {
 #[derive(Serialize, JsonSchema)]
 #[serde(untagged)]
 #[serde(rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum TargetContext {
     Snowflake(SnowflakeTargetEnv),
     Trino(TrinoTargetEnv),
@@ -655,6 +702,26 @@ pub struct SnowflakeTargetEnv {
 pub struct BigqueryTargetEnv {
     pub project: String,
     pub dataset: String,
+    pub client_id: Option<String>,
+    pub compute_region: Option<String>,
+    pub dataproc_batch: Option<String>,
+    pub dataproc_cluster_name: Option<String>,
+    pub dataproc_region: Option<String>,
+    pub execution_project: Option<String>,
+    pub gcs_bucket: Option<String>,
+    pub impersonate_service_account: Option<String>,
+    pub job_creation_timeout_seconds: Option<String>,
+    pub job_execution_timeout_seconds: Option<String>,
+    pub job_retries: Option<i64>,
+    pub job_retry_deadline_seconds: Option<String>,
+    pub location: Option<String>,
+    pub maximum_bytes_billed: Option<i64>,
+    pub method: Option<String>,
+    pub priority: Option<String>,
+    pub retries: Option<i64>,
+    pub target_name: Option<String>,
+    pub timeout_seconds: Option<i64>,
+    pub token_uri: Option<String>,
     #[serde(flatten)]
     pub common: CommonTargetContext,
 }
@@ -685,7 +752,7 @@ pub struct RedshiftTargetEnv {
 }
 
 fn missing(field: &str) -> String {
-    format!("In file `profiles.yml`, field `{}` is required.", field)
+    format!("In file `profiles.yml`, field `{field}` is required.")
 }
 
 // This target context is only to be used in rendering yml's
@@ -789,6 +856,26 @@ impl TryFrom<DbConfig> for TargetContext {
                         type_: adapter_type,
                         threads: None,
                     },
+                    client_id: config.client_id.clone(),
+                    compute_region: config.compute_region.clone(),
+                    dataproc_batch: config.dataproc_batch.clone(),
+                    dataproc_cluster_name: config.dataproc_cluster_name.clone(),
+                    dataproc_region: config.dataproc_region.clone(),
+                    execution_project: config.execution_project.clone(),
+                    gcs_bucket: config.gcs_bucket.clone(),
+                    impersonate_service_account: config.impersonate_service_account.clone(),
+                    job_creation_timeout_seconds: config.job_creation_timeout_seconds.clone(),
+                    job_execution_timeout_seconds: config.job_execution_timeout_seconds.clone(),
+                    job_retries: config.job_retries,
+                    job_retry_deadline_seconds: config.job_retry_deadline_seconds.clone(),
+                    location: config.location.clone(),
+                    maximum_bytes_billed: config.maximum_bytes_billed,
+                    method: config.method.clone(),
+                    priority: config.priority.clone(),
+                    retries: config.retries,
+                    target_name: config.target_name.clone(),
+                    timeout_seconds: config.timeout_seconds,
+                    token_uri: config.token_uri,
                 }))
             }
 

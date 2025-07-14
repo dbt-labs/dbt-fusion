@@ -51,7 +51,7 @@ impl Object for ValidatorObject {
         self: &Arc<Self>,
         _state: &State,
         args: &[Value],
-        _listener: std::rc::Rc<dyn minijinja::listener::RenderingEventListener>,
+        _listeners: &[std::rc::Rc<dyn minijinja::listener::RenderingEventListener>],
     ) -> Result<Value, Error> {
         // TODO: we need to implement validating the the value against the type
         let mut valid_type_or_value_list = Vec::new();
@@ -89,16 +89,13 @@ impl Object for ValidatorObject {
         // If we get here, validation failed
         let valid_values_str = valid_type_or_value_list
             .iter()
-            .map(|v| format!("\"{}\"", v))
+            .map(|v| format!("\"{v}\""))
             .collect::<Vec<_>>()
             .join(", ");
 
         Err(Error::new(
             ErrorKind::InvalidArgument,
-            format!(
-                "Expected value \"{}\" to be one of [{}]",
-                value, valid_values_str
-            ),
+            format!("Expected value \"{value}\" to be one of [{valid_values_str}]"),
         ))
     }
 }

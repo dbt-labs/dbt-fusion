@@ -1,17 +1,20 @@
 use dbt_common::io_args::IoArgs;
 use dbt_common::stdfs::File;
-use dbt_common::{constants::DBT_PACKAGES_LOCK_FILE, err, fs_err, stdfs, ErrorCode, FsResult};
+use dbt_common::{
+    constants::DBT_PACKAGES_LOCK_FILE, err, fs_err, show_warning, stdfs, ErrorCode, FsResult,
+};
 use dbt_jinja_utils::jinja_environment::JinjaEnvironment;
 use dbt_schemas::schemas::packages::DbtPackagesLock;
 use flate2::read::GzDecoder;
 use std::path::{Path, PathBuf};
-use vortex_client::event_functions::package_install_event;
+use vortex_events::package_install_event;
 
 use crate::package_listing::UnpinnedPackage;
 
 use crate::{
     hub_client::HubClient,
     package_listing::PackageListing,
+    tarball_client::TarballClient,
     utils::{handle_git_like_package, read_and_validate_dbt_project},
 };
 
@@ -61,6 +64,22 @@ pub async fn install_packages(
         match package {
             UnpinnedPackage::Hub(hub_unpinned_package) => {
                 let pinned_package = hub_unpinned_package.resolved(hub_registry).await?;
+                if pinned_package.version != pinned_package.version_latest
+                    && (std::env::var("NEXTEST").is_err()
+                        || (std::env::var("NEXTEST").is_ok()
+                            && std::env::var("TEST_DEPS_LATEST_VERSION").is_ok()))
+                {
+                    show_warning!(
+                        io_args,
+                        fs_err!(
+                            ErrorCode::DependencyWarning,
+                            "Updated version available for {}@{}: {}",
+                            pinned_package.name,
+                            pinned_package.version,
+                            pinned_package.version_latest,
+                        )
+                    );
+                }
                 let version = pinned_package.get_version();
                 let tar_name = format!("{}.{}.tar.gz", pinned_package.package, version);
                 let tar_path = tarball_dir.path().join(tar_name);
@@ -76,34 +95,36 @@ pub async fn install_packages(
                     .expect("Version should exist in package metadata");
                 let tarball_url = metadata.downloads.tarball.clone();
                 let project_name = metadata.name.clone();
-                // Download the tarball
-                hub_registry
-                    .download_tarball(&tarball_url, &tar_path)
-                    .await?;
-                // Extract the tarball
+
+                // Use TarballClient to download and extract the tarball
                 let untar_path = tempfile::TempDir::new_in(packages_install_path).map_err(|e| {
                     fs_err!(ErrorCode::IoError, "Failed to create untar dir: {}", e)
                 })?;
-                // Reopen the tar file for extraction
-                let tar = File::open(&tar_path)
-                    .map_err(|e| fs_err!(ErrorCode::IoError, "Failed to open tar file: {}", e))?;
-                let gz = GzDecoder::new(tar);
-                let mut tar = tar::Archive::new(gz);
-                tar.unpack(&untar_path)
-                    .map_err(|e| fs_err!(ErrorCode::IoError, "Failed to unpack tar file: {}", e))?;
+                let mut tarball_client = TarballClient::new();
+                tarball_client
+                    .download_and_extract_tarball(
+                        &tarball_url,
+                        &tar_path,
+                        &untar_path,
+                        "hub_package",
+                    )
+                    .await?;
+
                 if let Some(common_prefix) = get_common_prefix(&tar_path)? {
                     let rename_path = packages_install_path.join(project_name);
                     stdfs::rename(untar_path.path().join(&common_prefix), &rename_path)?;
                 } else {
                     return err!(ErrorCode::IoError, "No common prefix for package found");
                 }
-                package_install_event(
-                    io_args.invocation_id.to_string(),
-                    pinned_package.name.clone(),
-                    pinned_package.version.clone(),
-                    "hub".to_string(),
-                )
-                .await;
+                if io_args.send_anonymous_usage_stats {
+                    package_install_event(
+                        io_args.invocation_id.to_string(),
+                        pinned_package.name.clone(),
+                        pinned_package.version.clone(),
+                        "hub".to_string(),
+                    )
+                    .await;
+                }
             }
             UnpinnedPackage::Git(git_unpinned_package) => {
                 let (tmp_dir, checkout_path, commit_sha) = handle_git_like_package(
@@ -111,6 +132,7 @@ pub async fn install_packages(
                     &git_unpinned_package.revisions,
                     &git_unpinned_package.subdirectory,
                     git_unpinned_package.warn_unpinned.unwrap_or_default(),
+                    Some(packages_install_path),
                 )?;
                 let dbt_project = read_and_validate_dbt_project(&checkout_path)?;
                 let project_name = dbt_project.name;
@@ -151,6 +173,7 @@ pub async fn install_packages(
                     &private_unpinned_package.revisions,
                     &private_unpinned_package.subdirectory,
                     private_unpinned_package.warn_unpinned.unwrap_or_default(),
+                    Some(packages_install_path),
                 )?;
                 let dbt_project = read_and_validate_dbt_project(&checkout_path)?;
                 let project_name = dbt_project.name;
@@ -165,6 +188,64 @@ pub async fn install_packages(
                         .unwrap_or("none".to_string()),
                     commit_sha,
                     "private".to_string(),
+                )
+                .await;
+            }
+            UnpinnedPackage::Tarball(tarball_unpinned_package) => {
+                // Download and extract the tarball
+                let tarball_dir = tempfile::tempdir().map_err(|e| {
+                    fs_err!(ErrorCode::IoError, "Failed to create temp dir: {}", e,)
+                })?;
+                let tar_path = tarball_dir
+                    .path()
+                    .join(tarball_unpinned_package.tarball.replace('/', "_"));
+                let untar_path = tempfile::TempDir::new_in(packages_install_path).map_err(|e| {
+                    fs_err!(ErrorCode::IoError, "Failed to create untar dir: {}", e)
+                })?;
+                let mut tarball_client = TarballClient::new();
+                tarball_client
+                    .download_and_extract_tarball(
+                        &tarball_unpinned_package.tarball,
+                        &tar_path,
+                        &untar_path,
+                        "tarball_package",
+                    )
+                    .await?;
+
+                // Find the extracted package directory
+                let tar_contents = std::fs::read_dir(&untar_path).map_err(|e| {
+                    fs_err!(
+                        ErrorCode::IoError,
+                        "Failed to read untarred directory: {}",
+                        e
+                    )
+                })?;
+                let tar_contents: Vec<_> = tar_contents
+                    .filter_map(|entry| entry.ok())
+                    .filter(|entry| entry.path().is_dir())
+                    .collect();
+
+                if tar_contents.len() != 1 {
+                    return err!(
+                        ErrorCode::InvalidConfig,
+                        "Incorrect structure for package extracted from {}. The extracted package needs to follow the structure <package_name>/<package_contents>.",
+                        tarball_unpinned_package.tarball
+                    );
+                }
+
+                let checkout_path = tar_contents[0].path();
+                let dbt_project = read_and_validate_dbt_project(&checkout_path)?;
+                let project_name = dbt_project.name;
+                stdfs::rename(&checkout_path, packages_install_path.join(project_name))?;
+
+                package_install_event(
+                    io_args.invocation_id.to_string(),
+                    tarball_unpinned_package
+                        .name
+                        .clone()
+                        .unwrap_or("none".to_string()),
+                    "tarball".to_string(),
+                    "tarball".to_string(),
                 )
                 .await;
             }

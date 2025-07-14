@@ -222,8 +222,10 @@ mod expression;
 mod output;
 mod output_tracker;
 mod template;
+mod types;
 mod utils;
 mod vm;
+pub use vm::listeners::TypecheckingEventListener;
 
 pub mod cache_key;
 pub mod filters;
@@ -265,6 +267,7 @@ pub use self::value::Value;
 
 pub use self::macros::__context;
 pub use self::vm::State;
+pub use crate::vm::CodeLocation;
 
 // forwards compatibility
 #[cfg(not(feature = "serde"))]

@@ -43,6 +43,7 @@ pub async fn execute_fs(arg: SystemArgs, cli: Cli) -> FsResult<i32> {
     do_execute_fs(arg, cli).await
 }
 
+#[allow(clippy::cognitive_complexity)]
 async fn do_execute_fs(arg: SystemArgs, cli: Cli) -> FsResult<i32> {
     let start = SystemTime::now();
 
@@ -107,6 +108,7 @@ async fn do_execute_fs(arg: SystemArgs, cli: Cli) -> FsResult<i32> {
     }
 }
 
+#[allow(clippy::cognitive_complexity)]
 async fn execute_setup_and_all_phases(
     system_arg: SystemArgs,
     cli: Cli,
@@ -179,13 +181,14 @@ async fn execute_setup_and_all_phases(
     }
 }
 
+#[allow(clippy::cognitive_complexity)]
 async fn execute_all_phases(arg: &EvalArgs, _cli: &Cli) -> FsResult<i32> {
     let start = SystemTime::now();
 
     // Loads all .yml files + collects all included files
     let load_args = LoadArgs::from_eval_args(arg);
     let invocation_args = InvocationArgs::from_eval_args(arg);
-    let (dbt_state, num_threads) = load(&load_args, &invocation_args).await?;
+    let (dbt_state, num_threads, _dbt_cloud) = load(&load_args, &invocation_args).await?;
 
     let arg = arg
         .with_target(dbt_state.dbt_profile.target.to_string())

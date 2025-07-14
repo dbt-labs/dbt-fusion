@@ -404,7 +404,7 @@ mod builtins {
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
     pub fn length(v: &Value) -> Result<usize, Error> {
-        if v.is_undefined() {
+        if v.is_undefined() || v.is_none() {
             return Ok(0);
         }
         v.len().ok_or_else(|| {
@@ -441,7 +441,13 @@ mod builtins {
     /// * `by`: set to `"value"` to sort by value. Defaults to `"key"`.
     /// * `reverse`: set to `true` to sort in reverse.
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn dictsort(v: &Value, kwargs: Kwargs) -> Result<Value, Error> {
+    pub fn dictsort(
+        v: &Value,
+        case_sensitive: Option<bool>,
+        by_value: Option<Cow<'_, str>>,
+        reverse: Option<bool>,
+        kwargs: Kwargs,
+    ) -> Result<Value, Error> {
         if v.kind() != ValueKind::Map {
             return Err(Error::new(
                 ErrorKind::InvalidOperation,
@@ -449,8 +455,12 @@ mod builtins {
             ));
         }
 
-        let by_value = matches!(ok!(kwargs.get("by")), Some("value"));
-        let case_sensitive = ok!(kwargs.get::<Option<bool>>("case_sensitive")).unwrap_or(false);
+        let by_value = matches!(
+            ok!(kwargs.get::<Option<&str>>("by")).unwrap_or(by_value.as_deref().unwrap_or("key")),
+            "value"
+        );
+        let case_sensitive = ok!(kwargs.get::<Option<bool>>("case_sensitive"))
+            .unwrap_or(case_sensitive.unwrap_or(false));
         let mut rv: Vec<_> = ok!(v.try_iter())
             .map(|key| (key.clone(), v.get_item(&key).unwrap_or(Value::UNDEFINED)))
             .collect();
@@ -458,7 +468,7 @@ mod builtins {
             let (a, b) = if by_value { (&a.1, &b.1) } else { (&a.0, &b.0) };
             cmp_helper(a, b, case_sensitive)
         });
-        if let Some(true) = ok!(kwargs.get("reverse")) {
+        if ok!(kwargs.get::<Option<bool>>("reverse")).unwrap_or(reverse.unwrap_or(false)) {
             rv.reverse();
         }
         kwargs.assert_all_used()?;
@@ -1241,7 +1251,7 @@ mod builtins {
                     output.push_str(&indent_with);
                 }
             } else {
-                write!(output, "{}{}", indent_with, line).ok();
+                write!(output, "{indent_with}{line}").ok();
             }
             output.push('\n');
         }
@@ -1683,7 +1693,7 @@ mod builtins {
     /// This is useful for debugging as it better shows what's inside an object.
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
     pub fn pprint(value: &Value) -> String {
-        format!("{:#?}", value)
+        format!("{value:#?}")
     }
 
     /// Formats a string using printf-style formatting.

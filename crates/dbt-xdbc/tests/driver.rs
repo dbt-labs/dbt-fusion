@@ -53,7 +53,7 @@ mod tests {
                     .with_named_option(bigquery::AUTH_CREDENTIALS, auth_credentials)?;
                 Ok(builder)
             }
-            Backend::Postgres => {
+            Backend::Postgres | Backend::Redshift => {
                 // Configuration for Postgres:
                 //     CREATE ROLE username WITH LOGIN PASSWORD 'an_secure_password';
                 //     CREATE DATABASE adbc_test;
@@ -435,8 +435,8 @@ mod tests {
                      VALUES
                        (21 + 21, 'Snowman ☃'),
                        (43, NULL),
-                       (NULL, REPEAT('A string that is longer than 64 characters because it goes on and on about nothing in particular ☃', {}))
-                   ) AS tbl(id, name)"#, REPEAT).as_str(),
+                       (NULL, REPEAT('A string that is longer than 64 characters because it goes on and on about nothing in particular ☃', {REPEAT}))
+                   ) AS tbl(id, name)"#).as_str(),
             ))?;
             let batch = statement
                 .execute()?
