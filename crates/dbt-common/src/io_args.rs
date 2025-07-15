@@ -613,13 +613,19 @@ pub fn check_var(vars: &str) -> Result<BTreeMap<String, Value>, String> {
             // This is an invalid YAML syntax according to the spec but might be leniently parsed by some libraries.
             // We want to explicitly disallow it to prevent incorrect interpretations (like 'value' being null).
             if vars.starts_with('{') && vars.contains(':') {
-                let potential_pairs: Vec<&str> = vars.trim_matches('{').trim_matches('}').split(',').collect();
+                let potential_pairs: Vec<&str> = vars
+                    .trim_matches('{')
+                    .trim_matches('}')
+                    .split(',')
+                    .collect();
                 for pair in potential_pairs {
                     let trimmed_pair = pair.trim(); // Trim leading/trailing whitespace from each pair
                     if let Some(colon_idx) = trimmed_pair.find(':') {
                         // Check if the character immediately after the colon is not a space
                         // and ensure it's not the end of the string (e.g., "key:")
-                        if colon_idx + 1 < trimmed_pair.len() && trimmed_pair.chars().nth(colon_idx + 1) != Some(' ') {
+                        if colon_idx + 1 < trimmed_pair.len()
+                            && trimmed_pair.chars().nth(colon_idx + 1) != Some(' ')
+                        {
                             return Err("Invalid YAML format: Missing space after colon in flow-style mapping. Example: '{key: value}'".to_string());
                         }
                     }
@@ -729,12 +735,17 @@ parent_key:
     - item2
         "#;
         let result = check_var(input).unwrap();
-        let expected = BTreeMap::from([( "parent_key".to_string(), yaml_value(r#"
+        let expected = BTreeMap::from([(
+            "parent_key".to_string(),
+            yaml_value(
+                r#"
             child_key: value
             list_key:
               - item1
               - item2
-        "#),)]);
+        "#,
+            ),
+        )]);
         assert_eq!(result, expected);
     }
 
@@ -742,14 +753,14 @@ parent_key:
     fn test_check_var_valid_yaml_scalars() {
         let test_cases = vec![
             ("key: \"hello world\"", "\"hello world\""), // String
-            ("key: 123", "123"), // Integer
-            ("key: true", "true"), // Boolean
-            ("key: null", "null"), // Null
+            ("key: 123", "123"),                         // Integer
+            ("key: true", "true"),                       // Boolean
+            ("key: null", "null"),                       // Null
         ];
 
         for (input, expected_value_yaml) in test_cases {
             let result = check_var(input).unwrap();
-            let expected = BTreeMap::from([( "key".to_string(), yaml_value(expected_value_yaml),)]);
+            let expected = BTreeMap::from([("key".to_string(), yaml_value(expected_value_yaml))]);
             assert_eq!(result, expected, "Failed for input: {}", input);
         }
     }
@@ -806,13 +817,18 @@ parent_key:
             }
         }"#;
         let result = check_var(input).unwrap();
-        let expected = BTreeMap::from([( "parent_key".to_string(), json_value(r#"{
+        let expected = BTreeMap::from([(
+            "parent_key".to_string(),
+            json_value(
+                r#"{
                 "child_key": "value",
                 "list_key": [
                     "item1",
                     "item2"
                 ]
-            }"#),)]);
+            }"#,
+            ),
+        )]);
         assert_eq!(result, expected);
     }
 
@@ -820,14 +836,14 @@ parent_key:
     fn test_check_var_valid_json_scalars() {
         let test_cases = vec![
             (r#"{"key": "hello world"}"#, r#""hello world""#), // String
-            (r#"{"key": 123}"#, r#"123"#), // Number
-            (r#"{"key": true}"#, r#"true"#), // Boolean
-            (r#"{"key": null}"#, r#"null"#), // Null
+            (r#"{"key": 123}"#, r#"123"#),                     // Number
+            (r#"{"key": true}"#, r#"true"#),                   // Boolean
+            (r#"{"key": null}"#, r#"null"#),                   // Null
         ];
 
         for (input, expected_value_json) in test_cases {
             let result = check_var(input).unwrap();
-            let expected = BTreeMap::from([( "key".to_string(), json_value(expected_value_json),)]);
+            let expected = BTreeMap::from([("key".to_string(), json_value(expected_value_json))]);
             assert_eq!(result, expected, "Failed for input: {}", input);
         }
     }
@@ -866,21 +882,28 @@ parent_key:
         assert_eq!(check_var("").unwrap_err(), "Empty vars input is not valid");
 
         assert!(check_var("   ").is_err());
-        assert_eq!(check_var("   ").unwrap_err(), "Empty vars input is not valid");
+        assert_eq!(
+            check_var("   ").unwrap_err(),
+            "Empty vars input is not valid"
+        );
     }
 
     #[test]
     fn test_check_var_invalid_non_map_root() {
         let test_cases = vec![
-            "123",          // Not a map (integer)
-            "true",         // Not a map (boolean)
-            "- item",       // YAML sequence
-            "[1,2,3]",      // JSON array
+            "123",     // Not a map (integer)
+            "true",    // Not a map (boolean)
+            "- item",  // YAML sequence
+            "[1,2,3]", // JSON array
         ];
 
         for input in test_cases {
             let result = check_var(input);
-            assert!(result.is_err(), "Should have failed for non-map input: {}", input);
+            assert!(
+                result.is_err(),
+                "Should have failed for non-map input: {}",
+                input
+            );
             let error_message = result.unwrap_err();
             assert!(error_message.contains("YAML parsing error:"));
             assert!(error_message.contains("JSON parsing error:"));
@@ -890,16 +913,20 @@ parent_key:
     #[test]
     fn test_check_var_invalid_incomplete_structures() {
         let test_cases = vec![
-            "{",            // Incomplete JSON/YAML object
-            "key: [",       // Incomplete YAML list
-            "key: {",       // Incomplete YAML map
-            "key",          // Missing colon or not a map
-            "key value",    // Missing colon
+            "{",         // Incomplete JSON/YAML object
+            "key: [",    // Incomplete YAML list
+            "key: {",    // Incomplete YAML map
+            "key",       // Missing colon or not a map
+            "key value", // Missing colon
         ];
 
         for input in test_cases {
             let result = check_var(input);
-            assert!(result.is_err(), "Should have failed for incomplete structure: {}", input);
+            assert!(
+                result.is_err(),
+                "Should have failed for incomplete structure: {}",
+                input
+            );
             let error_message = result.unwrap_err();
             assert!(error_message.contains("YAML parsing error:"));
             assert!(error_message.contains("JSON parsing error:"));
