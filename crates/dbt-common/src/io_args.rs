@@ -603,20 +603,22 @@ pub fn check_var(vars: &str) -> Result<BTreeMap<String, Value>, String> {
         return Err("Empty vars input is not valid".into());
     }
 
-    // Strip outer quotes if present
-    let vars = vars.trim().trim_matches('\'');
-
-    // Check if the input is already wrapped in curly braces
-    let yaml_str = if vars.trim().starts_with('{') {
-        vars.to_string()
+    let path = Path::new(vars);
+    let yaml_str = if path.is_file() {
+        match fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(err) => return Err(format!("Failed to read file '{}': {}", vars, err)),
+        }
     } else {
-        // Handle single key-value pair separated by a colon
-        if vars.trim().matches(':').count() != 1 {
+        // For direct string input, enforce 'key: value' or '{key: value, ...}' format
+        let trimmed_vars = vars.trim().trim_matches('\'');
+        if !trimmed_vars.starts_with('{') && trimmed_vars.matches(':').count() != 1 {
             return Err(format!(
-                "Invalid key-value pair: '{vars}'. Expected format: 'key: value'."
+                "Invalid key-value pair: '{}'. Expected format: 'key: value'.",
+                vars
             ));
         }
-        vars.to_string()
+        trimmed_vars.to_string()
     };
 
     // Try parsing as YAML first
@@ -736,5 +738,89 @@ mod tests {
         for var in invalid_vars {
             assert!(check_var(var).is_err(), "Should have failed: {var}");
         }
+    }
+
+    #[test]
+    fn test_check_var_from_yaml_file() {
+        let file_content = r#"
+key1: value1
+key2:
+  nested_key: nested_value
+list_key:
+  - item1
+  - item2
+        "#;
+        let file_path = "test_vars.yml";
+        std::fs::write(file_path, file_content).unwrap();
+
+        let result = check_var(file_path).unwrap();
+        let expected_result = BTreeMap::from([
+            (
+                "key1".to_string(),
+                dbt_serde_yaml::from_str("value1").unwrap(),
+            ),
+            (
+                "key2".to_string(),
+                dbt_serde_yaml::from_str("{nested_key: nested_value}").unwrap(),
+            ),
+            (
+                "list_key".to_string(),
+                dbt_serde_yaml::from_str("[\"item1\", \"item2\"]").unwrap(),
+            ),
+        ]);
+
+        assert_eq!(result, expected_result);
+        std::fs::remove_file(file_path).unwrap();
+    }
+
+    #[test]
+    fn test_check_var_from_json_file() {
+        let file_content = r#"{
+            "key1": "value1",
+            "key2": {
+                "nested_key": "nested_value"
+            },
+            "list_key": [
+                "item1",
+                "item2"
+            ]
+        }"#;
+        let file_path = "test_vars.json";
+        std::fs::write(file_path, file_content).unwrap();
+
+        let result = check_var(file_path).unwrap();
+        let expected_result = BTreeMap::from([
+            (
+                "key1".to_string(),
+                serde_json::from_str("\"value1\"").unwrap(),
+            ),
+            (
+                "key2".to_string(),
+                serde_json::from_str("{\"nested_key\": \"nested_value\"}").unwrap(),
+            ),
+            (
+                "list_key".to_string(),
+                serde_json::from_str("[\"item1\", \"item2\"]").unwrap(),
+            ),
+        ]);
+
+        assert_eq!(result, expected_result);
+        std::fs::remove_file(file_path).unwrap();
+    }
+
+    #[test]
+    fn test_check_var_from_nonexistent_file() {
+        let file_path = "non_existent_file.yml";
+        assert!(check_var(file_path).is_err());
+    }
+
+    #[test]
+    fn test_check_var_from_invalid_file_content() {
+        let file_content = "this is not valid yaml or json";
+        let file_path = "invalid_content.yml";
+        std::fs::write(file_path, file_content).unwrap();
+
+        assert!(check_var(file_path).is_err());
+        std::fs::remove_file(file_path).unwrap();
     }
 }
