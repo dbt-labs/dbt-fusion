@@ -730,7 +730,7 @@ macro_rules! show_autofix_suggestion {
             )
         );
         $crate::_log!(
-            $crate::macros::log_adapter::log::Level::Info,
+            $crate::macros::log_adapter::log::Level::Warn,
             _INVOCATION_ID_ = $io.invocation_id.as_u128();
             "{} Try the autofix script: {}",
             BLUE.apply_to("suggestion:"),
