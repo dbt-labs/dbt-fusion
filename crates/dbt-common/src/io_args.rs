@@ -606,36 +606,16 @@ pub fn check_var(vars: &str) -> Result<BTreeMap<String, Value>, String> {
     // Strip outer quotes if present
     let vars = vars.trim().trim_matches('\'');
 
-    // Check if the input is already wrapped in curly braces
-    let yaml_str = if vars.trim().starts_with('{') {
-        vars.to_string()
-    } else {
-        // Handle single key-value pair separated by a colon
-        if vars.trim().matches(':').count() != 1 {
-            return Err(format!(
-                "Invalid key-value pair: '{vars}'. Expected format: 'key: value'."
-            ));
-        }
-        vars.to_string()
-    };
-
     // Try parsing as YAML first
-    match dbt_serde_yaml::from_str::<BTreeMap<String, Value>>(&yaml_str) {
+    match dbt_serde_yaml::from_str::<BTreeMap<String, Value>>(vars) {
         Ok(btree) => {
             // Disallow the '{key:value}' format for flow-style YAML syntax
             // to prevent key:value: None interpretation: https://stackoverflow.com/a/70909331
-            for key in btree.keys() {
-                if key.contains(':') {
-                    return Err(format!(
-                        "Invalid key-value pair: '{key}'. Value must start with a space after colon."
-                    ));
-                }
-            }
             Ok(btree)
         }
         Err(_) => {
             // If YAML parsing fails, try JSON
-            match serde_json::from_str(&yaml_str) {
+            match serde_json::from_str(vars) {
                 Ok(btree) => Ok(btree),
                 Err(_) => Err(
                     "Invalid YAML/JSON format. Expected format: 'key: value' or '{key: value, ..}'. Note both argument forms must be just one shell token"
@@ -725,16 +705,252 @@ mod tests {
     }
 
     #[test]
-    fn test_check_var_invalid() {
+    fn test_check_var_invalid_old() {
         let invalid_vars = vec![
-            "key",                    // Missing colon
-            "key:value",              // Missing space after colon
-            "key: value:with:colons", // Value with colons
-            "{key:value}",            // Flow-style YAML syntax without space after colon
+            "key",                    // Missing colon or not a map
+            "key:value",              // Missing space after colon in key-value pair
         ];
 
         for var in invalid_vars {
             assert!(check_var(var).is_err(), "Should have failed: {var}");
         }
     }
+
+    #[test]
+    fn test_check_var_from_yaml_file() {
+        let file_content = r#"
+key1: value1
+key2:
+  nested_key: nested_value
+list_key:
+  - item1
+  - item2
+        "#;
+        let result = check_var(file_content).unwrap();
+        let expected_result = BTreeMap::from([
+            (
+                "key1".to_string(),
+                dbt_serde_yaml::from_str("value1").unwrap(),
+            ),
+            (
+                "key2".to_string(),
+                dbt_serde_yaml::from_str("{nested_key: nested_value}").unwrap(),
+            ),
+            (
+                "list_key".to_string(),
+                dbt_serde_yaml::from_str("[\"item1\", \"item2\"]").unwrap(),
+            ),
+        ]);
+
+        assert_eq!(result, expected_result);
+    }
+
+    #[test]
+    fn test_check_var_from_json_file() {
+        let file_content = r#"{
+            "key1": "value1",
+            "key2": {
+                "nested_key": "nested_value"
+            },
+            "list_key": [
+                "item1",
+                "item2"
+            ]
+        }"#;
+        let result = check_var(file_content).unwrap();
+        let expected_result = BTreeMap::from([
+            (
+                "key1".to_string(),
+                serde_json::from_str("\"value1\"").unwrap(),
+            ),
+            (
+                "key2".to_string(),
+                serde_json::from_str("{\"nested_key\": \"nested_value\"}").unwrap(),
+            ),
+            (
+                "list_key".to_string(),
+                serde_json::from_str("[\"item1\", \"item2\"]").unwrap(),
+            ),
+        ]);
+
+        assert_eq!(result, expected_result);
+    }
+
+    #[test]
+    fn test_check_var_with_yaml_scalars() {
+        let test_cases = vec![
+            ("key: \"hello world\"", "hello world"),
+            ("key: 123", "123"),
+            ("key: true", "true"),
+            ("key: null", "null"),
+        ];
+
+        for (input, expected_value) in test_cases {
+            let result = check_var(input).unwrap();
+            let expected = BTreeMap::from([(
+                "key".to_string(),
+                dbt_serde_yaml::from_str(expected_value).unwrap(),
+            )]);
+            assert_eq!(result, expected, "Failed for input: {}", input);
+        }
+    }
+
+    #[test]
+    fn test_check_var_with_yaml_nested_maps_and_lists() {
+        let input = r#"
+parent_key:
+  child_key: value
+  list_key:
+    - item1
+    - item2
+        "#;
+        let result = check_var(input).unwrap();
+        let expected = BTreeMap::from([(
+            "parent_key".to_string(),
+            dbt_serde_yaml::from_str(
+                r#"{
+                child_key: value,
+                list_key: [item1, item2]
+            }"#,
+            )
+            .unwrap(),
+        )]);
+        assert_eq!(result, expected, "Failed for nested YAML input");
+
+        let input_complex = r#"
+data:
+  users:
+    - id: 1
+      name: Alice
+    - id: 2
+      name: Bob
+  products:
+    - name: Laptop
+      price: 1200
+    - name: Mouse
+      price: 25
+        "#;
+        let result_complex = check_var(input_complex).unwrap();
+        let expected_complex = BTreeMap::from([(
+            "data".to_string(),
+            dbt_serde_yaml::from_str(
+                r#"{
+                users: [{id: 1, name: Alice}, {id: 2, name: Bob}],
+                products: [{name: Laptop, price: 1200}, {name: Mouse, price: 25}]
+            }"#,
+            )
+            .unwrap(),
+        )]);
+        assert_eq!(result_complex, expected_complex, "Failed for complex nested YAML input");
+    }
+
+    #[test]
+    fn test_check_var_with_json_scalars() {
+        let test_cases = vec![
+            (r#"{ "key": "hello world" }"#, r#""hello world""#),
+            (r#"{ "key": 123 }"#, r#"123"#),
+            (r#"{ "key": true }"#, r#"true"#),
+            (r#"{ "key": null }"#, r#"null"#),
+        ];
+
+        for (input, expected_value) in test_cases {
+            let result = check_var(input).unwrap();
+            let expected = BTreeMap::from([(
+                "key".to_string(),
+                serde_json::from_str(expected_value).unwrap(),
+            )]);
+            assert_eq!(result, expected, "Failed for input: {}", input);
+        }
+    }
+
+    #[test]
+    fn test_check_var_with_json_nested_maps_and_lists() {
+        let input = r#"{
+            "parent_key": {
+                "child_key": "value",
+                "list_key": [
+                    "item1",
+                    "item2"
+                ]
+            }
+        }"#;
+        let result = check_var(input).unwrap();
+        let expected = BTreeMap::from([(
+            "parent_key".to_string(),
+            serde_json::from_str(
+                r#"{
+                "child_key": "value",
+                "list_key": ["item1", "item2"]
+            }"#,
+            )
+            .unwrap(),
+        )]);
+        assert_eq!(result, expected, "Failed for nested JSON input");
+
+        let input_complex = r#"{
+            "data": {
+                "users": [
+                    {"id": 1, "name": "Alice"},
+                    {"id": 2, "name": "Bob"}
+                ],
+                "products": [
+                    {"name": "Laptop", "price": 1200},
+                    {"name": "Mouse", "price": 25}
+                ]
+            }
+        }"#;
+        let result_complex = check_var(input_complex).unwrap();
+        let expected_complex = BTreeMap::from([(
+            "data".to_string(),
+            serde_json::from_str(
+                r#"{
+                "users": [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}],
+                "products": [{"name": "Laptop", "price": 1200}, {"name": "Mouse", "price": 25}]
+            }"#,
+            )
+            .unwrap(),
+        )]);
+        assert_eq!(result_complex, expected_complex, "Failed for complex nested JSON input");
+    }
+
+    #[test]
+    fn test_check_var_with_mixed_yaml_styles() {
+        let input = r#"
+key1: value1
+key2: [value21, value22, value23]
+key3: {key31: value31, key32: value32}
+        "#;
+        let result = check_var(input).unwrap();
+
+        let expected = BTreeMap::from([
+            ("key1".to_string(), dbt_serde_yaml::from_str("value1").unwrap()),
+            ("key2".to_string(), dbt_serde_yaml::from_str("[value21, value22, value23]").unwrap()),
+            ("key3".to_string(), dbt_serde_yaml::from_str("{key31: value31, key32: value32}").unwrap()),
+        ]);
+
+        assert_eq!(result, expected, "Failed for mixed YAML styles");
+    }
+
+    #[test]
+    fn test_check_var_invalid_new_cases() {
+        let invalid_vars = vec![
+            "",                       // Empty string
+            " ",                      // Whitespace only
+            ": key",                  // Invalid YAML (starts with colon)
+            "key value",              // Missing colon
+            "{",                      // Incomplete JSON/YAML
+            "key: [",                 // Incomplete YAML list
+            "key: {",                 // Incomplete YAML map
+            "123",                    // Not a map
+            "true",                   // Not a map
+            "key: - value",           // YAML sequence instead of map
+            "- item",                 // YAML sequence instead of map
+            "[1,2,3]",                // JSON array instead of map
+        ];
+
+        for var in invalid_vars {
+            assert!(check_var(var).is_err(), "Should have failed for input: {}", var);
+        }
+    }
+
 }
