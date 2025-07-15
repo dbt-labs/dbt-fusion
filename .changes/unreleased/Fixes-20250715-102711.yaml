@@ -1,0 +1,3 @@
+kind: Fixes
+body: Enable to parse YAML with --vars
+time: 2025-07-15T10:27:11.787166+09:00
