@@ -190,7 +190,7 @@ impl FsError {
             minijinja::ErrorKind::DisabledModel => ErrorCode::DisabledModel,
             _ => ErrorCode::JinjaError,
         };
-        FsError::new(err_code, format!("{context} {err}")).with_location(MiniJinjaErrorWrapper(err))
+        FsError::new(err_code, format!("{context} - {err}")).with_location(MiniJinjaErrorWrapper(err))
     }
 
     /// True if this error contains a backtrace.
