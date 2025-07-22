@@ -1,4 +1,4 @@
-use dbt_jinja_utils::jinja_environment::JinjaEnvironment;
+use dbt_jinja_utils::jinja_environment::JinjaEnv;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -7,8 +7,8 @@ use dbt_common::constants::DBT_PROJECT_YML;
 
 use dbt_common::stdfs;
 
-use dbt_common::{err, fs_err, show_warning};
 use dbt_common::{ErrorCode, FsResult};
+use dbt_common::{err, fs_err, show_warning};
 use dbt_schemas::state::{DbtPackage, DbtVars};
 
 use crate::args::LoadArgs;
@@ -26,7 +26,7 @@ mod assets {
 
 pub async fn load_packages(
     arg: &LoadArgs,
-    env: &mut JinjaEnvironment<'static>,
+    env: &JinjaEnv,
     collected_vars: &mut Vec<(String, BTreeMap<String, DbtVars>)>,
     lookup_map: &BTreeMap<String, String>,
     packages_install_path: &Path,
@@ -54,7 +54,7 @@ pub async fn load_packages(
 
 pub async fn load_internal_packages(
     arg: &LoadArgs,
-    env: &mut JinjaEnvironment<'static>,
+    env: &JinjaEnv,
     collected_vars: &mut Vec<(String, BTreeMap<String, DbtVars>)>,
     internal_packages_install_path: &Path,
 ) -> FsResult<Vec<DbtPackage>> {
@@ -84,7 +84,7 @@ pub fn persist_internal_packages(
     // to prevent user from modifying them
     let _ = std::fs::remove_dir_all(internal_packages_install_path);
     // Copy the dbt-adapters and dbt-{adapter_type} to the packages_install_path
-    let adapter_package = format!("dbt-{}", adapter_type);
+    let adapter_package = format!("dbt-{adapter_type}");
     let mut internal_packages = vec!["dbt-adapters", &adapter_package];
     if adapter_type == "redshift" {
         internal_packages.push("dbt-postgres");
@@ -129,7 +129,7 @@ pub fn persist_internal_packages(
 
 async fn collect_packages(
     arg: &LoadArgs,
-    env: &mut JinjaEnvironment<'static>,
+    env: &JinjaEnv,
     collected_vars: &mut Vec<(String, BTreeMap<String, DbtVars>)>,
     package_paths: Vec<PathBuf>,
     lookup_map: &BTreeMap<String, String>,

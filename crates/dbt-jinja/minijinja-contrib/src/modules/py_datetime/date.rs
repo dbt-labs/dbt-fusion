@@ -63,7 +63,7 @@ impl PyDateClass {
         let naive = NaiveDate::from_num_days_from_ce_opt(ordinal as i32).ok_or_else(|| {
             Error::new(
                 ErrorKind::InvalidArgument,
-                format!("Invalid ordinal: {}", ordinal),
+                format!("Invalid ordinal: {ordinal}"),
             )
         })?;
 
@@ -115,7 +115,7 @@ impl PyDateClass {
         let naive_date = NaiveDate::parse_from_str(iso_str, "%Y-%m-%d").map_err(|e| {
             Error::new(
                 ErrorKind::InvalidArgument,
-                format!("Invalid ISO date format: {}: {}", iso_str, e),
+                format!("Invalid ISO date format: {iso_str}: {e}"),
             )
         })?;
 
@@ -129,7 +129,7 @@ impl Object for PyDateClass {
         self: &Arc<Self>,
         _state: &minijinja::State<'_, '_>,
         args: &[Value],
-        _listener: std::rc::Rc<dyn minijinja::listener::RenderingEventListener>,
+        _listeners: &[std::rc::Rc<dyn minijinja::listener::RenderingEventListener>],
     ) -> Result<Value, Error> {
         // Convert PyDate to Value here
         Self::create_date(args).map(Value::from_object)
@@ -141,7 +141,7 @@ impl Object for PyDateClass {
         _state: &minijinja::State<'_, '_>,
         method: &str,
         args: &[Value],
-        _listener: std::rc::Rc<dyn minijinja::listener::RenderingEventListener>,
+        _listeners: &[std::rc::Rc<dyn minijinja::listener::RenderingEventListener>],
     ) -> Result<Value, Error> {
         match method {
             "today" => Self::date_today(args).map(Value::from_object),
@@ -150,7 +150,7 @@ impl Object for PyDateClass {
             "fromisoformat" => Self::fromisoformat(args).map(Value::from_object),
             _ => Err(Error::new(
                 ErrorKind::UnknownMethod("PyDateClass".to_string(), method.to_string()),
-                format!("date has no method named '{}'", method),
+                format!("date has no method named '{method}'"),
             )),
         }
     }
@@ -245,7 +245,7 @@ impl PyDate {
             Some(new_date) => Ok(PyDate::new(new_date)),
             None => Err(Error::new(
                 ErrorKind::InvalidArgument,
-                format!("Invalid date: year={}, month={}, day={}", year, month, day),
+                format!("Invalid date: year={year}, month={month}, day={day}"),
             )),
         }
     }
@@ -303,7 +303,7 @@ impl Object for PyDate {
         _state: &minijinja::State<'_, '_>,
         method: &str,
         args: &[Value],
-        _listener: std::rc::Rc<dyn minijinja::listener::RenderingEventListener>,
+        _listeners: &[std::rc::Rc<dyn minijinja::listener::RenderingEventListener>],
     ) -> Result<Value, Error> {
         match method {
             "strftime" => Self::strftime(self, args),
@@ -320,7 +320,7 @@ impl Object for PyDate {
 
             _ => Err(Error::new(
                 ErrorKind::UnknownMethod("PyDate".to_string(), method.to_string()),
-                format!("date has no method named '{}'", method),
+                format!("date has no method named '{method}'"),
             )),
         }
     }
@@ -328,8 +328,6 @@ impl Object for PyDate {
 
 #[cfg(test)]
 mod tests {
-    use std::rc::Rc;
-
     use super::*;
     use crate::modules::py_datetime::timedelta::PyTimeDelta;
     use minijinja::args;
@@ -369,27 +367,17 @@ mod tests {
 
         // Create a template that uses date and strftime
         let template = env
-            .template_from_str("{{ date(2023, 5, 15).strftime('%Y-%m-%d') }}")
+            .template_from_str("{{ date(2023, 5, 15).strftime('%Y-%m-%d') }}", &[])
             .unwrap();
-        let result = template
-            .render(
-                context!(),
-                Rc::new(minijinja::listener::DefaultRenderingEventListener),
-            )
-            .unwrap();
-        assert_eq!(result.0, "2023-05-15");
+        let result = template.render(context!(), &[]).unwrap();
+        assert_eq!(result, "2023-05-15");
 
         // Test with a different format
         let template = env
-            .template_from_str("{{ date(2023, 5, 15).strftime('%d/%m/%Y') }}")
+            .template_from_str("{{ date(2023, 5, 15).strftime('%d/%m/%Y') }}", &[])
             .unwrap();
-        let result = template
-            .render(
-                context!(),
-                Rc::new(minijinja::listener::DefaultRenderingEventListener),
-            )
-            .unwrap();
-        assert_eq!(result.0, "15/05/2023");
+        let result = template.render(context!(), &[]).unwrap();
+        assert_eq!(result, "15/05/2023");
     }
 
     #[test]
@@ -489,46 +477,37 @@ mod tests {
 
         // Test adding days
         let template = env
-            .template_from_str("{{ (date(2023, 5, 15) + timedelta(days=5)).strftime('%Y-%m-%d') }}")
-            .unwrap();
-        let result = template
-            .render(
-                context!(),
-                Rc::new(minijinja::listener::DefaultRenderingEventListener),
+            .template_from_str(
+                "{{ (date(2023, 5, 15) + timedelta(days=5)).strftime('%Y-%m-%d') }}",
+                &[],
             )
             .unwrap();
-        assert_eq!(result.0, "2023-05-20");
+        let result = template.render(context!(), &[]).unwrap();
+        assert_eq!(result, "2023-05-20");
 
         // Test subtracting days
         let template = env
-            .template_from_str("{{ (date(2023, 5, 15) - timedelta(days=3)).strftime('%Y-%m-%d') }}")
-            .unwrap();
-        let result = template
-            .render(
-                context!(),
-                Rc::new(minijinja::listener::DefaultRenderingEventListener),
+            .template_from_str(
+                "{{ (date(2023, 5, 15) - timedelta(days=3)).strftime('%Y-%m-%d') }}",
+                &[],
             )
             .unwrap();
-        assert_eq!(result.0, "2023-05-12");
+        let result = template.render(context!(), &[]).unwrap();
+        assert_eq!(result, "2023-05-12");
 
         // Test date subtraction
         let template = env
-            .template_from_str("{{ (date(2023, 5, 20) - date(2023, 5, 15)).days }}")
+            .template_from_str("{{ (date(2023, 5, 20) - date(2023, 5, 15)).days }}", &[])
             .unwrap();
-        let result = template
-            .render(
-                context!(),
-                Rc::new(minijinja::listener::DefaultRenderingEventListener),
-            )
-            .unwrap();
-        assert_eq!(result.0, "5");
+        let result = template.render(context!(), &[]).unwrap();
+        assert_eq!(result, "5");
     }
 
     #[test]
     fn test_date_replace() {
         let date = PyDate::new(NaiveDate::from_ymd_opt(2023, 5, 15).unwrap());
         let date_arc = Arc::new(date);
-        println!("date_arc: {:?}", date_arc);
+        println!("date_arc: {date_arc:?}");
         // Test replacing year
         let result = date_arc.replace(args!(year => 2024)).unwrap();
         assert_eq!(result.date.year(), 2024);

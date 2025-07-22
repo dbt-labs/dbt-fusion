@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_with::skip_serializing_none;
 
-use super::{CommonAttributes, DbtConfig, NodeBaseAttributes};
+use crate::schemas::CommonAttributes;
 
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -12,12 +12,6 @@ use super::{CommonAttributes, DbtConfig, NodeBaseAttributes};
 pub struct DbtOperation {
     #[serde(flatten)]
     pub common_attr: CommonAttributes,
-
-    #[serde(flatten)]
-    pub base_attr: NodeBaseAttributes,
-
-    // Model Specific Attributes
-    pub config: DbtConfig,
 
     #[serde(flatten)]
     pub other: BTreeMap<String, Value>,

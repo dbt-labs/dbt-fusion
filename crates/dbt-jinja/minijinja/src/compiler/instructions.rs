@@ -1,6 +1,7 @@
 #[cfg(feature = "internal_debug")]
 use std::fmt;
 
+use crate::compiler::codegen::TypeConstraint;
 use crate::compiler::tokens::Span;
 use crate::output::CaptureMode;
 use crate::value::Value;
@@ -34,22 +35,22 @@ pub enum Instruction<'source> {
     EmitRaw(&'source str),
 
     /// Stores a variable (only possible in for loops)
-    StoreLocal(&'source str),
+    StoreLocal(&'source str, Span),
 
     /// Load a variable,
-    Lookup(&'source str),
+    Lookup(&'source str, Span),
 
     /// Looks up an attribute.
-    GetAttr(&'source str),
+    GetAttr(&'source str, Span),
 
     /// Sets an attribute.
     SetAttr(&'source str),
 
     /// Looks up an item.
-    GetItem,
+    GetItem(Span),
 
     /// Performs a slice operation.
-    Slice,
+    Slice(Span),
 
     /// Loads a constant value.
     LoadConst(Value),
@@ -64,74 +65,74 @@ pub enum Instruction<'source> {
     MergeKwargs(usize),
 
     /// Builds a list of the last n pairs on the stack.
-    BuildList(Option<usize>),
+    BuildList(Option<usize>, Span),
 
     /// Builds a tuple of the last n pairs on the stack.
-    BuildTuple(Option<usize>),
+    BuildTuple(Option<usize>, Span),
 
     /// Unpacks a list into N stack items.
-    UnpackList(usize),
+    UnpackList(usize, Span),
 
     /// Unpacks N lists onto the stack and pushes the number of items there were unpacked.
     UnpackLists(usize),
 
     /// Add the top two values
-    Add,
+    Add(Span),
 
     /// Subtract the top two values
-    Sub,
+    Sub(Span),
 
     /// Multiply the top two values
-    Mul,
+    Mul(Span),
 
     /// Divide the top two values
-    Div,
+    Div(Span),
 
     /// Integer divide the top two values as "integer".
     ///
     /// Note that in MiniJinja this currently uses an euclidean
     /// division to match the rem implementation.  In Python this
     /// instead uses a flooring division and a flooring remainder.
-    IntDiv,
+    IntDiv(Span),
 
     /// Calculate the remainder the top two values
-    Rem,
+    Rem(Span),
 
     /// x to the power of y.
-    Pow,
+    Pow(Span),
 
     /// Negates the value.
-    Neg,
+    Neg(Span),
 
     /// `=` operator
-    Eq,
+    Eq(Span),
 
     /// `!=` operator
-    Ne,
+    Ne(Span),
 
     /// `>` operator
-    Gt,
+    Gt(Span),
 
     /// `>=` operator
-    Gte,
+    Gte(Span),
 
     /// `<` operator
-    Lt,
+    Lt(Span),
 
     /// `<=` operator
-    Lte,
+    Lte(Span),
 
     /// Unary not
-    Not,
+    Not(Span),
 
     /// String concatenation operator
-    StringConcat,
+    StringConcat(Span),
 
     /// Performs a containment check
-    In,
+    In(Span),
 
     /// Apply a filter.
-    ApplyFilter(&'source str, Option<u16>, LocalId),
+    ApplyFilter(&'source str, Option<u16>, LocalId, Span),
 
     /// Perform a filter.
     PerformTest(&'source str, Option<u16>, LocalId),
@@ -142,7 +143,7 @@ pub enum Instruction<'source> {
     /// Starts a loop
     ///
     /// The argument are loop flags.
-    PushLoop(u8),
+    PushLoop(u8, Span),
 
     /// Starts a with block.
     PushWith,
@@ -166,13 +167,13 @@ pub enum Instruction<'source> {
     JumpIfFalse(usize),
 
     /// Jump if the stack top evaluates to false or pops the value
-    JumpIfFalseOrPop(usize),
+    JumpIfFalseOrPop(usize, Span),
 
     /// Jump if the stack top evaluates to true or pops the value
-    JumpIfTrueOrPop(usize),
+    JumpIfTrueOrPop(usize, Span),
 
     /// Sets the auto escape flag to the current value.
-    PushAutoEscape,
+    PushAutoEscape(Span),
 
     /// Resets the auto escape flag to the previous value.
     PopAutoEscape,
@@ -184,13 +185,13 @@ pub enum Instruction<'source> {
     EndCapture,
 
     /// Calls a global function
-    CallFunction(&'source str, Option<u16>),
+    CallFunction(&'source str, Option<u16>, Span),
 
     /// Calls a method
-    CallMethod(&'source str, Option<u16>),
+    CallMethod(&'source str, Option<u16>, Span),
 
     /// Calls an object
-    CallObject(Option<u16>),
+    CallObject(Option<u16>, Span),
 
     /// Duplicates the top item
     DupTop,
@@ -213,7 +214,7 @@ pub enum Instruction<'source> {
 
     /// Loads block from a template with name on stack ("extends")
     #[cfg(feature = "multi_template")]
-    LoadBlocks,
+    LoadBlocks(Span),
 
     /// Includes another template.
     #[cfg(feature = "multi_template")]
@@ -225,7 +226,7 @@ pub enum Instruction<'source> {
 
     /// Builds a macro on the stack.
     #[cfg(feature = "macros")]
-    BuildMacro(&'source str, usize, u8),
+    BuildMacro(&'source str, usize, u8, Span),
 
     /// Breaks from the interpreter loop (exists a function)
     #[cfg(feature = "macros")]
@@ -243,13 +244,22 @@ pub enum Instruction<'source> {
     #[cfg(feature = "macros")]
     GetClosure,
 
-    MacroStart(u32, u32, u32),
+    MacroStart(u32, u32, u32, u32, u32, u32),
     MacroStop(u32, u32, u32),
 
-    ModelReference(String, u32, u32, u32, u32, u32, u32),
+    // A label instruction to indicate the start of a macro
+    // After MacroName, there will be a series of StoreLocal instructions for parameters
+    // We need to push parameter types to the stack.
+    MacroName(&'source str, Span),
 
-    CallStart(u32, u32, u32),
-    CallStop(u32, u32, u32),
+    /// Type constraint is used to tell type checker to mutate the type of the variable
+    TypeConstraint(TypeConstraint, bool),
+
+    /// Load a type to the stack
+    LoadType(Value),
+
+    /// Union the top two types
+    UnionType,
 }
 
 #[derive(Copy, Clone)]
@@ -273,6 +283,7 @@ pub struct Instructions<'source> {
     span_infos: Vec<SpanInfo>,
     name: &'source str,
     source: &'source str,
+    filename: Option<String>,
 }
 
 pub(crate) static EMPTY_INSTRUCTIONS: Instructions<'static> = Instructions {
@@ -282,11 +293,16 @@ pub(crate) static EMPTY_INSTRUCTIONS: Instructions<'static> = Instructions {
     span_infos: Vec::new(),
     name: "<unknown>",
     source: "",
+    filename: None,
 };
 
 impl<'source> Instructions<'source> {
     /// Creates a new instructions object.
-    pub fn new(name: &'source str, source: &'source str) -> Instructions<'source> {
+    pub fn new(
+        name: &'source str,
+        source: &'source str,
+        filename: Option<String>,
+    ) -> Instructions<'source> {
         Instructions {
             instructions: Vec::with_capacity(128),
             line_infos: Vec::with_capacity(128),
@@ -294,12 +310,20 @@ impl<'source> Instructions<'source> {
             span_infos: Vec::with_capacity(128),
             name,
             source,
+            filename,
         }
     }
 
     /// Returns the name of the template.
     pub fn name(&self) -> &'source str {
         self.name
+    }
+
+    /// Returns the filename of the template.
+    pub fn filename(&self) -> String {
+        self.filename
+            .clone()
+            .unwrap_or_else(|| self.name.to_string())
     }
 
     /// Returns the source reference.
@@ -329,7 +353,7 @@ impl<'source> Instructions<'source> {
         let same_loc = self
             .line_infos
             .last()
-            .map_or(false, |last_loc| last_loc.line == line);
+            .is_some_and(|last_loc| last_loc.line == line);
         if !same_loc {
             self.line_infos.push(LineInfo {
                 first_instruction: instr as u32,
@@ -346,7 +370,7 @@ impl<'source> Instructions<'source> {
         // if we follow up to a valid span with no more span, clear it out
         #[cfg(feature = "debug")]
         {
-            if self.span_infos.last().map_or(false, |x| x.span.is_some()) {
+            if self.span_infos.last().is_some_and(|x| x.span.is_some()) {
                 self.span_infos.push(SpanInfo {
                     first_instruction: rv as u32,
                     span: None,
@@ -364,7 +388,7 @@ impl<'source> Instructions<'source> {
             let same_loc = self
                 .span_infos
                 .last()
-                .map_or(false, |last_loc| last_loc.span == Some(span));
+                .is_some_and(|last_loc| last_loc.span == Some(span));
             if !same_loc {
                 self.span_infos.push(SpanInfo {
                     first_instruction: rv as u32,
@@ -422,11 +446,11 @@ impl<'source> Instructions<'source> {
         let idx = idx.min(self.instructions.len() - 1);
         for instr in self.instructions[..=idx].iter().rev() {
             let name = match instr {
-                Instruction::Lookup(name)
-                | Instruction::StoreLocal(name)
-                | Instruction::CallFunction(name, _) => *name,
-                Instruction::PushLoop(flags) if flags & LOOP_FLAG_WITH_LOOP_VAR != 0 => "loop",
-                Instruction::PushLoop(_) | Instruction::PushWith => break,
+                Instruction::Lookup(name, _)
+                | Instruction::StoreLocal(name, _)
+                | Instruction::CallFunction(name, _, _) => *name,
+                Instruction::PushLoop(flags, _) if flags & LOOP_FLAG_WITH_LOOP_VAR != 0 => "loop",
+                Instruction::PushLoop(_, _) | Instruction::PushWith => break,
                 _ => continue,
             };
             if !rv.contains(&name) {
@@ -481,5 +505,5 @@ impl fmt::Debug for Instructions<'_> {
 #[test]
 #[cfg(target_pointer_width = "64")]
 fn test_sizes() {
-    assert_eq!(std::mem::size_of::<Instruction>(), 48);
+    assert_eq!(std::mem::size_of::<Instruction>(), 72);
 }

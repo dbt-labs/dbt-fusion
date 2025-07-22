@@ -1,3 +1,6 @@
+// !!@DEPRECATED@!! This module is deprecated -- statistics gathering should be
+// migrated to use the structured logging [crate::logging::StatEvent]
+
 // This module keep track of error and warning counters.
 // It uses `DashMap` for concurrent access
 // and `AtomicUsize` for atomic counter increments.
@@ -6,8 +9,8 @@
 // we use dbt's invocation_id as key for the counters.
 
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub static ERROR_COUNTERS: LazyLock<DashMap<String, AtomicUsize>> = LazyLock::new(DashMap::new);
 pub static WARNING_COUNTERS: LazyLock<DashMap<String, AtomicUsize>> = LazyLock::new(DashMap::new);

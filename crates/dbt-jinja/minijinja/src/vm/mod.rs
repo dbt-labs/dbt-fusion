@@ -16,10 +16,11 @@ use crate::environment::Environment;
 use crate::error::{Error, ErrorKind};
 use crate::listener::RenderingEventListener;
 use crate::machinery::Span;
-use crate::output::{CaptureMode, MacroSpans, Output};
+use crate::output::{CaptureMode, Output};
 use crate::output_tracker::OutputTrackerLocation;
-use crate::utils::{untrusted_size_hint, AutoEscape, UndefinedBehavior};
+use crate::utils::{untrusted_size_hint, AutoEscape};
 use crate::value::mutable_vec::MutableVec;
+use crate::value::namespace_name::NamespaceName;
 use crate::value::namespace_object::Namespace;
 use crate::value::Object;
 use crate::value::{
@@ -33,6 +34,7 @@ use crate::vm::state::BlockStack;
 #[cfg(feature = "macros")]
 use crate::vm::closure_object::Closure;
 
+pub use crate::types::utils::CodeLocation;
 pub(crate) use crate::vm::context::{Context, Frame};
 pub use crate::vm::state::State;
 
@@ -41,10 +43,14 @@ mod closure_object;
 mod context;
 #[cfg(feature = "fuel")]
 mod fuel;
+pub mod listeners;
 mod loop_object;
 #[cfg(feature = "macros")]
 mod macro_object;
+mod mod_typecheck;
 mod state;
+pub mod typemeta;
+pub use mod_typecheck::find_macro_signatures;
 
 // the cost of a single include against the stack limit.
 #[cfg(feature = "multi_template")]
@@ -104,8 +110,7 @@ impl<'env> Vm<'env> {
         out: &mut Output,
         current_location: Rc<OutputTrackerLocation>,
         auto_escape: AutoEscape,
-        macro_spans: &mut MacroSpans,
-        listener: Rc<dyn RenderingEventListener>,
+        listeners: &[Rc<dyn RenderingEventListener>],
     ) -> Result<(Option<Value>, State<'template, 'env>), Error> {
         self.eval_with_outer_stack_depth(
             instructions,
@@ -114,8 +119,7 @@ impl<'env> Vm<'env> {
             out,
             current_location,
             auto_escape,
-            macro_spans,
-            listener,
+            listeners,
             0,
         )
     }
@@ -129,8 +133,7 @@ impl<'env> Vm<'env> {
         out: &mut Output,
         current_location: Rc<OutputTrackerLocation>,
         auto_escape: AutoEscape,
-        macro_spans: &mut MacroSpans,
-        listener: Rc<dyn RenderingEventListener>,
+        listeners: &[Rc<dyn RenderingEventListener>],
         outer_stack_depth: usize,
     ) -> Result<(Option<Value>, State<'template, 'env>), Error> {
         let _guard = value_optimization();
@@ -150,8 +153,16 @@ impl<'env> Vm<'env> {
             instructions,
             prepare_blocks(blocks),
         );
-        self.eval_state(&mut state, out, current_location, macro_spans, listener)
-            .map(|x| (x, state))
+        listeners.iter().for_each(|listener| {
+            listener.on_enter_func_body();
+        });
+        let result = self
+            .eval_state(&mut state, out, current_location, listeners)
+            .map(|x| (x, state));
+        listeners.iter().for_each(|listener| {
+            listener.on_exit_func_body();
+        });
+        result
     }
 
     /// Evaluate a macro in a state.
@@ -170,7 +181,7 @@ impl<'env> Vm<'env> {
         current_location: Rc<OutputTrackerLocation>,
         state: &State,
         args: Vec<Value>,
-        listener: Rc<dyn RenderingEventListener>,
+        listeners: &[Rc<dyn RenderingEventListener>],
     ) -> Result<Option<Value>, Error> {
         let mut ctx = Context::new_with_frame(
             Frame::new(context_base),
@@ -205,10 +216,9 @@ impl<'env> Vm<'env> {
             },
             out,
             current_location,
-            &mut MacroSpans::default(),
             Stack::from(args),
             pc,
-            listener,
+            listeners,
         )
     }
 
@@ -219,18 +229,9 @@ impl<'env> Vm<'env> {
         state: &mut State<'_, 'env>,
         out: &mut Output,
         current_location: Rc<OutputTrackerLocation>,
-        macro_spans: &mut MacroSpans,
-        listener: Rc<dyn RenderingEventListener>,
+        listeners: &[Rc<dyn RenderingEventListener>],
     ) -> Result<Option<Value>, Error> {
-        self.do_eval(
-            state,
-            out,
-            current_location,
-            macro_spans,
-            Stack::default(),
-            0,
-            listener,
-        )
+        self.do_eval(state, out, current_location, Stack::default(), 0, listeners)
     }
 
     /// Performs the actual evaluation, optionally with stack growth functionality.
@@ -240,36 +241,19 @@ impl<'env> Vm<'env> {
         state: &mut State<'_, 'env>,
         out: &mut Output,
         current_location: Rc<OutputTrackerLocation>,
-        macro_spans: &mut MacroSpans,
         stack: Stack,
         pc: usize,
-        listener: Rc<dyn RenderingEventListener>,
+        listeners: &[Rc<dyn RenderingEventListener>],
     ) -> Result<Option<Value>, Error> {
         #[cfg(feature = "stacker")]
         {
             stacker::maybe_grow(32 * 1024, 1024 * 1024, || {
-                self.eval_impl(
-                    state,
-                    out,
-                    current_location,
-                    macro_spans,
-                    stack,
-                    pc,
-                    listener,
-                )
+                self.eval_impl(state, out, current_location, stack, pc, listeners)
             })
         }
         #[cfg(not(feature = "stacker"))]
         {
-            self.eval_impl(
-                state,
-                out,
-                current_location,
-                macro_spans,
-                stack,
-                pc,
-                listener,
-            )
+            self.eval_impl(state, out, current_location, stack, pc, listeners)
         }
     }
 
@@ -280,10 +264,9 @@ impl<'env> Vm<'env> {
         state: &mut State<'_, 'env>,
         out: &mut Output,
         current_location: Rc<OutputTrackerLocation>,
-        macro_spans: &mut MacroSpans,
         mut stack: Stack,
         mut pc: usize,
-        listener: Rc<dyn RenderingEventListener>,
+        listeners: &[Rc<dyn RenderingEventListener>],
     ) -> Result<Option<Value>, Error> {
         let initial_auto_escape = state.auto_escape;
         let undefined_behavior = state.undefined_behavior();
@@ -291,8 +274,6 @@ impl<'env> Vm<'env> {
         let mut next_loop_recursion_jump = None;
         let mut loaded_filters = [None; MAX_LOCALS];
         let mut loaded_tests = [None; MAX_LOCALS];
-        let mut macro_start_stack = vec![];
-        let mut call_start_stack = vec![];
 
         // If we are extending we are holding the instructions of the target parent
         // template here.  This is used to detect multiple extends and the evaluation
@@ -362,7 +343,7 @@ impl<'env> Vm<'env> {
                     stack.push(match ops::$method(&a, &b) {
                         Ok(rv) => rv,
                         Err(e) if e.kind() == ErrorKind::InvalidOperation => {
-                            match a.call_method(state, $obj_method, &[b], listener.clone()) {
+                            match a.call_method(state, $obj_method, &[b], listeners) {
                                 Ok(rv) => rv,
                                 Err(e2) if matches!(e2.kind(), ErrorKind::UnknownMethod(_, _)) => {
                                     bail!(e)
@@ -432,25 +413,23 @@ impl<'env> Vm<'env> {
                 Instruction::Emit => {
                     ctx_ok!(self.env.format(&stack.pop(), state, out));
                 }
-                Instruction::StoreLocal(name) => {
+                Instruction::StoreLocal(name, _) => {
                     state.ctx.store(name, stack.pop());
                 }
-                Instruction::Lookup(name) => {
-                    // TODO: it is possible that a variable name conflict with the template name
-                    // look up if it is a package name first
-                    if namespace_registry.contains_key(&Value::from(name as &str)) {
-                        stack.push(Value::from(name.to_string()));
-                    // check if it is a regular variable in state first
-                    // Somehow a macro try to set all varibale it uses to undefined
-                    } else if state.lookup(name).is_some()
+                Instruction::Lookup(name, _) => {
+                    if state.lookup(name).is_some()
                         && !state
                             .lookup(name)
                             .expect("we just checked that it is some")
                             .is_undefined()
                     {
                         stack.push(state.lookup(name).expect("we just checked that it is some"));
+                    } else if namespace_registry.contains_key(&Value::from(name as &str)) {
+                        stack.push(Value::from_object(NamespaceName::new(name)));
+                    // check if it is a regular variable in state first
+                    // Somehow a macro try to set all varibale it uses to undefined
                     } else if let Some(template_name) =
-                        macro_namespace_template_resolver(state, name, &mut Vec::new())
+                        macro_namespace_template_resolver(state, name, &mut Vec::new(), listeners)
                     {
                         if let Some((pkg, macro_name)) = template_name.split_once('.') {
                             stack.push(Value::from_object(DispatchObject {
@@ -458,7 +437,7 @@ impl<'env> Vm<'env> {
                                 package_name: Some(pkg.to_string()),
                                 strict: true,
                                 auto_execute: false,
-                                context: state.get_base_context(),
+                                context: Some(state.get_base_context()),
                             }));
                         }
                     // check if it is a regular variable in the state
@@ -466,7 +445,7 @@ impl<'env> Vm<'env> {
                         stack.push(Value::UNDEFINED);
                     }
                 }
-                Instruction::GetAttr(name) => {
+                Instruction::GetAttr(name, _span) => {
                     a = stack.pop();
                     // This is a common enough operation that it's interesting to consider a fast
                     // path here.  This is slightly faster than the regular attr lookup because we
@@ -476,22 +455,28 @@ impl<'env> Vm<'env> {
                     stack.push(match a.get_attr_fast(name) {
                         Some(value) => assert_valid!(value),
                         None => {
-                            // a could be a package name, we need to check if there's a macro in the namespace
-                            if namespace_registry.contains_key(&a)
-                                && namespace_registry
-                                    .get(&a)
+                            if let Some(namespace) = a.downcast_object_ref::<NamespaceName>() {
+                                let ns_name = Value::from(namespace.get_name());
+                                // a could be a package name, we need to check if there's a macro in the namespace
+                                if namespace_registry
+                                    .get(&ns_name)
                                     .unwrap_or(&Value::from_serialize(Vec::<Value>::new()))
                                     .downcast_object::<MutableVec<Value>>()
                                     .unwrap_or_default()
                                     .contains(&Value::from(name as &str))
-                            {
-                                Value::from_object(DispatchObject {
-                                    macro_name: name.to_string(),
-                                    package_name: Some(a.to_string()),
-                                    strict: true,
-                                    auto_execute: false,
-                                    context: state.get_base_context(),
-                                })
+                                {
+                                    Value::from_object(DispatchObject {
+                                        macro_name: name.to_string(),
+                                        package_name: Some(namespace.get_name().to_string()),
+                                        strict: true,
+                                        auto_execute: false,
+                                        context: Some(state.get_base_context()),
+                                    })
+                                } else {
+                                    ctx_ok!(
+                                        undefined_behavior.handle_undefined(Some(a.is_undefined()))
+                                    )
+                                }
                             } else {
                                 ctx_ok!(undefined_behavior.handle_undefined(Some(a.is_undefined())))
                             }
@@ -510,7 +495,7 @@ impl<'env> Vm<'env> {
                         ));
                     }
                 }
-                Instruction::GetItem => {
+                Instruction::GetItem(_) => {
                     a = stack.pop();
                     b = stack.pop();
                     stack.push(match b.get_item_opt(&a) {
@@ -520,14 +505,11 @@ impl<'env> Vm<'env> {
                         }
                     });
                 }
-                Instruction::Slice => {
+                Instruction::Slice(_span) => {
                     let step = stack.pop();
                     let stop = stack.pop();
                     b = stack.pop();
                     a = stack.pop();
-                    if a.is_undefined() && matches!(undefined_behavior, UndefinedBehavior::Strict) {
-                        bail!(Error::from(ErrorKind::UndefinedError));
-                    }
                     stack.push(ctx_ok!(ops::slice(a, b, stop, step)));
                 }
                 Instruction::LoadConst(value) => {
@@ -583,7 +565,7 @@ impl<'env> Vm<'env> {
                     }
                     stack.push(Kwargs::wrap(rv));
                 }
-                Instruction::BuildList(n) => {
+                Instruction::BuildList(n, _span) => {
                     let count = n.unwrap_or_else(|| stack.pop().try_into().unwrap());
                     let mut v = Vec::with_capacity(untrusted_size_hint(count));
                     for _ in 0..count {
@@ -593,7 +575,7 @@ impl<'env> Vm<'env> {
                     let v = mutable_vec::MutableVec::from(v);
                     stack.push(Value::from_object(v))
                 }
-                Instruction::BuildTuple(count) => {
+                Instruction::BuildTuple(count, _span) => {
                     let count = count.unwrap_or_else(|| stack.pop().try_into().unwrap());
                     let mut v = Vec::with_capacity(untrusted_size_hint(count));
                     for _ in 0..count {
@@ -602,7 +584,7 @@ impl<'env> Vm<'env> {
                     v.reverse();
                     stack.push(Value::from_object(v))
                 }
-                Instruction::UnpackList(count) => {
+                Instruction::UnpackList(count, _span) => {
                     ctx_ok!(self.unpack_list(&mut stack, *count));
                 }
                 Instruction::UnpackLists(count) => {
@@ -619,29 +601,29 @@ impl<'env> Vm<'env> {
                     }
                     stack.push(Value::from(len));
                 }
-                Instruction::Add => func_binop!(add, "__add__"),
-                Instruction::Sub => func_binop!(sub, "__sub__"),
-                Instruction::Mul => func_binop!(mul, "__mul__"),
-                Instruction::Div => func_binop!(div, "__truediv__"),
-                Instruction::IntDiv => func_binop!(int_div, "__floordiv__"),
-                Instruction::Rem => func_binop!(rem, "__mod__"),
-                Instruction::Pow => func_binop!(pow, "__pow__"),
-                Instruction::Eq => op_binop!(==),
-                Instruction::Ne => op_binop!(!=),
-                Instruction::Gt => op_binop!(>),
-                Instruction::Gte => op_binop!(>=),
-                Instruction::Lt => op_binop!(<),
-                Instruction::Lte => op_binop!(<=),
-                Instruction::Not => {
+                Instruction::Add(_) => func_binop!(add, "__add__"),
+                Instruction::Sub(_) => func_binop!(sub, "__sub__"),
+                Instruction::Mul(_) => func_binop!(mul, "__mul__"),
+                Instruction::Div(_) => func_binop!(div, "__truediv__"),
+                Instruction::IntDiv(_) => func_binop!(int_div, "__floordiv__"),
+                Instruction::Rem(_) => func_binop!(rem, "__mod__"),
+                Instruction::Pow(_) => func_binop!(pow, "__pow__"),
+                Instruction::Eq(_) => op_binop!(==),
+                Instruction::Ne(_) => op_binop!(!=),
+                Instruction::Gt(_) => op_binop!(>),
+                Instruction::Gte(_) => op_binop!(>=),
+                Instruction::Lt(_) => op_binop!(<),
+                Instruction::Lte(_) => op_binop!(<=),
+                Instruction::Not(_) => {
                     a = stack.pop();
                     stack.push(Value::from(!a.is_true()));
                 }
-                Instruction::StringConcat => {
+                Instruction::StringConcat(_) => {
                     a = stack.pop();
                     b = stack.pop();
                     stack.push(ops::string_concat(b, &a));
                 }
-                Instruction::In => {
+                Instruction::In(_) => {
                     a = stack.pop();
                     b = stack.pop();
                     // the in-operator can fail if the value is undefined and
@@ -649,7 +631,7 @@ impl<'env> Vm<'env> {
                     ctx_ok!(state.undefined_behavior().assert_iterable(&a));
                     stack.push(ctx_ok!(ops::contains(&a, &b)));
                 }
-                Instruction::Neg => {
+                Instruction::Neg(_) => {
                     a = stack.pop();
                     stack.push(ctx_ok!(ops::neg(&a)));
                 }
@@ -673,7 +655,7 @@ impl<'env> Vm<'env> {
                     a = stack.pop();
                     stack.push(Value::from(a.is_undefined()));
                 }
-                Instruction::PushLoop(flags) => {
+                Instruction::PushLoop(flags, _) => {
                     a = stack.pop();
                     ctx_ok!(self.push_loop(state, a, *flags, pc, next_loop_recursion_jump.take()));
                 }
@@ -718,7 +700,7 @@ impl<'env> Vm<'env> {
                         continue;
                     }
                 }
-                Instruction::JumpIfFalseOrPop(jump_target) => {
+                Instruction::JumpIfFalseOrPop(jump_target, _) => {
                     if !ctx_ok!(undefined_behavior.is_true(stack.peek())) {
                         pc = *jump_target;
                         continue;
@@ -726,7 +708,7 @@ impl<'env> Vm<'env> {
                         stack.pop();
                     }
                 }
-                Instruction::JumpIfTrueOrPop(jump_target) => {
+                Instruction::JumpIfTrueOrPop(jump_target, _) => {
                     if ctx_ok!(undefined_behavior.is_true(stack.peek())) {
                         pc = *jump_target;
                         continue;
@@ -737,17 +719,10 @@ impl<'env> Vm<'env> {
                 #[cfg(feature = "multi_template")]
                 Instruction::CallBlock(name) => {
                     if parent_instructions.is_none() && !out.is_discarding() {
-                        self.call_block(
-                            name,
-                            state,
-                            out,
-                            current_location.clone(),
-                            macro_spans,
-                            listener.clone(),
-                        )?;
+                        self.call_block(name, state, out, current_location.clone(), listeners)?;
                     }
                 }
-                Instruction::PushAutoEscape => {
+                Instruction::PushAutoEscape(_) => {
                     a = stack.pop();
                     auto_escape_stack.push(state.auto_escape);
                     state.auto_escape = ctx_ok!(self.derive_auto_escape(a, initial_auto_escape));
@@ -761,7 +736,7 @@ impl<'env> Vm<'env> {
                 Instruction::EndCapture => {
                     stack.push(out.end_capture(state.auto_escape));
                 }
-                Instruction::ApplyFilter(name, arg_count, local_id) => {
+                Instruction::ApplyFilter(name, arg_count, local_id, _span) => {
                     let filter =
                         ctx_ok!(get_or_lookup_local(&mut loaded_filters, *local_id, || {
                             state.env.get_filter(name)
@@ -791,10 +766,10 @@ impl<'env> Vm<'env> {
                     stack.drop_top(arg_count);
                     stack.push(Value::from(rv));
                 }
-                Instruction::CallFunction(name, arg_count) => {
+                Instruction::CallFunction(name, arg_count, this_span) => {
                     let path_and_span_and_deltaline = if let Some((Some(path), Some(span))) =
                         template_registry
-                            .get(&Value::from(&format!("{}.{}", root_package_name, name)))
+                            .get(&Value::from(&format!("{root_package_name}.{name}")))
                             .map(|value| (value.get_attr_fast("path"), value.get_attr_fast("span")))
                     {
                         let path = deserialize_path(&path);
@@ -818,7 +793,18 @@ impl<'env> Vm<'env> {
                             .file_stack
                             .push((path.clone(), *span, *delta_line));
                     }
-                    listener.on_reference(name);
+                    listeners.iter().for_each(|listener| {
+                        if *name == "return" {
+                            listener.on_return(
+                                state.ctx.file_stack.last().map(|x| x.0.as_path()),
+                                &current_location.line(),
+                                &current_location.col(),
+                                &current_location.index(),
+                            );
+                        } else {
+                            listener.on_reference(name);
+                        }
+                    });
                     let args = stack.get_call_args(*arg_count);
                     // super is a special function reserved for super-ing into blocks.
                     let rv = if *name == "super" {
@@ -832,9 +818,8 @@ impl<'env> Vm<'env> {
                             state,
                             out,
                             current_location.clone(),
-                            macro_spans,
                             true,
-                            listener.clone()
+                            listeners
                         ))
                     // loop is a special name which when called recurses the current loop.
                     } else if *name == "loop" {
@@ -849,34 +834,45 @@ impl<'env> Vm<'env> {
                         recurse_loop!(true);
                     } else if (*name == "ref" || *name == "source") && {
                         // we only consider the ref source override in root package
-                        let template_result = self.env.get_template(name).or_else(|_| {
-                            self.env
-                                .get_template(&format!("{}.{}", root_package_name, *name))
-                        });
+                        let template_result =
+                            self.env.get_template(name, listeners).or_else(|_| {
+                                self.env.get_template(
+                                    &format!("{}.{}", root_package_name, *name),
+                                    listeners,
+                                )
+                            });
                         template_result.is_ok()
                     } {
                         let template = self
                             .env
-                            .get_template(name)
+                            .get_template(name, listeners)
                             .or_else(|_| {
-                                self.env
-                                    .get_template(&format!("{}.{}", root_package_name, *name))
+                                self.env.get_template(
+                                    &format!("{}.{}", root_package_name, *name),
+                                    listeners,
+                                )
                             })
                             .unwrap();
                         let inner_state: State<'_, '_> = template
                             .eval_to_state_with_outer_stack_depth(
                                 state.get_base_context(),
-                                listener.clone(),
+                                listeners,
                                 state.ctx.depth() + INCLUDE_RECURSION_COST,
                             )?;
                         let func = inner_state.lookup(name).unwrap();
-                        let rv = match func.call(&inner_state, args, listener.clone()) {
+                        listeners.iter().for_each(|listener| {
+                            listener.on_enter_func_body();
+                        });
+                        let rv = match func.call(&inner_state, args, listeners) {
                             Ok(rv) => rv,
                             Err(err) => match err.try_abrupt_return() {
                                 Some(rv) => rv.clone(),
                                 None => bail!(err),
                             },
                         };
+                        listeners.iter().for_each(|listener| {
+                            listener.on_exit_func_body();
+                        });
                         rv
                     } else if let Some(func) =
                         state.lookup(name).filter(|func| !func.is_undefined())
@@ -888,7 +884,11 @@ impl<'env> Vm<'env> {
 
                         let args: Vec<Value> =
                             if function_name == "ref" || function_name == "source" {
-                                let start: &(u32, u32, u32) = call_start_stack.last().unwrap();
+                                let start: (u32, u32, u32) = (
+                                    this_span.start_line,
+                                    this_span.start_col,
+                                    this_span.start_offset,
+                                );
                                 let mut location_arg = value_map_with_capacity(1);
                                 location_arg
                                     .insert(Value::from("location"), Value::from_serialize(start));
@@ -898,11 +898,17 @@ impl<'env> Vm<'env> {
                                 args.to_vec()
                             };
 
-                        let rv = match func.call(state, &args, listener.clone()) {
+                        if *name != "return" {
+                            listeners.iter().for_each(|listener| {
+                                listener.on_enter_func_body();
+                            });
+                        }
+
+                        let rv = match func.call(state, &args, listeners) {
                             Ok(rv) => {
                                 // return implements  https://docs.getdbt.com/reference/dbt-jinja-functions/return
                                 if *name == "return" {
-                                    return Err(Error::abrupt_return(rv));
+                                    return Err(Error::abrupt_return(rv, *this_span));
                                 } else {
                                     rv
                                 }
@@ -912,16 +918,21 @@ impl<'env> Vm<'env> {
                                 None => bail!(err),
                             },
                         };
+                        if *name != "return" {
+                            listeners.iter().for_each(|listener| {
+                                listener.on_exit_func_body();
+                            });
+                        }
                         rv
                     // Resolve the template using the dbt macro namespace resolution logic
                     } else if let Some(template_name) =
-                        macro_namespace_template_resolver(state, name, &mut Vec::new())
+                        macro_namespace_template_resolver(state, name, &mut Vec::new(), listeners)
                     {
                         // The template was found, now get and execute it
-                        let template = self.env.get_template(&template_name)?;
+                        let template = self.env.get_template(&template_name, listeners)?;
                         let mut new_state = template.eval_to_state_with_outer_stack_depth(
                             state.get_base_context(),
-                            listener.clone(),
+                            listeners,
                             state.ctx.depth() + MACRO_RECURSION_COST,
                         )?;
                         let mut args = args.to_vec();
@@ -959,11 +970,14 @@ impl<'env> Vm<'env> {
 
                         // look up and evaluate the macro
                         let func = new_state.lookup(name).unwrap();
-                        let rv = match func.call(&new_state, &args, listener.clone()) {
+                        listeners.iter().for_each(|listener| {
+                            listener.on_enter_func_body();
+                        });
+                        let rv = match func.call(&new_state, &args, listeners) {
                             Ok(rv) => {
                                 // return implements  https://docs.getdbt.com/reference/dbt-jinja-functions/return
                                 if *name == "return" {
-                                    return Err(Error::abrupt_return(rv));
+                                    return Err(Error::abrupt_return(rv, *this_span));
                                 } else {
                                     rv
                                 }
@@ -973,12 +987,14 @@ impl<'env> Vm<'env> {
                                 None => bail!(err),
                             },
                         };
+                        listeners.iter().for_each(|listener| {
+                            listener.on_exit_func_body();
+                        });
                         rv
                     } else if *name == "render" {
                         let raw = args[0].as_str().unwrap_or_default();
-                        let template = state.env().template_from_str(raw)?;
-                        let (rendered_sql, _) =
-                            template.render(state.get_base_context(), listener.clone())?;
+                        let template = state.env().template_from_str(raw, listeners)?;
+                        let rendered_sql = template.render(state.get_base_context(), listeners)?;
                         Value::from(rendered_sql)
                     } else {
                         bail!(Error::new(
@@ -990,10 +1006,10 @@ impl<'env> Vm<'env> {
                     let rv = if (name == &"var" || name == &"env_var")
                         && rv.as_str().unwrap_or_default().contains("{{")
                     {
-                        let (rv, _) = self.env.render_str(
+                        let rv = self.env.render_str(
                             rv.as_str().unwrap(),
                             state.get_base_context(),
-                            Some(listener.clone()),
+                            listeners,
                         )?;
                         Value::from(rv)
                     } else {
@@ -1006,19 +1022,21 @@ impl<'env> Vm<'env> {
                         state.ctx.file_stack.pop();
                     }
                 }
-                Instruction::CallMethod(name, arg_count) => {
-                    listener.on_reference(name);
+                Instruction::CallMethod(name, arg_count, this_span) => {
+                    listeners
+                        .iter()
+                        .for_each(|listener| listener.on_reference(name));
                     let args = stack.get_call_args(*arg_count);
                     let arg_count = args.len();
 
-                    let a = if let Some(arg0) = args[0]
-                        .as_str()
-                        .filter(|arg0| namespace_registry.contains_key(&Value::from(*arg0)))
-                    {
+                    let a = if let Some(ns) = args[0].downcast_object_ref::<NamespaceName>() {
+                        let ns_name = ns.get_name();
                         let args = &args[1..];
                         // if not found, attempt to lookup the template and function using name stripped of test_
                         // see generate_test_macro in resolve_generic_tests.rs -> a subset of generated macro names are prefixed with test_
-                        let Ok(template) = self.env.get_template(&format!("{}.{}", arg0, name))
+                        let Ok(template) = self
+                            .env
+                            .get_template(&format!("{ns_name}.{name}"), listeners)
                         else {
                             bail!(Error::new(
                                 ErrorKind::UnknownFunction,
@@ -1028,7 +1046,7 @@ impl<'env> Vm<'env> {
 
                         let path_and_span_and_deltaline = if let Some((Some(path), Some(span))) =
                             template_registry
-                                .get(&Value::from(&format!("{}.{}", arg0, name)))
+                                .get(&Value::from(&format!("{ns_name}.{name}")))
                                 .map(|value| {
                                     (value.get_attr_fast("path"), value.get_attr_fast("span"))
                                 }) {
@@ -1054,16 +1072,19 @@ impl<'env> Vm<'env> {
                         }
                         let macro_state = template.eval_to_state_with_outer_stack_depth(
                             state.get_base_context(),
-                            listener.clone(),
+                            listeners,
                             state.ctx.depth() + MACRO_RECURSION_COST,
                         )?;
                         let func = macro_state.lookup(name).unwrap();
-                        let rv = match func.call(&macro_state, args, listener.clone()) {
+                        listeners.iter().for_each(|listener| {
+                            listener.on_enter_func_body();
+                        });
+                        let rv = match func.call(&macro_state, args, listeners) {
                             Ok(rv) => {
                                 // return implements  https://docs.getdbt.com/reference/dbt-jinja-functions/return
 
                                 if *name == "return" {
-                                    return Err(Error::abrupt_return(rv));
+                                    return Err(Error::abrupt_return(rv, *this_span));
                                 } else {
                                     rv
                                 }
@@ -1073,6 +1094,9 @@ impl<'env> Vm<'env> {
                                 None => bail!(err),
                             },
                         };
+                        listeners.iter().for_each(|listener| {
+                            listener.on_exit_func_body();
+                        });
                         if path_and_span_and_deltaline.is_some() {
                             state.ctx.file_stack.pop();
                         }
@@ -1083,7 +1107,11 @@ impl<'env> Vm<'env> {
                             .map(|x| x.to_string())
                             .unwrap_or(name.to_string());
                         let args_vals = if function_name == "ref" || function_name == "source" {
-                            let start: &(u32, u32, u32) = call_start_stack.last().unwrap();
+                            let start: (u32, u32, u32) = (
+                                this_span.start_line,
+                                this_span.start_col,
+                                this_span.start_offset,
+                            );
                             let mut location_arg = value_map_with_capacity(1);
                             location_arg
                                 .insert(Value::from("location"), Value::from_serialize(start));
@@ -1092,14 +1120,14 @@ impl<'env> Vm<'env> {
                         } else {
                             args[1..].to_vec()
                         };
-                        let res = args[0].call_method(state, name, &args_vals, listener.clone());
+                        let res = args[0].call_method(state, name, &args_vals, listeners);
                         match res {
                             Ok(rv) => match rv.downcast_object::<DispatchObject>() {
                                 // If we return DispatchObject from a
                                 // method call, we immediately forward
                                 // the call to the dispatch object.
                                 Some(obj) if obj.auto_execute => {
-                                    ctx_ok!(obj.call(state, &args[1..], listener.clone()))
+                                    ctx_ok!(obj.call(state, &args[1..], listeners))
                                 }
                                 _ => rv,
                             },
@@ -1109,10 +1137,10 @@ impl<'env> Vm<'env> {
                     stack.drop_top(arg_count);
                     stack.push(a);
                 }
-                Instruction::CallObject(arg_count) => {
+                Instruction::CallObject(arg_count, _span) => {
                     let args = stack.get_call_args(*arg_count);
                     let arg_count = args.len();
-                    a = ctx_ok!(args[0].call(state, &args[1..], listener.clone()));
+                    a = ctx_ok!(args[0].call(state, &args[1..], listeners));
                     stack.drop_top(arg_count);
                     stack.push(a);
                 }
@@ -1127,9 +1155,8 @@ impl<'env> Vm<'env> {
                         state,
                         out,
                         current_location.clone(),
-                        macro_spans,
                         false,
-                        listener.clone()
+                        listeners
                     ));
                 }
                 Instruction::FastRecurse => {
@@ -1159,7 +1186,7 @@ impl<'env> Vm<'env> {
                 // lets you put some imports there and for as long as you do not
                 // create name clashes this works fine.
                 #[cfg(feature = "multi_template")]
-                Instruction::LoadBlocks => {
+                Instruction::LoadBlocks(_) => {
                     a = stack.pop();
                     if parent_instructions.is_some() {
                         bail!(Error::new(
@@ -1167,7 +1194,7 @@ impl<'env> Vm<'env> {
                             "tried to extend a second time in a template"
                         ));
                     }
-                    parent_instructions = Some(ctx_ok!(self.load_blocks(a, state)));
+                    parent_instructions = Some(ctx_ok!(self.load_blocks(a, state, listeners)));
                     out.begin_capture(CaptureMode::Discard);
                 }
                 #[cfg(feature = "multi_template")]
@@ -1178,9 +1205,8 @@ impl<'env> Vm<'env> {
                         state,
                         out,
                         current_location.clone(),
-                        macro_spans,
                         *ignore_missing,
-                        listener.clone()
+                        listeners
                     ));
                 }
                 #[cfg(feature = "multi_template")]
@@ -1193,8 +1219,10 @@ impl<'env> Vm<'env> {
                     stack.push(Value::from_object(module));
                 }
                 #[cfg(feature = "macros")]
-                Instruction::BuildMacro(name, offset, flags) => {
-                    listener.on_definition(name);
+                Instruction::BuildMacro(name, offset, flags, _) => {
+                    listeners
+                        .iter()
+                        .for_each(|listener| listener.on_definition(name));
                     self.build_macro(&mut stack, state, *offset, name, *flags);
                 }
                 #[cfg(feature = "macros")]
@@ -1220,97 +1248,93 @@ impl<'env> Vm<'env> {
                             .map_or(Value::UNDEFINED, |x| Value::from_dyn_object(x.clone())),
                     );
                 }
-                Instruction::MacroStart(line, col, index) => {
+                Instruction::MacroStart(line, col, index, stop_line, stop_col, stop_offset) => {
                     if let Some((path, span, _)) = state.ctx.file_stack.last() {
-                        let line = span.start_line + *line;
+                        let line = span.start_line + *line - 1;
                         let col = *col
                             + if span.start_line == 1 {
-                                span.start_col
+                                span.start_col - 1
                             } else {
                                 0
                             };
                         let offset = *index + span.start_offset;
-                        listener.on_macro_start(Some(path), &line, &col, &offset);
+                        listeners.iter().for_each(|listener| {
+                            listener.on_macro_start(
+                                Some(path),
+                                &line,
+                                &col,
+                                &offset,
+                                &current_location.line(),
+                                &current_location.col(),
+                                &current_location.index(),
+                                stop_line,
+                                stop_col,
+                                stop_offset,
+                            )
+                        });
                     } else {
-                        listener.on_macro_start(None, line, col, index);
+                        listeners.iter().for_each(|listener| {
+                            listener.on_macro_start(
+                                None,
+                                line,
+                                col,
+                                index,
+                                &current_location.line(),
+                                &current_location.col(),
+                                &current_location.index(),
+                                stop_line,
+                                stop_col,
+                                stop_offset,
+                            )
+                        });
                     }
-
-                    macro_start_stack.push((
-                        *line,
-                        *col,
-                        *index,
-                        current_location.line(),
-                        current_location.col(),
-                        current_location.index(),
-                    ));
                 }
                 Instruction::MacroStop(line, col, index) => {
                     if let Some((path, span, _)) = state.ctx.file_stack.last() {
-                        let line = span.start_line + *line;
+                        let line = span.start_line + *line - 1;
                         let col = *col
                             + if span.start_line == 1 {
-                                span.start_col
+                                span.start_col - 1
                             } else {
                                 0
                             };
                         let offset = *index + span.start_offset;
-                        listener.on_macro_stop(Some(path), &line, &col, &offset);
+                        listeners.iter().for_each(|listener| {
+                            listener.on_macro_stop(
+                                Some(path),
+                                &line,
+                                &col,
+                                &offset,
+                                &current_location.line(),
+                                &current_location.col(),
+                                &current_location.index(),
+                            )
+                        });
                     } else {
-                        listener.on_macro_stop(None, line, col, index);
-                    }
-                    let (
-                        source_line,
-                        source_col,
-                        source_index,
-                        expanded_line,
-                        expanded_col,
-                        expanded_index,
-                    ) = macro_start_stack.pop().unwrap();
-                    if macro_start_stack.is_empty() {
-                        macro_spans.push(
-                            Span {
-                                start_line: source_line.to_owned(),
-                                start_col: source_col.to_owned(),
-                                start_offset: source_index.to_owned(),
-                                end_line: line.to_owned(),
-                                end_col: col.to_owned(),
-                                end_offset: index.to_owned(),
-                            },
-                            Span {
-                                start_line: expanded_line,
-                                start_col: expanded_col,
-                                start_offset: expanded_index,
-                                end_line: current_location.line(),
-                                end_col: current_location.col(),
-                                end_offset: current_location.index(),
-                            },
-                        );
+                        listeners.iter().for_each(|listener| {
+                            listener.on_macro_stop(
+                                None,
+                                line,
+                                col,
+                                index,
+                                &current_location.line(),
+                                &current_location.col(),
+                                &current_location.index(),
+                            )
+                        });
                     }
                 }
-                Instruction::ModelReference(
-                    name,
-                    start_line,
-                    start_col,
-                    start_offset,
-                    end_line,
-                    end_col,
-                    end_offset,
-                ) => {
-                    listener.on_model_reference(
-                        name,
-                        start_line,
-                        start_col,
-                        start_offset,
-                        end_line,
-                        end_col,
-                        end_offset,
-                    );
+                Instruction::MacroName(_, _) => {
+                    // no-op, we don't need to do anything here
                 }
-                Instruction::CallStart(start_line, start_col, start_offset) => {
-                    call_start_stack.push((*start_line, *start_col, *start_offset));
+                Instruction::TypeConstraint(_type_constraint, _is_true) => {
+                    // no-op, we don't need to do anything here
                 }
-                Instruction::CallStop(_, _, _) => {
-                    call_start_stack.pop();
+                Instruction::LoadType(_type) => {
+                    // no-op, we don't need to do anything here
+                }
+                Instruction::UnionType => {
+                    // no-op, we don't need to do anything here
                 }
             }
             pc += 1;
@@ -1327,9 +1351,8 @@ impl<'env> Vm<'env> {
         state: &mut State<'_, 'env>,
         out: &mut Output,
         current_location: Rc<OutputTrackerLocation>,
-        macro_spans: &mut MacroSpans,
         ignore_missing: bool,
-        listener: Rc<dyn RenderingEventListener>,
+        listeners: &[Rc<dyn RenderingEventListener>],
     ) -> Result<(), Error> {
         let obj = name.as_object();
         let choices = obj
@@ -1347,7 +1370,7 @@ impl<'env> Vm<'env> {
                     "template name was not a string",
                 )
             }));
-            let tmpl = match state.get_template(name) {
+            let tmpl = match state.get_template(name, listeners) {
                 Ok(tmpl) => tmpl,
                 Err(err) => {
                     if err.kind() == ErrorKind::TemplateNotFound {
@@ -1372,7 +1395,7 @@ impl<'env> Vm<'env> {
             #[cfg(feature = "macros")]
             {
                 let old_closure = state.ctx.take_closure();
-                rv = self.eval_state(state, out, current_location, macro_spans, listener);
+                rv = self.eval_state(state, out, current_location, listeners);
                 state.ctx.reset_closure(old_closure);
             }
             #[cfg(not(feature = "macros"))]
@@ -1418,9 +1441,8 @@ impl<'env> Vm<'env> {
         state: &mut State<'_, 'env>,
         out: &mut Output,
         current_location: Rc<OutputTrackerLocation>,
-        macro_spans: &mut MacroSpans,
         capture: bool,
-        listener: Rc<dyn RenderingEventListener>,
+        listeners: &[Rc<dyn RenderingEventListener>],
     ) -> Result<Value, Error> {
         let name = ok!(state.current_block.ok_or_else(|| {
             Error::new(ErrorKind::InvalidOperation, "cannot super outside of block")
@@ -1440,7 +1462,7 @@ impl<'env> Vm<'env> {
 
         let old_instructions = mem::replace(&mut state.instructions, block_stack.instructions());
         ok!(state.ctx.push_frame(Frame::default()));
-        let rv = self.eval_state(state, out, current_location, macro_spans, listener);
+        let rv = self.eval_state(state, out, current_location, listeners);
         state.ctx.pop_frame();
         state.instructions = old_instructions;
         state.blocks.get_mut(name).unwrap().pop();
@@ -1478,6 +1500,7 @@ impl<'env> Vm<'env> {
         &self,
         name: Value,
         state: &mut State<'_, 'env>,
+        listeners: &[Rc<dyn RenderingEventListener>],
     ) -> Result<&'env Instructions<'env>, Error> {
         let name = match name.as_str() {
             Some(name) => name,
@@ -1494,7 +1517,7 @@ impl<'env> Vm<'env> {
                 format!("cycle in template inheritance. {name:?} was referenced more than once"),
             ));
         }
-        let tmpl = ok!(state.get_template(name));
+        let tmpl = ok!(state.get_template(name, listeners));
         let (new_instructions, new_blocks) = ok!(tmpl.instructions_and_blocks());
         state.loaded_templates.insert(new_instructions.name());
         for (name, instr) in new_blocks.iter() {
@@ -1514,15 +1537,14 @@ impl<'env> Vm<'env> {
         state: &mut State<'_, 'env>,
         out: &mut Output,
         current_location: Rc<OutputTrackerLocation>,
-        macro_spans: &mut MacroSpans,
-        listener: Rc<dyn RenderingEventListener>,
+        listeners: &[Rc<dyn RenderingEventListener>],
     ) -> Result<Option<Value>, Error> {
         if let Some((name, block_stack)) = state.blocks.get_key_value(name) {
-            let old_block = mem::replace(&mut state.current_block, Some(name));
+            let old_block = state.current_block.replace(name);
             let old_instructions =
                 mem::replace(&mut state.instructions, block_stack.instructions());
             state.ctx.push_frame(Frame::default())?;
-            let rv = self.eval_state(state, out, current_location, macro_spans, listener);
+            let rv = self.eval_state(state, out, current_location, listeners);
             state.ctx.pop_frame();
             state.instructions = old_instructions;
             state.current_block = old_block;
@@ -1530,7 +1552,7 @@ impl<'env> Vm<'env> {
         } else {
             Err(Error::new(
                 ErrorKind::UnknownBlock,
-                format!("block '{}' not found", name),
+                format!("block '{name}' not found"),
             ))
         }
     }
@@ -1620,7 +1642,7 @@ impl<'env> Vm<'env> {
         } else {
             Err(Error::new(
                 ErrorKind::CannotUnpack,
-                format!("sequence of wrong length (expected {}, got {})", count, n,),
+                format!("sequence of wrong length (expected {count}, got {n})",),
             ))
         }
     }
@@ -1680,9 +1702,9 @@ fn process_err(err: &mut Error, pc: usize, state: &State) {
         };
         err.insert_filename_and_span(prev_filename, prev_span.with_delta(delta_line as i32, 0, 0));
     } else if let Some(span) = state.instructions.get_span(pc) {
-        err.insert_filename_and_span(state.instructions.name(), span);
+        err.insert_filename_and_span(&state.instructions.filename(), span);
     } else if let Some(line) = state.instructions.get_line(pc) {
-        err.insert_filename_and_line(state.instructions.name(), line);
+        err.insert_filename_and_line(&state.instructions.filename(), line);
     }
 
     // only attach debug info if we don't have one yet and we are in debug mode.

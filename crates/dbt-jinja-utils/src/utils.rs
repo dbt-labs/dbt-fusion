@@ -1,26 +1,23 @@
-use dbt_common::stdfs;
-use dbt_common::{constants::DBT_CTE_PREFIX, error::MacroSpan, tokiofs, FsResult};
+use dbt_common::{ErrorCode, FsError, fs_err, stdfs};
+use dbt_common::{FsResult, constants::DBT_CTE_PREFIX, error::MacroSpan, tokiofs};
 use dbt_frontend_common::{error::CodeLocation, span::Span};
-use dbt_fusion_adapter::adapters::utils::create_relation;
-use dbt_fusion_adapter::adapters::AdapterTyping;
+use dbt_fusion_adapter::relation_object::create_relation_internal;
+use dbt_fusion_adapter::{AdapterTyping, ParseAdapter};
 use dbt_schemas::schemas::common::ResolvedQuoting;
-use dbt_schemas::schemas::manifest::{
-    DbtModel, DbtSeed, DbtSnapshot, DbtTest, DbtUnitTest, InternalDbtNode,
-};
+use dbt_schemas::schemas::{DbtModel, DbtSeed, DbtSnapshot, DbtTest, DbtUnitTest, InternalDbtNode};
 use minijinja::arg_utils::ArgParser;
-use minijinja::{functions::debug, value::Rest, Error, ErrorKind, MacroSpans, State, Value};
+use minijinja::{Error, ErrorKind, MacroSpans, State, Value, functions::debug, value::Rest};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::rc::Rc;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
     sync::Mutex,
 };
 
-use crate::{jinja_environment::JinjaEnvironment, listener::ListenerFactory};
+use crate::{jinja_environment::JinjaEnv, listener::ListenerFactory};
 
 /// The prefix for environment variables that contain secrets
 pub const SECRET_ENV_VAR_PREFIX: &str = "DBT_ENV_SECRET";
@@ -148,11 +145,11 @@ pub async fn inject_and_persist_ephemeral_models(
     if !sql.contains(DBT_CTE_PREFIX) {
         // Write the ephemeral model to the ephemeral directory
         if is_current_model_ephemeral {
-            let ephemeral_path = ephemeral_dir.join(format!("{}.sql", model_name));
+            let ephemeral_path = ephemeral_dir.join(format!("{model_name}.sql"));
             tokiofs::create_dir_all(ephemeral_path.parent().unwrap()).await?;
             tokiofs::write(
                 ephemeral_path,
-                format!("{}{} as (\n{}\n)", DBT_CTE_PREFIX, model_name, sql),
+                format!("{DBT_CTE_PREFIX}{model_name} as (\n{sql}\n)"),
             )
             .await?;
         }
@@ -197,108 +194,49 @@ pub async fn inject_and_persist_ephemeral_models(
     // Write all CTEs up to this point for this model for next use.
     // this avoid graph walk for ephemeral models
     if is_current_model_ephemeral {
-        let ephemeral_path = ephemeral_dir.join(format!("{}.sql", model_name));
+        let ephemeral_path = ephemeral_dir.join(format!("{model_name}.sql"));
         tokiofs::create_dir_all(ephemeral_path.parent().unwrap()).await?;
-        let cte_line = format!("{}{} as (\n{}\n)", DBT_CTE_PREFIX, model_name, final_sql);
+        let cte_line = format!("{DBT_CTE_PREFIX}{model_name} as (\n{final_sql}\n)");
         all_ctes.push(cte_line.clone());
         tokiofs::write(ephemeral_path, &all_ctes.join(sep)).await?;
         all_ctes.pop();
     }
 
-    // Find first non-whitespace/comment content
-    let sql_lower = final_sql.to_lowercase();
-    let mut content_start = 0;
-    let mut in_comment = false;
-    let mut in_multiline = false;
-    let mut chars = sql_lower.chars().enumerate().peekable();
-    while let Some((i, c)) = chars.next() {
-        if in_multiline {
-            if c == '*' && chars.next_if(|(_, c)| *c == '/').is_some() {
-                in_multiline = false;
-            }
-            continue;
-        }
-        if in_comment {
-            if c == '\n' {
-                in_comment = false;
-            }
-            continue;
-        }
-        if c == '/' {
-            if let Some((_, _)) = chars.next_if(|(_, c)| *c == '/') {
-                in_comment = true;
-                continue;
-            }
-            if let Some((_, _)) = chars.next_if(|(_, c)| *c == '*') {
-                in_multiline = true;
-                continue;
-            }
-        }
-        if !c.is_whitespace() {
-            content_start = i;
-            break;
-        }
-    }
-
-    // Check if SQL already has a WITH statement
-    let with_prefix = "with";
-    let mut insert_pos = content_start;
-    let has_with = sql_lower[content_start..].starts_with(with_prefix);
-
-    // handle recursive CTEs
-    if has_with {
-        insert_pos += with_prefix.len();
-        let after_with = &sql_lower[insert_pos..];
-        let has_recursive = after_with.trim_start().starts_with("recursive");
-        if has_recursive {
-            insert_pos += "recursive".len();
-        }
-    }
+    // Wrap the current SQL in a subquery and prepend CTEs
     let ctes = all_ctes.join(", ");
-    if has_with {
-        // SQL already has WITH - insert CTEs after WITH keyword
-        final_sql.insert_str(insert_pos, &format!(" {}, ", ctes));
-    } else {
-        // No WITH - add one at start with the CTEs
-        final_sql.insert_str(0, &format!("with {} ", ctes));
-    }
-    // Shift expanded macro spans down by number of added lines
-    let added_lines = ctes.lines().count();
+    final_sql = format!("with {ctes}\n\nselect * from (\n{final_sql}\n)");
+    // Shift expanded macro spans down by number of added lines and added offet
+    // for the "with ... select * from (" line, and the CTEs
+    let added_lines = ctes.lines().count() + 2;
+    let added_offset = ctes.len() + 23;
     for span in macro_spans.items.iter_mut() {
         span.1.start_line += added_lines as u32;
         span.1.end_line += added_lines as u32;
+        span.1.start_offset += added_offset as u32;
+        span.1.end_offset += added_offset as u32;
     }
     Ok(final_sql)
 }
 
 /// Renders SQL with Jinja macros
 #[allow(clippy::too_many_arguments)]
-pub fn render_sql<'a, E>(
+pub fn render_sql(
     sql: &str,
-    env: E,
-    ctx: BTreeMap<String, Value>,
-    listener_factory: Option<&dyn ListenerFactory>,
+    env: &JinjaEnv,
+    ctx: &BTreeMap<String, Value>,
+    listener_factory: &dyn ListenerFactory,
     filename: &Path,
-) -> Result<(String, MacroSpans), Error>
-where
-    E: AsRef<JinjaEnvironment<'a>>,
-{
-    let result = if let Some(listener_factory) = &listener_factory {
-        let listener = listener_factory.create_listener(filename);
-        let result = env.as_ref().render_named_str(
-            filename.to_str().unwrap(),
-            sql,
-            ctx,
-            Some(listener.to_owned()),
-        );
+) -> FsResult<String> {
+    let listeners = listener_factory.create_listeners(filename, &CodeLocation::start_of_file());
+    let result = env
+        .as_ref()
+        .render_named_str(filename.to_str().unwrap(), sql, ctx, &listeners)
+        .map_err(|e| FsError::from_jinja_err(e, "Failed to render SQL"))?;
+    for listener in listeners {
         listener_factory.destroy_listener(filename, listener);
-        result
-    } else {
-        env.as_ref()
-            .render_named_str(filename.to_str().unwrap(), sql, ctx, None)
-    };
+    }
 
-    result
+    Ok(result)
 }
 
 /// Converts a MacroSpans object to a vector of MacroSpan objects
@@ -352,42 +290,24 @@ pub fn get_method(args: &[Value], map: &BTreeMap<String, Value>) -> Result<Value
 
 /// Generate a component name using the specified macro
 pub fn generate_component_name(
-    env: &JinjaEnvironment,
+    env: &JinjaEnv,
     component: &str,
     root_project_name: &str,
     current_project_name: &str,
     base_ctx: &BTreeMap<String, Value>,
     custom_name: Option<String>,
     node: Option<&dyn InternalDbtNode>,
-) -> Result<String, Error> {
-    let macro_name = format!("generate_{}_name", component);
+) -> FsResult<String> {
+    let macro_name = format!("generate_{component}_name");
     // find the macro template - this is now cached for performance
     let template_name =
         find_generate_macro_template(env, component, root_project_name, current_project_name)?;
 
-    // Optimization: If the template starts with "default__", use the native Rust implementation
-    if template_name.contains(&format!("dbt.generate_{}_name", component)) {
-        // technically this would call adapter.dispatch and the user could overwrite the default
-        // but this isn't a a behavior we should support cause the user can already overrride without the default prefix
-        // Determine which default implementation to use based on component type
-        return match component {
-            "database" => default_generate_database_name(env, custom_name, node),
-            "schema" => default_generate_schema_name(env, custom_name, node),
-            "alias" => default_generate_alias_name(custom_name, node),
-            _ => Err(Error::new(
-                ErrorKind::InvalidOperation,
-                format!("No default implementation for component: {}", component),
-            )),
-        };
-    }
-
     // Create a state object for rendering
     let template = env.get_template(&template_name)?;
-    // Create a listener
-    let listener = Rc::new(minijinja::listener::DefaultRenderingEventListener);
 
     // Create a new state
-    let new_state = template.eval_to_state(base_ctx, listener.clone())?;
+    let new_state = template.eval_to_state(base_ctx, &[])?;
 
     // Build the args
     let mut args = custom_name
@@ -397,7 +317,7 @@ pub fn generate_component_name(
         args.push(Value::from_serialize(node.serialize()));
     }
     // Call the macro
-    let result = match new_state.call_macro(macro_name.as_str(), &args, listener) {
+    let result = match new_state.call_macro(macro_name.as_str(), &args, &[]) {
         Ok(value) => value,
         Err(e) => {
             // These macros can call do return which returns an abrupt return error
@@ -405,7 +325,7 @@ pub fn generate_component_name(
             if let Some(value) = e.try_abrupt_return() {
                 value.to_string()
             } else {
-                return Err(e);
+                return Err(fs_err!(ErrorCode::JinjaError, "Failed to call macro"));
             }
         }
     }
@@ -413,94 +333,6 @@ pub fn generate_component_name(
     .to_string();
     // Return the result
     Ok(result)
-}
-
-/// Rust implementation of default__generate_database_name
-fn default_generate_database_name(
-    env: &JinjaEnvironment,
-    custom_database_name: Option<String>,
-    _node: Option<&dyn InternalDbtNode>,
-) -> Result<String, Error> {
-    // Get target.database from context
-
-    let target = env
-        .get_global("target")
-        .ok_or_else(|| Error::new(ErrorKind::InvalidOperation, "Target not found in context"))?;
-
-    let default_database = target
-        .get_attr("database")
-        .map_err(|_| Error::new(ErrorKind::InvalidOperation, "database not found in target"))?
-        .to_string();
-
-    // Return either the custom name or default database
-    Ok(match custom_database_name {
-        None => default_database,
-        Some(name) if name.is_empty() => default_database,
-        Some(name) => name,
-    })
-}
-
-/// Rust implementation of default__generate_schema_name
-fn default_generate_schema_name(
-    env: &JinjaEnvironment,
-    custom_schema_name: Option<String>,
-    _node: Option<&dyn InternalDbtNode>,
-) -> Result<String, Error> {
-    // Get target.schema from context
-
-    let target = env
-        .get_global("target")
-        .ok_or_else(|| Error::new(ErrorKind::InvalidOperation, "Target not found in context"))?;
-
-    let default_schema = target
-        .get_attr("schema")
-        .map_err(|_| Error::new(ErrorKind::InvalidOperation, "schema not found in target"))?
-        .to_string();
-
-    // Return either the default schema or a combination with custom schema
-    Ok(match custom_schema_name {
-        None => default_schema,
-        Some(name) if name.is_empty() => default_schema,
-        Some(name) => format!("{}_{}", default_schema, name.trim()),
-    })
-}
-
-/// Rust implementation of default__generate_alias_name
-fn default_generate_alias_name(
-    custom_alias_name: Option<String>,
-    node: Option<&dyn InternalDbtNode>,
-) -> Result<String, Error> {
-    if let Some(name) = custom_alias_name {
-        if !name.is_empty() {
-            return Ok(name.trim().to_string());
-        }
-    }
-
-    // Get the node name and version if available
-    if let Some(node) = node {
-        // Get node common attributes for name
-        let common = node.common();
-
-        // For the version, we need to check the specific type
-        match node.resource_type() {
-            "model" => {
-                if let Some(version) = &node.version() {
-                    // Replace dots with underscores in version
-                    let formatted_version = version.to_string().replace('.', "_");
-                    return Ok(format!("{}_v{}", common.name, formatted_version));
-                }
-            }
-            // Other node types don't have versions
-            _ => {}
-        }
-
-        return Ok(common.name.clone());
-    }
-
-    Err(Error::new(
-        ErrorKind::InvalidOperation,
-        "Cannot generate alias: no custom name or node provided",
-    ))
 }
 
 /// Clear template cache (primarily for testing purposes)
@@ -512,12 +344,12 @@ pub fn clear_template_cache() {
 
 /// Find a generate macro by name (database, schema, or alias)
 pub fn find_generate_macro_template(
-    env: &JinjaEnvironment,
+    env: &JinjaEnv,
     component: &str,
     root_project_name: &str,
     current_project_name: &str,
-) -> Result<String, Error> {
-    let macro_name = format!("generate_{}_name", component);
+) -> FsResult<String> {
+    let macro_name = format!("generate_{component}_name");
     let cache_key = (current_project_name.to_string(), component.to_string());
 
     // Check cache first - return early if found
@@ -527,7 +359,7 @@ pub fn find_generate_macro_template(
         }
     }
     // First try - check the current project
-    let template_name = format!("{}.{}", current_project_name, macro_name);
+    let template_name = format!("{current_project_name}.{macro_name}");
     if env.has_template(&template_name) {
         // Cache and return
         if let Ok(mut cache) = TEMPLATE_CACHE.lock() {
@@ -537,7 +369,7 @@ pub fn find_generate_macro_template(
     }
 
     // Second try - check the root project
-    let template_name = format!("{}.{}", root_project_name, macro_name);
+    let template_name = format!("{root_project_name}.{macro_name}");
     if env.has_template(&template_name) {
         // Cache and return
         if let Ok(mut cache) = TEMPLATE_CACHE.lock() {
@@ -549,7 +381,7 @@ pub fn find_generate_macro_template(
     // Last attempt - check dbt internal package
     let dbt_and_adapters = env.get_dbt_and_adapters_namespace();
     if let Some(package) = dbt_and_adapters.get(&Value::from(macro_name.as_str())) {
-        let template_name = format!("{}.{}", package, macro_name);
+        let template_name = format!("{package}.{macro_name}");
         if env.has_template(&template_name) {
             // Cache and return
             if let Ok(mut cache) = TEMPLATE_CACHE.lock() {
@@ -560,26 +392,24 @@ pub fn find_generate_macro_template(
     }
 
     // Template not found in any location
-    Err(Error::new(
-        ErrorKind::TemplateNotFound,
-        format!("Could not find template for {}", macro_name),
+    Err(fs_err!(
+        ErrorCode::JinjaError,
+        "Could not find template for {}",
+        macro_name
     ))
 }
 
 /// Generate a relation name from database, schema, alias
 pub fn generate_relation_name(
-    env: &JinjaEnvironment,
+    parse_adapter: Arc<ParseAdapter>,
     database: &str,
     schema: &str,
     identifier: &str,
     quote_config: ResolvedQuoting,
-) -> Result<String, Error> {
-    let adapter = env
-        .get_parse_adapter()
-        .expect("Failed to get parse adapter");
-    let adapter_type = adapter.adapter_type().to_string();
+) -> FsResult<String> {
+    let adapter_type = parse_adapter.adapter_type().to_string();
     // Create relation using the adapter
-    match create_relation(
+    match create_relation_internal(
         adapter_type,
         database.to_owned(),
         schema.to_owned(),
@@ -587,18 +417,7 @@ pub fn generate_relation_name(
         None, // relation_type
         quote_config,
     ) {
-        Ok(relation) => {
-            // Call render_self() to get the relation name
-            let relation_name = relation.render_self()?;
-            let name_str = relation_name.as_str().ok_or_else(|| {
-                Error::new(
-                    ErrorKind::InvalidOperation,
-                    "Failed to render relation name",
-                )
-            })?;
-
-            Ok(name_str.to_string())
-        }
+        Ok(relation) => Ok(relation.render_self_as_str()),
         Err(e) => Err(e),
     }
 }

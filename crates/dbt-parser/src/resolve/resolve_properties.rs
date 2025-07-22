@@ -1,12 +1,12 @@
 use crate::args::ResolveArgs;
-use dbt_common::fs_err;
 use dbt_common::io_args::IoArgs;
-use dbt_common::io_utils::try_read_yml_to_str;
 use dbt_common::show_warning_soon_to_be_error;
-use dbt_common::stdfs::diff_paths;
-use dbt_common::{constants::PARSING, fsinfo, show_progress, show_warning, ErrorCode, FsResult};
-use dbt_jinja_utils::jinja_environment::JinjaEnvironment;
-use dbt_jinja_utils::serde::{into_typed_raw, into_typed_with_jinja, value_from_str};
+use dbt_common::{
+    ErrorCode, FsResult, constants::PARSING, fs_err, fsinfo, show_error, show_progress,
+    show_warning,
+};
+use dbt_jinja_utils::jinja_environment::JinjaEnv;
+use dbt_jinja_utils::serde::{into_typed_raw, into_typed_with_jinja, value_from_file};
 use dbt_schemas::schemas::properties::{
     DbtPropertiesFileValues, MinimalSchemaValue, MinimalTableValue,
 };
@@ -46,7 +46,7 @@ impl MinimalProperties {
         &mut self,
         io_args: &IoArgs,
         other: DbtPropertiesFileValues,
-        jinja_env: &JinjaEnvironment<'static>,
+        jinja_env: &JinjaEnv,
         properties_path: &Path,
         base_ctx: &BTreeMap<String, MinijinjaValue>,
     ) -> FsResult<()> {
@@ -60,7 +60,7 @@ impl MinimalProperties {
                     false,
                     jinja_env,
                     base_ctx,
-                    None,
+                    &[],
                 )?;
                 for (key, maybe_version_info) in collect_model_version_info(&model).into_iter() {
                     if let Some(existing_model) = self.models.get_mut(&key) {
@@ -87,20 +87,27 @@ impl MinimalProperties {
             for source_value in sources {
                 let source = into_typed_with_jinja::<MinimalSchemaValue, _>(
                     Some(io_args),
-                    source_value,
+                    source_value.clone(),
                     false,
                     jinja_env,
                     base_ctx,
-                    None,
+                    &[],
                 )?;
-                if let Some(tables) = &*source.tables {
-                    // Construct this once and reuse it for all tables:
-                    let schema_value = dbt_serde_yaml::to_value(MinimalSchemaValue {
-                        // Clear the tables field since it's already processed here:
-                        tables: Verbatim(None),
-                        ..source.clone()
-                    })?;
 
+                if let Some(tables) = &*source.tables {
+                    // Clone the original source_value to preserve all field spans
+                    // and only modify the tables field to null
+                    let mut schema_value = source_value.clone();
+
+                    // Set only the tables field to null while preserving all other fields and their spans
+                    if let Some(mapping) = schema_value.as_mapping_mut() {
+                        mapping.insert(
+                            dbt_serde_yaml::Value::string("tables".to_string()),
+                            dbt_serde_yaml::Value::null(),
+                        );
+                    }
+
+                    validate_resource_name(&source.name)?;
                     for table in tables.iter() {
                         let minimum_table_value = into_typed_with_jinja::<MinimalTableValue, _>(
                             Some(io_args),
@@ -108,7 +115,7 @@ impl MinimalProperties {
                             false,
                             jinja_env,
                             base_ctx,
-                            None,
+                            &[],
                         )?;
                         let key = (source.name.clone(), minimum_table_value.name.clone());
 
@@ -132,10 +139,7 @@ impl MinimalProperties {
                             self.source_tables.insert(
                                 key,
                                 MinimalPropertiesEntry {
-                                    name: validate_resource_name(&format!(
-                                        "{}.{}",
-                                        source.name, minimum_table_value.name
-                                    ))?,
+                                    name: minimum_table_value.name,
                                     relative_path: properties_path.to_path_buf(),
                                     schema_value: schema_value.clone(),
                                     table_value: Some(table.clone()), // Store table separately
@@ -166,7 +170,7 @@ impl MinimalProperties {
                     false,
                     jinja_env,
                     base_ctx,
-                    None,
+                    &[],
                 )?;
                 if let Some(existing_seed) = self.seeds.get_mut(&seed.name) {
                     existing_seed
@@ -195,7 +199,7 @@ impl MinimalProperties {
                     false,
                     jinja_env,
                     base_ctx,
-                    None,
+                    &[],
                 )?;
                 if let Some(existing_snapshot) = self.snapshots.get_mut(&snapshot.name) {
                     existing_snapshot
@@ -224,7 +228,7 @@ impl MinimalProperties {
                     false,
                     jinja_env,
                     base_ctx,
-                    None,
+                    &[],
                 )?;
                 if let Some(existing_unit_test) = self.unit_tests.get_mut(&unit_test.name) {
                     existing_unit_test
@@ -253,7 +257,7 @@ impl MinimalProperties {
                     false,
                     jinja_env,
                     base_ctx,
-                    None,
+                    &[],
                 )?;
                 if let Some(existing_test) = self.tests.get_mut(&test.name) {
                     existing_test
@@ -282,7 +286,7 @@ impl MinimalProperties {
                     false,
                     jinja_env,
                     base_ctx,
-                    None,
+                    &[],
                 )?;
                 if let Some(existing_test) = self.tests.get_mut(&test.name) {
                     existing_test
@@ -325,7 +329,7 @@ fn validate_resource_name(name: &str) -> FsResult<String> {
 pub fn resolve_minimal_properties(
     arg: &ResolveArgs,
     package: &DbtPackage,
-    jinja_env: &JinjaEnvironment<'static>,
+    jinja_env: &JinjaEnv,
     base_ctx: &BTreeMap<String, MinijinjaValue>,
 ) -> FsResult<MinimalProperties> {
     let mut minimal_resolved_properties = MinimalProperties::default();
@@ -342,11 +346,8 @@ pub fn resolve_minimal_properties(
                     .to_string()
             )
         );
-        let properties_file_value = value_from_str(
-            Some(&arg.io),
-            &try_read_yml_to_str(&absolute_path)?,
-            Some(&diff_paths(&absolute_path, &arg.io.in_dir)?),
-        )?;
+        let properties_file_value = value_from_file(Some(&arg.io), &absolute_path)?;
+
         match into_typed_raw::<DbtPropertiesFileValues>(Some(&arg.io), properties_file_value) {
             Ok(properties_file_values) => {
                 minimal_resolved_properties.extend_from_minimal_properties_file(
@@ -358,7 +359,11 @@ pub fn resolve_minimal_properties(
                 )?;
             }
             Err(e) => {
-                show_warning_soon_to_be_error!(arg.io, e);
+                if std::env::var("_DBT_FUSION_STRICT_MODE").is_ok() {
+                    show_error!(arg.io, e);
+                } else {
+                    show_warning_soon_to_be_error!(arg.io, e);
+                }
                 continue; // processing other files
             }
         }
@@ -451,7 +456,7 @@ pub fn collect_model_version_info(
             .iter()
             .find(|(v, _, _)| v == &latest_version)
             .map(|(_, _, config)| config.clone())
-            .unwrap_or_else(|| Verbatim(None));
+            .unwrap_or_else(|| Verbatim::from(None));
 
         // Only add the latest version by model.name if it's not already in the list (as in, defined by a defined_in)
         if !version_entries.iter().any(|(_, d, _)| d == &model.name) {

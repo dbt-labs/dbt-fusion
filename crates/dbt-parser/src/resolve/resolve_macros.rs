@@ -1,6 +1,6 @@
-use dbt_common::io_args::IoArgs;
 use dbt_common::ErrorCode;
 use dbt_common::FsResult;
+use dbt_common::io_args::IoArgs;
 use dbt_common::{err, fs_err, stdfs};
 use dbt_jinja_utils::phases::parse::sql_resource::SqlResource;
 use dbt_schemas::schemas::macros::DbtDocsMacro;
@@ -44,7 +44,7 @@ pub fn resolve_docs_macros(
                 for resource in resources {
                     match resource {
                         SqlResource::Doc(name, span) => {
-                            let unique_id = format!("doc.{}.{}", package_name, name);
+                            let unique_id = format!("doc.{package_name}.{name}");
                             let part =
                                 &docs_macro[span.start_offset as usize..span.end_offset as usize];
                             if let Some(existing_doc) = docs_map.get(&unique_id) {
@@ -88,7 +88,7 @@ pub fn resolve_docs_macros(
 /// Resolve macros from a list of macro files
 pub fn resolve_macros(
     io: &IoArgs,
-    macro_files: &Vec<&DbtAsset>,
+    macro_files: &[&DbtAsset],
 ) -> FsResult<HashMap<String, DbtMacro>> {
     let mut nodes = HashMap::new();
 
@@ -110,10 +110,9 @@ pub fn resolve_macros(
                 )
             })?;
             let relative_macro_file_path = stdfs::diff_paths(&macro_file_path, &io.in_dir)?;
-
             let resources = parse_macro_statements(
                 &macro_sql,
-                &macro_file_path,
+                &relative_macro_file_path,
                 &["macro", "test", "materialization", "snapshot"],
             )?;
 
@@ -124,7 +123,7 @@ pub fn resolve_macros(
             for resource in resources {
                 match resource {
                     SqlResource::Test(name, span) => {
-                        let unique_id = format!("macro.{}.{}", package_name, name);
+                        let unique_id = format!("macro.{package_name}.{name}");
                         let split_macro_sql =
                             &macro_sql[span.start_offset as usize..span.end_offset as usize];
 
@@ -146,7 +145,7 @@ pub fn resolve_macros(
                         nodes.insert(unique_id, dbt_macro);
                     }
                     SqlResource::Macro(name, span) => {
-                        let unique_id = format!("macro.{}.{}", package_name, name);
+                        let unique_id = format!("macro.{package_name}.{name}");
                         let split_macro_sql =
                             &macro_sql[span.start_offset as usize..span.end_offset as usize];
 
@@ -171,7 +170,7 @@ pub fn resolve_macros(
                         let split_macro_sql =
                             &macro_sql[span.start_offset as usize..span.end_offset as usize];
                         // TODO: Return the adapter type with the SqlResource (for now, default always)
-                        let unique_id = format!("macro.{}.{}", package_name, name);
+                        let unique_id = format!("macro.{package_name}.{name}");
                         let dbt_macro = DbtMacro {
                             name: name.clone(),
                             package_name: package_name.clone(),
@@ -190,7 +189,7 @@ pub fn resolve_macros(
                         nodes.insert(unique_id, dbt_macro);
                     }
                     SqlResource::Snapshot(name, span) => {
-                        let unique_id = format!("snapshot.{}.{}", package_name, name);
+                        let unique_id = format!("snapshot.{package_name}.{name}");
                         let split_macro_sql =
                             &macro_sql[span.start_offset as usize..span.end_offset as usize];
 
@@ -214,7 +213,8 @@ pub fn resolve_macros(
                     _ => {
                         return err!(
                             ErrorCode::MacroSyntaxError,
-                            "Refs, sources, configs and other resources are not allowed in macros. Path: {}", macro_file.display()
+                            "Refs, sources, configs and other resources are not allowed in macros. Path: {}",
+                            macro_file.display()
                         );
                     }
                 }

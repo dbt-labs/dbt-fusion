@@ -6,17 +6,17 @@ use core::fmt;
 use std::sync::Arc;
 
 use adbc_core::{
+    Optionable, PartitionedResult, Statement as _,
     driver_manager::ManagedStatement as ManagedAdbcStatement,
     error::Result,
     options::{OptionStatement, OptionValue},
-    Optionable, PartitionedResult, Statement as _,
 };
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::Schema;
 
 #[cfg(feature = "odbc")]
 use crate::odbc::ManagedOdbcStatement;
-use crate::{Backend, QueryCtx, Semaphore};
+use crate::{Backend, QueryCtx, semaphore::Semaphore};
 
 /// XDBC Statement.
 ///
@@ -196,8 +196,11 @@ impl Statement for AdbcStatement {
     }
 
     fn set_sql_query(&mut self, query: &QueryCtx) -> Result<()> {
-        assert!(query.sql().is_some());
-        self.1.set_sql_query(query.sql().unwrap())
+        // Because context might hot have sql (e.g., ingest)
+        match query.sql() {
+            Some(sql) => self.1.set_sql_query(sql),
+            None => Ok(()),
+        }
     }
 
     fn set_substrait_plan(&mut self, plan: &[u8]) -> Result<()> {

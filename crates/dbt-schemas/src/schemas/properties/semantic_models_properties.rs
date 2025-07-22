@@ -1,4 +1,4 @@
-use crate::schemas::common::Dimension;
+use crate::schemas::{common::Dimension, project::SemanticModelConfig};
 
 use dbt_serde_yaml::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -22,14 +22,6 @@ pub struct SemanticModelsProperties {
 
 #[skip_serializing_none]
 #[derive(Deserialize, Serialize, Debug, Clone, JsonSchema)]
-pub struct SemanticModelConfig {
-    pub enabled: Option<bool>,
-    pub group: Option<String>,
-    pub meta: Option<BTreeMap<String, serde_json::Value>>,
-}
-
-#[skip_serializing_none]
-#[derive(Deserialize, Serialize, Debug, Clone, JsonSchema)]
 pub struct SemanticModelsDefaults {
     pub agg_time_dimension: Option<String>,
 }
@@ -37,7 +29,7 @@ pub struct SemanticModelsDefaults {
 #[skip_serializing_none]
 #[derive(Deserialize, Serialize, Debug, Clone, JsonSchema)]
 pub struct Entity {
-    pub config: EntityConfig,
+    pub config: Option<EntityConfig>,
     pub description: Option<String>,
     pub expr: Option<EntityExpr>,
     pub label: Option<String>,

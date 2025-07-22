@@ -1,6 +1,8 @@
 use crate::schemas::common::TimeGranularity;
+use crate::schemas::project::MetricConfig;
 use crate::schemas::serde::StringOrArrayOfStrings;
 use dbt_serde_yaml::JsonSchema;
+use dbt_serde_yaml::UntaggedEnumDeserialize;
 use dbt_serde_yaml::Verbatim;
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
@@ -15,11 +17,11 @@ pub struct MetricsProperties {
     pub type_: MetricType,
     pub type_params: MetricTypeParams,
     pub description: Option<String>,
-    pub config: Option<MetricsPropertiesConfig>,
-    pub filter: Option<String>,
+    pub config: Option<MetricConfig>,
+    pub filter: Option<StringOrArrayOfStrings>,
     pub time_granularity: Option<TimeGranularity>,
     // Flattened field:
-    pub __additional_properties__: Verbatim<BTreeMap<String, dbt_serde_yaml::Value>>,
+    pub __unused__: Verbatim<BTreeMap<String, dbt_serde_yaml::Value>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, JsonSchema)]
@@ -32,44 +34,40 @@ pub enum MetricType {
     Conversion,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone, JsonSchema)]
+#[derive(UntaggedEnumDeserialize, Serialize, Debug, Clone, JsonSchema)]
 #[serde(untagged)]
 pub enum StringOrMetricInputMeasure {
     String(String),
     MetricInputMeasure(MetricInputMeasure),
 }
 
+#[derive(UntaggedEnumDeserialize, Serialize, Debug, Clone, JsonSchema)]
+#[serde(untagged)]
+pub enum StringOrMetricInput {
+    String(String),
+    MetricInput(MetricInput),
+}
+
 #[skip_serializing_none]
 #[derive(Default, Deserialize, Serialize, Debug, Clone, JsonSchema)]
 pub struct MetricTypeParams {
     pub measure: Option<StringOrMetricInputMeasure>,
-    #[serde(default)]
-    pub input_measures: Vec<MetricInputMeasure>,
-    pub numerator: Option<MetricInput>,
-    pub denominator: Option<MetricInput>,
+    pub numerator: Option<StringOrMetricInput>,
+    pub denominator: Option<StringOrMetricInput>,
     pub expr: Option<String>,
-    pub window: Option<MetricTimeWindow>,
-    pub metrics: Option<Vec<MetricInput>>,
+    pub window: Option<String>,
+    pub metrics: Option<Vec<StringOrMetricInput>>,
     pub conversion_type_params: Option<ConversionTypeParams>,
     pub cumulative_type_params: Option<CumulativeTypeParams>,
 }
 
 #[skip_serializing_none]
 #[derive(Deserialize, Serialize, Debug, Clone, JsonSchema)]
-pub struct MetricsPropertiesConfig {
-    pub enabled: Option<bool>,
-    pub meta: Option<BTreeMap<String, serde_json::Value>>,
-    pub tags: Option<StringOrArrayOfStrings>,
-    pub group: Option<String>,
-}
-
-#[skip_serializing_none]
-#[derive(Deserialize, Serialize, Debug, Clone, JsonSchema)]
 pub struct MetricInputMeasure {
     pub name: String,
-    pub filter: Option<WhereFilterIntersection>,
+    pub filter: Option<StringOrArrayOfStrings>,
     pub alias: Option<String>,
-    pub join_to_timepine: Option<bool>,
+    pub join_to_timespine: Option<bool>,
     pub fill_nulls_with: Option<i32>,
 }
 
@@ -91,17 +89,17 @@ pub struct MetricTimeWindow {
 
 #[derive(Deserialize, Serialize, Debug, Clone, JsonSchema)]
 pub struct ConversionTypeParams {
-    pub base_measure: MetricInputMeasure,
-    pub conversion_measure: MetricInputMeasure,
+    pub base_measure: StringOrMetricInputMeasure,
+    pub conversion_measure: StringOrMetricInputMeasure,
     pub entity: String,
     pub calculation: ConversionCalculationType,
-    pub window: Option<MetricTimeWindow>,
+    pub window: Option<String>,
     pub constant_properties: Option<Vec<ConstantPropertyInput>>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, JsonSchema)]
 pub struct CumulativeTypeParams {
-    pub window: Option<MetricTimeWindow>,
+    pub window: Option<String>,
     pub grain_to_date: Option<String>,
     pub period_agg: PeriodAggregationType,
 }
@@ -132,8 +130,8 @@ pub enum ConversionCalculationType {
 #[derive(Deserialize, Serialize, Debug, Clone, JsonSchema)]
 pub struct MetricInput {
     pub name: String,
-    pub filter: Option<WhereFilterIntersection>,
+    pub filter: Option<StringOrArrayOfStrings>,
     pub alias: Option<String>,
-    pub offset_window: Option<MetricTimeWindow>,
+    pub offset_window: Option<String>,
     pub offset_to_grain: Option<String>,
 }

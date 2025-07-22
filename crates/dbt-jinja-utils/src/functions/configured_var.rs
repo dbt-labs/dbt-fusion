@@ -4,8 +4,8 @@ use std::{collections::BTreeMap, rc::Rc, sync::Arc};
 
 use dbt_schemas::state::DbtVars;
 use minijinja::{
-    constants::TARGET_PACKAGE_NAME, listener::RenderingEventListener, value::Object, Error,
-    ErrorKind, State, Value,
+    Error, ErrorKind, State, Value, constants::TARGET_PACKAGE_NAME,
+    listener::RenderingEventListener, value::Object,
 };
 
 /// A struct that represent a var object to be used in configuration contexts
@@ -30,7 +30,7 @@ impl Object for ConfiguredVar {
         self: &Arc<Self>,
         state: &State<'_, '_>,
         args: &[Value],
-        _listener: Rc<dyn RenderingEventListener>,
+        _listeners: &[Rc<dyn RenderingEventListener>],
     ) -> Result<Value, Error> {
         // Safely get var_name, defaulting to empty string if args is empty or not a string
         let var_name = args
@@ -54,10 +54,7 @@ impl Object for ConfiguredVar {
             } else {
                 return Err(Error::new(
                     ErrorKind::InvalidOperation,
-                    format!(
-                        "Missing default value for var in dbt_project.yml: {}",
-                        var_name
-                    ),
+                    format!("Missing default value for var in dbt_project.yml: {var_name}"),
                 ));
             }
         }
@@ -68,19 +65,15 @@ impl Object for ConfiguredVar {
             .and_then(|v| v.as_str().map(|s| s.to_string()))
         else {
             return Err(Error::new(
-                    ErrorKind::InvalidOperation,
-                    format!(
-                        "'TARGET_PACKAGE_NAME' should be set. Missing in configured var context while looking up var: {}",
-                        var_name
-                    ),
-                ));
+                ErrorKind::InvalidOperation,
+                format!(
+                    "'TARGET_PACKAGE_NAME' should be set. Missing in configured var context while looking up var: {var_name}"
+                ),
+            ));
         };
         let vars_lookup = self.vars.get(&package_name).ok_or(Error::new(
             ErrorKind::InvalidOperation,
-            format!(
-                "Package vars should be initialized for package: {}",
-                package_name
-            ),
+            format!("Package vars should be initialized for package: {package_name}"),
         ))?;
         if let Some(var) = vars_lookup.get(&var_name) {
             Ok(Value::from_serialize(var))
@@ -91,7 +84,9 @@ impl Object for ConfiguredVar {
         } else if state.lookup("this").is_none() {
             Err(Error::new(
                 ErrorKind::InvalidOperation,
-                format!("Var should be initialized for package: {}", package_name),
+                format!(
+                    "Missing context variable 'this'. Var should be initialized for package: {package_name}"
+                ),
             ))
         // if the var isn't found, if parse, return none, if compile, return error
         } else if let Some(execute) = state.lookup("execute").map(|v| v.is_true()) {
@@ -122,7 +117,7 @@ impl Object for ConfiguredVar {
         state: &State<'_, '_>,
         method: &str,
         args: &[Value],
-        _listener: Rc<dyn RenderingEventListener>,
+        _listeners: &[Rc<dyn RenderingEventListener>],
     ) -> Result<Value, Error> {
         // implement the has_var method
         if method == "has_var" {
@@ -132,19 +127,15 @@ impl Object for ConfiguredVar {
                 .and_then(|v| v.as_str().map(|s| s.to_string()))
             else {
                 return Err(Error::new(
-                        ErrorKind::InvalidOperation,
-                        format!(
-                            "'TARGET_PACKAGE_NAME' should be set. Missing in configured var context while looking up var: {}",
-                            var_name
-                        ),
-                    ));
+                    ErrorKind::InvalidOperation,
+                    format!(
+                        "'TARGET_PACKAGE_NAME' should be set. Missing in configured var context while looking up var: {var_name}"
+                    ),
+                ));
             };
             let vars_lookup = self.vars.get(&package_name).ok_or(Error::new(
                 ErrorKind::InvalidOperation,
-                format!(
-                    "Package vars should be initialized for package: {}",
-                    package_name
-                ),
+                format!("Package vars should be initialized for package: {package_name}"),
             ))?;
             if vars_lookup.contains_key(&var_name) {
                 Ok(Value::from(true))
@@ -154,7 +145,7 @@ impl Object for ConfiguredVar {
         } else {
             Err(Error::new(
                 ErrorKind::InvalidOperation,
-                format!("Method {} not found", method),
+                format!("Method {method} not found"),
             ))
         }
     }

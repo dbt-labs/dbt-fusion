@@ -27,25 +27,25 @@ impl PyTimeClass {
         if !(0..=23).contains(&hour) {
             return Err(Error::new(
                 ErrorKind::InvalidArgument,
-                format!("hour must be in 0..=23, got {}", hour),
+                format!("hour must be in 0..=23, got {hour}"),
             ));
         }
         if !(0..=59).contains(&minute) {
             return Err(Error::new(
                 ErrorKind::InvalidArgument,
-                format!("minute must be in 0..=59, got {}", minute),
+                format!("minute must be in 0..=59, got {minute}"),
             ));
         }
         if !(0..=59).contains(&second) {
             return Err(Error::new(
                 ErrorKind::InvalidArgument,
-                format!("second must be in 0..=59, got {}", second),
+                format!("second must be in 0..=59, got {second}"),
             ));
         }
         if !(0..1_000_000).contains(&microsecond) {
             return Err(Error::new(
                 ErrorKind::InvalidArgument,
-                format!("microsecond must be in 0..1_000_000, got {}", microsecond),
+                format!("microsecond must be in 0..1_000_000, got {microsecond}"),
             ));
         }
 
@@ -91,7 +91,7 @@ impl PyTimeClass {
             Err(e) => {
                 return Err(Error::new(
                     ErrorKind::InvalidArgument,
-                    format!("Invalid iso time format: {}: {}", iso_str, e),
+                    format!("Invalid iso time format: {iso_str}: {e}"),
                 ))
             }
         };
@@ -107,7 +107,7 @@ impl Object for PyTimeClass {
         self: &Arc<Self>,
         _state: &minijinja::State<'_, '_>,
         args: &[Value],
-        _listener: std::rc::Rc<dyn minijinja::listener::RenderingEventListener>,
+        _listeners: &[std::rc::Rc<dyn minijinja::listener::RenderingEventListener>],
     ) -> Result<Value, Error> {
         Self::create_time(args).map(Value::from_object)
     }
@@ -118,14 +118,14 @@ impl Object for PyTimeClass {
         _state: &minijinja::State<'_, '_>,
         method: &str,
         args: &[Value],
-        _listener: std::rc::Rc<dyn minijinja::listener::RenderingEventListener>,
+        _listeners: &[std::rc::Rc<dyn minijinja::listener::RenderingEventListener>],
     ) -> Result<Value, Error> {
         match method {
             "now" => Self::now(args).map(Value::from_object),
             "fromisoformat" => Self::fromisoformat(args).map(Value::from_object),
             _ => Err(Error::new(
                 ErrorKind::UnknownMethod("PyTimeClass".to_string(), method.to_string()),
-                format!("time has no method named '{}'", method),
+                format!("time has no method named '{method}'"),
             )),
         }
     }
@@ -165,7 +165,7 @@ impl PyTime {
 
                 // Add microseconds (6 digits)
                 let microseconds = self.time.nanosecond() / 1000;
-                result.push_str(&format!("{:06}", microseconds));
+                result.push_str(&format!("{microseconds:06}"));
 
                 // Continue with the rest of the string
                 remaining = &remaining[pos + 2..]; // +2 to skip "%f"
@@ -278,7 +278,7 @@ impl Object for PyTime {
         _state: &minijinja::State<'_, '_>,
         method: &str,
         args: &[Value],
-        _listener: std::rc::Rc<dyn minijinja::listener::RenderingEventListener>,
+        _listeners: &[std::rc::Rc<dyn minijinja::listener::RenderingEventListener>],
     ) -> Result<Value, Error> {
         match method {
             "isoformat" => {
@@ -297,7 +297,7 @@ impl Object for PyTime {
             "__sub__" => self.add_op(args, false),
             _ => Err(Error::new(
                 ErrorKind::UnknownMethod("PyTime".to_string(), method.to_string()),
-                format!("time object has no method '{}'", method),
+                format!("time object has no method '{method}'"),
             )),
         }
     }
@@ -316,8 +316,6 @@ impl Object for PyTime {
 
 #[cfg(test)]
 mod tests {
-    use std::rc::Rc;
-
     use super::*;
     use crate::modules::py_datetime::timedelta::PyTimeDelta;
     use minijinja::context;
@@ -359,39 +357,27 @@ mod tests {
 
         // Create a template that uses time and strftime
         let template = env
-            .template_from_str("{{ time(14, 30, 45, 123456).strftime('%H:%M:%S') }}")
+            .template_from_str("{{ time(14, 30, 45, 123456).strftime('%H:%M:%S') }}", &[])
             .unwrap();
-        let result = template
-            .render(
-                context!(),
-                Rc::new(minijinja::listener::DefaultRenderingEventListener),
-            )
-            .unwrap();
-        assert_eq!(result.0, "14:30:45");
+        let result = template.render(context!(), &[]).unwrap();
+        assert_eq!(result, "14:30:45");
 
         // Test with a different format
         let template = env
-            .template_from_str("{{ time(14, 30, 45, 123456).strftime('%I:%M %p') }}")
+            .template_from_str("{{ time(14, 30, 45, 123456).strftime('%I:%M %p') }}", &[])
             .unwrap();
-        let result = template
-            .render(
-                context!(),
-                Rc::new(minijinja::listener::DefaultRenderingEventListener),
-            )
-            .unwrap();
-        assert_eq!(result.0, "02:30 PM");
+        let result = template.render(context!(), &[]).unwrap();
+        assert_eq!(result, "02:30 PM");
 
         // Test with microseconds
         let template = env
-            .template_from_str("{{ time(14, 30, 45, 123456).strftime('%H:%M:%S.%f') }}")
-            .unwrap();
-        let result = template
-            .render(
-                context!(),
-                Rc::new(minijinja::listener::DefaultRenderingEventListener),
+            .template_from_str(
+                "{{ time(14, 30, 45, 123456).strftime('%H:%M:%S.%f') }}",
+                &[],
             )
             .unwrap();
-        assert_eq!(result.0, "14:30:45.123456");
+        let result = template.render(context!(), &[]).unwrap();
+        assert_eq!(result, "14:30:45.123456");
     }
 
     #[test]
@@ -489,41 +475,30 @@ mod tests {
 
         // Test adding hours
         let template = env
-            .template_from_str("{{ (time(14, 30, 0) + timedelta(hours=1)).strftime('%H:%M:%S') }}")
-            .unwrap();
-        let result = template
-            .render(
-                context!(),
-                Rc::new(minijinja::listener::DefaultRenderingEventListener),
+            .template_from_str(
+                "{{ (time(14, 30, 0) + timedelta(hours=1)).strftime('%H:%M:%S') }}",
+                &[],
             )
             .unwrap();
-        assert_eq!(result.0, "15:30:00");
+        let result = template.render(context!(), &[]).unwrap();
+        assert_eq!(result, "15:30:00");
 
         // Test subtracting minutes
         let template = env
             .template_from_str(
                 "{{ (time(14, 30, 0) - timedelta(minutes=45)).strftime('%H:%M:%S') }}",
+                &[],
             )
             .unwrap();
-        let result = template
-            .render(
-                context!(),
-                Rc::new(minijinja::listener::DefaultRenderingEventListener),
-            )
-            .unwrap();
-        assert_eq!(result.0, "13:45:00");
+        let result = template.render(context!(), &[]).unwrap();
+        assert_eq!(result, "13:45:00");
 
         // Test time subtraction
         let template = env
-            .template_from_str("{{ (time(14, 30, 0) - time(13, 15, 0)).seconds }}")
+            .template_from_str("{{ (time(14, 30, 0) - time(13, 15, 0)).seconds }}", &[])
             .unwrap();
-        let result = template
-            .render(
-                context!(),
-                Rc::new(minijinja::listener::DefaultRenderingEventListener),
-            )
-            .unwrap();
+        let result = template.render(context!(), &[]).unwrap();
         // 1 hour 15 minutes = 75 minutes = 4500 seconds
-        assert_eq!(result.0, "4500");
+        assert_eq!(result, "4500");
     }
 }

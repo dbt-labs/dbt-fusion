@@ -8,9 +8,8 @@ use std::str::FromStr;
 use std::{
     collections::{BTreeMap, HashSet},
     fmt::{self, Display},
-    io::Write,
     path::{Path, PathBuf},
-    sync::{atomic::AtomicBool, Arc, Mutex},
+    sync::{Arc, atomic::AtomicBool},
 };
 use strum::EnumIter;
 use strum_macros::Display;
@@ -22,8 +21,8 @@ use crate::{
     io_utils::StatusReporter,
     logging::LogFormat,
     node_selector::{
-        conjoin_expression, parse_model_specifiers, IndirectSelection, SelectExpression,
-        SelectionCriteria,
+        IndirectSelection, SelectExpression, SelectionCriteria, conjoin_expression,
+        parse_model_specifiers,
     },
     pretty_string::BLUE,
 };
@@ -38,17 +37,30 @@ pub struct IoArgs {
     pub out_dir: PathBuf,
     pub log_path: Option<PathBuf>,
     pub trace_path: Option<PathBuf>,
-    // todo: replace std Mutex with tokio Mutex
-    pub stdout: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
-    pub stderr: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
     pub log_format: LogFormat,
     pub log_level: Option<LevelFilter>,
     pub log_level_file: Option<LevelFilter>,
 
     /// Optional status reporter for reporting status messages during execution
     pub status_reporter: Option<Arc<dyn StatusReporter>>,
+    pub send_anonymous_usage_stats: bool,
     pub should_cancel_compilation: Option<Arc<AtomicBool>>,
+
+    // internal fields
+    pub show_timings: bool, // whether to show timings in the status messages
+    pub build_cache_url: Option<String>,
+    pub build_cache_cas_url: Option<String>,
+    pub build_cache_mode: Option<BuildCacheMode>,
 }
+impl IoArgs {
+    pub fn is_generated_file(&self, rel_path: &Path) -> bool {
+        // Get last component of out_dir (as_os_str returns None if out_dir is empty)
+        let out_dir_last = self.out_dir.components().next_back();
+        let rel_first = rel_path.components().next();
+        out_dir_last == rel_first
+    }
+}
+
 // define a clone for IoArgs
 impl Clone for IoArgs {
     fn clone(&self) -> Self {
@@ -59,13 +71,16 @@ impl Clone for IoArgs {
             out_dir: self.out_dir.clone(),
             log_path: self.log_path.clone(),
             trace_path: self.trace_path.clone(),
-            stdout: self.stdout.as_ref().map(|w| w.clone()),
-            stderr: self.stderr.as_ref().map(|w| w.clone()),
             log_format: self.log_format,
             log_level_file: self.log_level_file,
             log_level: self.log_level,
             status_reporter: self.status_reporter.clone(),
+            send_anonymous_usage_stats: self.send_anonymous_usage_stats,
             should_cancel_compilation: self.should_cancel_compilation.clone(),
+            show_timings: self.show_timings,
+            build_cache_url: self.build_cache_url.clone(),
+            build_cache_cas_url: self.build_cache_cas_url.clone(),
+            build_cache_mode: self.build_cache_mode,
         }
     }
 }
@@ -76,8 +91,6 @@ impl fmt::Debug for IoArgs {
             .field("show", &self.show)
             .field("in_dir", &self.in_dir)
             .field("out_dir", &self.out_dir)
-            .field("stdout", &self.stdout.is_some())
-            .field("stderr", &self.stderr.is_some())
             .field("status_reporter", &self.status_reporter.is_some())
             .finish()
     }
@@ -113,17 +126,21 @@ impl IoArgs {
     /// This function takes an artifact path, which may either be a workspace
     /// resource, or some generated temp location, and returns a path to its
     /// corresponding location in the workspace
-    ///
-    /// FIXME: this is really a hack, the proper thing to do is to have a
-    /// semantic representation for each artifact that can generate workspace or
-    /// temporary paths
-    pub fn map_to_workspace_path(&self, path: &Path) -> PathBuf {
-        let special_component_idx = path.components().position(|c| {
-            c.as_os_str() == DBT_GENERIC_TESTS_DIR_NAME || c.as_os_str() == DBT_SNAPSHOTS_DIR_NAME
-        });
-        if let Some(idx) = special_component_idx {
-            self.out_dir
-                .join(path.components().skip(idx).collect::<PathBuf>())
+    pub fn map_to_workspace_path(&self, path: &Path, resource_type: &str) -> PathBuf {
+        if resource_type == "unit_test" || resource_type == "snapshot" {
+            let special_component_idx = path.components().position(|c| {
+                c.as_os_str() == DBT_GENERIC_TESTS_DIR_NAME
+                    || c.as_os_str() == DBT_SNAPSHOTS_DIR_NAME
+            });
+            if let Some(idx) = special_component_idx {
+                // FIXME: this is really a hack, the proper thing to do is to have a
+                // semantic representation for each artifact that can generate workspace or
+                // temporary paths
+                self.out_dir
+                    .join(path.components().skip(idx).collect::<PathBuf>())
+            } else {
+                self.out_dir.join(path)
+            }
         } else {
             self.in_dir.join(path)
         }
@@ -132,8 +149,21 @@ impl IoArgs {
     pub fn should_show(&self, option: ShowOptions) -> bool {
         self.show.contains(&option) || option == ShowOptions::All
     }
-}
 
+    /// Returns true if the build cache should be used (read or readwrite mode, or --use-build-cache flag).
+    pub fn should_use_build_cache(&self) -> bool {
+        self.build_cache_mode
+            .map(|c| matches!(c, BuildCacheMode::Read | BuildCacheMode::ReadWrite))
+            .unwrap_or_default()
+    }
+
+    /// Returns true if the build cache should be saved (write or readwrite mode).
+    pub fn should_save_build_cache(&self) -> bool {
+        self.build_cache_mode
+            .map(|c| matches!(c, BuildCacheMode::Write | BuildCacheMode::ReadWrite))
+            .unwrap_or_default()
+    }
+}
 // ----------------------------------------------------------------------------------------------
 // System Args
 #[derive(Clone, Debug)]
@@ -157,6 +187,8 @@ pub struct EvalArgs {
     pub profiles_dir: Option<PathBuf>,
     // The directory to install packages
     pub packages_install_path: Option<PathBuf>,
+    // A package to add to deps
+    pub add_package: Option<String>,
     // The profile to use
     pub profile: Option<String>,
     // The target within the profile to use for the dbt run
@@ -167,8 +199,8 @@ pub struct EvalArgs {
     pub phase: Phases,
     // Display rows in different formats, this is .to_string on DisplayFormat; we use a string here to break dep. cycle
     pub format: String,
-    /// Limiting number of shown rows. Run with --limit 0 to remove limit
-    pub limit: usize,
+    /// Limiting number of shown rows. None means no limit, run with --limit -1 to remove limit
+    pub limit: Option<usize>,
     /// called as bin or as library
     pub from_main: bool,
     /// The number of threads to use
@@ -185,6 +217,8 @@ pub struct EvalArgs {
     pub output_keys: Vec<String>,
     /// Resource types to filter by
     pub resource_types: Vec<ClapResourceType>,
+    /// Exclude nodes of a specific type
+    pub exclude_resource_types: Vec<ClapResourceType>,
     /// Debug flag
     pub debug: bool,
     /// Set log file format, overriding the default and --log-format setting.
@@ -230,12 +264,13 @@ pub struct EvalArgs {
     pub warn_error: bool,
     pub warn_error_options: BTreeMap<String, Value>,
     pub version_check: bool,
-    pub defer: bool,
+    pub defer: Option<bool>,
     pub fail_fast: bool,
     pub empty: bool,
     pub full_refresh: bool,
     pub favor_state: bool,
     pub send_anonymous_usage_stats: bool,
+    pub check_all: bool,
 }
 impl fmt::Debug for EvalArgs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -277,17 +312,6 @@ impl EvalArgs {
     pub fn without_show(&self, option: ShowOptions) -> Self {
         let mut new_args = self.clone();
         new_args.io.show.remove(&option);
-        new_args
-    }
-
-    pub fn with_std_out_std_err(
-        &self,
-        stdout: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
-        stderr: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
-    ) -> EvalArgs {
-        let mut new_args = self.clone();
-        new_args.io.stdout = stdout;
-        new_args.io.stderr = stderr;
         new_args
     }
 
@@ -338,8 +362,8 @@ impl EvalArgs {
 #[derive(
     Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Default, ValueEnum, Serialize, Deserialize,
 )]
-#[serde(rename_all = "lowercase")]
-#[clap(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
+#[clap(rename_all = "snake_case")]
 pub enum ClapResourceType {
     #[default]
     Model,
@@ -360,7 +384,7 @@ impl Display for ClapResourceType {
             ClapResourceType::Test => "test",
             ClapResourceType::UnitTest => "unit_test",
         };
-        write!(f, "{}", s)
+        write!(f, "{s}")
     }
 }
 
@@ -381,9 +405,10 @@ impl Display for ClapResourceType {
 #[serde(rename_all = "lowercase")]
 #[clap(rename_all = "lowercase")]
 pub enum Phases {
-    Debug, // dbt debug
-    Deps,  // dbt deps
-    Parse, // dbt parse
+    Debug,      // dbt debug
+    Deps,       // dbt deps
+    JinjaCheck, // dbt jinja-check
+    Parse,      // dbt parse
     Format,
     Lint,
     Schedule,
@@ -488,6 +513,28 @@ pub enum StaticAnalysisKind {
     On,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BuildCacheMode {
+    Read,
+    Write,
+    #[default]
+    ReadWrite,
+}
+
+impl FromStr for StaticAnalysisKind {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "unsafe" => Ok(StaticAnalysisKind::Unsafe),
+            "off" => Ok(StaticAnalysisKind::Off),
+            "on" => Ok(StaticAnalysisKind::On),
+            _ => Err(()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Display, Serialize, Deserialize, ValueEnum, Default)]
 pub enum RunCacheMode {
     #[default]
@@ -518,7 +565,7 @@ impl FromStr for RunCacheMode {
             "noop" => Ok(RunCacheMode::Noop),
             "read-write" => Ok(RunCacheMode::ReadWrite),
             "write-only" => Ok(RunCacheMode::WriteOnly),
-            _ => Err(format!("Invalid RunCacheMode: {}", s)),
+            _ => Err(format!("Invalid RunCacheMode: {s}")),
         }
     }
 }
@@ -529,7 +576,8 @@ pub enum ShowOptions {
     Progress,
     ProgressRun,
     ProgressParse,
-    ProgressCompile,
+    ProgressRender,
+    ProgressAnalyze,
     InputFiles,
     Manifest,
     Schedule,
@@ -562,7 +610,8 @@ impl ShowOptions {
             ShowOptions::Progress
             | ShowOptions::ProgressRun
             | ShowOptions::ProgressParse
-            | ShowOptions::ProgressCompile
+            | ShowOptions::ProgressRender
+            | ShowOptions::ProgressAnalyze
             | ShowOptions::Schema
             | ShowOptions::Data
             | ShowOptions::Lineage
@@ -586,8 +635,7 @@ pub fn check_selector(selector: &str) -> Result<String, String> {
 pub fn check_target(filename: &str) -> Result<String, String> {
     let path = Path::new(filename);
     let err = Err(format!(
-        "Input file '{}' must have .sql, or .yml extension",
-        filename
+        "Input file '{filename}' must have .sql, or .yml extension"
     ));
     // TODO check that this test is universal for all inputs...
     if path.is_dir() {
@@ -616,33 +664,35 @@ pub fn check_var(vars: &str) -> Result<BTreeMap<String, Value>, String> {
     let yaml_str = if vars.trim().starts_with('{') {
         vars.to_string()
     } else {
-        // Handle multiple key-value pairs separated by spaces
-        let pairs: Vec<&str> = vars.split_whitespace().collect();
-        let mut formatted_pairs = Vec::new();
-
-        for pair in pairs {
-            if pair.matches(':').count() != 1 {
-                return Err(format!(
-                    "Invalid key-value pair: '{}'. Expected format: 'key:value'.",
-                    pair
-                ));
-            }
-            formatted_pairs.push(pair);
+        // Handle single key-value pair separated by a colon
+        if vars.trim().matches(':').count() != 1 {
+            return Err(format!(
+                "Invalid key-value pair: '{vars}'. Expected format: 'key: value'."
+            ));
         }
-
-        // Wrap the pairs in curly braces
-        format!("{{{}}}", formatted_pairs.join(", "))
+        vars.to_string()
     };
 
     // Try parsing as YAML first
-    match dbt_serde_yaml::from_str(&yaml_str) {
-        Ok(btree) => Ok(btree),
+    match dbt_serde_yaml::from_str::<BTreeMap<String, Value>>(&yaml_str) {
+        Ok(btree) => {
+            // Disallow the '{key:value}' format for flow-style YAML syntax
+            // to prevent key:value: None interpretation: https://stackoverflow.com/a/70909331
+            for key in btree.keys() {
+                if key.contains(':') {
+                    return Err(format!(
+                        "Invalid key-value pair: '{key}'. Value must start with a space after colon."
+                    ));
+                }
+            }
+            Ok(btree)
+        }
         Err(_) => {
             // If YAML parsing fails, try JSON
             match serde_json::from_str(&yaml_str) {
                 Ok(btree) => Ok(btree),
                 Err(_) => Err(
-                    "Invalid YAML/JSON format. Expected format: 'key:value' or '{key: value, ..}'. Note both argument forms must be just one shell token"
+                    "Invalid YAML/JSON format. Expected format: 'key: value' or '{key: value, ..}'. Note both argument forms must be just one shell token"
                         .to_string(),
                 ),
             }
@@ -681,6 +731,64 @@ pub fn check_env_var(vars: &str) -> Result<HashMap<String, String>, String> {
             }
         } else {
             Err("Value must be a .yml file or a yml string like so: '{ dialect: trino }'".into())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_check_single_var() {
+        let result = check_var("key: value").unwrap();
+        let expected_result = BTreeMap::from([(
+            "key".to_string(),
+            dbt_serde_yaml::from_str("value").unwrap(),
+        )]);
+
+        assert_eq!(result, expected_result);
+    }
+
+    #[test]
+    fn test_check_single_bracket_var() {
+        let result = check_var("{key: value}").unwrap();
+        let expected_result = BTreeMap::from([(
+            "key".to_string(),
+            dbt_serde_yaml::from_str("value").unwrap(),
+        )]);
+
+        assert_eq!(result, expected_result);
+    }
+
+    #[test]
+    fn test_check_multiple_bracket_var() {
+        let result = check_var("{key: value, key2: value2}").unwrap();
+        let expected_result = BTreeMap::from([
+            (
+                "key".to_string(),
+                dbt_serde_yaml::from_str("value").unwrap(),
+            ),
+            (
+                "key2".to_string(),
+                dbt_serde_yaml::from_str("value2").unwrap(),
+            ),
+        ]);
+
+        assert_eq!(result, expected_result);
+    }
+
+    #[test]
+    fn test_check_var_invalid() {
+        let invalid_vars = vec![
+            "key",                    // Missing colon
+            "key:value",              // Missing space after colon
+            "key: value:with:colons", // Value with colons
+            "{key:value}",            // Flow-style YAML syntax without space after colon
+        ];
+
+        for var in invalid_vars {
+            assert!(check_var(var).is_err(), "Should have failed: {var}");
         }
     }
 }

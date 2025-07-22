@@ -1,11 +1,9 @@
-use dbt_common::io_utils::try_read_yml_to_str;
-use dbt_common::node_selector::{IndirectSelection, SelectExpression};
+use dbt_common::node_selector::IndirectSelection;
 use dbt_common::once_cell_vars::DISPATCH_CONFIG;
-use dbt_common::stdfs::diff_paths;
-use dbt_common::{err, fs_err, ErrorCode, FsResult};
-use dbt_jinja_utils::jinja_environment::JinjaEnvironment;
+use dbt_common::{ErrorCode, FsResult, err, fs_err};
+use dbt_jinja_utils::jinja_environment::JinjaEnv;
 use dbt_jinja_utils::phases::parse::build_resolve_context;
-use dbt_jinja_utils::serde::value_from_str;
+use dbt_jinja_utils::serde::value_from_file;
 use dbt_schemas::schemas::selectors::{SelectorEntry, SelectorFile};
 use dbt_selector_parser::{ResolvedSelector, SelectorParser};
 use std::collections::{BTreeMap, HashMap};
@@ -28,7 +26,7 @@ use crate::args::ResolveArgs;
 /// Returns the final include and exclude expressions to be used by the scheduler.
 pub fn resolve_final_selectors(
     root_package_name: &str,
-    jinja_env: &JinjaEnvironment<'static>,
+    jinja_env: &JinjaEnv,
     arg: &ResolveArgs,
 ) -> FsResult<ResolvedSelector> {
     let path = arg.io.in_dir.join("selectors.yml");
@@ -52,11 +50,7 @@ pub fn resolve_final_selectors(
         return Ok(resolved);
     }
 
-    let raw_selectors = value_from_str(
-        Some(&arg.io),
-        &try_read_yml_to_str(&path)?,
-        Some(&diff_paths(&path, &arg.io.in_dir)?),
-    )?;
+    let raw_selectors = value_from_file(Some(&arg.io), &path)?;
 
     let context = build_resolve_context(
         root_package_name,
@@ -72,7 +66,7 @@ pub fn resolve_final_selectors(
         false,
         jinja_env,
         &context,
-        None,
+        &[],
     ) {
         Ok(yaml) => yaml,
         Err(e) => {
@@ -90,14 +84,14 @@ pub fn resolve_final_selectors(
         .iter()
         .map(|d| (d.name.clone(), d.clone()))
         .collect::<BTreeMap<_, _>>();
-    let parser = SelectorParser::new(defs);
+    let parser = SelectorParser::new(defs, &arg.io);
     let mut resolved_selectors = HashMap::new();
     for def in yaml.selectors {
         let resolved = parser.parse_definition(&def.definition)?;
         resolved_selectors.insert(
             def.name.clone(),
             SelectorEntry {
-                resolved,
+                include: resolved,
                 is_default: def.default.unwrap_or(false),
                 description: def.description,
             },
@@ -114,7 +108,8 @@ pub fn resolve_final_selectors(
 
     // Find default selector name if no explicit selector provided
     let default_sel_name = resolved_selectors.iter().find_map(|(name, entry)| {
-        if entry.is_default {
+        // Command line arguments (if provided) take precedence over the default
+        if entry.is_default && !(arg.select.is_some() || arg.exclude.is_some()) {
             Some(name.clone())
         } else {
             None
@@ -133,23 +128,21 @@ pub fn resolve_final_selectors(
         })?;
 
         // Use selector's include and apply CLI indirect selection as fallback
-        let mut include = entry.resolved.include.clone();
-        if let (Some(cli_mode), Some(inc)) = (arg.indirect_selection, include.as_mut()) {
-            inc.set_indirect_selection(cli_mode);
+        let mut include = entry.include.clone();
+        if let Some(cli_mode) = arg.indirect_selection {
+            include.set_indirect_selection(cli_mode);
         }
 
-        // Combine selector's exclude with CLI exclude and apply CLI indirect selection as fallback
-        let mut exclude = match (entry.resolved.exclude.clone(), arg.exclude.clone()) {
-            (Some(e1), Some(e2)) => Some(SelectExpression::Or(vec![e1, e2])),
-            (Some(e1), None) => Some(e1),
-            (None, Some(e2)) => Some(e2),
-            (None, None) => None,
-        };
+        // Set exclude to CLI exclude and apply CLI indirect selection as fallback
+        let mut exclude = arg.exclude.clone();
         if let (Some(cli_mode), Some(exc)) = (arg.indirect_selection, exclude.as_mut()) {
             exc.set_indirect_selection(cli_mode);
         }
 
-        Ok(ResolvedSelector { include, exclude })
+        Ok(ResolvedSelector {
+            include: Some(include),
+            exclude,
+        })
     } else {
         // No selector chosen → use CLI flags and apply CLI indirect selection
         let mut resolved = ResolvedSelector {

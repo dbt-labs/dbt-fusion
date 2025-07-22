@@ -1,6 +1,4 @@
-use minijinja::listener::DefaultRenderingEventListener;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, LinkedList, VecDeque};
-use std::rc::Rc;
 use std::sync::Arc;
 
 use insta::{assert_debug_snapshot, assert_snapshot};
@@ -378,7 +376,7 @@ fn test_mutable_vec_in_set_stmt() {
     let rv = minijinja::render!(
         in env,
         "{% set my_arr = [1, 2, 3] %}
-         {% for v in my_arr %}{% set my_arr = my_arr.append(v) %}{% endfor %}
+         {% for v in my_arr %}{% do my_arr.append(v) %}{% endfor %}
          {{ my_arr }}",
     );
     assert_snapshot!(rv, @"[1, 2, 3, 1, 2, 3]");
@@ -559,15 +557,15 @@ fn test_value_cmp() {
 #[test]
 fn test_call_kwargs() {
     let mut env = Environment::new();
-    env.add_template("foo", "").unwrap();
-    let tmpl = env.get_template("foo").unwrap();
+    env.add_template("foo", "", &[]).unwrap();
+    let tmpl = env.get_template("foo", &[]).unwrap();
     let state = tmpl.new_state();
     let val = Value::from_function(|kwargs: Kwargs| kwargs.get::<i32>("foo"));
     let rv = val
         .call(
             &state,
             &[Kwargs::from_iter([("foo", Value::from(42))]).into()],
-            Rc::new(DefaultRenderingEventListener),
+            &[],
         )
         .unwrap();
     assert_eq!(rv, Value::from(42));
@@ -584,22 +582,10 @@ fn test_kwargs_error() {
 fn test_return_none() {
     let env = Environment::empty();
     let val = Value::from_function(|| -> Result<(), Error> { Ok(()) });
-    let rv = val
-        .call(
-            &env.empty_state(),
-            &[][..],
-            Rc::new(DefaultRenderingEventListener),
-        )
-        .unwrap();
+    let rv = val.call(&env.empty_state(), &[][..], &[]).unwrap();
     assert!(rv.is_none());
     let val = Value::from_function(|| ());
-    let rv = val
-        .call(
-            &env.empty_state(),
-            &[][..],
-            Rc::new(DefaultRenderingEventListener),
-        )
-        .unwrap();
+    let rv = val.call(&env.empty_state(), &[][..], &[]).unwrap();
     assert!(rv.is_none());
 }
 
@@ -1239,7 +1225,7 @@ fn test_downcast_arg() {
     struct B;
 
     fn my_func(a: &A, b: Arc<B>) -> String {
-        format!("{:?}|{:?}", a, b)
+        format!("{a:?}|{b:?}")
     }
 
     impl Object for A {}

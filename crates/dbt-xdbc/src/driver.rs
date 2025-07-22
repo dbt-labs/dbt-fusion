@@ -2,17 +2,17 @@
 //!
 //!
 
+use crate::Database;
 use crate::database::AdbcDatabase;
 #[cfg(feature = "odbc")]
 use crate::database::OdbcDatabase;
 use crate::install;
-use crate::Database;
-use crate::Semaphore;
+use crate::semaphore::Semaphore;
 use adbc_core::{
+    Driver as _,
     driver_manager::ManagedDriver as ManagedAdbcDriver,
     error::{Error, Result, Status},
     options::{AdbcVersion, OptionDatabase, OptionValue},
-    Driver as _,
 };
 use libloading;
 use parking_lot::RwLockUpgradableReadGuard;
@@ -35,6 +35,8 @@ pub enum Backend {
     Postgres,
     /// Databricks driver implementation (ADBC).
     Databricks,
+    /// Redshift driver implementation (ADBC).
+    Redshift,
     /// Databricks driver implementation (ODBC).
     DatabricksODBC,
     /// Redshift driver implementation (ODBC).
@@ -62,9 +64,10 @@ impl Display for Backend {
             Backend::BigQuery => write!(f, "BigQuery"),
             Backend::Postgres => write!(f, "PostgreSQL"),
             Backend::Databricks => write!(f, "Databricks"),
+            Backend::Redshift => write!(f, "Redshift"),
             Backend::DatabricksODBC => write!(f, "Databricks"),
             Backend::RedshiftODBC => write!(f, "Redshift"),
-            Backend::Generic { library_name, .. } => write!(f, "Generic({})", library_name),
+            Backend::Generic { library_name, .. } => write!(f, "Generic({library_name})"),
         }
     }
 }
@@ -76,6 +79,8 @@ impl Backend {
             Backend::BigQuery => Some("adbc_driver_bigquery"),
             Backend::Postgres => Some("adbc_driver_postgresql"),
             Backend::Databricks => Some("adbc_driver_databricks"),
+            // todo: swap over to Redshift specific driver once available
+            Backend::Redshift => Some("adbc_driver_postgresql"),
             Backend::DatabricksODBC | Backend::RedshiftODBC => None, // these use ODBC
             Backend::Generic { library_name, .. } => Some(library_name),
         }
@@ -98,6 +103,7 @@ impl Backend {
             Backend::BigQuery => FFIProtocol::Adbc,
             Backend::Postgres => FFIProtocol::Adbc,
             Backend::Databricks => FFIProtocol::Adbc,
+            Backend::Redshift => FFIProtocol::Adbc,
             Backend::DatabricksODBC => FFIProtocol::Odbc,
             Backend::RedshiftODBC => FFIProtocol::Odbc,
             Backend::Generic { .. } => FFIProtocol::Adbc,
@@ -223,7 +229,11 @@ impl AdbcDriver {
     ) -> Result<ManagedAdbcDriver> {
         match backend {
             // These drivers are published to the dbt Labs CDN.
-            Backend::Snowflake | Backend::BigQuery | Backend::Postgres | Backend::Databricks => {
+            Backend::Snowflake
+            | Backend::BigQuery
+            | Backend::Postgres
+            | Backend::Databricks
+            | Backend::Redshift => {
                 debug_assert!(backend.ffi_protocol() == FFIProtocol::Adbc);
                 debug_assert!(install::is_installable_driver(backend));
                 #[cfg(debug_assertions)]
@@ -256,8 +266,7 @@ impl AdbcDriver {
             // ODBC drivers.
             Backend::DatabricksODBC | Backend::RedshiftODBC => Err(Error::with_message_and_status(
                 format!(
-                    "Can not load ADBC driver for {:?} because ODBC should be used instead.",
-                    backend
+                    "Can not load ADBC driver for {backend:?} because ODBC should be used instead."
                 ),
                 Status::InvalidArguments,
             )),
@@ -342,7 +351,7 @@ impl OdbcDriver {
     pub(crate) fn try_load_dynamic(backend: Backend) -> Result<Self> {
         match backend.ffi_protocol() {
             FFIProtocol::Adbc => Err(Error::with_message_and_status(
-                format!("The {:?} backend uses ADBC instead of ODBC", backend),
+                format!("The {backend:?} backend uses ADBC instead of ODBC"),
                 Status::InvalidArguments,
             )),
             FFIProtocol::Odbc => {

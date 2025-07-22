@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use dbt_serde_yaml::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::stdfs;
@@ -7,7 +8,7 @@ use crate::stdfs;
 use super::preprocessor_location;
 
 /// Represents a concrete location in some source file.
-#[derive(Clone, Default, Debug, Eq, PartialEq, Serialize, Deserialize, Hash)]
+#[derive(Clone, Default, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, JsonSchema)]
 pub struct CodeLocation {
     pub line: usize,
     pub col: usize,
@@ -103,6 +104,22 @@ impl CodeLocation {
             ..self
         }
     }
+
+    pub fn with_offset(self, offset: dbt_frontend_common::error::CodeLocation) -> Self {
+        let line = self.line + offset.line - 1;
+        let col = if self.line == 1 {
+            self.col + offset.col - 1
+        } else {
+            self.col
+        };
+        let index = self.index + offset.index;
+        CodeLocation {
+            line,
+            col,
+            index,
+            ..self
+        }
+    }
 }
 
 impl From<PathBuf> for CodeLocation {
@@ -168,7 +185,7 @@ impl std::fmt::Display for CodeLocation {
             write!(f, "{}:{}:{}", relative_path.display(), self.line, self.col)?;
         }
         if let Some(expanded) = &self.expanded {
-            write!(f, " ({})", expanded)?;
+            write!(f, " ({expanded})")?;
         }
         Ok(())
     }
@@ -210,6 +227,13 @@ impl Span {
         Span {
             start: self.start.with_macro_spans(spans, expanded_file.to_owned()),
             stop: self.stop.with_macro_spans(spans, expanded_file),
+        }
+    }
+
+    pub fn with_offset(self, offset: dbt_frontend_common::error::CodeLocation) -> Self {
+        Span {
+            start: self.start.with_offset(offset),
+            stop: self.stop.with_offset(offset),
         }
     }
 }

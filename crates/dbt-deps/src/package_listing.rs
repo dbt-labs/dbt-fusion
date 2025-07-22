@@ -1,29 +1,31 @@
 use dbt_serde_yaml::Verbatim;
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::Path,
+};
 
 use dbt_common::{
-    constants::DBT_PROJECT_YML, err, io_args::IoArgs, io_utils::try_read_yml_to_str, ErrorCode,
-    FsResult,
+    ErrorCode, FsResult, constants::DBT_PROJECT_YML, err, io_args::IoArgs,
+    io_utils::try_read_yml_to_str, unexpected_fs_err,
 };
 use dbt_jinja_utils::{
-    jinja_environment::JinjaEnvironment,
+    jinja_environment::JinjaEnv,
+    phases::load::LoadContext,
     serde::{from_yaml_raw, into_typed_with_jinja},
 };
 use dbt_schemas::schemas::{
     packages::{
         DbtPackageEntry, DbtPackages, DbtPackagesLock, GitPackage, HubPackage, LocalPackage,
-        PrivatePackage,
+        PrivatePackage, TarballPackage,
     },
     project::DbtProject,
 };
 
-use crate::{
-    private_package::get_resolved_url, types::LocalPinnedPackage,
-    utils::get_local_package_full_path,
-};
+use crate::{private_package::get_resolved_url, utils::get_local_package_full_path};
 
 use super::types::{
-    GitUnpinnedPackage, HubUnpinnedPackage, LocalUnpinnedPackage, PrivateUnpinnedPackage,
+    GitUnpinnedPackage, HubUnpinnedPackage, LocalPinnedPackage, LocalUnpinnedPackage,
+    PrivateUnpinnedPackage, TarballUnpinnedPackage,
 };
 
 trait Incorporatable {
@@ -43,6 +45,12 @@ impl Incorporatable for PrivateUnpinnedPackage {
     }
 }
 
+impl Incorporatable for TarballUnpinnedPackage {
+    fn incorporate(&mut self, other: Self) {
+        self.incorporate(other);
+    }
+}
+
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum UnpinnedPackage {
@@ -50,6 +58,7 @@ pub enum UnpinnedPackage {
     Git(GitUnpinnedPackage),
     Local(LocalUnpinnedPackage),
     Private(PrivateUnpinnedPackage),
+    Tarball(TarballUnpinnedPackage),
 }
 
 impl UnpinnedPackage {
@@ -59,19 +68,22 @@ impl UnpinnedPackage {
             UnpinnedPackage::Git(_) => "git",
             UnpinnedPackage::Local(_) => "local",
             UnpinnedPackage::Private(_) => "private",
+            UnpinnedPackage::Tarball(_) => "tarball",
         }
     }
 }
 
 pub struct PackageListing {
     pub io_args: IoArgs,
+    pub vars: BTreeMap<String, dbt_serde_yaml::Value>,
     pub packages: HashMap<String, UnpinnedPackage>,
 }
 
 impl PackageListing {
-    pub fn new(io_args: IoArgs) -> Self {
+    pub fn new(io_args: IoArgs, vars: BTreeMap<String, dbt_serde_yaml::Value>) -> Self {
         Self {
             io_args,
+            vars,
             packages: HashMap::new(),
         }
     }
@@ -83,7 +95,7 @@ impl PackageListing {
     pub fn hydrate_dbt_packages(
         &mut self,
         packages: &DbtPackages,
-        jinja_env: &JinjaEnvironment<'static>,
+        jinja_env: &JinjaEnv,
     ) -> FsResult<()> {
         for package in packages.packages.iter() {
             self.incorporate(package.clone(), jinja_env)?;
@@ -94,7 +106,7 @@ impl PackageListing {
     pub fn hydrate_dbt_packages_lock(
         &mut self,
         dbt_packages_lock: &DbtPackagesLock,
-        jinja_env: &JinjaEnvironment<'static>,
+        jinja_env: &JinjaEnv,
     ) -> FsResult<()> {
         for package in dbt_packages_lock.packages.iter() {
             self.incorporate(package.clone().into(), jinja_env)?;
@@ -102,16 +114,22 @@ impl PackageListing {
         Ok(())
     }
 
-    fn incorporate(
-        &mut self,
-        package: DbtPackageEntry,
-        jinja_env: &JinjaEnvironment<'static>,
-    ) -> FsResult<()> {
+    fn incorporate(&mut self, package: DbtPackageEntry, jinja_env: &JinjaEnv) -> FsResult<()> {
+        let deps_context = LoadContext::new(self.vars.clone());
         match package {
             DbtPackageEntry::Hub(hub_package) => {
                 let hub_package: HubPackage = {
-                    let value = dbt_serde_yaml::to_value(&hub_package)?;
-                    into_typed_with_jinja(Some(&self.io_args), value, true, jinja_env, &(), None)
+                    let value = dbt_serde_yaml::to_value(&hub_package).map_err(|e| {
+                        unexpected_fs_err!("Failed to serialize hub package spec: {e}")
+                    })?;
+                    into_typed_with_jinja(
+                        Some(&self.io_args),
+                        value,
+                        true,
+                        jinja_env,
+                        &deps_context,
+                        &[],
+                    )
                 }?;
                 if let Some(unpinned_package) = self.packages.get_mut(&hub_package.package) {
                     match unpinned_package {
@@ -136,16 +154,40 @@ impl PackageListing {
             }
             DbtPackageEntry::Git(git_package) => {
                 let git_package: GitPackage = {
-                    let value = dbt_serde_yaml::to_value(&git_package)?;
-                    into_typed_with_jinja(Some(&self.io_args), value, true, jinja_env, &(), None)
+                    let value = dbt_serde_yaml::to_value(&git_package).map_err(|e| {
+                        unexpected_fs_err!("Failed to serialize git package spec: {e}")
+                    })?;
+                    into_typed_with_jinja(
+                        Some(&self.io_args),
+                        value,
+                        true,
+                        jinja_env,
+                        &deps_context,
+                        &[],
+                    )
                 }?;
                 let git_package_url: String = {
-                    let value = dbt_serde_yaml::to_value(&git_package.git)?;
-                    into_typed_with_jinja(Some(&self.io_args), value, true, jinja_env, &(), None)
+                    let value = dbt_serde_yaml::to_value(&git_package.git).map_err(|e| {
+                        unexpected_fs_err!("Failed to serialize git package URL: {e}")
+                    })?;
+                    into_typed_with_jinja(
+                        Some(&self.io_args),
+                        value,
+                        true,
+                        jinja_env,
+                        &deps_context,
+                        &[],
+                    )
                 }?;
 
+                // Create key that includes subdirectory if present
+                let mut package_key = git_package_url.clone();
+                if let Some(subdirectory) = &git_package.subdirectory {
+                    package_key.push_str(&format!("#{subdirectory}"));
+                }
+
                 self.handle_remote_package(
-                    &git_package_url.clone(),
+                    &package_key,
                     UnpinnedPackage::Git(GitUnpinnedPackage {
                         git: git_package_url,
                         name: None,
@@ -164,8 +206,17 @@ impl PackageListing {
             }
             DbtPackageEntry::Local(local_package) => {
                 let local_package: LocalPackage = {
-                    let value = dbt_serde_yaml::to_value(&local_package)?;
-                    into_typed_with_jinja(Some(&self.io_args), value, true, jinja_env, &(), None)
+                    let value = dbt_serde_yaml::to_value(&local_package).map_err(|e| {
+                        unexpected_fs_err!("Failed to serialize local package spec: {e}")
+                    })?;
+                    into_typed_with_jinja(
+                        Some(&self.io_args),
+                        value,
+                        true,
+                        jinja_env,
+                        &deps_context,
+                        &[],
+                    )
                 }?;
                 // Get absolute path of local package
                 let full_path = get_local_package_full_path(self.in_dir(), &local_package);
@@ -192,19 +243,45 @@ impl PackageListing {
             }
             DbtPackageEntry::Private(private_package) => {
                 let mut private_package: PrivatePackage = {
-                    let value = dbt_serde_yaml::to_value(&private_package)?;
-                    into_typed_with_jinja(Some(&self.io_args), value, true, jinja_env, &(), None)
+                    let value = dbt_serde_yaml::to_value(&private_package).map_err(|e| {
+                        unexpected_fs_err!("Failed to serialize private package spec: {e}")
+                    })?;
+                    into_typed_with_jinja(
+                        Some(&self.io_args),
+                        value,
+                        true,
+                        jinja_env,
+                        &deps_context,
+                        &[],
+                    )
                 }?;
                 let private_package_private: String = {
-                    let value = dbt_serde_yaml::to_value(&private_package.private)?;
-                    into_typed_with_jinja(Some(&self.io_args), value, true, jinja_env, &(), None)
+                    let value =
+                        dbt_serde_yaml::to_value(&private_package.private).map_err(|e| {
+                            unexpected_fs_err!("Failed to serialize private package URL: {e}")
+                        })?;
+                    into_typed_with_jinja(
+                        Some(&self.io_args),
+                        value,
+                        true,
+                        jinja_env,
+                        &deps_context,
+                        &[],
+                    )
                 }?;
 
-                private_package.private = Verbatim(private_package_private);
+                private_package.private = Verbatim::from(private_package_private);
 
                 let private_package_url = get_resolved_url(&private_package)?;
+
+                // Create key that includes subdirectory if present
+                let mut package_key = private_package_url.clone();
+                if let Some(subdirectory) = &private_package.subdirectory {
+                    package_key.push_str(&format!("#{subdirectory}"));
+                }
+
                 self.handle_remote_package(
-                    &private_package_url.clone(),
+                    &package_key,
                     UnpinnedPackage::Private(PrivateUnpinnedPackage {
                         private: private_package_url,
                         name: None,
@@ -222,17 +299,57 @@ impl PackageListing {
                     "private",
                 )?;
             }
+            DbtPackageEntry::Tarball(tarball_package) => {
+                let tarball_package: TarballPackage = {
+                    let value = dbt_serde_yaml::to_value(&tarball_package).map_err(|e| {
+                        unexpected_fs_err!("Failed to serialize tarball package spec: {e}")
+                    })?;
+                    into_typed_with_jinja(
+                        Some(&self.io_args),
+                        value,
+                        true,
+                        jinja_env,
+                        &deps_context,
+                        &[],
+                    )
+                }?;
+                let tarball_url: String = {
+                    let value =
+                        dbt_serde_yaml::to_value(&tarball_package.tarball).map_err(|e| {
+                            unexpected_fs_err!("Failed to serialize tarball package URL: {e}")
+                        })?;
+                    into_typed_with_jinja(
+                        Some(&self.io_args),
+                        value,
+                        true,
+                        jinja_env,
+                        &deps_context,
+                        &[],
+                    )
+                }?;
+
+                self.handle_remote_package(
+                    &tarball_url.clone(),
+                    UnpinnedPackage::Tarball(TarballUnpinnedPackage {
+                        tarball: tarball_url,
+                        name: None,
+                        unrendered: tarball_package.unrendered.clone(),
+                        original_entry: tarball_package,
+                    }),
+                    "tarball",
+                )?;
+            }
         }
         Ok(())
     }
 
     fn handle_remote_package(
         &mut self,
-        package_url: &str,
+        package_key: &str,
         new_package: UnpinnedPackage,
         package_type: &str,
     ) -> FsResult<()> {
-        if let Some(existing_package) = self.packages.get_mut(package_url) {
+        if let Some(existing_package) = self.packages.get_mut(package_key) {
             match existing_package {
                 UnpinnedPackage::Git(existing_git_package) if package_type == "git" => {
                     if let UnpinnedPackage::Git(new_git_package) = new_package {
@@ -244,18 +361,23 @@ impl PackageListing {
                         existing_private_package.incorporate(new_private_package);
                     }
                 }
+                UnpinnedPackage::Tarball(existing_tarball_package) if package_type == "tarball" => {
+                    if let UnpinnedPackage::Tarball(new_tarball_package) = new_package {
+                        existing_tarball_package.incorporate(new_tarball_package);
+                    }
+                }
                 _ => {
                     return err!(
                         ErrorCode::InvalidConfig,
                         "Found conflicting package types for package {}: '{}' vs '{}'",
-                        package_url,
+                        package_key,
                         package_type,
                         existing_package.type_name(),
                     );
                 }
             }
         } else {
-            self.packages.insert(package_url.to_string(), new_package);
+            self.packages.insert(package_key.to_string(), new_package);
         }
         Ok(())
     }
@@ -276,6 +398,11 @@ impl PackageListing {
                 UnpinnedPackage::Private(existing_private_package) if package_type == "private" => {
                     if let UnpinnedPackage::Private(new_private_package) = new_package {
                         existing_private_package.incorporate(new_private_package.clone());
+                    }
+                }
+                UnpinnedPackage::Tarball(existing_tarball_package) if package_type == "tarball" => {
+                    if let UnpinnedPackage::Tarball(new_tarball_package) = new_package {
+                        existing_tarball_package.incorporate(new_tarball_package.clone());
                     }
                 }
                 _ => {
@@ -320,8 +447,13 @@ impl PackageListing {
                 }
             }
             UnpinnedPackage::Git(git_unpinned_package) => {
+                // Create key that includes subdirectory if present
+                let mut package_key = git_unpinned_package.git.clone();
+                if let Some(subdirectory) = &git_unpinned_package.subdirectory {
+                    package_key.push_str(&format!("#{subdirectory}"));
+                }
                 self.handle_remote_unpinned_package::<GitUnpinnedPackage>(
-                    &git_unpinned_package.git,
+                    &package_key,
                     package,
                     "git",
                 )?;
@@ -363,10 +495,22 @@ impl PackageListing {
                 }
             }
             UnpinnedPackage::Private(private_unpinned_package) => {
+                // Create key that includes subdirectory if present
+                let mut package_key = private_unpinned_package.private.clone();
+                if let Some(subdirectory) = &private_unpinned_package.subdirectory {
+                    package_key.push_str(&format!("#{subdirectory}"));
+                }
                 self.handle_remote_unpinned_package::<PrivateUnpinnedPackage>(
-                    &private_unpinned_package.private,
+                    &package_key,
                     package,
                     "private",
+                )?;
+            }
+            UnpinnedPackage::Tarball(tarball_unpinned_package) => {
+                self.handle_remote_unpinned_package::<TarballUnpinnedPackage>(
+                    &tarball_unpinned_package.tarball,
+                    package,
+                    "tarball",
                 )?;
             }
         }
@@ -376,11 +520,153 @@ impl PackageListing {
     pub fn update_from(
         &mut self,
         packages: &Vec<DbtPackageEntry>,
-        jinja_env: &JinjaEnvironment<'static>,
+        jinja_env: &JinjaEnv,
     ) -> FsResult<()> {
         for package in packages {
             self.incorporate(package.clone(), jinja_env)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dbt_common::io_args::IoArgs;
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_handle_remote_package_with_subdirectory() {
+        let io_args = IoArgs::default();
+        let mut package_listing = PackageListing::new(io_args, BTreeMap::new());
+
+        // Create two git packages with the same URL but different subdirectories
+        let git_package_1 = UnpinnedPackage::Git(GitUnpinnedPackage {
+            git: "https://github.com/dbt-labs/dbt-core.git".to_string(),
+            name: None,
+            warn_unpinned: None,
+            revisions: vec!["main".to_string()],
+            subdirectory: Some("core".to_string()),
+            unrendered: HashMap::new(),
+            original_entry: GitPackage {
+                git: Verbatim::from("https://github.com/dbt-labs/dbt-core.git".to_string()),
+                revision: Some("main".to_string()),
+                warn_unpinned: None,
+                subdirectory: Some("core".to_string()),
+                unrendered: HashMap::new(),
+            },
+        });
+
+        let git_package_2 = UnpinnedPackage::Git(GitUnpinnedPackage {
+            git: "https://github.com/dbt-labs/dbt-core.git".to_string(),
+            name: None,
+            warn_unpinned: None,
+            revisions: vec!["main".to_string()],
+            subdirectory: Some("adapters".to_string()),
+            unrendered: HashMap::new(),
+            original_entry: GitPackage {
+                git: Verbatim::from("https://github.com/dbt-labs/dbt-core.git".to_string()),
+                revision: Some("main".to_string()),
+                warn_unpinned: None,
+                subdirectory: Some("adapters".to_string()),
+                unrendered: HashMap::new(),
+            },
+        });
+
+        // Add the first package
+        package_listing
+            .handle_remote_package(
+                "https://github.com/dbt-labs/dbt-core.git#core",
+                git_package_1,
+                "git",
+            )
+            .unwrap();
+
+        // Add the second package - should be treated as a separate package
+        package_listing
+            .handle_remote_package(
+                "https://github.com/dbt-labs/dbt-core.git#adapters",
+                git_package_2,
+                "git",
+            )
+            .unwrap();
+
+        // Verify that both packages are stored with different keys
+        assert_eq!(package_listing.packages.len(), 2);
+        assert!(
+            package_listing
+                .packages
+                .contains_key("https://github.com/dbt-labs/dbt-core.git#core")
+        );
+        assert!(
+            package_listing
+                .packages
+                .contains_key("https://github.com/dbt-labs/dbt-core.git#adapters")
+        );
+    }
+
+    #[test]
+    fn test_handle_remote_package_same_url_no_subdirectory() {
+        let io_args = IoArgs::default();
+        let mut package_listing = PackageListing::new(io_args, BTreeMap::new());
+
+        // Create two git packages with the same URL and no subdirectory
+        let git_package_1 = UnpinnedPackage::Git(GitUnpinnedPackage {
+            git: "https://github.com/dbt-labs/dbt-core.git".to_string(),
+            name: None,
+            warn_unpinned: None,
+            revisions: vec!["main".to_string()],
+            subdirectory: None,
+            unrendered: HashMap::new(),
+            original_entry: GitPackage {
+                git: Verbatim::from("https://github.com/dbt-labs/dbt-core.git".to_string()),
+                revision: Some("main".to_string()),
+                warn_unpinned: None,
+                subdirectory: None,
+                unrendered: HashMap::new(),
+            },
+        });
+
+        let git_package_2 = UnpinnedPackage::Git(GitUnpinnedPackage {
+            git: "https://github.com/dbt-labs/dbt-core.git".to_string(),
+            name: None,
+            warn_unpinned: None,
+            revisions: vec!["develop".to_string()],
+            subdirectory: None,
+            unrendered: HashMap::new(),
+            original_entry: GitPackage {
+                git: Verbatim::from("https://github.com/dbt-labs/dbt-core.git".to_string()),
+                revision: Some("develop".to_string()),
+                warn_unpinned: None,
+                subdirectory: None,
+                unrendered: HashMap::new(),
+            },
+        });
+
+        // Add the first package
+        package_listing
+            .handle_remote_package(
+                "https://github.com/dbt-labs/dbt-core.git",
+                git_package_1,
+                "git",
+            )
+            .unwrap();
+
+        // Add the second package - should be incorporated into the first one
+        package_listing
+            .handle_remote_package(
+                "https://github.com/dbt-labs/dbt-core.git",
+                git_package_2,
+                "git",
+            )
+            .unwrap();
+
+        // Verify that only one package is stored (they should be incorporated)
+        assert_eq!(package_listing.packages.len(), 1);
+        assert!(
+            package_listing
+                .packages
+                .contains_key("https://github.com/dbt-labs/dbt-core.git")
+        );
     }
 }

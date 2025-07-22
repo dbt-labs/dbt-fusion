@@ -1,6 +1,10 @@
-use crate::{functions::register_base_functions, jinja_environment::JinjaEnvironment};
-use dbt_fusion_adapter::adapters::BaseAdapter;
+use crate::{
+    functions::register_base_functions, jinja_environment::JinjaEnv, listener::ListenerFactory,
+};
+use dbt_common::{FsError, FsResult, io_args::IoArgs, unexpected_fs_err};
+use dbt_fusion_adapter::BaseAdapter;
 use minijinja::{
+    Environment, Error as MinijinjaError, ErrorKind as MinijinjaErrorKind, Value,
     constants::{
         DBT_AND_ADAPTERS_NAMESPACE, MACRO_NAMESPACE_REGISTRY, MACRO_TEMPLATE_REGISTRY,
         NON_INTERNAL_PACKAGES, ROOT_PACKAGE_NAME,
@@ -8,11 +12,10 @@ use minijinja::{
     dispatch_object::get_internal_packages,
     macro_unit::MacroUnit,
     value::ValueKind,
-    Environment, Error as MinijinjaError, ErrorKind as MinijinjaErrorKind, Value,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 type PackageName = String;
 
@@ -33,21 +36,23 @@ impl MacroUnitsWrapper {
 /// A builder struct that configures and returns a Minijinja Environment.
 /// You can add additional fields and methods as needed.
 // Default Jinja Env Behaves differently than Envirornment::new()
-pub struct JinjaEnvironmentBuilder {
+pub struct JinjaEnvBuilder {
     env: Environment<'static>,
     adapter: Option<Arc<dyn BaseAdapter>>,
     globals: BTreeMap<String, Value>,
     root_package: Option<String>,
+    io_args: IoArgs,
 }
 
-impl JinjaEnvironmentBuilder {
-    /// Create a new JinjaEnvironmentBuilder with a default Environment.
+impl JinjaEnvBuilder {
+    /// Create a new JinjaEnvBuilder with a default Environment.
     pub fn new() -> Self {
         Self {
             env: Environment::new(),
             adapter: None,
             globals: BTreeMap::new(),
             root_package: None,
+            io_args: IoArgs::default(),
         }
     }
 
@@ -73,22 +78,27 @@ impl JinjaEnvironmentBuilder {
         self
     }
 
+    /// Add IoArgs
+    pub fn with_io_args(mut self, io_args: IoArgs) -> Self {
+        self.io_args = io_args;
+        self
+    }
+
     /// Register macros with the environment.
-    pub fn try_with_macros(mut self, macros: MacroUnitsWrapper) -> Result<Self, MinijinjaError> {
+    pub fn try_with_macros(
+        mut self,
+        macros: MacroUnitsWrapper,
+        listener_factory: Option<Arc<dyn ListenerFactory>>,
+    ) -> FsResult<Self> {
         let adapter = self.adapter.as_ref().ok_or_else(|| {
-            MinijinjaError::new(
-                MinijinjaErrorKind::InvalidOperation,
-                "try_with_macros requires adapter configuration to be set",
-            )
+            unexpected_fs_err!("try_with_macros requires adapter configuration to be set")
         })?;
 
         // Get the root package name
-        let root_package = self.root_package.clone().ok_or_else(|| {
-            MinijinjaError::new(
-                MinijinjaErrorKind::InvalidOperation,
-                "try_with_macros requires root package to be set",
-            )
-        })?;
+        let root_package = self
+            .root_package
+            .clone()
+            .ok_or_else(|| unexpected_fs_err!("try_with_macros requires root package to be set"))?;
 
         // Get internal packages for this adapter
         let internal_packages = get_internal_packages(adapter.adapter_type().as_ref());
@@ -128,12 +138,33 @@ impl JinjaEnvironmentBuilder {
             }
 
             for macro_unit in macro_units {
+                let filename = macro_unit.info.path.to_string_lossy().to_string();
+                let offset = dbt_frontend_common::error::CodeLocation::new(
+                    macro_unit.info.span.start_line as usize,
+                    macro_unit.info.span.start_col as usize,
+                    macro_unit.info.span.start_offset as usize,
+                );
+                let listeners = listener_factory
+                    .as_ref()
+                    .map(|factory| factory.create_listeners(Path::new(&filename), &offset))
+                    .unwrap_or_default();
                 let macro_name = macro_unit.info.name.clone();
-                let template_name = format!("{}.{}", package_name, macro_name);
+                let template_name = format!("{package_name}.{macro_name}");
 
                 // Add to environment and template registry
                 self.env
-                    .add_template_owned(template_name.clone(), macro_unit.sql.clone())?;
+                    .add_template_owned(
+                        template_name.clone(),
+                        macro_unit.sql.clone(),
+                        Some(filename.clone()),
+                        &listeners,
+                    )
+                    .map_err(|e| FsError::from_jinja_err(e, "Failed to add template"))?;
+                for listener in listeners {
+                    if let Some(factory) = listener_factory.as_ref() {
+                        factory.destroy_listener(Path::new(&filename), listener)
+                    };
+                }
 
                 macro_template_registry.insert(
                     Value::from(template_name),
@@ -190,7 +221,7 @@ impl JinjaEnvironmentBuilder {
     }
 
     /// Build the Minijinja Environment with all configured settings.
-    pub fn build(mut self) -> Result<JinjaEnvironment<'static>, MinijinjaError> {
+    pub fn build(mut self) -> JinjaEnv {
         // Register filters (as_bool, as_number, as_native, as_text)
         // These are used to convert values to the appropriate type that might be
         // expected by the jinja template.
@@ -201,7 +232,7 @@ impl JinjaEnvironmentBuilder {
         self.register_tests();
 
         // Register "base" dbt style functions.
-        register_base_functions(&mut self.env);
+        register_base_functions(&mut self.env, self.io_args);
 
         // Register all configured global values.
         // TODO (Ani) type the globals struct to validate we recieve all the globals we need
@@ -216,12 +247,12 @@ impl JinjaEnvironmentBuilder {
         self.env
             .set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
 
-        let mut jinja_env = JinjaEnvironment::new(self.env);
+        let mut jinja_env = JinjaEnv::new(self.env);
         if let Some(adapter) = self.adapter {
             jinja_env.set_adapter(adapter);
         }
 
-        Ok(jinja_env)
+        jinja_env
     }
 
     fn register_filters(&mut self) {
@@ -231,22 +262,28 @@ impl JinjaEnvironmentBuilder {
         self.env.add_filter("as_native", |value: Value| Ok(value));
         self.env
             .add_filter("as_text", |value: Value| match value.kind() {
-                ValueKind::Bool => Ok(Value::from(format!("{}", value))),
+                ValueKind::Bool => Ok(Value::from(format!("{value}"))),
                 ValueKind::String => Ok(value),
-                ValueKind::Number => Ok(Value::from(format!("{}", value))),
+                ValueKind::Number => Ok(Value::from(format!("{value}"))),
                 ValueKind::None => Ok(Value::from("")),
-                _ => Err(MinijinjaError::new(
-                    MinijinjaErrorKind::InvalidOperation,
-                    format!("Failed applying 'as_text' filter to {}", value.kind()),
-                )),
+                _ => {
+                    // Try to see if Value is an Object - use debug to render if so
+                    if let Some(object) = value.as_object() {
+                        // Call the render method on the object
+                        let debug = format!("{object:?}");
+                        Ok(Value::from(debug))
+                    } else {
+                        Err(MinijinjaError::new(
+                            MinijinjaErrorKind::InvalidOperation,
+                            format!("Failed applying 'as_text' filter to {}", value.kind()),
+                        ))
+                    }
+                }
             });
 
         self.env
             .add_filter("as_bool", |value: Value| match value.kind() {
-                ValueKind::Undefined => Err(MinijinjaError::new(
-                    MinijinjaErrorKind::InvalidOperation,
-                    "Failed applying 'as_bool' filter to undefined value",
-                )),
+                ValueKind::Undefined => Ok(Value::UNDEFINED),
                 ValueKind::None => Ok(Value::from(false)),
                 ValueKind::Bool | ValueKind::Number => Ok(value),
 
@@ -273,8 +310,7 @@ impl JinjaEnvironmentBuilder {
                         MinijinjaError::new(
                             MinijinjaErrorKind::InvalidOperation,
                             format!(
-                                "Failed applying 'as_number' filter to bytes string '{}'",
-                                string_from_bytes
+                                "Failed applying 'as_number' filter to bytes string '{string_from_bytes}'"
                             ),
                         )
                     })?;
@@ -295,10 +331,7 @@ impl JinjaEnvironmentBuilder {
 
         self.env
             .add_filter("as_number", |value: Value| match value.kind() {
-                ValueKind::Undefined => Err(MinijinjaError::new(
-                    MinijinjaErrorKind::InvalidOperation,
-                    "Failed applying 'as_number' filter to undefined value",
-                )),
+                ValueKind::Undefined => Ok(Value::UNDEFINED),
                 ValueKind::None => Ok(Value::from(0)),
                 ValueKind::Bool => Ok(value),
                 ValueKind::Number => Ok(value),
@@ -325,8 +358,7 @@ impl JinjaEnvironmentBuilder {
                         MinijinjaError::new(
                             MinijinjaErrorKind::InvalidOperation,
                             format!(
-                                "Failed applying 'as_number' filter to bytes string '{}'",
-                                string_from_bytes
+                                "Failed applying 'as_number' filter to bytes string '{string_from_bytes}'"
                             ),
                         )
                     })?;
@@ -355,7 +387,7 @@ impl JinjaEnvironmentBuilder {
     }
 }
 
-impl Default for JinjaEnvironmentBuilder {
+impl Default for JinjaEnvBuilder {
     fn default() -> Self {
         Self::new()
     }
@@ -365,7 +397,7 @@ impl Default for JinjaEnvironmentBuilder {
 mod tests {
     use std::{collections::BTreeSet, path::PathBuf, sync::Mutex};
 
-    use dbt_fusion_adapter::adapters::parse::adapter::create_parse_adapter;
+    use dbt_fusion_adapter::parse::adapter::create_parse_adapter;
     use dbt_schemas::schemas::relations::DEFAULT_DBT_QUOTING;
     use minijinja::{
         constants::MACRO_DISPATCH_ORDER, context, dispatch_object::THREAD_LOCAL_DEPENDENCIES,
@@ -391,6 +423,28 @@ mod tests {
             sql: sql.to_string(),
         }
     }
+
+    #[test]
+    fn test_filter_none() {
+        let mut builder = JinjaEnvBuilder::new();
+        builder.register_filters();
+        let env = builder.build();
+        let rv = env
+            .render_str(
+                r#"
+    {%- set x = y | as_bool -%}
+    {%- set x = y | as_number -%}   
+    all okay!
+    "#,
+                context! {},
+                &[],
+            )
+            .unwrap();
+        assert_snapshot!(rv, @r"
+
+all okay!");
+    }
+
     #[test]
     fn test_dispatch_mode() {
         THREAD_LOCAL_DEPENDENCIES
@@ -451,43 +505,38 @@ mod tests {
                 "{% macro default__one() %}test_package one{% endmacro %}",
             )],
         );
-        let builder: JinjaEnvironmentBuilder = JinjaEnvironmentBuilder::new()
+        let builder: JinjaEnvBuilder = JinjaEnvBuilder::new()
             .with_adapter(create_parse_adapter("postgres", DEFAULT_DBT_QUOTING).unwrap())
             .with_root_package("test_package".to_string())
-            .try_with_macros(macro_units)
+            .try_with_macros(macro_units, None)
             .expect("Failed to register macros");
-        let env = builder.build().unwrap();
+        let env = builder.build();
         // one exists in test_package, dbt_postgres, and dbt
         let rv = env
-            .render_str("{{adapter.dispatch('one', 'dbt')()}}", context! {}, None)
-            .unwrap()
-            .0;
+            .render_str("{{adapter.dispatch('one', 'dbt')()}}", context! {}, &[])
+            .unwrap();
         assert_snapshot!(rv, "test_package one");
         // two exists in dbt_postgres, and dbt
         let rv = env
-            .render_str("{{adapter.dispatch('two', 'dbt')()}}", context! {}, None)
-            .unwrap()
-            .0;
+            .render_str("{{adapter.dispatch('two', 'dbt')()}}", context! {}, &[])
+            .unwrap();
         assert_snapshot!(rv, "postgres two");
         // three exists in dbt
         let rv = env
-            .render_str("{{adapter.dispatch('three', 'dbt')()}}", context! {}, None)
-            .unwrap()
-            .0;
+            .render_str("{{adapter.dispatch('three', 'dbt')()}}", context! {}, &[])
+            .unwrap();
         assert_snapshot!(rv, "dbt default three");
 
         // one exists in test_package, dbt_postgres, and dbt, but package is not specified, so last one wins
         let rv = env
-            .render_str("{{adapter.dispatch('one')()}}", context! {}, None)
-            .unwrap()
-            .0;
+            .render_str("{{adapter.dispatch('one')()}}", context! {}, &[])
+            .unwrap();
         assert_snapshot!(rv, "test_package one");
 
         // some_macro exists in a_package, and dbt_postgres, but package is not specified, so last one wins
         let rv = env
-            .render_str("{{adapter.dispatch('some_macro')()}}", context! {}, None)
-            .unwrap()
-            .0;
+            .render_str("{{adapter.dispatch('some_macro')()}}", context! {}, &[])
+            .unwrap();
         assert_snapshot!(rv, "some_macro in a_package");
 
         // some_macro exists in a_package, postgres, and dbt_postgres, but package is specified, so a_package wins
@@ -495,10 +544,9 @@ mod tests {
             .render_str(
                 "{{adapter.dispatch('some_macro', 'a_package')()}}",
                 context! {},
-                None,
+                &[],
             )
-            .unwrap()
-            .0;
+            .unwrap();
         assert_snapshot!(rv, "some_macro in a_package");
     }
     #[test]
@@ -537,12 +585,12 @@ mod tests {
                 ),
             ],
         );
-        let builder: JinjaEnvironmentBuilder = JinjaEnvironmentBuilder::new()
+        let builder: JinjaEnvBuilder = JinjaEnvBuilder::new()
             .with_adapter(create_parse_adapter("postgres", DEFAULT_DBT_QUOTING).unwrap())
             .with_root_package("test_package".to_string())
-            .try_with_macros(macro_units)
+            .try_with_macros(macro_units, None)
             .expect("Failed to register macros");
-        let env = builder.build().unwrap();
+        let env = builder.build();
 
         // Set non-default dispatch order of a_package and dbt
         let ctx = BTreeMap::from([(
@@ -568,17 +616,15 @@ mod tests {
             .render_str(
                 "{{adapter.dispatch('some_macro', 'a_package')()}}",
                 &ctx,
-                None,
+                &[],
             )
-            .unwrap()
-            .0;
+            .unwrap();
         assert_eq!(rv, "some_macro in test_package");
 
         // some_macro dispatched with dbt now resolves to dbt
         let rv = env
-            .render_str("{{adapter.dispatch('some_macro', 'dbt')()}}", &ctx, None)
-            .unwrap()
-            .0;
+            .render_str("{{adapter.dispatch('some_macro', 'dbt')()}}", &ctx, &[])
+            .unwrap();
         assert_eq!(rv, "some_macro in dbt");
 
         // some_macro does not exist in b_package, so when dispatched with test_package still resolves to test_package
@@ -586,16 +632,15 @@ mod tests {
             .render_str(
                 "{{adapter.dispatch('some_macro', 'test_package')()}}",
                 ctx,
-                None,
+                &[],
             )
-            .unwrap()
-            .0;
+            .unwrap();
         assert_snapshot!(rv, "some_macro in test_package");
     }
 
     #[test]
     fn test_macro_assignment() {
-        let env = JinjaEnvironmentBuilder::new()
+        let env = JinjaEnvBuilder::new()
             .with_root_package("test_package".to_string())
             .with_adapter(create_parse_adapter("postgres", DEFAULT_DBT_QUOTING).unwrap())
             .try_with_macros(MacroUnitsWrapper::new(BTreeMap::from([(
@@ -625,15 +670,12 @@ mod tests {
                         sql: "{% macro macro_b() %}{%- set small_macro_name = some_macro -%} {{ small_macro_name() }}{% endmacro %}".to_string(),
                     },
                 ],
-            )])))
+            )]),
+        ), None)
             .unwrap()
-            .build()
-            .unwrap();
+            .build();
         // Test assigning macro to variable and using it
-        let rv = env
-            .render_str("{{macro_b()}}", context! {}, None)
-            .unwrap()
-            .0;
+        let rv = env.render_str("{{macro_b()}}", context! {}, &[]).unwrap();
 
         // The first print should show the macro object, second print shows the macro output
         // assert!(rv.contains("<macro 'some_macro'>"));
@@ -641,21 +683,21 @@ mod tests {
     }
     #[test]
     fn test_date_format() {
-        let env = JinjaEnvironmentBuilder::new().build().unwrap();
+        let env = JinjaEnvBuilder::new().build();
         let rv = env
             .render_str(
                 "{{modules.pytz.utc}} {{- modules.datetime.datetime.now(modules.pytz.utc).isoformat() -}}",
                 context! {},
-                None,
+                &[],
             )
             .unwrap()
-            .0;
+            ;
         assert!(rv.contains("UTC"));
         assert!(rv.contains("+00:00"));
     }
     #[test]
     fn test_datetime_strftime_with_timedelta() {
-        let env = JinjaEnvironmentBuilder::new().build().unwrap();
+        let env = JinjaEnvBuilder::new().build();
         let rv = env
             .render_str(
                 "
@@ -663,10 +705,10 @@ mod tests {
                 {%- set now = modules.datetime.datetime.now().astimezone(modules.pytz.timezone('UTC')) -%}
                 {{modules.datetime.datetime.strftime(today - modules.datetime.timedelta(days=1), '%Y-%m-%d')}}",
                 context! {},
-                None,
+                &[],
             )
             .unwrap()
-            .0;
+            ;
         // Extract the date from the rendered string and verify it's in the expected format
         let date_pattern = regex::Regex::new(r"^\d{4}-\d{2}-\d{2}$").unwrap();
         assert!(
@@ -705,13 +747,13 @@ mod tests {
         // Root package has no macros
 
         // Build environment with the empty root package
-        let builder: JinjaEnvironmentBuilder = JinjaEnvironmentBuilder::new()
+        let builder: JinjaEnvBuilder = JinjaEnvBuilder::new()
             .with_adapter(create_parse_adapter("postgres", DEFAULT_DBT_QUOTING).unwrap())
             .with_root_package("empty_root".to_string())
-            .try_with_macros(macro_units)
+            .try_with_macros(macro_units, None)
             .expect("Failed to register macros");
 
-        let env = builder.build().unwrap();
+        let env = builder.build();
 
         // Get the non_internal_packages registry
         let non_internal_packages = env.get_global(NON_INTERNAL_PACKAGES).unwrap();

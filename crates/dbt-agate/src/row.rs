@@ -1,9 +1,9 @@
 use crate::columns::ColumnNamesAsTuple;
 use crate::table::TableRepr;
 use crate::{MappedSequence, Tuple, TupleRepr};
+use minijinja::Value;
 use minijinja::listener::RenderingEventListener;
 use minijinja::value::{Enumerator, Object, ObjectRepr};
-use minijinja::Value;
 use minijinja::{Error as MinijinjaError, State};
 use std::fmt;
 use std::rc::Rc;
@@ -100,9 +100,9 @@ impl Object for Row {
         state: &State<'_, '_>,
         method: &str,
         args: &[Value],
-        listener: Rc<dyn RenderingEventListener>,
+        listeners: &[Rc<dyn RenderingEventListener>],
     ) -> Result<Value, MinijinjaError> {
-        MappedSequence::call_method(self, state, method, args, listener)
+        MappedSequence::call_method(self, state, method, args, listeners)
     }
 
     fn render(self: &Arc<Self>, f: &mut fmt::Formatter<'_>) -> fmt::Result {

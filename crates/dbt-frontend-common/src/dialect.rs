@@ -1,9 +1,10 @@
 use crate::ident::{
-    ColumnRef, FullyQualifiedName, QualifiedName, LOWERCASE_DRAFT_SUFFIX, UPPERCASE_DRAFT_SUFFIX,
+    ColumnRef, FullyQualifiedName, LOWERCASE_DRAFT_SUFFIX, QualifiedName, UPPERCASE_DRAFT_SUFFIX,
 };
 
-use super::error::{internal_err, InternalError, InternalResult};
+use super::error::{InternalError, InternalResult, internal_err};
 use super::ident::Identifier;
+use crate::make_internal_err;
 use serde::{Deserialize, Serialize};
 use std::{fmt::Display, str::FromStr};
 
@@ -139,40 +140,6 @@ impl From<&Dialect> for Dialect {
     }
 }
 
-impl From<dbt_frontend_schemas::dialect::Dialect> for Dialect {
-    fn from(value: dbt_frontend_schemas::dialect::Dialect) -> Self {
-        match value {
-            dbt_frontend_schemas::dialect::Dialect::Trino => Self::Trino,
-            dbt_frontend_schemas::dialect::Dialect::Snowflake => Self::Snowflake,
-            dbt_frontend_schemas::dialect::Dialect::Sdf => Self::Sdf,
-            dbt_frontend_schemas::dialect::Dialect::Postgresql => Self::Postgresql,
-            dbt_frontend_schemas::dialect::Dialect::Bigquery => Self::Bigquery,
-            dbt_frontend_schemas::dialect::Dialect::DataFusion => Self::DataFusion,
-            dbt_frontend_schemas::dialect::Dialect::SparkSql => Self::SparkSql,
-            dbt_frontend_schemas::dialect::Dialect::SparkLp => Self::SparkLp,
-            dbt_frontend_schemas::dialect::Dialect::Redshift => Self::Redshift,
-            dbt_frontend_schemas::dialect::Dialect::Databricks => Self::Databricks,
-        }
-    }
-}
-
-impl From<Dialect> for dbt_frontend_schemas::dialect::Dialect {
-    fn from(value: Dialect) -> Self {
-        match value {
-            Dialect::Trino => Self::Trino,
-            Dialect::Snowflake => Self::Snowflake,
-            Dialect::Sdf => Self::Sdf,
-            Dialect::Postgresql => Self::Postgresql,
-            Dialect::Bigquery => Self::Bigquery,
-            Dialect::DataFusion => Self::DataFusion,
-            Dialect::SparkSql => Self::SparkSql,
-            Dialect::SparkLp => Self::SparkLp,
-            Dialect::Redshift => Self::Redshift,
-            Dialect::Databricks => Self::Databricks,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypeFormattingContext {
     Production,
@@ -271,7 +238,7 @@ impl Dialect {
                 // TODO: revert this once
                 // https://github.com/sdf-labs/sdf/issues/3328 is fixed:
                 // c.is_alphanumeric() || ['_', '`', '@'].contains(&c)
-                c != '.' && c != self.quote_char() && !c.is_whitespace() && c != '/'
+                c != '.' && c != self.quote_char() && !c.is_whitespace() && c != '/' && c != ';'
             }
             Dialect::Redshift => c.is_alphanumeric() || c == '_',
             _ => c.is_alphanumeric() || c == '_',
@@ -345,9 +312,9 @@ impl Dialect {
 
     /// Parse the given string as a qualified name.
     pub fn parse_qualified_name(&self, sql: &str) -> InternalResult<QualifiedName> {
-        let idents = self.parse_dot_separated_identifiers(sql).map_err(|e| {
-            InternalError::new(format!("Failed to parse {sql} as qualified name: {e}"))
-        })?;
+        let idents = self
+            .parse_dot_separated_identifiers(sql)
+            .map_err(|e| make_internal_err!("Failed to parse {sql} as qualified name: {e}"))?;
         QualifiedName::try_from(idents)
     }
 
@@ -359,9 +326,9 @@ impl Dialect {
 
     /// Parse the given string as a column reference.
     pub fn parse_column_ref(&self, sql: &str) -> InternalResult<ColumnRef> {
-        let idvec = self.parse_dot_separated_identifiers(sql).map_err(|e| {
-            InternalError::new(format!("Failed to parse {sql} as column reference: {e}"))
-        })?;
+        let idvec = self
+            .parse_dot_separated_identifiers(sql)
+            .map_err(|e| make_internal_err!("Failed to parse {sql} as column reference: {e}"))?;
         if idvec.len() != 4 {
             return internal_err!(
                 "Failed to parse {sql} as column reference:
@@ -401,7 +368,7 @@ where
 
     let Some((_, c)) = chars.peek() else {
         // Empty string is not a syntactically valid identifier
-        return internal_err!("expecting identifier but got end of input");
+        return internal_err!("Expecting identifier but got end of input");
     };
 
     let is_quoted = *c == quote_char;

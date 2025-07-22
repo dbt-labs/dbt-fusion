@@ -1,10 +1,10 @@
-use clap::error::ErrorKind;
 use clap::Error;
 use clap::Parser;
+use clap::error::ErrorKind;
 
 use dbt_common::{constants::PANIC, pretty_string::GREEN, pretty_string::RED};
-use dbt_sa_lib::dbt_sa_clap::from_main;
 use dbt_sa_lib::dbt_sa_clap::Cli;
+use dbt_sa_lib::dbt_sa_clap::from_main;
 use dbt_sa_lib::dbt_sa_lib::execute_fs;
 use std::io::{self, Write};
 use std::process::ExitCode;
@@ -138,5 +138,5 @@ fn print_trimmed_error(e: Error) {
     }
 
     // Always print this footer
-    let _ = writeln!(stderr, "\nFor more information, try '{} --help'.", command);
+    let _ = writeln!(stderr, "\nFor more information, try '{command} --help'.");
 }

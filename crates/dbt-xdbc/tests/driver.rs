@@ -19,10 +19,9 @@ mod tests {
     use arrow_array::Array as _;
     use arrow_array::{cast::AsArray, types::*};
     use dbt_xdbc::{
-        bigquery, connection,
+        Backend, Connection, Database, Driver, QueryCtx, Statement, bigquery, connection,
         database::{self, LogLevel},
-        databricks, driver, redshift, snowflake, Backend, Connection, Database, Driver, QueryCtx,
-        Statement,
+        databricks, driver, redshift, snowflake,
     };
 
     const ADBC_VERSION: AdbcVersion = AdbcVersion::V110;
@@ -53,7 +52,7 @@ mod tests {
                     .with_named_option(bigquery::AUTH_CREDENTIALS, auth_credentials)?;
                 Ok(builder)
             }
-            Backend::Postgres => {
+            Backend::Postgres | Backend::Redshift => {
                 // Configuration for Postgres:
                 //     CREATE ROLE username WITH LOGIN PASSWORD 'an_secure_password';
                 //     CREATE DATABASE adbc_test;
@@ -206,9 +205,11 @@ mod tests {
     fn database_get_info() -> Result<()> {
         with_database(Backend::Snowflake, |mut database| {
             assert_eq!(database.vendor_name(), Ok("Snowflake".to_owned()));
-            assert!(database
-                .vendor_version()
-                .is_ok_and(|version| version.starts_with("v")));
+            assert!(
+                database
+                    .vendor_version()
+                    .is_ok_and(|version| version.starts_with("v"))
+            );
             assert!(database.vendor_arrow_version().is_ok());
             assert_eq!(database.vendor_sql(), Ok(true));
             assert_eq!(database.vendor_substrait(), Ok(false));
@@ -435,8 +436,8 @@ mod tests {
                      VALUES
                        (21 + 21, 'Snowman ☃'),
                        (43, NULL),
-                       (NULL, REPEAT('A string that is longer than 64 characters because it goes on and on about nothing in particular ☃', {}))
-                   ) AS tbl(id, name)"#, REPEAT).as_str(),
+                       (NULL, REPEAT('A string that is longer than 64 characters because it goes on and on about nothing in particular ☃', {REPEAT}))
+                   ) AS tbl(id, name)"#).as_str(),
             ))?;
             let batch = statement
                 .execute()?
@@ -524,9 +525,10 @@ mod tests {
         assert!(conn_res.is_err());
         let err = conn_res.unwrap_err();
         assert!(err.message.contains("nonexistent_driver"));
-        assert!(err
-            .message
-            .contains("The Databricks ODBC driver can be downloaded from"));
+        assert!(
+            err.message
+                .contains("The Databricks ODBC driver can be downloaded from")
+        );
         Ok(())
     }
 

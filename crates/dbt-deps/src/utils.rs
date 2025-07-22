@@ -4,7 +4,7 @@ use dbt_schemas::schemas::packages::{DbtPackageEntry, LocalPackage};
 use sha1::Digest;
 
 use dbt_common::{
-    constants::DBT_PROJECT_YML, err, fs_err, io_utils::try_read_yml_to_str, ErrorCode, FsResult,
+    ErrorCode, FsResult, constants::DBT_PROJECT_YML, err, fs_err, io_utils::try_read_yml_to_str,
 };
 use dbt_jinja_utils::serde::from_yaml_raw;
 use dbt_schemas::schemas::project::DbtProject;
@@ -36,8 +36,10 @@ pub fn handle_git_like_package(
     revisions: &[String],
     subdirectory: &Option<String>,
     warn_unpinned: bool,
+    packages_install_path: Option<&Path>,
 ) -> FsResult<(tempfile::TempDir, PathBuf, String)> {
-    let tmp_dir = tempfile::tempdir()
+    let tmp_dir = packages_install_path
+        .map_or_else(tempfile::tempdir, tempfile::tempdir_in)
         .map_err(|e| fs_err!(ErrorCode::IoError, "Failed to create temp dir: {}", e))?;
     let revision = revisions.last().unwrap_or(&"HEAD".to_string()).clone();
     let (checkout_path, commit_sha) = clone_and_checkout(
@@ -52,8 +54,7 @@ pub fn handle_git_like_package(
     )?;
     if ["HEAD", "main", "master"].contains(&revision.as_str()) && warn_unpinned {
         println!(
-            "\nWARNING: The package {} is pinned to the default branch, which is not recommended. Consider pinning to a specific commit SHA instead.",
-            repo_url
+            "\nWARNING: The package {repo_url} is pinned to the default branch, which is not recommended. Consider pinning to a specific commit SHA instead."
         );
     }
     Ok((tmp_dir, checkout_path, commit_sha))

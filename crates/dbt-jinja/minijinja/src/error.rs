@@ -25,8 +25,8 @@ use crate::compiler::tokens::Span;
 /// # let mut env = minijinja::Environment::new();
 /// # env.add_template("", "");
 /// # let template = env.get_template("").unwrap(); let ctx = ();
-/// match template.render(ctx, Rc::new(DefaultRenderingEventListener)) {
-///     Ok((result, _)) => println!("{}", result),
+/// match template.render(ctx, &[Rc::new(DefaultRenderingEventListener::default())]) {
+///     Ok(result) => println!("{}", result),
 ///     Err(err) => {
 ///         eprintln!("Could not render template: {:#}", err);
 ///         // render causes as well
@@ -62,6 +62,7 @@ struct ErrorRepr {
     debug_info: Option<Arc<crate::debug::DebugInfo>>,
     return_value: Option<crate::value::Value>,
     suspend_vm: Option<(String, crate::cache_key::CacheKey)>,
+    span: Option<Span>,
 }
 
 impl fmt::Debug for Error {
@@ -167,6 +168,8 @@ pub enum ErrorKind {
     RegexError,
     /// Error for when a disabled model is encountered
     DisabledModel,
+    /// Error for typecheck
+    TypeError,
 }
 
 impl ErrorKind {
@@ -183,7 +186,7 @@ impl ErrorKind {
             ErrorKind::UnknownFunction => "unknown function".to_string(),
             ErrorKind::UnknownTest => "unknown test".to_string(),
             ErrorKind::UnknownMethod(caller, name) => {
-                format!("No method named '{}' for '{}'", name, caller)
+                format!("No method named '{name}' for '{caller}'")
             }
             ErrorKind::BadEscape => "bad string escape".to_string(),
             ErrorKind::UndefinedError => "undefined value".to_string(),
@@ -213,6 +216,7 @@ impl ErrorKind {
             ErrorKind::SerdeDeserializeError => "could not deserialize".to_string(),
             ErrorKind::RegexError => "regex error".to_string(),
             ErrorKind::DisabledModel => "model is disabled".to_string(),
+            ErrorKind::TypeError => "type error".to_string(),
         }
     }
 }
@@ -266,12 +270,13 @@ impl Error {
                 debug_info: None,
                 return_value: None,
                 suspend_vm: None,
+                span: None,
             }),
         }
     }
 
     /// Creates a new error for an abrupt return with the given value.
-    pub fn abrupt_return(value: crate::value::Value) -> Error {
+    pub fn abrupt_return(value: crate::value::Value, span: Span) -> Error {
         Error {
             repr: Box::new(ErrorRepr {
                 kind: ErrorKind::InvalidOperation,
@@ -283,6 +288,7 @@ impl Error {
                 debug_info: None,
                 return_value: Some(value),
                 suspend_vm: None,
+                span: Some(span),
             }),
         }
     }
@@ -300,6 +306,7 @@ impl Error {
                 debug_info: None,
                 return_value: None,
                 suspend_vm: Some((name, cache_key)),
+                span: None,
             }),
         }
     }
@@ -307,6 +314,11 @@ impl Error {
     /// Returns the value if the error was caused by an abrupt return.
     pub fn try_abrupt_return(&self) -> Option<&crate::value::Value> {
         self.repr.return_value.as_ref()
+    }
+
+    /// Returns the span of the abrupt return if available.
+    pub fn get_abrupt_return_span(&self) -> Span {
+        self.repr.span.unwrap()
     }
 
     /// Returns the value if the error was caused by a suspend vm
@@ -424,7 +436,7 @@ impl Error {
     /// # let mut env = Environment::new();
     /// # env.set_debug(true);
     /// let tmpl = env.template_from_str("Hello {{ foo + bar }}!").unwrap();
-    /// let err = tmpl.render(context!(foo => "a string", bar => 0), Rc::new(DefaultRenderingEventListener)).unwrap_err();
+    /// let err = tmpl.render(context!(foo => "a string", bar => 0), &[Rc::new(DefaultRenderingEventListener::default())]).unwrap_err();
     /// let src = err.template_source().unwrap();
     /// assert_eq!(&src[err.range().unwrap()], "{{ foo + bar }}");
     /// ```
@@ -512,6 +524,7 @@ impl From<ErrorKind> for Error {
                 debug_info: None,
                 return_value: None,
                 suspend_vm: None,
+                span: None,
             }),
         }
     }

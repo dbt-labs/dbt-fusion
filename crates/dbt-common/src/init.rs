@@ -2,7 +2,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use crate::pretty_string::{GREEN, YELLOW};
-use crate::{fs_err, profile_setup::ProfileSetup, ErrorCode, FsResult};
+use crate::{ErrorCode, FsResult, fs_err, profile_setup::ProfileSetup};
 use rust_embed::RustEmbed;
 use std::env;
 use std::fs;
@@ -130,7 +130,7 @@ pub fn get_profiles_dir() -> String {
     // Try environment variable first, then fall back to default
     env::var("DBT_PROFILES_DIR").unwrap_or_else(|_| {
         let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        format!("{}/.dbt", home)
+        format!("{home}/.dbt")
     })
 }
 
@@ -193,7 +193,10 @@ pub fn run_init_workflow(
             ));
         }
 
-        log::info!("{} A dbt_project.yml already exists in this directory; skipping sample project creation.", YELLOW.apply_to("Warning"));
+        log::info!(
+            "{} A dbt_project.yml already exists in this directory; skipping sample project creation.",
+            YELLOW.apply_to("Warning")
+        );
 
         // Create or update .vscode/extensions.json even when skipping project creation
         create_or_update_vscode_extensions(Path::new("."))?;
@@ -276,7 +279,7 @@ pub fn run_init_workflow(
 fn next_available_dir_name(base: &str) -> String {
     let mut counter = 1;
     loop {
-        let candidate = format!("{}_{}", base, counter);
+        let candidate = format!("{base}_{counter}");
         if !Path::new(&candidate).exists() {
             return candidate;
         }

@@ -1,3 +1,4 @@
+use crate::Tuple;
 use crate::column::Column;
 use crate::columns::ColumnNamesAsTuple;
 use crate::columns::Columns;
@@ -7,14 +8,17 @@ use crate::print_table::print_table;
 use crate::row::Row;
 use crate::rows::Rows;
 use crate::vec_of_rows::VecOfRows;
-use crate::Tuple;
 
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{ArrowError, Schema};
-use minijinja::listener::RenderingEventListener;
-use minijinja::value::{Enumerator, Object};
 use minijinja::Value;
-use minijinja::{Error as MinijinjaError, State};
+use minijinja::arg_utils::ArgsIter;
+use minijinja::listener::RenderingEventListener;
+use minijinja::value::Kwargs;
+use minijinja::value::ValueMap;
+use minijinja::value::mutable_map::MutableMap;
+use minijinja::value::{Enumerator, Object};
+use minijinja::{Error as MinijinjaError, ErrorKind, State};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -184,6 +188,20 @@ impl TableRepr {
         todo!()
     }
 
+    fn with_renamed_columns(&self, renamed_columns: Vec<String>) -> Self {
+        debug_assert!(renamed_columns.len() == self.num_columns());
+        match self {
+            TableRepr::Arrow(batch) => {
+                let new_batch = batch.with_renamed_columns(&renamed_columns);
+                TableRepr::Arrow(new_batch)
+            }
+            TableRepr::RowTable(vec_of_rows) => {
+                let new_vec_of_rows = vec_of_rows.with_renamed_columns(renamed_columns);
+                TableRepr::RowTable(Arc::new(new_vec_of_rows))
+            }
+        }
+    }
+
     // Rows -------------------------------------------------------------------
 
     pub fn num_rows(&self) -> usize {
@@ -242,7 +260,7 @@ impl TableRepr {
                 make_array_converter(column)
                     .map(|converter| converter.to_value(row_idx))
                     .map_err(|e| {
-                        debug_assert!(false, "Unexpected Arrow error: {}", e);
+                        debug_assert!(false, "Unexpected Arrow error: {e}");
                         e
                     })
                     .ok()
@@ -252,7 +270,7 @@ impl TableRepr {
                 match row.get_item_by_index(col_idx) {
                     Ok(value) => Some(value),
                     Err(e) => {
-                        debug_assert!(false, "Unexpected error: {}", e);
+                        debug_assert!(false, "Unexpected error: {e}");
                         None
                     }
                 }
@@ -346,6 +364,70 @@ impl AgateTable {
         // TODO(felipecrv): implement row names logic
         None
     }
+
+    // Rest of API ------------------------------------------------------------
+
+    fn rename(
+        &self,
+        column_names: Option<&Value>, // array or map
+        row_names: Option<&Value>,    // array or map
+        slug_columns: bool,
+        slug_rows: bool,
+        _kwargs: &Kwargs,
+    ) -> Result<AgateTable, MinijinjaError> {
+        let renamed_columns = column_names.map(|v| {
+            let old = self.column_names();
+            if let Some(map) = v.downcast_object_ref::<ValueMap>() {
+                let mut renamed = old.clone();
+                for (key, value) in map {
+                    for (i, col) in old.iter().enumerate() {
+                        if key.as_str().is_some_and(|k| k == col) {
+                            renamed[i] = value.to_string();
+                        }
+                    }
+                }
+                renamed
+            } else if let Some(map) = v.downcast_object_ref::<MutableMap>() {
+                let map: ValueMap = map.clone().into();
+                let mut renamed = old.clone();
+                for (key, value) in map {
+                    for (i, col) in old.iter().enumerate() {
+                        if key.as_str().is_some_and(|k| k == col) {
+                            renamed[i] = value.to_string();
+                        }
+                    }
+                }
+                renamed
+            } else if let Some(array) = v.downcast_object_ref::<Vec<String>>() {
+                let mut renamed = old;
+                for (i, col) in array.iter().enumerate() {
+                    renamed[i] = col.to_string();
+                }
+                renamed
+            } else {
+                unreachable!("Agate.rename: column_names must be a map or an array");
+            }
+        });
+        if row_names.is_some() {
+            return Err(MinijinjaError::new(
+                ErrorKind::InvalidOperation,
+                "Agate.rename: renaming row names is not implemented yet",
+            ));
+        }
+        if slug_columns || slug_rows {
+            return Err(MinijinjaError::new(
+                ErrorKind::InvalidOperation,
+                "Agate.rename: slugging columns or rows is not implemented yet",
+            ));
+        }
+
+        if let Some(renamed_columns) = renamed_columns {
+            let repr = self.repr.with_renamed_columns(renamed_columns);
+            Ok(AgateTable::new(repr))
+        } else {
+            Ok(self.clone())
+        }
+    }
 }
 
 impl Default for AgateTable {
@@ -398,7 +480,7 @@ impl Object for AgateTable {
         _state: &State,
         name: &str,
         args: &[Value],
-        _listener: Rc<dyn RenderingEventListener>,
+        _listeners: &[Rc<dyn RenderingEventListener>],
     ) -> Result<Value, MinijinjaError> {
         match name {
             "print_table" => {
@@ -409,13 +491,48 @@ impl Object for AgateTable {
                 //         max_precision=3):
                 //
                 // TODO: implement output, locale and max_precision
-                #[allow(clippy::get_first)]
-                let max_rows = args.get(0).and_then(|v| v.as_i64()).unwrap_or(20) as usize;
-                let max_columns = args.get(1).and_then(|v| v.as_i64()).unwrap_or(6) as usize;
-                // output is not implemented yet
-                let max_column_width = args.get(3).and_then(|v| v.as_i64()).unwrap_or(20) as usize;
+                let iter = ArgsIter::new("Table.print_table", &[], args);
+                let max_rows = iter.next_kwarg::<Option<i64>>("max_rows")?.unwrap_or(20) as usize;
+                let max_columns =
+                    iter.next_kwarg::<Option<i64>>("max_columns")?.unwrap_or(6) as usize;
+                let _output = iter.next_kwarg::<Option<&Value>>("output")?;
+                let max_column_width = iter
+                    .next_kwarg::<Option<i64>>("max_column_width")?
+                    .unwrap_or(20) as usize;
+                let _locale = iter.next_kwarg::<Option<&Value>>("locale")?;
+                let _max_precision = iter.next_kwarg::<Option<&Value>>("max_precision")?;
+                iter.finish()?;
 
                 print_table(self, max_rows, max_columns, max_column_width)
+            }
+            "rename" => {
+                //     def rename(column_names=None, row_names=None,
+                //                slug_columns=False, slug_rows=False,
+                //                **kwargs)
+                //
+                //     column_names: array | dict | None
+                //     row_names:    array | dict | None
+                //     slug_columns: bool
+                //     slug_rows:    bool
+                let iter = ArgsIter::new("Table.rename", &[], args);
+                let column_names = iter.next_kwarg::<Option<&Value>>("column_names")?;
+                let row_names = iter.next_kwarg::<Option<&Value>>("row_names")?;
+                let slug_columns = iter
+                    .next_kwarg::<Option<bool>>("slug_columns")?
+                    .unwrap_or(false);
+                let slug_rows = iter
+                    .next_kwarg::<Option<bool>>("slug_rows")?
+                    .unwrap_or(false);
+                let kwargs = iter.trailing_kwargs()?;
+
+                let table = self.as_ref().rename(
+                    column_names,
+                    row_names,
+                    slug_columns,
+                    slug_rows,
+                    kwargs,
+                )?;
+                Ok(Value::from_object(table))
             }
             other => unimplemented!("{}", other),
         }
@@ -434,6 +551,9 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use arrow_schema::Fields;
+    use minijinja::Environment;
+    use minijinja::value::ValueMap;
+    use minijinja::value::mutable_map::MutableMap;
     use std::sync::Arc;
 
     fn simple_record_batch() -> RecordBatch {
@@ -697,5 +817,87 @@ mod tests {
         let batch = nested_record_batch();
         let _batch = FlatRecordBatch::new(Arc::new(batch));
         // TODO(felipcrv); implement CSV serialization to assert here
+    }
+
+    #[test]
+    fn test_column_renaming() {
+        let batch = Arc::new(nested_record_batch());
+        let agate_table = AgateTable::from_record_batch(batch);
+        let col_names = agate_table.column_names();
+        let table = Value::from_object(agate_table);
+
+        let env = Environment::new();
+        let state = env.empty_state();
+        let rename = |table: &Value, args: &[Value]| -> Result<Value, MinijinjaError> {
+            table.call_method(&state, "rename", args, &[])
+        };
+
+        // Original column names:
+        //   "id", "name", "event_tags.0", "event_tags.1", "event_meta/device",
+        //   "event_meta/item_id", "event_meta/amount", "event_meta/duration_sec",
+        //   "event_meta/success", "groups.0", "groups.1", "groups.2", "groups.3"
+
+        // Renaming with a map
+        let map = ValueMap::from_iter([
+            ("groups.0".into(), "first_group".into()),
+            ("groups.1".into(), "second_group".into()),
+            ("groups.2".into(), "third_group".into()),
+            ("groups.3".into(), "fourth_group".into()),
+            ("nonexistent".into(), "should_not_exist".into()),
+        ]);
+        let new_names = rename(&table, &[Value::from_object(map.clone())])
+            .unwrap()
+            .downcast_object::<AgateTable>()
+            .unwrap()
+            .column_names();
+        assert_eq!(
+            new_names[0..new_names.len() - 4],
+            col_names[0..col_names.len() - 4]
+        );
+        assert_eq!(
+            new_names[new_names.len() - 4..],
+            ["first_group", "second_group", "third_group", "fourth_group",]
+        );
+
+        // Renaming with a mutable map
+        let map: MutableMap = map.into();
+        let new_names = rename(&table, &[Value::from_object(map)])
+            .unwrap()
+            .downcast_object::<AgateTable>()
+            .unwrap()
+            .column_names();
+        assert_eq!(
+            new_names[0..new_names.len() - 4],
+            col_names[0..col_names.len() - 4]
+        );
+        assert_eq!(
+            new_names[new_names.len() - 4..],
+            ["first_group", "second_group", "third_group", "fourth_group",]
+        );
+
+        // Renaming with an array
+        let array = {
+            let mut array = col_names[0..col_names.len() - 4].to_vec();
+            array.extend_from_slice(&[
+                "first_group".to_string(),
+                "second_group".to_string(),
+                "third_group".to_string(),
+                "fourth_group".to_string(),
+            ]);
+            Value::from_object(array)
+        };
+        let new_names = rename(&table, &[array])
+            .unwrap()
+            .downcast_object::<AgateTable>()
+            .unwrap()
+            .column_names();
+        assert_eq!(
+            new_names[0..new_names.len() - 4],
+            col_names[0..col_names.len() - 4]
+        );
+        assert_eq!(
+            new_names[new_names.len() - 4..],
+            ["first_group", "second_group", "third_group", "fourth_group",]
+        );
     }
 }

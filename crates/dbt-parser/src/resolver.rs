@@ -1,19 +1,20 @@
 //! Module containing the entrypoint for the resolve phase.
-use dbt_common::constants::DBT_GENERIC_TESTS_DIR_NAME;
-use dbt_common::once_cell_vars::DISPATCH_CONFIG;
 #[allow(unused_imports)]
 use dbt_common::FsError;
-use dbt_common::{err, fs_err, show_error, ErrorCode, FsResult};
+use dbt_common::constants::{DBT_GENERIC_TESTS_DIR_NAME, RESOLVING};
+use dbt_common::once_cell_vars::DISPATCH_CONFIG;
+use dbt_common::{ErrorCode, FsResult, err, fs_err, show_error, with_progress};
 use dbt_common::{show_warning, stdfs};
 use dbt_jinja_utils::invocation_args::InvocationArgs;
 use dbt_jinja_utils::phases::parse::build_resolve_context;
 use dbt_jinja_utils::phases::parse::init::initialize_parse_jinja_environment;
-use dbt_jinja_utils::refs_and_sources::{resolve_dependencies, RefsAndSources};
+use dbt_jinja_utils::refs_and_sources::{RefsAndSources, resolve_dependencies};
 use dbt_schemas::dbt_utils::resolve_package_quoting;
+use dbt_schemas::schemas::common::Access;
 use dbt_schemas::schemas::macros::build_macro_units;
-use dbt_schemas::schemas::manifest::{InternalDbtNode, Nodes};
+use dbt_schemas::schemas::{InternalDbtNode, Nodes};
 
-use dbt_jinja_utils::jinja_environment::JinjaEnvironment;
+use dbt_jinja_utils::jinja_environment::JinjaEnv;
 use dbt_schemas::state::RenderResults;
 use dbt_schemas::state::{DbtPackage, Macros};
 use dbt_schemas::state::{DbtRuntimeConfig, Operations};
@@ -24,7 +25,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::args::ResolveArgs;
-use crate::dbt_project_config::{build_root_project_configs, RootProjectConfigs};
+use crate::dbt_project_config::{RootProjectConfigs, build_root_project_configs};
 use crate::resolve::resolve_operations::resolve_operations;
 use crate::utils::{self};
 
@@ -52,7 +53,10 @@ pub async fn resolve(
     arg: &ResolveArgs,
     invocation_args: &InvocationArgs,
     dbt_state: Arc<DbtState>,
-) -> FsResult<(ResolverState, JinjaEnvironment<'static>)> {
+    listener_factory: Option<Arc<dyn dbt_jinja_utils::listener::ListenerFactory>>,
+) -> FsResult<(ResolverState, Arc<JinjaEnv>)> {
+    let _pb = with_progress!(arg.io, spinner => RESOLVING);
+
     // Get the root project name
     let root_project_name = dbt_state.root_project_name();
     let adapter_type = dbt_state.dbt_profile.db_config.adapter_type();
@@ -63,16 +67,8 @@ pub async fn resolve(
     for package in &dbt_state.packages {
         dbt_common::check_cancellation!(arg.io.should_cancel_compilation)?;
 
-        let resolved_macros = resolve_macros(
-            &arg.io,
-            &package
-                .macro_files
-                .iter()
-                // This is a temporary solution, for a feature that is supposed to be
-                // deprecated in the future
-                .chain(&package.snapshot_files)
-                .collect(),
-        )?;
+        let macro_files = package.macro_files.iter().chain(&package.snapshot_files);
+        let resolved_macros = resolve_macros(&arg.io, macro_files.collect::<Vec<_>>().as_slice())?;
         macros.macros.extend(resolved_macros);
         let docs_macros = resolve_docs_macros(&package.docs_files)?;
         macros.docs_macros.extend(docs_macros);
@@ -80,11 +76,7 @@ pub async fn resolve(
 
     let mut operations = Operations::default();
     for package in &dbt_state.packages {
-        let (on_run_start, on_run_end) = resolve_operations(
-            &dbt_state.dbt_profile.database,
-            &dbt_state.dbt_profile.schema,
-            &package.dbt_project,
-        );
+        let (on_run_start, on_run_end) = resolve_operations(&package.dbt_project);
         operations.on_run_start.extend(on_run_start);
         operations.on_run_end.extend(on_run_end);
     }
@@ -95,7 +87,7 @@ pub async fn resolve(
         &dbt_state.dbt_profile.db_config.adapter_type(),
     );
 
-    let jinja_env = initialize_parse_jinja_environment(
+    let jinja_env = Arc::new(initialize_parse_jinja_environment(
         root_project_name,
         &dbt_state.dbt_profile.profile,
         &dbt_state.dbt_profile.target,
@@ -113,22 +105,21 @@ pub async fn resolve(
             .iter()
             .map(|p| p.dbt_project.name.clone())
             .collect(),
-    )?;
+        arg.io.clone(),
+        listener_factory,
+    )?);
 
     // Compute final selectors
     let resolved_selectors = resolve_final_selectors(root_project_name, &jinja_env, arg)?;
+    // dbg!(&resolved_selectors);
 
     // Create a map to store full runtime configs for ALL packages
     let mut all_runtime_configs: BTreeMap<String, Arc<DbtRuntimeConfig>> = BTreeMap::new();
 
     let mut nodes = Nodes::default();
     let mut disabled_nodes = Nodes::default();
-    let root_project_configs = build_root_project_configs(
-        &arg.io,
-        dbt_state.root_project(),
-        root_project_quoting,
-        &jinja_env,
-    )?;
+    let root_project_configs =
+        build_root_project_configs(&arg.io, dbt_state.root_project(), root_project_quoting)?;
     let root_project_configs = Arc::new(root_project_configs);
 
     // Process packages in topological order
@@ -151,7 +142,7 @@ pub async fn resolve(
                 root_project_configs.clone(),
                 &adapter_type,
                 &macros,
-                &jinja_env,
+                jinja_env.clone(),
                 &mut refs_and_sources,
                 &mut all_runtime_configs,
             )
@@ -173,7 +164,7 @@ pub async fn resolve(
                 root_project_configs.clone(),
                 &adapter_type,
                 &macros,
-                &jinja_env,
+                jinja_env.clone(),
                 &mut refs_and_sources,
                 &mut all_runtime_configs,
             )
@@ -215,6 +206,10 @@ pub async fn resolve(
         .unwrap();
 
     resolve_dependencies(&arg.io, &mut nodes, &mut disabled_nodes, &refs_and_sources);
+
+    // Check access
+    check_access(arg, &nodes, &all_runtime_configs);
+
     Ok((
         ResolverState {
             root_project_name: root_project_name.to_string(),
@@ -237,6 +232,51 @@ pub async fn resolve(
     ))
 }
 
+// Check that models accessing other models (dependecies) can do so.
+fn check_access(
+    arg: &ResolveArgs,
+    nodes: &Nodes,
+    all_runtime_configs: &BTreeMap<String, Arc<DbtRuntimeConfig>>,
+) {
+    for (unique_id, node) in nodes.models.iter() {
+        for (target_unique_id, location) in &node.base().depends_on.nodes_with_ref_location {
+            if let Some(target_node) = nodes.models.get(target_unique_id) {
+                let restricted_access = all_runtime_configs
+                    .get(&target_node.common().package_name)
+                    .is_some_and(|config| config.inner.restrict_access.unwrap_or(false));
+
+                let diffent_packages = target_node.common().package_name
+                    != node.common().package_name
+                    && restricted_access;
+
+                if target_node.model_attr.access == Access::Private
+                    && (node.model_attr.group != target_node.model_attr.group || diffent_packages)
+                {
+                    let err = fs_err!(
+                        code => ErrorCode::AccessDenied,
+                        loc => location.clone(),
+                        "Node '{}' attempted to reference node '{}', which is not allowed because the referenced node is private to the '{}' group",
+                        unique_id,
+                        target_unique_id,
+                        target_node.model_attr.group.as_deref().unwrap_or(""),
+                    );
+                    show_error!(arg.io, err);
+                } else if target_node.model_attr.access == Access::Protected && diffent_packages {
+                    let err = fs_err!(
+                        code => ErrorCode::AccessDenied,
+                        loc => location.clone(),
+                        "Node '{}' attempted to reference node '{}', which is not allowed because the referenced node is protected to the '{}' package",
+                        unique_id,
+                        target_unique_id,
+                        target_node.common().package_name,
+                    );
+                    show_error!(arg.io, err);
+                }
+            }
+        }
+    }
+}
+
 /// Inner resolve function that resolves a single package.
 #[allow(clippy::too_many_arguments)]
 pub async fn resolve_inner(
@@ -247,7 +287,7 @@ pub async fn resolve_inner(
     root_project_configs: &RootProjectConfigs,
     adapter_type: &str,
     macros: &Macros,
-    jinja_env: &JinjaEnvironment<'static>,
+    jinja_env: Arc<JinjaEnv>,
     refs_and_sources: &mut RefsAndSources,
     runtime_config: Arc<DbtRuntimeConfig>,
 ) -> FsResult<(Nodes, Nodes, RenderResults, RefsAndSources)> {
@@ -267,7 +307,7 @@ pub async fn resolve_inner(
         DISPATCH_CONFIG.get().unwrap().read().unwrap().clone(),
     );
     // Resolve the dbt properties (schema.yml) files
-    let mut min_properties = resolve_minimal_properties(arg, package, jinja_env, &base_ctx)?;
+    let mut min_properties = resolve_minimal_properties(arg, package, &jinja_env, &base_ctx)?;
 
     let package_name = package.dbt_project.name.as_str();
 
@@ -286,7 +326,7 @@ pub async fn resolve_inner(
         database,
         adapter_type,
         &base_ctx,
-        jinja_env,
+        &jinja_env,
         &mut collected_tests,
         refs_and_sources,
     )?;
@@ -305,7 +345,7 @@ pub async fn resolve_inner(
         schema,
         adapter_type,
         package_name,
-        jinja_env,
+        &jinja_env,
         &base_ctx,
         &mut collected_tests,
         refs_and_sources,
@@ -325,7 +365,7 @@ pub async fn resolve_inner(
         database,
         schema,
         adapter_type,
-        jinja_env,
+        jinja_env.clone(),
         &base_ctx,
         runtime_config.clone(),
         refs_and_sources,
@@ -346,7 +386,7 @@ pub async fn resolve_inner(
         schema,
         adapter_type,
         package_name,
-        jinja_env,
+        jinja_env.clone(),
         &base_ctx,
         runtime_config.clone(),
         &mut collected_tests,
@@ -367,7 +407,7 @@ pub async fn resolve_inner(
         schema,
         adapter_type,
         package_name,
-        jinja_env,
+        jinja_env.clone(),
         &base_ctx,
         runtime_config.clone(),
         refs_and_sources,
@@ -385,9 +425,9 @@ pub async fn resolve_inner(
         database,
         schema,
         adapter_type,
-        jinja_env,
+        jinja_env.clone(),
         &base_ctx,
-        runtime_config,
+        runtime_config.clone(),
         &collected_tests,
     )
     .await?;
@@ -399,14 +439,15 @@ pub async fn resolve_inner(
         min_properties.unit_tests,
         package,
         package_quoting,
+        dbt_state.root_project(),
         root_project_configs,
-        database,
-        schema,
         adapter_type,
         package_name,
-        jinja_env,
+        &jinja_env,
         &base_ctx,
         &min_properties.models,
+        runtime_config,
+        &nodes.models,
     )?;
     nodes.unit_tests.extend(unit_tests);
     disabled_nodes.unit_tests.extend(disabled_unit_tests);
@@ -463,7 +504,7 @@ async fn resolve_package(
     root_project_configs: Arc<RootProjectConfigs>,
     adapter_type: String,
     macros: Macros,
-    jinja_env: JinjaEnvironment<'static>,
+    jinja_env: Arc<JinjaEnv>,
     refs_and_sources: RefsAndSources,
     all_runtime_configs: BTreeMap<String, Arc<DbtRuntimeConfig>>,
 ) -> FsResult<(
@@ -508,7 +549,7 @@ async fn resolve_package(
             &root_project_configs,
             &adapter_type,
             &macros,
-            &jinja_env,
+            jinja_env.clone(),
             &mut refs_and_sources.clone(),
             runtime_config.clone(),
         )
@@ -535,7 +576,7 @@ async fn resolve_packages_sequentially(
     root_project_configs: Arc<RootProjectConfigs>,
     adapter_type: &str,
     macros: &Macros,
-    jinja_env: &JinjaEnvironment<'static>,
+    jinja_env: Arc<JinjaEnv>,
     refs_and_sources: &mut RefsAndSources,
     all_runtime_configs: &mut BTreeMap<String, Arc<DbtRuntimeConfig>>,
 ) -> FsResult<(Nodes, Nodes, RenderResults)> {
@@ -598,7 +639,7 @@ async fn resolve_packages_parallel(
     root_project_configs: Arc<RootProjectConfigs>,
     adapter_type: &str,
     macros: &Macros,
-    jinja_env: &JinjaEnvironment<'static>,
+    jinja_env: Arc<JinjaEnv>,
     refs_and_sources: &mut RefsAndSources,
     all_runtime_configs: &mut BTreeMap<String, Arc<DbtRuntimeConfig>>,
 ) -> FsResult<(Nodes, Nodes, RenderResults)> {

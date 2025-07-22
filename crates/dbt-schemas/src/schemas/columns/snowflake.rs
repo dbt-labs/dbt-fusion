@@ -2,10 +2,10 @@ use std::any::Any;
 
 use dbt_adapter_proc_macros::{BaseColumnObject, StaticBaseColumnObject};
 use dbt_common::current_function_name;
-use minijinja::arg_utils::check_num_args;
-use minijinja::arg_utils::ArgParser;
-use minijinja::value::Enumerator;
 use minijinja::ErrorKind;
+use minijinja::arg_utils::ArgParser;
+use minijinja::arg_utils::check_num_args;
+use minijinja::value::Enumerator;
 use minijinja::{Error as MinijinjaError, Value};
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +31,17 @@ impl StaticBaseColumn for SnowflakeColumnType {
             numeric_precision,
             numeric_scale,
         }))
+    }
+
+    /// Translate the column type to a Snowflake type
+    fn translate_type(args: &[Value]) -> Result<Value, MinijinjaError> {
+        let mut args = ArgParser::new(args, None);
+        let column_type: String = args.get("dtype")?;
+        let column_type = match column_type.to_uppercase().as_str() {
+            "STRING" => "TEXT",
+            _ => &column_type,
+        };
+        Ok(Value::from(column_type))
     }
 }
 

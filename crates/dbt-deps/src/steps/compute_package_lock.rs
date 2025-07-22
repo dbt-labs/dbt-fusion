@@ -1,15 +1,16 @@
 use dbt_common::io_args::IoArgs;
-use dbt_common::{err, stdfs, ErrorCode, FsResult};
-use dbt_jinja_utils::jinja_environment::JinjaEnvironment;
+use dbt_common::{ErrorCode, FsResult, err, fs_err, stdfs};
+use dbt_jinja_utils::jinja_environment::JinjaEnv;
 use dbt_schemas::schemas::packages::{
     DbtPackageLock, DbtPackages, DbtPackagesLock, GitPackageLock, HubPackageLock, LocalPackageLock,
-    PackageVersion, PrivatePackageLock,
+    PackageVersion, PrivatePackageLock, TarballPackageLock,
 };
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::{
     package_listing::UnpinnedPackage,
-    types::{GitPinnedPackage, LocalPinnedPackage, PrivatePinnedPackage},
+    tarball_client::TarballClient,
+    types::{GitPinnedPackage, LocalPinnedPackage, PrivatePinnedPackage, TarballPinnedPackage},
     utils::{handle_git_like_package, read_and_validate_dbt_project, sha1_hash_packages},
 };
 
@@ -19,19 +20,21 @@ use super::load_dbt_packages;
 
 pub async fn compute_package_lock(
     io: &IoArgs,
-    jinja_env: &JinjaEnvironment<'static>,
+    vars: &BTreeMap<String, dbt_serde_yaml::Value>,
+    jinja_env: &JinjaEnv,
     hub_registry: &mut HubClient,
     dbt_packages: &DbtPackages,
 ) -> FsResult<DbtPackagesLock> {
     let sha1_hash = sha1_hash_packages(&dbt_packages.packages);
     // First step, is to flatten into a single list of packages
     let mut dbt_packages_lock = DbtPackagesLock::default();
-    let mut package_listing = PackageListing::new(io.clone());
+    let mut package_listing = PackageListing::new(io.clone(), vars.clone());
     package_listing.hydrate_dbt_packages(dbt_packages, jinja_env)?;
-    let mut final_listing = PackageListing::new(io.clone());
+    let mut final_listing = PackageListing::new(io.clone(), vars.clone());
     hub_registry.hydrate_index().await?;
     resolve_packages(
         io,
+        vars,
         hub_registry,
         &mut final_listing,
         &mut package_listing,
@@ -91,6 +94,21 @@ pub async fn compute_package_lock(
                         unrendered: pinned_package.unrendered,
                     }));
             }
+            UnpinnedPackage::Tarball(tarball_unpinned_package) => {
+                let pinned_package: TarballPinnedPackage =
+                    tarball_unpinned_package.clone().try_into()?;
+                let mut unrendered = pinned_package.unrendered;
+                // We remove the 'name' from unrendered so that we don't
+                // end up with two 'name' fields in the package lock.
+                unrendered.remove("name");
+                dbt_packages_lock
+                    .packages
+                    .push(DbtPackageLock::Tarball(TarballPackageLock {
+                        tarball: tarball_unpinned_package.original_entry.tarball.clone(),
+                        name: pinned_package.name,
+                        unrendered,
+                    }));
+            }
         }
     }
     dbt_packages_lock.sha1_hash = sha1_hash;
@@ -117,12 +135,13 @@ pub async fn compute_package_lock(
 
 async fn resolve_packages(
     io: &IoArgs,
+    vars: &BTreeMap<String, dbt_serde_yaml::Value>,
     hub_registry: &mut HubClient,
     final_listing: &mut PackageListing,
     package_listing: &mut PackageListing,
-    jinja_env: &JinjaEnvironment<'static>,
+    jinja_env: &JinjaEnv,
 ) -> FsResult<()> {
-    let mut next_listing = PackageListing::new(io.clone());
+    let mut next_listing = PackageListing::new(io.clone(), vars.clone());
     for unpinned_package in package_listing.packages.values_mut() {
         dbt_common::check_cancellation!(io.should_cancel_compilation)?;
         match unpinned_package {
@@ -143,6 +162,7 @@ async fn resolve_packages(
                     &git_unpinned_package.revisions,
                     &git_unpinned_package.subdirectory,
                     git_unpinned_package.warn_unpinned.unwrap_or_default(),
+                    None,
                 )?;
                 git_unpinned_package.revisions = vec![commit_sha];
                 let dbt_project = read_and_validate_dbt_project(&checkout_path)?;
@@ -165,6 +185,7 @@ async fn resolve_packages(
                     &private_unpinned_package.revisions,
                     &private_unpinned_package.subdirectory,
                     private_unpinned_package.warn_unpinned.unwrap_or_default(),
+                    None,
                 )?;
                 private_unpinned_package.revisions = vec![commit_sha];
                 let dbt_project = read_and_validate_dbt_project(&checkout_path)?;
@@ -175,12 +196,63 @@ async fn resolve_packages(
                 // Keep tmp_dir alive until we're done with checkout_path
                 drop(tmp_dir);
             }
+            UnpinnedPackage::Tarball(tarball_unpinned_package) => {
+                // Download and extract the tarball
+                let tarball_dir = tempfile::tempdir().map_err(|e| {
+                    fs_err!(ErrorCode::IoError, "Failed to create temp dir: {}", e,)
+                })?;
+                let tar_path = tarball_dir
+                    .path()
+                    .join(tarball_unpinned_package.tarball.replace('/', "_"));
+                let untar_path = tempfile::TempDir::new().map_err(|e| {
+                    fs_err!(ErrorCode::IoError, "Failed to create untar dir: {}", e)
+                })?;
+
+                let mut tarball_client = TarballClient::new();
+                tarball_client
+                    .download_and_extract_tarball(
+                        &tarball_unpinned_package.tarball,
+                        &tar_path,
+                        &untar_path,
+                        "tarball_package",
+                    )
+                    .await?;
+
+                // Find the extracted package directory
+                let tar_contents = std::fs::read_dir(&untar_path).map_err(|e| {
+                    fs_err!(
+                        ErrorCode::IoError,
+                        "Failed to read untarred directory: {}",
+                        e
+                    )
+                })?;
+                let tar_contents: Vec<_> = tar_contents
+                    .filter_map(|entry| entry.ok())
+                    .filter(|entry| entry.path().is_dir())
+                    .collect();
+
+                if tar_contents.len() != 1 {
+                    return err!(
+                        ErrorCode::InvalidConfig,
+                        "Incorrect structure for package extracted from {}. The extracted package needs to follow the structure <package_name>/<package_contents>.",
+                        tarball_unpinned_package.tarball
+                    );
+                }
+
+                let checkout_path = tar_contents[0].path();
+                let dbt_project = read_and_validate_dbt_project(&checkout_path)?;
+                tarball_unpinned_package.name = Some(dbt_project.name);
+                if let Some(dbt_packages) = load_dbt_packages(io, &checkout_path)?.0 {
+                    next_listing.update_from(&dbt_packages.packages, jinja_env)?;
+                }
+            }
         }
         final_listing.incorporate_unpinned_package(unpinned_package)?;
     }
     if !next_listing.packages.is_empty() {
         Box::pin(resolve_packages(
             io,
+            vars,
             hub_registry,
             final_listing,
             &mut next_listing,

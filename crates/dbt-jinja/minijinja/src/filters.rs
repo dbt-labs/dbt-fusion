@@ -404,7 +404,7 @@ mod builtins {
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
     pub fn length(v: &Value) -> Result<usize, Error> {
-        if v.is_undefined() {
+        if v.is_undefined() || v.is_none() {
             return Ok(0);
         }
         v.len().ok_or_else(|| {
@@ -441,7 +441,13 @@ mod builtins {
     /// * `by`: set to `"value"` to sort by value. Defaults to `"key"`.
     /// * `reverse`: set to `true` to sort in reverse.
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn dictsort(v: &Value, kwargs: Kwargs) -> Result<Value, Error> {
+    pub fn dictsort(
+        v: &Value,
+        case_sensitive: Option<bool>,
+        by_value: Option<Cow<'_, str>>,
+        reverse: Option<bool>,
+        kwargs: Kwargs,
+    ) -> Result<Value, Error> {
         if v.kind() != ValueKind::Map {
             return Err(Error::new(
                 ErrorKind::InvalidOperation,
@@ -449,8 +455,12 @@ mod builtins {
             ));
         }
 
-        let by_value = matches!(ok!(kwargs.get("by")), Some("value"));
-        let case_sensitive = ok!(kwargs.get::<Option<bool>>("case_sensitive")).unwrap_or(false);
+        let by_value = matches!(
+            ok!(kwargs.get::<Option<&str>>("by")).unwrap_or(by_value.as_deref().unwrap_or("key")),
+            "value"
+        );
+        let case_sensitive = ok!(kwargs.get::<Option<bool>>("case_sensitive"))
+            .unwrap_or(case_sensitive.unwrap_or(false));
         let mut rv: Vec<_> = ok!(v.try_iter())
             .map(|key| (key.clone(), v.get_item(&key).unwrap_or(Value::UNDEFINED)))
             .collect();
@@ -458,7 +468,7 @@ mod builtins {
             let (a, b) = if by_value { (&a.1, &b.1) } else { (&a.0, &b.0) };
             cmp_helper(a, b, case_sensitive)
         });
-        if let Some(true) = ok!(kwargs.get("reverse")) {
+        if ok!(kwargs.get::<Option<bool>>("reverse")).unwrap_or(reverse.unwrap_or(false)) {
             rv.reverse();
         }
         kwargs.assert_all_used()?;
@@ -827,18 +837,42 @@ mod builtins {
     /// {{ 42.55|round }}
     ///   -> 43.0
     /// ```
+    ///
+    /// It also supports the `method` parameter to specify the rounding method.
+    ///
+    /// ```jinja
+    /// {{ 42.55|round(0, method="ceil") }}
+    ///   -> 43.0
+    /// ```
+    ///
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
     pub fn round(args: &[Value]) -> Result<Value, Error> {
         let mut arg_parser = ArgParser::new(args, None);
         let value: Value = arg_parser.next_positional()?;
         let precision: Option<i32> = arg_parser.get_optional("precision");
+        let method: Option<String> = arg_parser.get_optional("method");
+
         match value.0 {
             ValueRepr::I64(_) | ValueRepr::I128(_) | ValueRepr::U64(_) | ValueRepr::U128(_) => {
                 Ok(value)
             }
             ValueRepr::F64(val) => {
                 let x = 10f64.powi(precision.unwrap_or(0));
-                Ok(Value::from((x * val).round() / x))
+                let scaled_val = x * val;
+
+                let rounded = match method.as_deref() {
+                    Some("ceil") => scaled_val.ceil(),
+                    Some("floor") => scaled_val.floor(),
+                    Some("common") | None => scaled_val.round(), // default behavior
+                    Some(other) => {
+                        return Err(Error::new(
+                            ErrorKind::InvalidOperation,
+                            format!("invalid rounding method '{other}', expected 'ceil', 'floor', or 'common'"),
+                        ));
+                    }
+                };
+
+                Ok(Value::from(rounded / x))
             }
             _ => Err(Error::new(
                 ErrorKind::InvalidOperation,
@@ -1206,16 +1240,13 @@ mod builtins {
     pub fn indent(args: &[Value]) -> Result<String, Error> {
         let mut arg_parser = ArgParser::new(args, None);
         let mut value: String = arg_parser.next_positional()?;
-        let width: usize = arg_parser.get_optional("width").unwrap_or(0);
-        let indent_first_line: bool = arg_parser
-            .get_optional("indent_first_line")
-            .unwrap_or(false);
-        let indent_blank_lines: bool = arg_parser
-            .get_optional("indent_blank_lines")
-            .unwrap_or(false);
+        let width: usize = arg_parser
+            .get_optional("width")
+            .or_else(|| arg_parser.next_positional().ok())
+            .unwrap_or(0);
+        let indent_first_line: bool = arg_parser.get_optional("first").unwrap_or(false);
+        let indent_blank_lines: bool = arg_parser.get_optional("blank").unwrap_or(false);
 
-        // Handle the case where width is specified both as positional and keyword argument
-        // This is invalid, so we return an error
         ok!(arg_parser.assert_all_used());
 
         fn strip_trailing_newline(input: &mut String) {
@@ -1241,7 +1272,7 @@ mod builtins {
                     output.push_str(&indent_with);
                 }
             } else {
-                write!(output, "{}{}", indent_with, line).ok();
+                write!(output, "{indent_with}{line}").ok();
             }
             output.push('\n');
         }
@@ -1683,7 +1714,7 @@ mod builtins {
     /// This is useful for debugging as it better shows what's inside an object.
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
     pub fn pprint(value: &Value) -> String {
-        format!("{:#?}", value)
+        format!("{value:#?}")
     }
 
     /// Formats a string using printf-style formatting.

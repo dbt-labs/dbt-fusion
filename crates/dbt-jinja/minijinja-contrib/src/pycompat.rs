@@ -26,6 +26,8 @@ use regex::Regex;
 /// * `dict.keys`
 /// * `dict.values`
 /// * `list.count`
+/// * `list.index`
+/// * `list.union`
 /// * `str.capitalize`
 /// * `str.count`
 /// * `str.endswith`
@@ -283,7 +285,7 @@ fn string_methods(value: &Value, method: &str, args: &[Value]) -> Result<Value, 
                 if idx > 0 {
                     rv.push_str(s);
                 }
-                write!(rv, "{}", value).ok();
+                write!(rv, "{value}").ok();
             }
             Ok(Value::from(rv))
         }
@@ -302,7 +304,7 @@ fn string_methods(value: &Value, method: &str, args: &[Value]) -> Result<Value, 
                     ));
                 }
                 for (idx, value) in args.iter().enumerate() {
-                    result = result.replace(&format!("{{{}}}", idx), &value.to_string());
+                    result = result.replace(&format!("{{{idx}}}"), &value.to_string());
                 }
             }
             // Handle simple {} placeholders
@@ -328,7 +330,7 @@ fn string_methods(value: &Value, method: &str, args: &[Value]) -> Result<Value, 
                 if let Some(obj) = args[0].as_object() {
                     if let Some(iter) = obj.try_iter_pairs() {
                         for (key, value) in iter {
-                            result = result.replace(&format!("{{{}}}", key), &value.to_string());
+                            result = result.replace(&format!("{{{key}}}"), &value.to_string());
                         }
                     }
                 }
@@ -337,7 +339,7 @@ fn string_methods(value: &Value, method: &str, args: &[Value]) -> Result<Value, 
         }
         "zfill" => {
             let (width,): (usize,) = from_args(args)?;
-            Ok(Value::from(format!("{:0>width$}", s, width = width)))
+            Ok(Value::from(format!("{s:0>width$}")))
         }
         "removesuffix" => {
             let (suffix,): (&str,) = from_args(args)?;
@@ -439,6 +441,81 @@ fn seq_methods(value: &Value, method: &str, args: &[Value]) -> Result<Value, Err
                 ErrorKind::InvalidOperation,
                 "Cannot subtract non-sequence".to_string(),
             ))
+        }
+        "union" => {
+            // Handle multiple arguments like Python's set.union(*others)
+            let mut result_set = BTreeSet::new();
+
+            // Add all items from the original sequence
+            if let Some(iter) = obj.try_iter() {
+                for item in iter {
+                    result_set.insert(item);
+                }
+            }
+
+            // Add all items from each argument sequence
+            for arg in args {
+                match arg.try_iter() {
+                    Ok(iter) => {
+                        for item in iter {
+                            result_set.insert(item);
+                        }
+                    }
+                    Err(_) => {
+                        return Err(Error::new(
+                            ErrorKind::InvalidOperation,
+                            "union() argument must be iterable",
+                        ));
+                    }
+                }
+            }
+
+            // Convert result back to a sequence
+            let result: Vec<Value> = result_set.into_iter().collect();
+            Ok(Value::from_object(MutableVec::from(result)))
+        }
+        "index" => {
+            let (what, start, end): (&Value, Option<i64>, Option<i64>) = from_args(args)?;
+            if let Some(iter) = obj.try_iter() {
+                let items: Vec<Value> = iter.collect();
+                let len = items.len() as i64;
+
+                // Handle negative indices and bounds
+                let start_idx = start.unwrap_or(0);
+                let start_idx = if start_idx < 0 {
+                    (len + start_idx).max(0) as usize
+                } else {
+                    start_idx.min(len) as usize
+                };
+
+                let end_idx = end.unwrap_or(len);
+                let end_idx = if end_idx < 0 {
+                    (len + end_idx).max(0) as usize
+                } else {
+                    end_idx.min(len) as usize
+                };
+
+                // Search for the item in the specified range
+                for (i, item) in items.iter().enumerate().skip(start_idx) {
+                    if i >= end_idx {
+                        break;
+                    }
+                    if item == what {
+                        return Ok(Value::from(i as i64));
+                    }
+                }
+
+                // Item not found - raise ValueError equivalent
+                Err(Error::new(
+                    ErrorKind::InvalidOperation,
+                    format!("{what} is not in list"),
+                ))
+            } else {
+                Err(Error::new(
+                    ErrorKind::InvalidOperation,
+                    "Cannot index non-iterable".to_string(),
+                ))
+            }
         }
         _ => Err(Error::from(ErrorKind::UnknownMethod(
             "Sequence".to_string(),

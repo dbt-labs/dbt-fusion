@@ -47,7 +47,7 @@
 //! let mut env = Environment::new();
 //! env.add_template("hello", "Hello {{ name }}!").unwrap();
 //! let tmpl = env.get_template("hello").unwrap();
-//! println!("{}", tmpl.render(context!(name => "John"), Rc::new(DefaultRenderingEventListener)).unwrap().0);
+//! println!("{}", tmpl.render(context!(name => "John"), &[Rc::new(DefaultRenderingEventListener::default())]).unwrap());
 //! ```
 //!
 //! ```plain
@@ -71,7 +71,7 @@
 //!
 //! let env = Environment::new();
 //! let expr = env.compile_expression("number < 42").unwrap();
-//! let result = expr.eval(context!(number => 23), Rc::new(DefaultRenderingEventListener)).unwrap();
+//! let result = expr.eval(context!(number => 23), &[Rc::new(DefaultRenderingEventListener::default())]).unwrap();
 //! assert_eq!(result.is_true(), true);
 //! ```
 //!
@@ -92,7 +92,7 @@
 //! env.add_filter("repeat", str::repeat);
 //! env.add_template("hello", "{{ 'Na '|repeat(3) }} {{ name }}!").unwrap();
 //! let tmpl = env.get_template("hello").unwrap();
-//! println!("{}", tmpl.render(context!(name => "Batman"), Rc::new(DefaultRenderingEventListener)).unwrap().0);
+//! println!("{}", tmpl.render(context!(name => "Batman"), &[Rc::new(DefaultRenderingEventListener::default())]).unwrap());
 //! ```
 //!
 //! ```plain
@@ -222,8 +222,11 @@ mod expression;
 mod output;
 mod output_tracker;
 mod template;
+mod types;
 mod utils;
 mod vm;
+pub use vm::find_macro_signatures;
+pub use vm::listeners::TypecheckingEventListener;
 
 pub mod cache_key;
 pub mod filters;
@@ -265,7 +268,8 @@ pub use self::value::Value;
 
 pub use self::macros::__context;
 pub use self::vm::State;
-
+pub use crate::types::adapter::AdapterDispatchFunction;
+pub use crate::vm::CodeLocation;
 // forwards compatibility
 #[cfg(not(feature = "serde"))]
 const _: () = {

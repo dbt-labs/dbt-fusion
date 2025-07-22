@@ -1,35 +1,39 @@
 //! Core functions that are shared across all contexts
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     rc::Rc,
     sync::Arc,
 };
 
-use dbt_schemas::schemas::manifest::{DbtNode, Nodes};
-use minijinja::{
-    listener::DefaultRenderingEventListener,
-    value::{mutable_map::MutableMap, ValueMap},
-};
+use dbt_agate::{AgateTable, print_table};
+use dbt_common::{ErrorCode, fs_err, io_args::IoArgs, show_warning};
+use dbt_schemas::schemas::{InternalDbtNode, Nodes};
+use minijinja::value::{ValueMap, mutable_map::MutableMap};
 
 use minijinja::{
+    Environment, Error, ErrorKind, State, Value,
     arg_utils::ArgParser,
     listener::RenderingEventListener,
     value::{Kwargs, Object},
-    Environment, Error, ErrorKind, State, Value,
 };
 
 use crate::utils::{
-    node_metadata_from_state, DBT_INTERNAL_ENV_VAR_PREFIX, ENV_VARS, SECRET_ENV_VAR_PREFIX,
+    DBT_INTERNAL_ENV_VAR_PREFIX, ENV_VARS, SECRET_ENV_VAR_PREFIX, node_metadata_from_state,
 };
+
+use crate::functions::contract_error::get_contract_mismatches;
 
 /// The default placeholder for environment variables when the default value is used
 pub const DEFAULT_ENV_PLACEHOLDER: &str = "__dbt_placeholder__";
 
 /// Registers all the functions shared across all contexts
-pub fn register_base_functions(env: &mut Environment) {
+pub fn register_base_functions(env: &mut Environment, io_args: IoArgs) {
     env.add_global("dbt_version", Value::from(crate::utils::DBT_VERSION));
-    env.add_global("exceptions".to_owned(), Value::from_object(Exceptions {}));
+    env.add_global(
+        "exceptions".to_owned(),
+        Value::from_object(Exceptions { io_args }),
+    );
 
     env.add_function("return", return_macro);
     env.add_function("fromjson", fromjson_fn());
@@ -132,7 +136,7 @@ impl Object for DocMacro {
         self: &Arc<Self>,
         _state: &State<'_, '_>,
         args: &[Value],
-        _listener: Rc<dyn RenderingEventListener>,
+        _listeners: &[Rc<dyn RenderingEventListener>],
     ) -> Result<Value, Error> {
         let mut args = ArgParser::new(args, None);
         let arg1 = args.get::<String>("");
@@ -153,7 +157,7 @@ impl Object for DocMacro {
                 return Err(Error::new(
                     ErrorKind::InvalidOperation,
                     "Invalid arguments to doc macro",
-                ))
+                ));
             }
         };
 
@@ -193,7 +197,7 @@ pub fn var_fn(
         } else {
             return Err(Error::new(
                 ErrorKind::InvalidOperation,
-                format!("'var': variable '{}' not found", var_name),
+                format!("'var': variable '{var_name}' not found"),
             ));
         };
         Ok(value)
@@ -221,16 +225,14 @@ pub fn env_var_fn() -> impl Fn(&[Value], Kwargs) -> Result<Value, Error> {
             return Err(Error::new(
                 ErrorKind::InvalidOperation,
                 format!(
-                    "Secret environment variables (starting with {}) cannot be accessed here",
-                    SECRET_ENV_VAR_PREFIX
+                    "Secret environment variables (starting with {SECRET_ENV_VAR_PREFIX}) cannot be accessed here"
                 ),
             ));
         } else if var_name.starts_with(DBT_INTERNAL_ENV_VAR_PREFIX) {
             return Err(Error::new(
                 ErrorKind::InvalidOperation,
                 format!(
-                    "Environment variables (starting with {}) cannot be accessed here",
-                    DBT_INTERNAL_ENV_VAR_PREFIX
+                    "Environment variables (starting with {DBT_INTERNAL_ENV_VAR_PREFIX}) cannot be accessed here"
                 ),
             ));
         }
@@ -255,7 +257,7 @@ pub fn env_var_fn() -> impl Fn(&[Value], Kwargs) -> Result<Value, Error> {
             }
             None => Err(Error::new(
                 ErrorKind::InvalidOperation,
-                format!("'env_var': environment variable '{}' not found", var_name),
+                format!("'env_var': environment variable '{var_name}' not found"),
             )),
         }
     }
@@ -304,7 +306,7 @@ pub fn fromjson_fn() -> impl Fn(&[Value], Kwargs) -> Result<Value, Error> {
                 Some(default_value) => Ok(default_value),
                 None => Err(Error::new(
                     ErrorKind::InvalidOperation,
-                    format!("Failed to parse JSON: {}", err),
+                    format!("Failed to parse JSON: {err}"),
                 )),
             },
         }
@@ -373,7 +375,7 @@ pub fn tojson_fn() -> impl Fn(&[Value], Kwargs) -> Result<Value, Error> {
                 Some(default_value) => Ok(default_value),
                 None => Err(Error::new(
                     ErrorKind::InvalidOperation,
-                    format!("Failed to convert value to JSON: {}", err),
+                    format!("Failed to convert value to JSON: {err}"),
                 )),
             },
         }
@@ -410,7 +412,7 @@ pub fn fromyaml_fn() -> impl Fn(&[Value], Kwargs) -> Result<Value, Error> {
                 Some(default_value) => Ok(default_value),
                 None => Err(Error::new(
                     ErrorKind::InvalidOperation,
-                    format!("Failed to parse YAML: {}", err),
+                    format!("Failed to parse YAML: {err}"),
                 )),
             },
         }
@@ -461,7 +463,7 @@ pub fn toyaml_fn() -> impl Fn(&[Value], Kwargs) -> Result<Value, Error> {
             Err(err) => {
                 return Err(Error::new(
                     ErrorKind::InvalidOperation,
-                    format!("Failed to convert value to YAML: {}", err),
+                    format!("Failed to convert value to YAML: {err}"),
                 ));
             }
         };
@@ -479,7 +481,7 @@ pub fn toyaml_fn() -> impl Fn(&[Value], Kwargs) -> Result<Value, Error> {
             Ok(yaml_str) => Ok(Value::from(yaml_str)),
             Err(err) => Err(Error::new(
                 ErrorKind::InvalidOperation,
-                format!("Failed to convert value to YAML: {}", err),
+                format!("Failed to convert value to YAML: {err}"),
             )),
         }
     }
@@ -503,7 +505,7 @@ pub fn diff_of_two_dicts_fn() -> impl Fn(&[Value], Kwargs) -> Result<Value, Erro
                 return Err(Error::new(
                     ErrorKind::InvalidOperation,
                     "diff_of_two_dicts requires a dict_a argument",
-                ))
+                ));
             }
         }
         .clone();
@@ -515,7 +517,7 @@ pub fn diff_of_two_dicts_fn() -> impl Fn(&[Value], Kwargs) -> Result<Value, Erro
                 return Err(Error::new(
                     ErrorKind::InvalidOperation,
                     "diff_of_two_dicts requires a dict_b argument",
-                ))
+                ));
             }
         }
         .clone();
@@ -581,7 +583,7 @@ pub fn set_fn() -> impl Fn(&[Value], Kwargs) -> Result<Value, Error> {
 
         match value.try_iter() {
             Ok(iter) => {
-                let set: HashSet<_> = iter.map(|v| v.to_string()).collect();
+                let set: BTreeSet<_> = iter.map(|v| v.to_string()).collect();
                 Ok(Value::from_iter(set))
             }
             Err(_) => match default {
@@ -620,11 +622,8 @@ pub fn render_fn() -> impl Fn(&State, &[Value], Kwargs) -> Result<Value, Error> 
 
         let env = state.env();
 
-        let template = env.template_from_str(sql)?;
-        let (rendered, _macro_span) = template.render(
-            state.get_base_context(),
-            Rc::new(DefaultRenderingEventListener),
-        )?;
+        let template = env.template_from_str(sql, &[])?;
+        let rendered = template.render(state.get_base_context(), &[])?;
         Ok(Value::from(rendered))
     }
 }
@@ -675,8 +674,8 @@ pub fn set_strict_fn() -> impl Fn(&[Value], Kwargs) -> Result<Value, Error> {
 /// ```jinja
 /// {% set result = try_or_compiler_error("Error", my_function, arg1, arg2, kwarg1="value1", kwarg2="value2") %}
 /// ```
-pub fn try_or_compiler_error_fn(
-) -> impl Fn(&State<'_, '_>, &[Value], Kwargs) -> Result<Value, Error> {
+pub fn try_or_compiler_error_fn()
+-> impl Fn(&State<'_, '_>, &[Value], Kwargs) -> Result<Value, Error> {
     move |state: &State<'_, '_>, args: &[Value], kwargs: Kwargs| -> Result<Value, Error> {
         let mut args = ArgParser::new(args, Some(kwargs));
         let message_if_exception = args.get::<String>("message_if_exception")?;
@@ -687,11 +686,7 @@ pub fn try_or_compiler_error_fn(
         let remaining_kwargs = Kwargs::from_iter(drained_kwargs);
         remaining_args.push(remaining_kwargs.into());
         // Call the function
-        match func.call(
-            state,
-            &remaining_args,
-            Rc::new(DefaultRenderingEventListener),
-        ) {
+        match func.call(state, &remaining_args, &[]) {
             Ok(result) => Ok(result),
             // TODO: we need to raise CompilationError(message_if_exception, self.model)
             Err(_) => Err(Error::new(
@@ -810,7 +805,7 @@ pub fn zip_strict_fn() -> impl Fn(&[Value], Kwargs) -> Result<Value, Error> {
 pub fn thread_id_fn() -> impl Fn() -> Result<Value, Error> {
     move || -> Result<Value, Error> {
         let thread_id = std::thread::current().id();
-        Ok(Value::from(format!("{:?}", thread_id)))
+        Ok(Value::from(format!("{thread_id:?}")))
     }
 }
 
@@ -864,7 +859,7 @@ pub fn log_fn() -> impl Fn(&[Value], Kwargs) -> Result<Value, Error> {
         let info = args.get::<Value>("info").ok();
         // todo: print should go to log, or not?
         if info.is_some() && info.unwrap().is_true() {
-            log::info!("{}", msg);
+            log::info!("{msg}");
         }
         Ok(Value::from(""))
     }
@@ -924,24 +919,44 @@ fn parse_dict_of_lists(dict: &Value) -> Result<BTreeMap<String, Vec<String>>, Er
 
 /// A struct that represents the 'exceptions' object, which makes exceptions.warn() and...
 #[derive(Debug)]
-pub struct Exceptions {}
+pub struct Exceptions {
+    io_args: IoArgs,
+}
 
 impl Object for Exceptions {
+    // todo: create a shared enum for call_method and get_value to work off
+    fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
+        // exceptions evaluate to 'true' in Python for truthiness checks
+        // usage: https://github.com/dbt-labs/dbt-adapters/blob/be0ab62ae2ad3504a37287f7a4ac12d30e7e94d9/dbt-adapters/src/dbt/include/global_project/macros/materializations/snapshots/helpers.sql#L271
+        match key.as_str()? {
+            "warn_snapshot_timestamp_data_types" => Some(Value::from(true)),
+            _ => None,
+        }
+    }
+
     fn call_method(
         self: &Arc<Self>,
         state: &State<'_, '_>,
         method: &str,
         args: &[Value],
-        _listener: Rc<dyn RenderingEventListener>,
+        _listeners: &[Rc<dyn RenderingEventListener>],
     ) -> Result<Value, Error> {
-        // TODO: Implement below
-        // reference: https://github.com/dbt-labs/dbt-core/blob/c28cb92af51d7f2cb27618aeb43705ba951aa3ef/core/dbt/context/exceptions_jinja.py#L130
-        // so far, stubs are only provided for methods seen used from dbt_macro_assets
+        // reference: core/dbt/context/exceptions_jinja.py
+        // We are only implementing methods actually used in the supported adapters.
         match method {
-            "warn" => Ok(Value::UNDEFINED),
+            "warn" => {
+                let mut args = ArgParser::new(args, None);
+                let warn_string = args.get::<String>("").unwrap_or_else(|_| "".to_string());
+                show_warning!(
+                    self.io_args,
+                    fs_err!(ErrorCode::Generic, "{}", warn_string.as_str(),)
+                );
+                Ok(Value::UNDEFINED)
+            }
+            // (msg, node=None)
             "raise_compiler_error" => {
                 let mut args = ArgParser::new(args, None);
-                let message = args.get::<String>("message")?;
+                let message = args.get::<String>("msg")?;
                 if let Some((node_id, file_path)) = node_metadata_from_state(state) {
                     Err(Error::new(
                         ErrorKind::InvalidOperation,
@@ -953,22 +968,176 @@ impl Object for Exceptions {
                         ),
                     ))
                 } else {
-                    // TODO: error on None?
                     Err(Error::new(
                         ErrorKind::InvalidOperation,
-                        format!("Compilation Error: {}", message),
+                        format!("Compilation Error: {message}"),
                     ))
                 }
             }
-            "raise_not_implemented" => Ok(Value::UNDEFINED),
-            "relation_wrong_type" => Ok(Value::UNDEFINED),
-            "raise_contract_error" => Ok(Value::UNDEFINED),
-            "column_type_missing" => Ok(Value::UNDEFINED),
-            "raise_fail_fast_error" => Ok(Value::UNDEFINED),
-            "warn_snapshot_timestamp_data_types" => Ok(Value::UNDEFINED),
+            // (msg) String
+            "raise_not_implemented" => {
+                let mut args = ArgParser::new(args, None);
+                let message = args.get::<String>("msg")?;
+                Err(Error::new(
+                    ErrorKind::InvalidOperation,
+                    format!("Not implemented: {message}"),
+                ))
+            }
+            // (relation, expected_type, model=None)
+            //   Relation,  String
+            "relation_wrong_type" => {
+                let mut args = ArgParser::new(args, None);
+                let relation = args.get::<Value>("relation").unwrap_or(Value::UNDEFINED);
+                let expected_type = args
+                    .get::<String>("expected_type")
+                    .unwrap_or("".to_string());
+
+                // Get the relation type from the relation value
+                let relation_type = if relation.is_undefined() {
+                    "unknown".to_string()
+                } else {
+                    match relation.get_item(&Value::from("type")) {
+                        Ok(type_value) => type_value.to_string(),
+                        Err(_) => "unknown".to_string(),
+                    }
+                };
+
+                let message = format!(
+                    "Trying to create {expected_type} {relation}, but it currently exists as a {relation_type}. Either drop {relation} manually, or run dbt with `--full-refresh` and dbt will drop it for you."
+                );
+                if let Some((node_id, file_path)) = node_metadata_from_state(state) {
+                    Err(Error::new(
+                        ErrorKind::InvalidOperation,
+                        format!(
+                            "Compilation Error for {} from {}: {}",
+                            node_id,
+                            file_path.display(),
+                            message
+                        ),
+                    ))
+                } else {
+                    Err(Error::new(
+                        ErrorKind::InvalidOperation,
+                        format!("Compilation Error: {message}"),
+                    ))
+                }
+            }
+            // (yaml_columns, sql_columns)
+            // [{"name": ..., "data_type": ..., "formatted": ...},...]
+            "raise_contract_error" => {
+                let mut args = ArgParser::new(args, None);
+                let yaml_columns = args
+                    .get::<Value>("yaml_columns")
+                    .unwrap_or(Value::UNDEFINED);
+                let sql_columns = args.get::<Value>("sql_columns").unwrap_or(Value::UNDEFINED);
+                let column_diff_table: &Arc<AgateTable> =
+                    get_contract_mismatches(yaml_columns, sql_columns)?;
+                //  print_table(table, max_rows, max_columns, max_column_width)
+                let column_diff_string = print_table(column_diff_table, 50, 50, 50)?;
+                let message = format!(
+                    "This model has an enforced contract that failed.\n Please ensure the name, data_type, and number of columns in your contract match the columns in your model's definition.\n\n {column_diff_string}"
+                );
+                if let Some((node_id, file_path)) = node_metadata_from_state(state) {
+                    Err(Error::new(
+                        ErrorKind::InvalidOperation,
+                        format!(
+                            "Compilation Error for {} from {}: {}",
+                            node_id,
+                            file_path.display(),
+                            message
+                        ),
+                    ))
+                } else {
+                    Err(Error::new(
+                        ErrorKind::InvalidOperation,
+                        format!("Compilation Error: {message}"),
+                    ))
+                }
+            }
+            // (column_names)
+            // ["column1", "column2"]
+            "column_type_missing" => {
+                let mut args = ArgParser::new(args, None);
+                // column_names should be a list of strings
+                let column_names = args
+                    .get::<Value>("column_names")
+                    .unwrap_or(Value::UNDEFINED);
+
+                // Convert column_names to a vector of strings
+                let column_names_string = if column_names.is_undefined() {
+                    "".to_string()
+                } else {
+                    match column_names.try_iter() {
+                        Ok(iter) => {
+                            let strings: Vec<String> = iter.map(|v| v.to_string()).collect();
+                            strings.join(", ")
+                        }
+                        Err(_) => "".to_string(),
+                    }
+                };
+
+                let message = format!(
+                    "Contracted models require data_type to be defined for each column.  Please ensure that the column name and data_type are defined within the YAML configuration for the {column_names_string} column(s)."
+                );
+                if let Some((node_id, file_path)) = node_metadata_from_state(state) {
+                    Err(Error::new(
+                        ErrorKind::InvalidOperation,
+                        format!(
+                            "Contract Error for {} from {}: {}",
+                            node_id,
+                            file_path.display(),
+                            message
+                        ),
+                    ))
+                } else {
+                    Err(Error::new(
+                        ErrorKind::InvalidOperation,
+                        format!("Contract Error: {message}"),
+                    ))
+                }
+            }
+            // (msg, node=None)
+            "raise_fail_fast_error" => {
+                let mut args = ArgParser::new(args, None);
+                let message = args.get::<String>("msg")?;
+                if let Some((node_id, file_path)) = node_metadata_from_state(state) {
+                    Err(Error::new(
+                        ErrorKind::InvalidOperation,
+                        format!(
+                            "FailFast Error for {} from {}: {}",
+                            node_id,
+                            file_path.display(),
+                            message
+                        ),
+                    ))
+                } else {
+                    Err(Error::new(
+                        ErrorKind::InvalidOperation,
+                        format!("FailFast Error: {message}"),
+                    ))
+                }
+            }
+            // (snapshot_time_data_type: str, updated_at_data_type: str)
+            "warn_snapshot_timestamp_data_types" => {
+                let mut args = ArgParser::new(args, None);
+                let snapshot_time_data_type = args
+                    .get::<String>("snapshot_time_data_type")
+                    .unwrap_or_else(|_| "".to_string());
+                let updated_at_data_type = args
+                    .get::<String>("updated_at_data_type")
+                    .unwrap_or_else(|_| "".to_string());
+                let warning = format!(
+                    "Data type of snapshot table timestamp columns ({snapshot_time_data_type}) doesn't match derived column 'updated_at' ({updated_at_data_type}). Please update snapshot config 'updated_at'."
+                );
+                show_warning!(
+                    self.io_args,
+                    fs_err!(ErrorCode::Generic, "{}", warning.as_str())
+                );
+                Ok(Value::UNDEFINED)
+            }
             _ => Err(Error::new(
                 ErrorKind::UnknownMethod("Exceptions".to_string(), method.to_string()),
-                format!("Unknown method on Exceptions: {}", method),
+                format!("Unknown method on Exceptions: {method}"),
             )),
         }
     }
@@ -984,32 +1153,44 @@ pub fn build_flat_graph(nodes: &Nodes) -> MutableMap {
         .map(|(unique_id, model)| {
             (
                 unique_id.clone(),
-                Value::from_serialize(DbtNode::Model((**model).clone())),
+                Value::from_serialize((Arc::as_ref(model) as &dyn InternalDbtNode).serialize()),
             )
         })
         .chain(nodes.snapshots.iter().map(|(unique_id, snapshot)| {
             (
                 unique_id.clone(),
-                Value::from_serialize(DbtNode::Snapshot((**snapshot).clone())),
+                Value::from_serialize((Arc::as_ref(snapshot) as &dyn InternalDbtNode).serialize()),
             )
         }))
         .chain(nodes.tests.iter().map(|(unique_id, test)| {
             (
                 unique_id.clone(),
-                Value::from_serialize(DbtNode::Test((**test).clone())),
+                Value::from_serialize((Arc::as_ref(test) as &dyn InternalDbtNode).serialize()),
             )
         }))
         .chain(nodes.seeds.iter().map(|(unique_id, seed)| {
             (
                 unique_id.clone(),
-                Value::from_serialize(DbtNode::Seed((**seed).clone())),
+                Value::from_serialize((Arc::as_ref(seed) as &dyn InternalDbtNode).serialize()),
             )
         }))
         .collect();
     graph.insert(Value::from("nodes"), Value::from_serialize(nodes_insert));
+
+    let sources_insert: BTreeMap<String, Value> = nodes
+        .sources
+        .iter()
+        .map(|(unique_id, source)| {
+            (
+                unique_id.clone(),
+                Value::from_serialize((Arc::as_ref(source) as &dyn InternalDbtNode).serialize()),
+            )
+        })
+        .collect();
+
     graph.insert(
         Value::from("sources"),
-        Value::from_serialize(nodes.sources.clone()),
+        Value::from_serialize(sources_insert),
     );
     graph.insert(
         Value::from("exposures"),
@@ -1032,4 +1213,78 @@ pub fn build_flat_graph(nodes: &Nodes) -> MutableMap {
         Value::from_serialize(BTreeMap::<String, Value>::new()),
     );
     MutableMap::from(graph)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use minijinja::{Environment, Value};
+    use minijinja_contrib::pycompat::unknown_method_callback;
+
+    #[test]
+    fn test_set_union_integration() {
+        let mut env = Environment::new();
+
+        // Register the set function from base.rs
+        env.add_function("set", set_fn());
+
+        // Enable pycompat for union() method
+        env.set_unknown_method_callback(unknown_method_callback);
+
+        // Test the exact DBT use case: {% set res = set([1, 2]).union(set([3, 4])) %}
+        let template_source = r#"
+        {%- set set1 = set([1, 2, 2]) -%}
+        {%- set set2 = set([3, 4, 4]) -%}
+        {%- set result = set1.union(set2) -%}
+        {{ result | sort | join(',') }}
+        "#;
+
+        let tmpl = env.template_from_str(template_source, &[]).unwrap();
+        let output = tmpl.render(Value::UNDEFINED, &[]).unwrap();
+
+        // Should contain all unique elements from both sets: 1,2,3,4
+        let result = output.trim();
+        assert_eq!(result, "1,2,3,4");
+    }
+
+    #[test]
+    fn test_set_union_multiple_args() {
+        let mut env = Environment::new();
+        env.add_function("set", set_fn());
+        env.set_unknown_method_callback(unknown_method_callback);
+
+        let template_source = r#"
+        {%- set set1 = set([1, 2]) -%}
+        {%- set set2 = set([3, 4]) -%}
+        {%- set set3 = set([5, 6]) -%}
+        {%- set result = set1.union(set2, set3) -%}
+        {{ result | length }}
+        "#;
+
+        let tmpl = env.template_from_str(template_source, &[]).unwrap();
+        let output = tmpl.render(Value::UNDEFINED, &[]).unwrap();
+
+        // Should have 6 unique elements
+        assert_eq!(output.trim(), "6");
+    }
+
+    #[test]
+    fn test_set_union_with_duplicates() {
+        let mut env = Environment::new();
+        env.add_function("set", set_fn());
+        env.set_unknown_method_callback(unknown_method_callback);
+
+        let template_source = r#"
+        {%- set original = [1, 1, 2, 2, 3] -%}
+        {%- set other = [3, 4, 4, 5] -%}
+        {%- set result = set(original).union(set(other)) -%}
+        {{ result | sort | join(',') }}
+        "#;
+
+        let tmpl = env.template_from_str(template_source, &[]).unwrap();
+        let output = tmpl.render(Value::UNDEFINED, &[]).unwrap();
+
+        // Should remove duplicates: 1,2,3,4,5
+        assert_eq!(output.trim(), "1,2,3,4,5");
+    }
 }

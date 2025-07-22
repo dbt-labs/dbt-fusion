@@ -15,13 +15,13 @@ pub(crate) struct PyTimeDeltaClass;
 impl PyTimeDeltaClass {
     fn timedelta_new(args: &[Value]) -> Result<PyTimeDelta, Error> {
         let mut parser = ArgParser::new(args, None);
-        let weeks: i64 = parser.get("weeks").unwrap_or(0);
         let days: i64 = parser.get("days").unwrap_or(0);
-        let hours: i64 = parser.get("hours").unwrap_or(0);
-        let minutes: i64 = parser.get("minutes").unwrap_or(0);
         let seconds: i64 = parser.get("seconds").unwrap_or(0);
         let microseconds: i64 = parser.get("microseconds").unwrap_or(0);
         let milliseconds: i64 = parser.get("milliseconds").unwrap_or(0);
+        let minutes: i64 = parser.get("minutes").unwrap_or(0);
+        let hours: i64 = parser.get("hours").unwrap_or(0);
+        let weeks: i64 = parser.get("weeks").unwrap_or(0);
 
         let duration = Duration::weeks(weeks)
             + Duration::days(days)
@@ -53,7 +53,7 @@ impl Object for PyTimeDeltaClass {
         self: &std::sync::Arc<Self>,
         _state: &minijinja::State<'_, '_>,
         args: &[Value],
-        _listener: std::rc::Rc<dyn minijinja::listener::RenderingEventListener>,
+        _listeners: &[std::rc::Rc<dyn minijinja::listener::RenderingEventListener>],
     ) -> Result<Value, Error> {
         Self::timedelta_new(args).map(Value::from_object)
     }
@@ -211,14 +211,14 @@ impl Object for PyTimeDelta {
         _state: &minijinja::State<'_, '_>,
         method: &str,
         args: &[Value],
-        _listener: std::rc::Rc<dyn minijinja::listener::RenderingEventListener>,
+        _listeners: &[std::rc::Rc<dyn minijinja::listener::RenderingEventListener>],
     ) -> Result<Value, Error> {
         match method {
             "__add__" => self.add(args),
             "__sub__" => self.sub(args),
             _ => Err(Error::new(
                 ErrorKind::UnknownMethod("PyTimeDelta".to_string(), method.to_string()),
-                format!("timedelta has no method named '{}'", method),
+                format!("timedelta has no method named '{method}'"),
             )),
         }
     }
@@ -254,8 +254,7 @@ impl Object for PyTimeDelta {
         } else {
             write!(
                 f,
-                "{}{:02}:{:02}:{:02}.{:06}",
-                sign, hours, minutes, seconds, microseconds
+                "{sign}{hours:02}:{minutes:02}:{seconds:02}.{microseconds:06}"
             )
         }
     }
@@ -267,7 +266,6 @@ mod tests {
     use minijinja::args;
     use minijinja::Environment;
     use minijinja::Value;
-    use std::rc::Rc;
 
     #[test]
     fn test_timedelta_creation() {
@@ -320,27 +318,25 @@ mod tests {
         let template = env
             .template_from_str(
                 "{{ timedelta(days=2, hours=3).days }}, {{ timedelta(minutes=90).seconds }}",
+                &[],
             )
             .unwrap();
-        let result = template
-            .render(
-                minijinja::context!(),
-                Rc::new(minijinja::listener::DefaultRenderingEventListener),
-            )
+        let result = template.render(minijinja::context!(), &[]).unwrap();
+        assert_eq!(result, "2, 5400");
+
+        // Test positional arguments creation
+        let template = env
+            .template_from_str("{{ timedelta(4).days }}", &[])
             .unwrap();
-        assert_eq!(result.0, "2, 5400");
+        let result = template.render(minijinja::context!(), &[]).unwrap();
+        assert_eq!(result, "4");
 
         // Test arithmetic
         let template = env
-            .template_from_str("{{ (timedelta(days=2) + timedelta(days=1)).days }}")
+            .template_from_str("{{ (timedelta(days=2) + timedelta(days=1)).days }}", &[])
             .unwrap();
-        let result = template
-            .render(
-                minijinja::context!(),
-                Rc::new(minijinja::listener::DefaultRenderingEventListener),
-            )
-            .unwrap();
-        assert_eq!(result.0, "3");
+        let result = template.render(minijinja::context!(), &[]).unwrap();
+        assert_eq!(result, "3");
     }
 
     #[test]

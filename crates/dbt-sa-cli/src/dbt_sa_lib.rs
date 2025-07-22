@@ -5,7 +5,7 @@ use dbt_schemas::man::execute_man_command;
 
 use dbt_common::io_args::{EvalArgs, IoArgs};
 use dbt_common::{
-    checkpoint_maybe_exit,
+    ErrorCode, FsResult, checkpoint_maybe_exit,
     constants::{DBT_MANIFEST_JSON, DBT_PROJECT_YML, DBT_TARGET_DIR_NAME, INSTALLING, VALIDATING},
     fs_err, fsinfo,
     io_args::{Phases, SystemArgs},
@@ -14,7 +14,6 @@ use dbt_common::{
     pretty_string::GREEN,
     show_error, show_progress, show_progress_exit, show_result_with_default_title, stdfs,
     tracing::init_tracing,
-    ErrorCode, FsResult,
 };
 
 #[allow(unused_imports)]
@@ -43,6 +42,7 @@ pub async fn execute_fs(arg: SystemArgs, cli: Cli) -> FsResult<i32> {
     do_execute_fs(arg, cli).await
 }
 
+#[allow(clippy::cognitive_complexity)]
 async fn do_execute_fs(arg: SystemArgs, cli: Cli) -> FsResult<i32> {
     let start = SystemTime::now();
 
@@ -107,6 +107,7 @@ async fn do_execute_fs(arg: SystemArgs, cli: Cli) -> FsResult<i32> {
     }
 }
 
+#[allow(clippy::cognitive_complexity)]
 async fn execute_setup_and_all_phases(
     system_arg: SystemArgs,
     cli: Cli,
@@ -179,13 +180,14 @@ async fn execute_setup_and_all_phases(
     }
 }
 
+#[allow(clippy::cognitive_complexity)]
 async fn execute_all_phases(arg: &EvalArgs, _cli: &Cli) -> FsResult<i32> {
     let start = SystemTime::now();
 
     // Loads all .yml files + collects all included files
     let load_args = LoadArgs::from_eval_args(arg);
     let invocation_args = InvocationArgs::from_eval_args(arg);
-    let (dbt_state, num_threads) = load(&load_args, &invocation_args).await?;
+    let (dbt_state, num_threads, _dbt_cloud) = load(&load_args, &invocation_args).await?;
 
     let arg = arg
         .with_target(dbt_state.dbt_profile.target.to_string())
@@ -200,8 +202,15 @@ async fn execute_all_phases(arg: &EvalArgs, _cli: &Cli) -> FsResult<i32> {
     let resolve_args = ResolveArgs::from_eval_args(&arg);
     let invocation_args = InvocationArgs::from_eval_args(&arg);
     let arc_dbt_state = Arc::new(dbt_state);
-    let (resolved_state, _jinja_env) =
-        resolve(&resolve_args, &invocation_args, arc_dbt_state).await?;
+    let (resolved_state, _jinja_env) = resolve(
+        &resolve_args,
+        &invocation_args,
+        arc_dbt_state,
+        Some(Arc::new(
+            dbt_jinja_utils::listener::DefaultListenerFactory::default(),
+        )),
+    )
+    .await?;
 
     let dbt_manifest = build_manifest(&arg.io.invocation_id.to_string(), &resolved_state);
 

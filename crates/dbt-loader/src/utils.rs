@@ -1,10 +1,10 @@
 use dbt_common::io_args::IoArgs;
 use dbt_common::{
+    ErrorCode, FsResult,
     constants::{DBT_DEPENDENCIES_YML, DBT_PACKAGES_YML},
-    err, fs_err,
-    io_utils::try_read_yml_to_str,
-    show_warning, stdfs, ErrorCode, FsResult,
+    err, fs_err, show_warning, stdfs,
 };
+use dbt_jinja_utils::serde::{from_yaml_error, value_from_file};
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::Read,
@@ -12,15 +12,15 @@ use std::{
 };
 
 use dbt_jinja_utils::{
-    jinja_environment::JinjaEnvironment,
-    serde::{from_yaml_raw, into_typed_with_jinja, value_from_str},
+    jinja_environment::JinjaEnv,
+    serde::{from_yaml_raw, into_typed_with_jinja},
 };
 use dbt_schemas::schemas::{
     packages::{DbtPackageEntry, DbtPackages},
     profiles::{DbConfig, DbTargets, DbtProfilesIntermediate},
 };
 use fs_deps::utils::get_local_package_full_path;
-use serde::de::DeserializeOwned;
+use serde::{Serialize, de::DeserializeOwned};
 use std::{fs::metadata, io, time::SystemTime};
 
 use walkdir::WalkDir;
@@ -58,7 +58,7 @@ pub fn collect_file_info<P: AsRef<Path>>(
 pub fn indent(data: &str, spaces: usize) -> String {
     let indent = " ".repeat(spaces);
     data.lines()
-        .map(|line| format!("{}{}", indent, line))
+        .map(|line| format!("{indent}{line}"))
         .collect::<Vec<String>>()
         .join("\n")
 }
@@ -84,7 +84,7 @@ pub fn get_db_config(
     // 6. Find the desired target
     let db_config = db_targets.outputs.get(&target_name).ok_or(fs_err!(
         ErrorCode::InvalidConfig,
-        "Could not find target {} in dbt profile.yml",
+        "Could not find target {} in profiles.yml",
         target_name,
     ))?;
     let db_config: DbConfig = serde_json::from_value(db_config.clone())?;
@@ -99,7 +99,7 @@ pub fn get_db_config(
                 db_config
                     .ignored_properties()
                     .keys()
-                    .map(|k| format!("'{}'", k))
+                    .map(|k| format!("'{k}'"))
                     .collect::<Vec<String>>()
                     .join(", ")
             )
@@ -108,60 +108,86 @@ pub fn get_db_config(
     Ok(db_config)
 }
 
-pub fn read_profiles_and_extract_db_config(
+pub fn read_profiles_and_extract_db_config<S: Serialize>(
     io_args: &IoArgs,
     dbt_target_override: &Option<String>,
-    jinja_env: &JinjaEnvironment<'static>,
+    jinja_env: &JinjaEnv,
+    ctx: &S,
     profile_str: &str,
     profile_path: PathBuf,
 ) -> Result<(String, DbConfig), Box<dbt_common::FsError>> {
-    // if profile_path is under io_args.in_dir, use the relative path
-    let maybe_relative_profile_path = if profile_path.starts_with(&io_args.in_dir) {
-        stdfs::diff_paths(&profile_path, &io_args.in_dir)?
-    } else {
-        #[allow(clippy::redundant_clone)]
-        profile_path.clone()
-    };
-    let prepared_profile_val = value_from_str(
-        Some(io_args),
-        &try_read_yml_to_str(&profile_path)?,
-        Some(&maybe_relative_profile_path),
-    )?;
-    let dbt_profiles = dbt_serde_yaml::from_value::<DbtProfilesIntermediate>(prepared_profile_val)?;
+    let prepared_profile_val = value_from_file(Some(io_args), &profile_path)?;
+    let dbt_profiles = dbt_serde_yaml::from_value::<DbtProfilesIntermediate>(prepared_profile_val)
+        .map_err(|e| from_yaml_error(e, Some(&profile_path)))?;
     if dbt_profiles.config.is_some() {
         return err!(
             ErrorCode::InvalidConfig,
-            "Unexpected 'config' key in dbt profiles.yml"
+            "Unexpected 'config' key in profiles.yml"
         );
     }
-    let profile_val = dbt_profiles.profiles.get(profile_str).ok_or(fs_err!(
-        ErrorCode::IoError,
-        "Profile '{}' not found in dbt profiles.yml",
-        profile_str
+
+    // get the profile value
+    let profile_val: &dbt_serde_yaml::Value =
+        dbt_profiles.profiles.get(profile_str).ok_or(fs_err!(
+            ErrorCode::IoError,
+            "Profile '{}' not found in profiles.yml",
+            profile_str
+        ))?;
+
+    // if dbt_target_override is None, render the target name in case the user uses an an env_var jinja expression here
+    let rendered_target = if let Some(dbt_target_override) = dbt_target_override {
+        dbt_target_override.clone()
+    } else {
+        profile_val
+            .get("target")
+            .and_then(|v| v.as_str())
+            .map(|s| jinja_env.render_str(s, ctx, &[]))
+            .transpose()?
+            .unwrap_or("default".to_string())
+    };
+    let unrendered_outputs = profile_val.get("outputs").ok_or(fs_err!(
+        ErrorCode::InvalidConfig,
+        "No 'outputs' key found in dbt profiles.yml"
     ))?;
-    let db_targets: DbTargets = into_typed_with_jinja(
+
+    // filter the db_targets to only include the target we want to use
+    let unrendered_outputs_filtered: BTreeMap<String, dbt_serde_yaml::Value> = unrendered_outputs
+        .as_mapping()
+        .unwrap()
+        .iter()
+        .filter(|(k, _)| k.as_str().unwrap() == rendered_target)
+        .map(|(k, v)| (k.as_str().unwrap().to_string(), v.clone()))
+        .collect();
+
+    if unrendered_outputs_filtered.is_empty() {
+        return err!(
+            ErrorCode::InvalidConfig,
+            "Target '{}' not found in profiles.yml",
+            rendered_target
+        );
+    }
+    // render just the target output we want to use
+    let rendered_db_target = into_typed_with_jinja(
         Some(io_args),
-        profile_val.clone(),
+        dbt_serde_yaml::to_value(BTreeMap::from([
+            (
+                "outputs".to_string(),
+                dbt_serde_yaml::to_value(&unrendered_outputs_filtered).unwrap(),
+            ),
+            (
+                "target".to_string(),
+                dbt_serde_yaml::to_value(&rendered_target).unwrap(),
+            ),
+        ]))
+        .map_err(|e| from_yaml_error(e, Some(&profile_path)))?,
         true,
         jinja_env,
-        &(),
-        None,
+        ctx,
+        &[],
     )?;
-    let target = match dbt_target_override {
-        Some(target) => db_targets
-            .outputs
-            .keys()
-            .any(|t| t == target)
-            .then(|| target.clone())
-            .ok_or(fs_err!(
-                ErrorCode::IoError,
-                "Target '{}' not found in dbt profiles.yml",
-                target
-            ))?,
-        None => db_targets.default_target.clone(),
-    };
-    let db_config = get_db_config(io_args, db_targets, Some(target.clone()))?;
-    Ok((target, db_config))
+    let db_config = get_db_config(io_args, rendered_db_target, Some(rendered_target.clone()))?;
+
+    Ok((rendered_target, db_config))
 }
 
 // TODO: this function should read to a yaml::Value so as to avoid double-io
@@ -197,13 +223,26 @@ fn process_package_file(
     for package in dbt_packages.packages {
         let entry_name = match package {
             DbtPackageEntry::Hub(hub_package) => hub_package.package,
-            DbtPackageEntry::Git(git_package) => (*git_package.git).clone(),
+            DbtPackageEntry::Git(git_package) => {
+                let mut key = (*git_package.git).clone();
+                if let Some(subdirectory) = &git_package.subdirectory {
+                    key.push_str(&format!("#{subdirectory}"));
+                }
+                key
+            }
             DbtPackageEntry::Local(local_package) => {
                 let full_path = get_local_package_full_path(in_dir, &local_package);
                 let relative_path = stdfs::diff_paths(&full_path, in_dir)?;
                 relative_path.to_string_lossy().to_string()
             }
-            DbtPackageEntry::Private(private_package) => (*private_package.private).clone(),
+            DbtPackageEntry::Private(private_package) => {
+                let mut key = (*private_package.private).clone();
+                if let Some(subdirectory) = &private_package.subdirectory {
+                    key.push_str(&format!("#{subdirectory}"));
+                }
+                key
+            }
+            DbtPackageEntry::Tarball(tarball_package) => (*tarball_package.tarball).clone(),
         };
         if let Some(entry_name) = package_lookup_map.get(&entry_name) {
             dependencies.insert(entry_name.to_string());

@@ -1,5 +1,5 @@
 use crate::error::InternalResult;
-use crate::expr::{try_parse, Evaluator, Value};
+use crate::expr::{Evaluator, Value, try_parse};
 use crate::internal_err;
 use arrow::datatypes::DataType;
 use linked_hash_map::LinkedHashMap;
@@ -45,7 +45,10 @@ pub fn populate_constraint_map(
         if bindings.contains_key(key.as_str()) {
             return internal_err!(
                 "Value for key '{}' already exists in bindings: {:?} when processing constraints {:?} with additional constraints {:?}",
-                key, bindings, constraint_map, additional_constraints,
+                key,
+                bindings,
+                constraint_map,
+                additional_constraints,
             );
         }
         // This could be done once, when loading functions from manifest file
@@ -62,8 +65,7 @@ pub fn populate_constraint_map(
             (_, Value::Int(value)) => {
                 let value: u8 = value.try_into().map_err(|_err| {
                     format!(
-                        "Processing of [{}] => [{}] produced result out of range: {:?}",
-                        key, expression, value
+                        "Processing of [{key}] => [{expression}] produced result out of range: {value:?}"
                     )
                 })?;
                 bindings.insert(key, value);

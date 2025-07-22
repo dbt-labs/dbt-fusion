@@ -14,7 +14,7 @@ use std::fmt;
 use url::Url;
 
 use crate::database::fingerprint_config;
-use crate::{builder::BuilderIter, Backend, Database, Driver};
+use crate::{Backend, Database, Driver, builder::BuilderIter};
 
 use super::Fingerprint;
 
@@ -153,7 +153,7 @@ impl fmt::Debug for Builder {
                     }
                 }
                 let safe_uri = Url::parse(&s);
-                debug_assert!(safe_uri.is_ok(), "failed to parse safe URI: {}", s);
+                debug_assert!(safe_uri.is_ok(), "failed to parse safe URI: {s}");
                 safe_uri.unwrap_or(uri)
             }),
         )
@@ -204,7 +204,7 @@ impl Builder {
         let get_field = |key: &str| {
             map["connections"][key].clone().ok_or_else(|| {
                 Error::with_message_and_status(
-                    format!("missing connections.{} in .snowsql/config", key),
+                    format!("missing connections.{key} in .snowsql/config"),
                     Status::Internal,
                 )
             })
@@ -343,7 +343,7 @@ impl IntoIterator for Builder {
 
     fn into_iter(self) -> Self::IntoIter {
         let fixed = match self.backend {
-            Backend::Postgres => {
+            Backend::Redshift | Backend::Postgres => {
                 // take username/password options and put them in the URI sent to the driver
                 // https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNSTRING
                 let mut uri = self

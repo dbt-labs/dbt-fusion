@@ -3,9 +3,9 @@ use std::sync::Arc;
 use std::{collections::BTreeMap, rc::Rc};
 
 use minijinja::{
+    Error as MinijinjaError, ErrorKind as MinijinjaErrorKind, State,
     listener::RenderingEventListener,
     value::{Object, ObjectRepr, Value},
-    Error as MinijinjaError, ErrorKind as MinijinjaErrorKind, State,
 };
 
 use crate::invocation_args::InvocationArgs;
@@ -36,13 +36,13 @@ impl Object for Flags {
         _state: &State<'_, '_>,
         name: &str,
         args: &[Value],
-        _listener: Rc<dyn RenderingEventListener>,
+        _listeners: &[Rc<dyn RenderingEventListener>],
     ) -> Result<Value, MinijinjaError> {
         match name {
             "get" => get_method(args, &self.flags),
             _ => Err(MinijinjaError::new(
                 MinijinjaErrorKind::UnknownMethod("Flags".to_string(), name.to_string()),
-                format!("Unknown method on flags: {}", name),
+                format!("Unknown method on flags: {name}"),
             )),
         }
     }

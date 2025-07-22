@@ -2,8 +2,10 @@ use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use dbt_common::once_cell_vars::DISPATCH_CONFIG;
 use dbt_jinja_utils::invocation_args::InvocationArgs;
-use dbt_jinja_utils::jinja_environment::JinjaEnvironment;
+use dbt_jinja_utils::jinja_environment::JinjaEnv;
 use dbt_jinja_utils::phases::load::init::initialize_load_jinja_environment;
+use dbt_jinja_utils::phases::load::init::initialize_load_profile_jinja_environment;
+use dbt_jinja_utils::serde::from_yaml_error;
 use dbt_schemas::schemas::serde::StringOrInteger;
 use fs_deps::get_or_install_packages;
 use pathdiff::diff_paths;
@@ -22,38 +24,62 @@ use dbt_common::error::LiftableResult;
 use project::DbtProject;
 
 use dbt_common::stdfs::last_modified;
-use dbt_common::{ectx, err, show_progress, ErrorCode};
-use dbt_common::{fs_err, FsResult};
-use dbt_schemas::schemas::project::{self, DbtProjectSimplified};
+use dbt_common::{ErrorCode, ectx, err, show_progress, with_progress};
+use dbt_common::{FsResult, fs_err};
+use dbt_schemas::schemas::project::{self, DbtProjectSimplified, ProjectDbtCloudConfig};
 use dbt_schemas::state::{DbtAsset, DbtPackage, DbtState, DbtVars, ResourcePathKind};
 
 use crate::args::LoadArgs;
 use crate::dbt_project_yml_loader::load_project_yml;
 use crate::download_publication::download_publication_artifacts;
-use crate::utils::{collect_file_info, identify_package_dependencies, load_raw_yml};
+use crate::utils::{collect_file_info, identify_package_dependencies};
 use crate::{
     load_internal_packages, load_packages, load_profiles, load_vars, persist_internal_packages,
 };
-use dbt_common::fsinfo;
 
-pub async fn load(arg: &LoadArgs, iarg: &InvocationArgs) -> FsResult<(DbtState, Option<usize>)> {
+use dbt_common::fsinfo;
+use dbt_jinja_utils::phases::load::secret_renderer::secret_context_env_var_fn;
+use dbt_jinja_utils::serde::{into_typed_with_jinja, value_from_file};
+use dbt_jinja_utils::var_fn;
+
+pub async fn load(
+    arg: &LoadArgs,
+    iarg: &InvocationArgs,
+) -> FsResult<(DbtState, Option<usize>, Option<ProjectDbtCloudConfig>)> {
+    let _pb = with_progress!(arg.io, spinner => LOADING);
+
     // Read the input file
     let dbt_project_path = arg.io.in_dir.join(DBT_PROJECT_YML);
-    let raw_dbt_project: DbtProjectSimplified = load_raw_yml(&dbt_project_path)?;
-    if raw_dbt_project.data_paths.is_some() {
+
+    let raw_dbt_project_in_val = value_from_file(None, &dbt_project_path)?;
+    let env = initialize_load_profile_jinja_environment();
+    let ctx: BTreeMap<String, minijinja::Value> = BTreeMap::from([
+        (
+            "env_var".to_owned(),
+            minijinja::Value::from_function(secret_context_env_var_fn()),
+        ),
+        (
+            "var".to_owned(),
+            minijinja::Value::from_function(var_fn(arg.vars.clone())),
+        ),
+    ]);
+
+    let simplified_dbt_project: DbtProjectSimplified =
+        into_typed_with_jinja(None, raw_dbt_project_in_val, true, &env, &ctx, &[])?;
+
+    if simplified_dbt_project.data_paths.is_some() {
         return err!(
             ErrorCode::InvalidConfig,
             "'data-paths' cannot be specified in dbt_project.yml",
         );
     }
-    if raw_dbt_project.source_paths.is_some() {
+    if simplified_dbt_project.source_paths.is_some() {
         return err!(
             ErrorCode::InvalidConfig,
             "'source-paths' cannot be specified in dbt_project.yml",
         );
     }
-    if raw_dbt_project
-        .log_path
+    if (*simplified_dbt_project.log_path)
         .as_ref()
         .is_some_and(|path| path != "logs")
     {
@@ -62,8 +88,7 @@ pub async fn load(arg: &LoadArgs, iarg: &InvocationArgs) -> FsResult<(DbtState, 
             "'log-path' cannot be specified in dbt_project.yml",
         );
     }
-    if raw_dbt_project
-        .target_path
+    if (*simplified_dbt_project.target_path)
         .as_ref()
         .is_some_and(|path| path != "target")
     {
@@ -73,17 +98,17 @@ pub async fn load(arg: &LoadArgs, iarg: &InvocationArgs) -> FsResult<(DbtState, 
         );
     }
 
-    let mut dbt_profile = load_profiles(arg, iarg, &raw_dbt_project)?;
+    let mut dbt_profile = load_profiles(arg, &simplified_dbt_project, &env, &ctx)?;
     // Check if .gitignore exists and add dbt_internal_packages/ if not present
     let gitignore_path = arg.io.in_dir.join(".gitignore");
     if gitignore_path.exists() {
         let gitignore_content = fs::read_to_string(&gitignore_path)?;
-        if !gitignore_content.contains(format!("{}/", DBT_INTERNAL_PACKAGES_DIR_NAME).as_str()) {
+        if !gitignore_content.contains(format!("{DBT_INTERNAL_PACKAGES_DIR_NAME}/").as_str()) {
             let mut updated_content = gitignore_content;
             if !updated_content.ends_with('\n') {
                 updated_content.push('\n');
             }
-            updated_content.push_str(format!("{}/\n", DBT_INTERNAL_PACKAGES_DIR_NAME).as_str());
+            updated_content.push_str(format!("{DBT_INTERNAL_PACKAGES_DIR_NAME}/\n").as_str());
             fs::write(&gitignore_path, updated_content)?;
         }
     }
@@ -96,7 +121,7 @@ pub async fn load(arg: &LoadArgs, iarg: &InvocationArgs) -> FsResult<(DbtState, 
                 StringOrInteger::String(ref s) => Some(s.parse::<usize>().map_err(|_| {
                     fs_err!(
                         ErrorCode::Generic,
-                        "Invalid number of threads in the profile.yml : {}",
+                        "Invalid number of threads in profiles.yml: {}",
                         s
                     )
                 })?),
@@ -113,7 +138,15 @@ pub async fn load(arg: &LoadArgs, iarg: &InvocationArgs) -> FsResult<(DbtState, 
         .set_threads(Some(StringOrInteger::Integer(
             final_threads.unwrap_or(0) as i64
         )));
-    let iarg = iarg.set_num_threads(final_threads);
+
+    let iarg = InvocationArgs {
+        num_threads: final_threads,
+        ..iarg.clone()
+    };
+    let arg = LoadArgs {
+        threads: final_threads,
+        ..arg.clone()
+    };
 
     let mut dbt_state = DbtState {
         dbt_profile,
@@ -125,7 +158,7 @@ pub async fn load(arg: &LoadArgs, iarg: &InvocationArgs) -> FsResult<(DbtState, 
 
     // If we are running `dbt debug` we don't need to collect dbt_project.yml files
     if arg.debug_profile {
-        return Ok((dbt_state, final_threads));
+        return Ok((dbt_state, final_threads, simplified_dbt_project.dbt_cloud));
     }
 
     // Load the packages.yml file, if it exists and install the packages if arg.install_deps is true
@@ -133,7 +166,7 @@ pub async fn load(arg: &LoadArgs, iarg: &InvocationArgs) -> FsResult<(DbtState, 
         &arg.io.in_dir,
         &arg.packages_install_path,
         &arg.internal_packages_install_path,
-        &raw_dbt_project,
+        &simplified_dbt_project,
     );
 
     persist_internal_packages(
@@ -142,57 +175,72 @@ pub async fn load(arg: &LoadArgs, iarg: &InvocationArgs) -> FsResult<(DbtState, 
     )?;
     let flags: BTreeMap<String, minijinja::Value> = iarg.to_dict();
 
-    let mut env = initialize_load_jinja_environment(
+    let env = initialize_load_jinja_environment(
         &dbt_state.dbt_profile.profile,
         &dbt_state.dbt_profile.target,
         &dbt_state.dbt_profile.db_config.adapter_type(),
         &dbt_state.dbt_profile.db_config,
         dbt_state.run_started_at,
         &flags,
+        arg.io.clone(),
     )?;
 
     let (packages_lock, upstream_projects) = get_or_install_packages(
         &arg.io,
-        &mut env,
+        &env,
         &packages_install_path,
         arg.install_deps,
+        arg.add_package.clone(),
         arg.vars.clone(),
     )
     .await?;
     // get publication artifact for each upstream project
-    download_publication_artifacts(&upstream_projects, &raw_dbt_project.dbt_cloud, &arg.io).await?;
+    download_publication_artifacts(
+        &upstream_projects,
+        &simplified_dbt_project.dbt_cloud,
+        &arg.io,
+    )
+    .await?;
     // If we are running `dbt deps` we don't need to collect files
     if arg.install_deps {
-        return Ok((dbt_state, final_threads));
+        return Ok((dbt_state, final_threads, simplified_dbt_project.dbt_cloud));
     }
 
     let lookup_map = packages_lock.lookup_map();
     let mut collected_vars = vec![];
-    let packages = load_packages(
-        arg,
-        &mut env,
-        &mut collected_vars,
-        &lookup_map,
-        &packages_install_path,
-    )
-    .await?;
-    dbt_state.packages = packages;
-    let packages = load_internal_packages(
-        arg,
-        &mut env,
-        &mut collected_vars,
-        &internal_packages_install_path,
-    )
-    .await?;
-    dbt_state.packages.extend(packages);
-    dbt_state.vars = collected_vars.into_iter().collect();
+    {
+        let _pb = with_progress!( arg.io, spinner => LOADING, item => "packages" );
 
-    Ok((dbt_state, final_threads))
+        let packages = load_packages(
+            &arg,
+            &env,
+            &mut collected_vars,
+            &lookup_map,
+            &packages_install_path,
+        )
+        .await?;
+        dbt_state.packages = packages;
+    }
+
+    {
+        let _pb = with_progress!( arg.io, spinner => LOADING, item => "internal packages" );
+
+        let packages = load_internal_packages(
+            &arg,
+            &env,
+            &mut collected_vars,
+            &internal_packages_install_path,
+        )
+        .await?;
+        dbt_state.packages.extend(packages);
+        dbt_state.vars = collected_vars.into_iter().collect();
+    }
+    Ok((dbt_state, final_threads, simplified_dbt_project.dbt_cloud))
 }
 
 pub async fn load_inner(
     arg: &LoadArgs,
-    env: &mut JinjaEnvironment<'static>,
+    env: &JinjaEnv,
     package_path: &Path,
     package_lookup_map: &BTreeMap<String, String>,
     collected_vars: &mut Vec<(String, BTreeMap<String, DbtVars>)>,
@@ -219,14 +267,15 @@ pub async fn load_inner(
         arg.io,
         fsinfo!(LOADING.into(), show_project_path.display().to_string())
     );
+
     let dbt_project = load_project_yml(&arg.io, env, &dbt_project_path, arg.vars.clone())?;
     load_vars(
         &dbt_project.name,
-        dbt_project
-            .vars
+        (*dbt_project.vars)
             .as_ref()
             .map(|vars| Deserialize::deserialize(vars.clone()))
-            .transpose()?,
+            .transpose()
+            .map_err(|e| from_yaml_error(e, Some(&dbt_project_path)))?,
         collected_vars,
     )?;
     // Set dispatch config for future use
@@ -359,14 +408,21 @@ pub async fn load_inner(
         package_path,
         &dbt_project.name,
         &ResourcePathKind::MacroPaths,
-        &["sql", "jinja"],
+        &["sql"],
         &all_files,
     );
     let test_files = find_files_by_kind_and_extension(
         package_path,
         &dbt_project.name,
         &ResourcePathKind::TestPaths,
-        &["sql", "jinja"],
+        &["sql"],
+        &all_files,
+    );
+    let fixture_files = find_files_by_kind_and_extension(
+        package_path,
+        &dbt_project.name,
+        &ResourcePathKind::FixturePaths,
+        &["csv"],
         &all_files,
     );
     let seed_files = find_files_by_kind_and_extension(
@@ -397,6 +453,7 @@ pub async fn load_inner(
         analysis_files,
         model_sql_files,
         test_files,
+        fixture_files,
         seed_files,
         macro_files,
         docs_files,
@@ -432,32 +489,18 @@ fn find_files_by_kind_and_extension(
     all_paths: &HashMap<ResourcePathKind, Vec<(PathBuf, SystemTime)>>,
 ) -> Vec<DbtAsset> {
     let default = vec![];
-    // If docs, we need to specially filter for md files from either
-    // (1) docs-paths, if specified
-    // (2) all paths, if docs-paths is not specified
-    let paths_to_filter: Vec<&(PathBuf, SystemTime)> = if *path_kind == ResourcePathKind::DocsPaths
-    {
-        if all_paths.get(path_kind).is_some()
-            && !all_paths.get(path_kind).as_ref().unwrap().is_empty()
-        {
-            all_paths.get(path_kind).unwrap().iter().collect()
-        } else {
-            all_paths.values().flatten().collect()
-        }
-    } else {
-        all_paths
-            .get(path_kind)
-            .unwrap_or(&default)
-            .iter()
-            .collect()
-    };
+    let paths_to_filter: Vec<_> = all_paths
+        .get(path_kind)
+        .unwrap_or(&default)
+        .iter()
+        .collect();
 
     let mut paths = paths_to_filter
         .iter()
         .filter_map(|(path, _)| {
             path.extension()
                 .and_then(OsStr::to_str)
-                .filter(|ext| extensions.contains(ext))
+                .filter(|ext| extensions.contains(&ext.to_lowercase().as_str()))
                 .filter(|_| !should_exclude_path(path_kind, path))
                 .map(|_| DbtAsset {
                     package_name: project_name.to_string(),
@@ -519,13 +562,37 @@ fn collect_paths(dbt_project: &DbtProject) -> HashMap<ResourcePathKind, Vec<Stri
         ResourcePathKind::TestPaths,
         dbt_project.test_paths.clone().unwrap_or_default(),
     );
+    all_dirs.insert(
+        ResourcePathKind::FixturePaths,
+        dbt_project
+            .test_paths
+            .clone()
+            .unwrap_or_default()
+            .iter()
+            .map(|p| {
+                let path = PathBuf::from(p).join("fixtures");
+                path.into_os_string().into_string().unwrap_or_default()
+            })
+            .collect(),
+    );
     // Only register docs paths if they are explicitly specified
-    // The default is to read all files in any directories for '*.md' files
     if dbt_project.docs_paths.is_some() && !dbt_project.docs_paths.as_ref().unwrap().is_empty() {
         all_dirs.insert(
             ResourcePathKind::DocsPaths,
             dbt_project.docs_paths.clone().unwrap_or_default(),
         );
+    } else {
+        // The default is to read all files in the following directories for '*.md' files
+        let mut result: Vec<String> = vec![];
+
+        result.extend_from_slice(dbt_project.analysis_paths.as_deref().unwrap_or_default());
+        result.extend_from_slice(dbt_project.macro_paths.as_deref().unwrap_or_default());
+        result.extend_from_slice(dbt_project.model_paths.as_deref().unwrap_or_default());
+        result.extend_from_slice(dbt_project.seed_paths.as_deref().unwrap_or_default());
+        result.extend_from_slice(dbt_project.snapshot_paths.as_deref().unwrap_or_default());
+        result.extend_from_slice(dbt_project.test_paths.as_deref().unwrap_or_default());
+
+        all_dirs.insert(ResourcePathKind::DocsPaths, result);
     }
     all_dirs
 }

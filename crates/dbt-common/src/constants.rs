@@ -32,6 +32,7 @@ pub const DBT_PACKAGES_DIR_NAME: &str = "dbt_packages";
 pub const DBT_INTERNAL_PACKAGES_DIR_NAME: &str = "dbt_internal_packages";
 pub const DBT_MANIFEST_JSON: &str = "manifest.json";
 pub const DBT_COMPILED_DIR_NAME: &str = "compiled";
+pub const DBT_METADATA_DIR_NAME: &str = "metadata";
 pub const DBT_EPHEMERAL_DIR_NAME: &str = "ephemeral";
 pub const DBT_HOOKS_DIR_NAME: &str = "hooks";
 pub const DBT_CTE_PREFIX: &str = "__dbt__cte__";
@@ -64,19 +65,24 @@ pub const VERDICT_WARN: &str = "[Warn]";
 // ----------------------------------------------------------------------------------------------
 // actions in order of appearance
 
+pub const ANALYZING: &str = " Analyzing";
 pub const LOADING: &str = "   Loading";
 pub const FETCHING: &str = "  Fetching";
 pub const INSTALLING: &str = "Installing";
 pub const EXTENDING: &str = " Extending";
+pub const RESOLVING: &str = " Resolving";
 pub const PARSING: &str = "   Parsing";
 pub const REMOVING: &str = "  Removing";
+pub const CACHING: &str = "   Caching";
 // not being issued right now
 pub const SCHEDULING: &str = "Scheduling";
 //
+pub const CLEANING: &str = "  Cleaning";
 pub const FORMATTING: &str = " Formatting";
 pub const LINTING: &str = "   Linting";
 pub const DOWNLOADING: &str = " Downloading";
 pub const COMPILING: &str = " Compiling";
+pub const RENDERING: &str = " Rendering";
 pub const SEEDING: &str = "   Seeding";
 pub const HYDRATING: &str = "  Hydrating";
 pub const TESTING: &str = "   Testing";
@@ -85,11 +91,14 @@ pub const WAITING: &str = "   Waiting";
 pub const ABORTED: &str = "   Aborted";
 pub const SUCCESS: &str = "   Success";
 pub const PASS: &str = "      Pass";
+pub const WARN: &str = "      Warn";
 pub const FAILED: &str = "    Failed";
 pub const REUSING: &str = "   Reusing";
 pub const STALE: &str = "     Stale";
 pub const SKIPPING: &str = "  Skipping";
-pub const COMPILED: &str = "  Compiled";
+pub const ANALYZED: &str = "  Analyzed";
+pub const RENDERED: &str = "  Rendered";
+pub const FRESHNESS: &str = " Freshness";
 
 // debug command
 pub const VALIDATING: &str = "Validating";
@@ -106,3 +115,10 @@ pub const NOOP: &str = "noop";
 
 // log targets
 pub const EXECUTING: &str = " ExecutingSql";
+
+// cas/node read/write
+
+pub const CAS_RD: &str = "   Reading";
+pub const CAS_WR: &str = "   Writing";
+pub const NODES_RD: &str = "   Reading";
+pub const NODES_WR: &str = "   Writing";

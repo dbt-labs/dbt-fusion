@@ -17,11 +17,29 @@ fn test_set_unwarp() {
     {{ a }}|{{ b }}|{{ c }}
     "#,
             context! {},
-            None,
+            &[],
         )
-        .unwrap()
-        .0;
+        .unwrap();
     assert_snapshot!(rv, @"one|two|three");
+}
+
+#[test]
+fn test_set_append() {
+    let env = Environment::new();
+    let rv = env
+        .render_str(
+            r#"
+    {%- set my_list = ['x'] -%}
+{{ my_list.append('y') }}
+{{ my_list }}
+    "#,
+            context! {},
+            &[],
+        )
+        .unwrap();
+    // would be None in dbt-core but this should be just cosmetic
+    assert_snapshot!(rv, @r"none
+['x', 'y']");
 }
 
 #[test]
@@ -41,7 +59,7 @@ fn test_macro_namespace_lookup() {
         MACRO_NAMESPACE_REGISTRY,
         Value::from_object(macro_namespace_registry),
     );
-    let _ = env.add_template("test_2.two", "{% macro two() %}two{% endmacro %}");
+    let _ = env.add_template("test_2.two", "{% macro two() %}two{% endmacro %}", &[]);
     let rv = env
         .render_str(
             r#"
@@ -49,10 +67,9 @@ fn test_macro_namespace_lookup() {
     {{ m() }}
         "#,
             context! {},
-            None,
+            &[],
         )
-        .unwrap()
-        .0;
+        .unwrap();
     assert_snapshot!(rv, @"two");
     let rv = env
         .render_str(
@@ -61,10 +78,9 @@ fn test_macro_namespace_lookup() {
     {{ m() }}
         "#,
             context! {},
-            None,
+            &[],
         )
-        .unwrap()
-        .0;
+        .unwrap();
     assert_snapshot!(rv, @"two");
 }
 #[test]
@@ -81,10 +97,9 @@ writing
 {%- endfilter -%}
             "#,
             context! {},
-            None,
+            &[],
         )
-        .unwrap()
-        .0;
+        .unwrap();
     assert_snapshot!(rv, @"here
   i
   am

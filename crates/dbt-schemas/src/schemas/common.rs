@@ -3,9 +3,9 @@
 use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 
-use dbt_common::{fs_err, CodeLocation, ErrorCode, FsError, FsResult};
+use dbt_common::{CodeLocation, ErrorCode, FsError, FsResult, err, fs_err};
 use dbt_frontend_common::Dialect;
-use dbt_serde_yaml::{JsonSchema, Verbatim};
+use dbt_serde_yaml::{JsonSchema, UntaggedEnumDeserialize, Verbatim};
 use hex;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -33,7 +33,8 @@ impl FreshnessRules {
             return Err(fs_err!(
                 ErrorCode::InvalidArgument,
                 "count and period are required when freshness is provided, count: {:?}, period: {:?}",
-                rule.count, rule.period
+                rule.count,
+                rule.period
             ));
         }
         Ok(())
@@ -45,6 +46,28 @@ pub enum FreshnessPeriod {
     minute,
     hour,
     day,
+}
+impl FromStr for FreshnessPeriod {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "minute" => Ok(FreshnessPeriod::minute),
+            "hour" => Ok(FreshnessPeriod::hour),
+            "day" => Ok(FreshnessPeriod::day),
+            _ => Err(()),
+        }
+    }
+}
+impl std::fmt::Display for FreshnessPeriod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let period_str = match self {
+            FreshnessPeriod::minute => "minute",
+            FreshnessPeriod::hour => "hour",
+            FreshnessPeriod::day => "day",
+        };
+        write!(f, "{period_str}")
+    }
 }
 
 #[skip_serializing_none]
@@ -83,21 +106,47 @@ impl<T: Clone + Merge<T>> Merge<Option<T>> for Option<T> {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, EnumIter, Eq)]
+#[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq, EnumIter, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DbtMaterialization {
+    #[default]
     View,
     Table,
     Incremental,
-    Snapshot,
     MaterializedView,
     External,
-    Seed,
     Test,
     Ephemeral,
     Unit,
+    Analysis,
+    /// only for databricks
+    StreamingTable,
     #[serde(untagged)]
     Unknown(String),
+}
+impl FromStr for DbtMaterialization {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "view" => Ok(DbtMaterialization::View),
+            "table" => Ok(DbtMaterialization::Table),
+            "incremental" => Ok(DbtMaterialization::Incremental),
+            "materialized_view" => Ok(DbtMaterialization::MaterializedView),
+            "external" => Ok(DbtMaterialization::External),
+            "test" => Ok(DbtMaterialization::Test),
+            "ephemeral" => Ok(DbtMaterialization::Ephemeral),
+            "unit" => Ok(DbtMaterialization::Unit),
+            "analysis" => Ok(DbtMaterialization::Analysis),
+            "streaming_table" => Ok(DbtMaterialization::StreamingTable),
+            other => Ok(DbtMaterialization::Unknown(other.to_string())),
+        }
+    }
+}
+impl From<DbtMaterialization> for String {
+    fn from(materialization: DbtMaterialization) -> Self {
+        materialization.to_string()
+    }
 }
 
 impl std::fmt::Display for DbtMaterialization {
@@ -106,16 +155,16 @@ impl std::fmt::Display for DbtMaterialization {
             DbtMaterialization::View => "view",
             DbtMaterialization::Table => "table",
             DbtMaterialization::Incremental => "incremental",
-            DbtMaterialization::Snapshot => "snapshot",
             DbtMaterialization::MaterializedView => "materialized_view",
             DbtMaterialization::External => "external",
-            DbtMaterialization::Seed => "seed",
             DbtMaterialization::Test => "test",
             DbtMaterialization::Ephemeral => "ephemeral",
             DbtMaterialization::Unit => "unit",
+            DbtMaterialization::StreamingTable => "streaming_table",
+            DbtMaterialization::Analysis => "analysis",
             DbtMaterialization::Unknown(s) => s.as_str(),
         };
-        write!(f, "{}", materialized_str)
+        write!(f, "{materialized_str}")
     }
 }
 
@@ -128,19 +177,17 @@ impl From<DbtMaterialization> for RelationType {
             DbtMaterialization::MaterializedView => RelationType::MaterializedView,
             DbtMaterialization::Ephemeral => RelationType::Ephemeral,
             DbtMaterialization::External => RelationType::External,
-            DbtMaterialization::Seed => RelationType::External, // TODO Validate this
             DbtMaterialization::Test => RelationType::External, // TODO Validate this
             DbtMaterialization::Incremental => RelationType::External, // TODO Validate this
-            DbtMaterialization::Snapshot => RelationType::External, // TODO Validate this
             DbtMaterialization::Unit => RelationType::External, // TODO Validate this
+            DbtMaterialization::StreamingTable => RelationType::StreamingTable,
+            DbtMaterialization::Analysis => RelationType::External, // TODO Validate this
             DbtMaterialization::Unknown(_) => RelationType::External, // TODO Validate this
         }
     }
 }
 
-#[derive(
-    Default, Debug, Clone, Serialize, Deserialize, PartialEq, Eq, EnumString, Display, JsonSchema,
-)]
+#[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Display, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum Access {
@@ -148,6 +195,19 @@ pub enum Access {
     #[default]
     Protected,
     Public,
+}
+
+impl FromStr for Access {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "private" => Ok(Access::Private),
+            "protected" => Ok(Access::Protected),
+            "public" => Ok(Access::Public),
+            _ => Err(()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -167,6 +227,16 @@ pub struct ResolvedQuoting {
     pub database: bool,
     pub identifier: bool,
     pub schema: bool,
+}
+
+impl Default for ResolvedQuoting {
+    fn default() -> Self {
+        // dbt rules
+        Self::trues()
+        // todo: however a much more sensible rule would be
+        // Self::falses()
+        // ... since SQL is case insensitive -- so let the dialect dictate and not the user...
+    }
 }
 
 impl ResolvedQuoting {
@@ -248,14 +318,14 @@ impl Serialize for DbtCheckColsSpec {
 }
 
 impl TryFrom<StringOrArrayOfStrings> for DbtCheckColsSpec {
-    type Error = Box<dyn std::error::Error>;
+    type Error = Box<FsError>;
     fn try_from(value: StringOrArrayOfStrings) -> Result<Self, Self::Error> {
         match value {
             StringOrArrayOfStrings::String(all) => {
                 if all == "all" {
                     Ok(DbtCheckColsSpec::All)
                 } else {
-                    Err(format!("Invalid check_cols value: {}", all).into())
+                    err!(ErrorCode::Generic, "Invalid check_cols value: {}", all)
                 }
             }
             StringOrArrayOfStrings::ArrayOfStrings(cols) => Ok(DbtCheckColsSpec::Cols(cols)),
@@ -290,14 +360,13 @@ impl<'de> Deserialize<'de> for DbtCheckColsSpec {
                 }
             }
             _ => Err(serde::de::Error::custom(format!(
-                "Expected a string or array of strings for check_cols, got {:?}",
-                value
+                "Expected a string or array of strings for check_cols, got {value:?}"
             ))),
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, EnumString, Display)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, EnumString, Display, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum DbtBatchSize {
@@ -309,12 +378,19 @@ pub enum DbtBatchSize {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq, JsonSchema)]
 pub struct DbtContract {
-    pub alias_types: Option<bool>,
-    pub enforced: Option<bool>,
+    #[serde(default = "default_alias_types")]
+    pub alias_types: bool,
+    #[serde(default)]
+    pub enforced: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub checksum: Option<Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, EnumString, Display)]
+fn default_alias_types() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, EnumString, Display, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum DbtIncrementalStrategy {
@@ -332,7 +408,7 @@ pub enum DbtIncrementalStrategy {
     Unknown,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(untagged)]
 pub enum DbtUniqueKey {
     Single(String),
@@ -369,7 +445,7 @@ impl From<StringOrArrayOfStrings> for DbtUniqueKey {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum HardDeletes {
     Ignore,
@@ -379,48 +455,16 @@ pub enum HardDeletes {
 
 // Impl try from string
 impl TryFrom<String> for HardDeletes {
-    type Error = Box<dyn std::error::Error>;
+    type Error = Box<FsError>;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
         Ok(match value.as_str() {
             "ignore" => HardDeletes::Ignore,
             "invalidate" => HardDeletes::Invalidate,
             "new_record" => HardDeletes::NewRecord,
-            _ => return Err(format!("Invalid hard_deletes value: {}", value).into()),
+            _ => return err!(ErrorCode::Generic, "Invalid hard_deletes value: {}", value),
         })
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-pub struct DatabricksModelConfig {
-    pub file_format: Option<String>,
-    pub location_root: Option<String>,
-    pub tblproperties: Option<BTreeMap<String, Value>>,
-    // this config is introduced here https://github.com/databricks/dbt-databricks/pull/823
-    pub include_full_name_in_path: Option<bool>,
-    pub liquid_clustered_by: Option<String>,
-    pub auto_liquid_cluster: Option<bool>,
-    pub clustered_by: Option<String>,
-    pub buckets: Option<i64>,
-    pub databricks_tags: Option<BTreeMap<String, Value>>,
-    pub compression: Option<String>,
-    pub databricks_compute: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-pub struct SnowflakeModelConfig {
-    pub external_volume: Option<String>,
-    pub base_location_root: Option<String>,
-    pub base_location_subpath: Option<String>,
-    pub target_lag: Option<String>,
-    pub snowflake_warehouse: Option<String>,
-    pub refresh_mode: Option<String>,
-    pub initialize: Option<String>,
-    pub tmp_relation_type: Option<String>,
-    pub query_tag: Option<String>,
-    pub automatic_clustering: Option<bool>,
-    pub copy_grants: Option<bool>,
-    pub secure: Option<bool>,
 }
 
 /// Constraints (model level or column level)
@@ -437,9 +481,8 @@ pub struct Constraint {
     /// Only ForeignKey constraints accept: a list columns in that table
     /// containing the corresponding primary or unique key.
     pub to_columns: Option<Vec<String>>,
-    /// model-level only
-    pub columns: Option<Vec<String>>,
     pub warn_unsupported: Option<bool>,
+    pub warn_unenforced: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -507,9 +550,9 @@ impl PartialEq for DbtChecksum {
 }
 
 impl DbtChecksum {
-    pub fn hash(s: &str) -> Self {
+    pub fn hash(s: &[u8]) -> Self {
         let mut hasher = Sha256::new();
-        hasher.update(s.as_bytes());
+        hasher.update(s);
         let checksum = hasher.finalize();
         Self::Object {
             name: "SHA256".to_string(),
@@ -525,7 +568,7 @@ pub struct IncludeExclude {
     pub include: Option<StringOrArrayOfStrings>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema, Default)]
 pub struct Expect {
     pub rows: Option<Rows>,
     #[serde(default)]
@@ -533,7 +576,9 @@ pub struct Expect {
     pub fixture: Option<String>,
 }
 
-#[derive(Debug, Serialize, Default, Deserialize, Clone, EnumString, Display, JsonSchema)]
+#[derive(
+    Debug, Serialize, Default, Deserialize, Clone, EnumString, Display, JsonSchema, PartialEq,
+)]
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]
 pub enum Formats {
@@ -591,7 +636,7 @@ pub struct PersistDocsConfig {
     pub relation: Option<bool>,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[derive(UntaggedEnumDeserialize, Serialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
 #[serde(untagged)]
 pub enum Hooks {
     String(String),
@@ -720,6 +765,25 @@ pub enum TimeGranularity {
     Year,
 }
 
+#[derive(Default, Deserialize, Serialize, Debug, Clone, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum StoreFailuresAs {
+    #[default]
+    Ephemeral,
+    Table,
+    View,
+}
+
+#[derive(Debug, Serialize, Default, Deserialize, Clone, EnumString, Display, JsonSchema)]
+#[strum(serialize_all = "lowercase")]
+pub enum Severity {
+    #[default]
+    #[serde(alias = "error", alias = "ERROR")]
+    Error,
+    #[serde(alias = "warn", alias = "WARN")]
+    Warn,
+}
+
 #[skip_serializing_none]
 #[derive(Deserialize, Serialize, Debug, Clone, JsonSchema)]
 pub struct Versions {
@@ -732,7 +796,7 @@ pub struct Versions {
 /// This function will parse the database, schema, and identifier
 /// according to the dialect and quoting rules.
 pub fn normalize_quoting(
-    quoting: ResolvedQuoting,
+    quoting: &ResolvedQuoting,
     adapter_type: &str,
     database: &str,
     schema: &str,

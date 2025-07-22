@@ -1,5 +1,5 @@
 use crate::pretty_string::GREEN;
-use crate::{fs_err, ErrorCode, FsResult};
+use crate::{ErrorCode, FsResult, fs_err};
 use dialoguer::{Confirm, Input, Password, Select};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -34,7 +34,7 @@ impl ProfileSetup {
         vec![
             "snowflake",
             "databricks", // TODO (Elias): Removing "coming soon" once Databricks goes live
-                          // "bigquery", // TODO (Elias): Removing "coming soon" once BigQuery goes live
+            "bigquery",   // TODO (Elias): Removing "coming soon" once BigQuery goes live
                           // "redshift", TODO (Elias): Add back once we have Redshift support
                           // "postgres", // TODO (Elias): Add back once we have Postgres support
         ]
@@ -73,7 +73,7 @@ impl ProfileSetup {
                     ErrorCode::InvalidArgument,
                     "Unsupported adapter: {}",
                     adapter
-                ))
+                ));
             }
         }
 

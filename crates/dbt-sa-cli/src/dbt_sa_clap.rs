@@ -1,11 +1,10 @@
-use clap::{builder::BoolishValueParser, ArgAction};
+use clap::{ArgAction, builder::BoolishValueParser};
 use console::Style;
 use dbt_common::logging::LogFormat;
 use dbt_serde_yaml::Value;
 use log::LevelFilter;
 use serde::{Deserialize, Serialize};
-use std::io::Write;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::LazyLock;
 use std::{
     collections::{BTreeMap, HashSet},
     path::{Path, PathBuf},
@@ -13,16 +12,17 @@ use std::{
 use strum::IntoEnumIterator;
 
 use dbt_common::io_args::{
-    check_selector, check_var, ClapResourceType, DisplayFormat, EvalArgs, IoArgs, JsonSchemaTypes,
-    Phases, ShowOptions, SystemArgs,
+    ClapResourceType, DisplayFormat, EvalArgs, IoArgs, JsonSchemaTypes, Phases, ShowOptions,
+    SystemArgs, check_selector, check_var,
 };
+use dbt_common::row_limit::RowLimit;
 
 use clap::arg;
 use clap::{Parser, Subcommand};
 
-use dbt_common::node_selector::{parse_model_specifiers, IndirectSelection};
+use dbt_common::node_selector::{IndirectSelection, parse_model_specifiers};
 
-const DEFAULT_LIMIT: usize = 10;
+const DEFAULT_LIMIT: &str = "10";
 static DEFAULT_FORMAT: LazyLock<String> = LazyLock::new(|| DisplayFormat::Table.to_string());
 
 // defined in pretty string, but copied here to avoid cycle...
@@ -105,6 +105,9 @@ pub struct InitArgs {
 
 #[derive(Parser, Debug, Default, Clone, Serialize, Deserialize)]
 pub struct DepsArgs {
+    #[arg(long)]
+    pub add_package: Option<String>,
+
     // Flattened Common args
     #[clap(flatten)]
     pub common_args: CommonArgs,
@@ -123,10 +126,9 @@ pub struct ListArgs {
     #[clap(flatten)]
     pub common_args: CommonArgs,
 
-    /// Limiting number of shown rows. Run with --limit 0 to remove limit [default: 10]
-    // todo: still left to be implemented
-    #[arg(long, hide = true)]
-    pub limit: Option<usize>,
+    /// Limiting number of shown rows. Run with --limit -1 to remove limit [default: 10]
+    #[arg(long, default_value=DEFAULT_LIMIT, allow_hyphen_values = true, hide = true)]
+    pub limit: RowLimit,
 
     /// Display rows in different formats, only table and json supported...
     #[arg(global = true, long, aliases = ["format"])]
@@ -139,6 +141,10 @@ pub struct ListArgs {
     /// Select nodes of a specific type;
     #[arg(long)]
     pub resource_type: Option<ClapResourceType>,
+
+    /// Exclude nodes of a specific type;
+    #[arg(long)]
+    pub exclude_resource_type: Option<ClapResourceType>,
 }
 
 #[derive(Parser, Debug, Default, Clone, Serialize, Deserialize)]
@@ -169,7 +175,7 @@ pub struct ManArgs {
 pub struct CommonArgs {
     /// The target to execute
     //  has no ENV_VAR euivalent
-    #[arg(global = true, long)]
+    #[arg(global = true, long, short = 't')]
     pub target: Option<String>,
 
     /// The directory to load the dbt project from
@@ -219,9 +225,9 @@ pub struct CommonArgs {
     #[arg(global = true, long, env = "DBT_QUIET", short = 'q')]
     pub quiet: bool,
 
-    /// The number of threads to use [Run with --threads 0 to use max_cpu [default: 1]]
-    // has no ENV_VAR
-    #[arg(global = true, long, short = 't')]
+    /// The number of threads to use [Run with --threads 0 to use max_cpu [default: max_cpu]]
+    // has no ENV_VAR, but can be set in profiles.yml
+    #[arg(global = true, long)]
     pub threads: Option<usize>,
 
     /// Overrides threads.
@@ -231,7 +237,7 @@ pub struct CommonArgs {
     /// Write JSON artifacts to disk [env: DBT_WRITE_JSON=]. Use --no-write-json to suppress writing JSON artifacts.
     #[arg(global = true, long,  default_value_t=true,  action = ArgAction::SetTrue, env = "DBT_WRITE_JSON", value_parser = BoolishValueParser::new())]
     pub write_json: bool,
-    #[arg(global = true,long,action = ArgAction::SetTrue,  default_value_t=false, env = "DBT_WRITE_JSON",value_parser = BoolishValueParser::new(),hide = true,conflicts_with = "write_json")]
+    #[arg(global = true,long,action = ArgAction::SetTrue,  default_value_t=false, value_parser = BoolishValueParser::new(),hide = true)]
     pub no_write_json: bool,
 
     /// Set 'log-path' for the current run, overriding 'DBT_LOG_PATH'.
@@ -252,6 +258,12 @@ pub struct CommonArgs {
     /// Set minimum log file severity, overriding the default and --log-level setting.
     #[arg(global = true, long, env = "DBT_LOG_LEVEL_FILE")]
     pub log_level_file: Option<LevelFilter>,
+
+    // Send anonymous usage stats to dbt Labs.
+    #[arg(global = true, long, default_value_t=true, action = ArgAction::SetTrue, env = "DBT_SEND_ANONYMOUS_USAGE_STATS", value_parser = BoolishValueParser::new())]
+    pub send_anonymous_usage_stats: bool,
+    #[arg(global = true, long, default_value_t=false, action = ArgAction::SetTrue, value_parser = BoolishValueParser::new())]
+    pub no_send_anonymous_usage_stats: bool,
 
     /// Debug flag
     #[arg(global = true, long, short = 'd', default_value = "false", action = ArgAction::SetTrue,  env = "DBT_DEBUG", value_parser = BoolishValueParser::new(),hide = true)]
@@ -354,7 +366,10 @@ impl ListArgs {
         if let Some(resource_type) = self.resource_type {
             eval_args.resource_types = vec![resource_type];
         }
-        eval_args.limit = self.limit.unwrap_or(DEFAULT_LIMIT);
+        if let Some(exclude_resource_type) = self.exclude_resource_type {
+            eval_args.exclude_resource_types = vec![exclude_resource_type];
+        }
+        eval_args.limit = self.limit.into();
         if let Some(output) = &self.output {
             eval_args.format = output.to_string();
         } else {
@@ -387,8 +402,7 @@ impl InitArgs {
                 out_dir: out_dir.to_path_buf(),
                 show,
                 invocation_id: arg.io.invocation_id,
-                stderr: arg.io.stderr,
-                stdout: arg.io.stdout,
+                send_anonymous_usage_stats: self.common_args.send_anonymous_usage_stats,
                 status_reporter: arg.io.status_reporter.clone(),
                 should_cancel_compilation: arg.io.should_cancel_compilation.clone(),
                 log_format: self.common_args.log_format,
@@ -396,6 +410,10 @@ impl InitArgs {
                 log_level_file: self.common_args.log_level_file,
                 log_path: self.common_args.log_path.clone(),
                 trace_path: self.common_args.trace_path.clone(),
+                show_timings: arg.from_main,
+                build_cache_mode: arg.io.build_cache_mode,
+                build_cache_url: arg.io.build_cache_url.clone(),
+                build_cache_cas_url: arg.io.build_cache_cas_url.clone(),
             },
             ..Default::default()
         }
@@ -408,8 +426,7 @@ impl InitArgs {
 pub fn check_target(filename: &str) -> Result<String, String> {
     let path = Path::new(filename);
     let err = Err(format!(
-        "Input file '{}' must have .sql, or .yml extension",
-        filename
+        "Input file '{filename}' must have .sql, or .yml extension"
     ));
     // TODO check that this test is universal for all inputs...
     if path.is_dir() {
@@ -435,7 +452,8 @@ impl CommonArgs {
             HashSet::from_iter(vec![
                 ShowOptions::Progress,
                 ShowOptions::ProgressParse,
-                ShowOptions::ProgressCompile,
+                ShowOptions::ProgressRender,
+                ShowOptions::ProgressAnalyze,
                 ShowOptions::ProgressRun,
             ])
         } else {
@@ -447,7 +465,8 @@ impl CommonArgs {
                         vec![
                             ShowOptions::Progress,
                             ShowOptions::ProgressParse,
-                            ShowOptions::ProgressCompile,
+                            ShowOptions::ProgressRender,
+                            ShowOptions::ProgressAnalyze,
                             ShowOptions::ProgressRun,
                         ]
                     } else {
@@ -465,11 +484,10 @@ impl CommonArgs {
             command: arg.command.clone(),
             io: IoArgs {
                 show,
-                stdout: arg.io.stdout.clone(),
-                stderr: arg.io.stderr.clone(),
                 invocation_id: arg.io.invocation_id,
                 in_dir: in_dir.to_path_buf(),
                 out_dir: out_dir.to_path_buf(),
+                send_anonymous_usage_stats: arg.io.send_anonymous_usage_stats,
                 status_reporter: arg.io.status_reporter.clone(),
                 should_cancel_compilation: arg.io.should_cancel_compilation.clone(),
                 log_format: self.log_format,
@@ -477,6 +495,10 @@ impl CommonArgs {
                 log_level_file: self.log_level_file,
                 log_path: self.log_path.clone(),
                 trace_path: self.trace_path.clone(),
+                show_timings: arg.from_main,
+                build_cache_mode: arg.io.build_cache_mode,
+                build_cache_url: arg.io.build_cache_url.clone(),
+                build_cache_cas_url: arg.io.build_cache_cas_url,
             },
             profiles_dir: self.profiles_dir.clone(),
             packages_install_path: self.packages_install_path.clone(),
@@ -485,7 +507,7 @@ impl CommonArgs {
             vars: self.vars.clone().unwrap_or_default(),
             phase: Phases::All,
             format: DEFAULT_FORMAT.clone(),
-            limit: 10,
+            limit: Some(10),
             debug: self.debug,
             num_threads: if self.single_threaded {
                 Some(1)
@@ -517,9 +539,21 @@ impl CommonArgs {
             log_path: self.log_path.clone(),
             project_dir: self.project_dir.clone(),
             quiet: self.quiet,
-            write_json: !self.no_write_json,
+            write_json: if self.no_write_json {
+                false
+            } else {
+                self.write_json
+            },
             target_path: self.target_path.clone(),
             ..Default::default()
+        }
+    }
+
+    pub fn get_send_anonymous_usage_stats(&self) -> bool {
+        if self.no_send_anonymous_usage_stats {
+            false
+        } else {
+            self.send_anonymous_usage_stats
         }
     }
 }
@@ -528,12 +562,11 @@ pub fn from_main(cli: &Cli) -> SystemArgs {
     SystemArgs {
         command: cli.get_command_str().to_string(),
         io: IoArgs {
-            stderr: None,
-            stdout: None,
             invocation_id: uuid::Uuid::new_v4(),
             show: cli.common_args().show.iter().cloned().collect(),
             in_dir: PathBuf::new(),
             out_dir: PathBuf::new(),
+            send_anonymous_usage_stats: cli.common_args().get_send_anonymous_usage_stats(),
             status_reporter: None,
             should_cancel_compilation: None,
             log_format: cli.common_args().log_format,
@@ -549,6 +582,10 @@ pub fn from_main(cli: &Cli) -> SystemArgs {
             },
             log_path: cli.common_args().log_path,
             trace_path: cli.common_args().trace_path,
+            show_timings: true, // always true for main
+            build_cache_mode: None,
+            build_cache_url: None,
+            build_cache_cas_url: None,
         },
         from_main: true,
 
@@ -557,20 +594,15 @@ pub fn from_main(cli: &Cli) -> SystemArgs {
     }
 }
 
-pub fn from_lib(
-    cli: &Cli,
-    stdout: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
-    stderr: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
-) -> SystemArgs {
+pub fn from_lib(cli: &Cli) -> SystemArgs {
     SystemArgs {
         command: cli.get_command_str().to_string(),
         io: IoArgs {
-            stderr,
-            stdout,
             invocation_id: uuid::Uuid::new_v4(),
             show: cli.common_args().show.iter().cloned().collect(),
             in_dir: PathBuf::new(),
             out_dir: PathBuf::new(),
+            send_anonymous_usage_stats: cli.common_args().get_send_anonymous_usage_stats(),
             status_reporter: None,
             should_cancel_compilation: None,
             log_format: cli.common_args().log_format,
@@ -578,6 +610,10 @@ pub fn from_lib(
             log_level_file: cli.common_args().log_level_file,
             log_path: cli.common_args().log_path,
             trace_path: cli.common_args().trace_path,
+            show_timings: false, // always false for lib
+            build_cache_mode: None,
+            build_cache_url: None,
+            build_cache_cas_url: None,
         },
         from_main: false,
         target: cli.common_args().target,

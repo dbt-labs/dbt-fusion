@@ -4,8 +4,8 @@ use std::{fmt, marker::PhantomData};
 use dashmap::DashMap;
 use minijinja::Value;
 use serde::{
-    de::{value::UnitDeserializer, Visitor},
     Deserialize, Deserializer, Serialize,
+    de::{Visitor, value::UnitDeserializer},
 };
 
 /// Converts a serde_json::Value to a minijinja::Value
@@ -221,7 +221,7 @@ where
         T::schema_name()
     }
 
-    fn json_schema(generator: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+    fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
         T::json_schema(generator)
     }
 
@@ -235,7 +235,7 @@ where
 
     #[doc(hidden)]
     fn _schemars_private_non_optional_json_schema(
-        generator: &mut schemars::gen::SchemaGenerator,
+        generator: &mut schemars::r#gen::SchemaGenerator,
     ) -> schemars::schema::Schema {
         T::_schemars_private_non_optional_json_schema(generator)
     }
@@ -291,11 +291,28 @@ impl<T> Omissible<T> {
             Omissible::Omitted => f(),
         }
     }
+
+    /// Converts the `Omissible` value into an `Option<T>`.
+    pub fn into_inner(self) -> Option<T> {
+        match self {
+            Omissible::Present(value) => Some(value),
+            Omissible::Omitted => None,
+        }
+    }
 }
 
 impl<T> From<T> for Omissible<T> {
     fn from(value: T) -> Self {
         Omissible::Present(value)
+    }
+}
+
+impl<T> From<Option<T>> for Omissible<T> {
+    fn from(value: Option<T>) -> Self {
+        match value {
+            Some(v) => Omissible::Present(v),
+            None => Omissible::Omitted,
+        }
     }
 }
 
@@ -335,17 +352,19 @@ mod tests {
             field: 
         "#;
         let err = dbt_serde_yaml::from_str::<TestStruct>(yaml).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("invalid type: unit value, expected a string"));
+        assert!(
+            err.to_string()
+                .contains("invalid type: unit value, expected a string")
+        );
 
         let yaml = r#"
             field: null
         "#;
         let err = dbt_serde_yaml::from_str::<TestStruct>(yaml).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("invalid type: unit value, expected a string"));
+        assert!(
+            err.to_string()
+                .contains("invalid type: unit value, expected a string")
+        );
     }
 
     #[test]
@@ -379,6 +398,15 @@ mod tests {
             field: Omissible::Present(None),
         };
         assert_eq!(value, expected);
+
+        let yaml = r#"
+            field: null
+        "#;
+        let value: TestStruct = dbt_serde_yaml::from_str(yaml).unwrap();
+        let expected = TestStruct {
+            field: Omissible::Present(None),
+        };
+        assert_eq!(value, expected);
     }
 
     #[test]
@@ -391,7 +419,7 @@ mod tests {
         }
         let schema = schema_for!(TestStruct);
         let schema_str = dbt_serde_yaml::to_string(&schema).unwrap();
-        println!("{}", schema_str);
+        println!("{schema_str}");
         assert_eq!(
             schema_str,
             indoc! {"

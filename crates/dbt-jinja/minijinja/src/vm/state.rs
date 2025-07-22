@@ -8,6 +8,9 @@ use crate::utils::{AutoEscape, UndefinedBehavior};
 use crate::value::mutable_map::MutableMap;
 use crate::value::{ArgType, Value};
 use crate::vm::context::Context;
+
+use serde::Deserialize;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::rc::Rc;
@@ -123,6 +126,45 @@ impl<'template, 'env> State<'template, 'env> {
             .unwrap_or_default()
     }
 
+    /// Returns true if the model to be executed is materialized as incremental
+    pub fn is_run_incremental(&self) -> bool {
+        let model = self.lookup("model");
+        if let Some(model) = model {
+            if let Some(config) = model.get_attr_fast("config") {
+                if let Some(result) = config.get_attr_fast("materialized") {
+                    return result.as_str() == Some("incremental");
+                }
+            }
+        }
+        false
+    }
+
+    /// Returns true if the relation of name fqn is a snapshot
+    pub fn is_relation_snapshot(&self, fqn: &str) -> bool {
+        let graph = self.lookup("graph");
+        if let Some(graph) = graph {
+            // refers to 'build_flat_graph'
+            // https://github.com/dbt-labs/fs/blob/b3b283e6becd65acdddd7cc43944e43de226cc14/fs/sa/crates/dbt-jinja-utils/src/functions/base.rs#L1130
+            #[derive(Deserialize, Debug)]
+            struct _Graph {
+                nodes: BTreeMap<String, _Node>,
+            }
+            #[derive(Deserialize, Debug)]
+            struct _Node {
+                resource_type: String,
+                relation_name: String,
+            }
+            let graph = <_Graph>::deserialize(graph);
+            if let Ok(graph) = graph {
+                let node = graph.nodes.values().find(|node| node.relation_name == fqn);
+                if let Some(node) = node {
+                    return node.resource_type == "snapshot";
+                }
+            }
+        }
+        false
+    }
+
     /// Returns the base context of the state and add file_stack to it.
     /// This should always be a mutable map wrapped in a Value:from_object
     pub fn get_base_context(&self) -> Value {
@@ -190,13 +232,13 @@ impl<'template, 'env> State<'template, 'env> {
         &self,
         name: &str,
         args: &[Value],
-        listener: Rc<dyn RenderingEventListener>,
+        listeners: &[Rc<dyn RenderingEventListener>],
     ) -> Result<String, Error> {
         let f = ok!(self.lookup(name).ok_or_else(|| Error::new(
             crate::error::ErrorKind::UnknownFunction,
             "macro not found"
         )));
-        f.call(self, args, listener).map(Into::into)
+        f.call(self, args, listeners).map(Into::into)
     }
 
     /// Renders a block with the given name into a string.
@@ -214,9 +256,9 @@ impl<'template, 'env> State<'template, 'env> {
     /// # let mut env = Environment::new();
     /// # env.add_template("hello", "{% block hi %}Hello {{ name }}!{% endblock %}")?;
     /// let tmpl = env.get_template("hello")?;
-    /// let (rv, _) = tmpl
-    ///     .eval_to_state(context!(name => "John"), Rc::new(DefaultRenderingEventListener))?
-    ///     .render_block("hi", Rc::new(DefaultRenderingEventListener))?;
+    /// let rv = tmpl
+    ///     .eval_to_state(context!(name => "John"), &[Rc::new(DefaultRenderingEventListener::default())])?
+    ///     .render_block("hi", &[Rc::new(DefaultRenderingEventListener::default())])?;
     /// println!("{}", rv);
     /// # Ok(()) }
     /// ```
@@ -231,26 +273,18 @@ impl<'template, 'env> State<'template, 'env> {
     pub fn render_block(
         &mut self,
         block: &str,
-        listener: Rc<dyn RenderingEventListener>,
-    ) -> Result<(String, crate::MacroSpans), Error> {
+        listeners: &[Rc<dyn RenderingEventListener>],
+    ) -> Result<String, Error> {
         use crate::output_tracker;
 
         let mut buf = String::new();
         let mut output_tracker = output_tracker::OutputTracker::new(&mut buf);
         let current_location = output_tracker.location.clone();
         let mut out = Output::with_write(&mut output_tracker);
-        let mut macro_spans = crate::MacroSpans::default();
         let value = crate::vm::Vm::new(self.env)
-            .call_block(
-                block,
-                self,
-                &mut out,
-                current_location,
-                &mut macro_spans,
-                listener,
-            )
+            .call_block(block, self, &mut out, current_location, listeners)
             .map(|_| buf)?;
-        Ok((value, macro_spans))
+        Ok(value)
     }
 
     /// Renders a block with the given name into an [`io::Write`](std::io::Write).
@@ -262,13 +296,13 @@ impl<'template, 'env> State<'template, 'env> {
         &mut self,
         block: &str,
         w: W,
-        listener: Rc<dyn RenderingEventListener>,
+        listeners: &[Rc<dyn RenderingEventListener>],
     ) -> Result<(), Error>
     where
         W: std::io::Write,
     {
         use crate::{
-            output::{self, MacroSpans},
+            output::{self},
             output_tracker::OutputTracker,
         };
 
@@ -277,14 +311,7 @@ impl<'template, 'env> State<'template, 'env> {
         let current_location = output_tracker.location;
         let mut out = output::Output::with_write(&mut wrapper);
         crate::vm::Vm::new(self.env)
-            .call_block(
-                block,
-                self,
-                &mut out,
-                current_location,
-                &mut MacroSpans::default(),
-                listener,
-            )
+            .call_block(block, self, &mut out, current_location, listeners)
             .map(|_| ())
             .map_err(|err| wrapper.take_err(err))
     }
@@ -301,9 +328,13 @@ impl<'template, 'env> State<'template, 'env> {
     /// it will be invoked with the name of the current template as parent template.
     ///
     /// For more information see [`Environment::set_path_join_callback`].
-    pub fn get_template(&self, name: &str) -> Result<Template<'env, 'env>, Error> {
+    pub fn get_template(
+        &self,
+        name: &str,
+        listeners: &[Rc<dyn RenderingEventListener>],
+    ) -> Result<Template<'env, 'env>, Error> {
         self.env
-            .get_template(&self.env.join_template_path(name, self.name()))
+            .get_template(&self.env.join_template_path(name, self.name()), listeners)
     }
 
     /// Invokes a filter with some arguments.

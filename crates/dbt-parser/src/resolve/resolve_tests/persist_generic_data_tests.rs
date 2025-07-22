@@ -1,14 +1,21 @@
 use super::utils::{base_tests_inner, column_tests_inner};
 use crate::args::ResolveArgs;
-use dbt_common::constants::DBT_GENERIC_TESTS_DIR_NAME;
 use dbt_common::FsError;
 use dbt_common::FsResult;
-use dbt_common::{err, ErrorCode};
+use dbt_common::constants::DBT_GENERIC_TESTS_DIR_NAME;
+use dbt_common::{ErrorCode, err};
 use dbt_common::{fs_err, stdfs};
+use dbt_frontend_common::Dialect;
 use dbt_jinja_utils::serde::check_single_expression_without_whitepsace_control;
 use dbt_schemas::schemas::common::Versions;
-use dbt_schemas::schemas::data_tests::DataTests;
+use dbt_schemas::schemas::common::normalize_quote;
+use dbt_schemas::schemas::data_tests::{
+    AcceptedValuesTestProperties, DataTests, NotNullTestProperties, RelationshipsTestProperties,
+    UniqueTestProperties,
+};
 
+use dbt_schemas::schemas::dbt_column::ColumnProperties;
+use dbt_schemas::schemas::project::DataTestConfig;
 use dbt_schemas::schemas::properties::Tables;
 use dbt_schemas::schemas::properties::{ModelProperties, SeedProperties, SnapshotProperties};
 use dbt_schemas::state::DbtAsset;
@@ -21,6 +28,7 @@ use std::hash::Hash;
 use std::hash::Hasher;
 use std::path::Path;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::LazyLock;
 
 const CONFIG_ARGS: &[&str] = &[
@@ -50,9 +58,12 @@ impl<T: TestableNodeTrait> TestableNode<'_, T> {
         project_name: &str,
         out_dir: &Path,
         collected_tests: &mut Vec<DbtAsset>,
+        adapter_type: &str,
     ) -> FsResult<()> {
         let test_configs: Vec<GenericTestConfig> = self.try_into()?;
         // Process tests for each version (or single resource)
+        let dialect = Dialect::from_str(adapter_type)
+            .map_err(|e| fs_err!(ErrorCode::Unexpected, "Failed to parse adapter type: {}", e))?;
         for test_config in test_configs {
             // Handle model-level tests
             if let Some(tests) = &test_config.model_tests {
@@ -64,13 +75,26 @@ impl<T: TestableNodeTrait> TestableNode<'_, T> {
 
             // Handle column-level tests
             if let Some(column_tests) = &test_config.column_tests {
-                for (column_name, tests) in column_tests {
+                for (column_name, (should_quote, tests)) in column_tests {
                     for test in tests {
+                        // Need dialect to quote properly
+                        let (column_name, should_quote) =
+                            normalize_quote(*should_quote, adapter_type, column_name);
+                        let quoted_column_name = if should_quote {
+                            format!(
+                                "{}{}{}",
+                                dialect.quote_char(),
+                                column_name,
+                                dialect.quote_char()
+                            )
+                        } else {
+                            column_name.to_string()
+                        };
                         let dbt_asset = persist_inner(
                             project_name,
                             out_dir,
                             &test_config,
-                            Some(column_name),
+                            Some(&quoted_column_name),
                             test,
                         )?;
                         collected_tests.push(dbt_asset);
@@ -102,14 +126,14 @@ fn persist_inner(
 
     let full_name = generate_test_name(
         test_macro_name.as_str(),
-        custom_test_name.is_some(),
+        custom_test_name,
         project_name,
         test_config,
         &kwargs,
         namespace.as_ref(),
         &jinja_set_vars,
     );
-    let path = PathBuf::from(DBT_GENERIC_TESTS_DIR_NAME).join(format!("{}.sql", full_name));
+    let path = PathBuf::from(DBT_GENERIC_TESTS_DIR_NAME).join(format!("{full_name}.sql"));
     let test_file = out_dir.join(&path);
     let generated_test_sql = generate_test_macro(
         test_macro_name.as_str(),
@@ -172,7 +196,7 @@ fn get_test_details(
 
     kwargs.insert(
         "model".to_string(),
-        Value::String(format!("get_where_subquery({})", model_string)),
+        Value::String(format!("get_where_subquery({model_string})")),
     );
     if let Some(col) = column_name {
         kwargs.insert("column_name".to_string(), Value::String(col.to_string()));
@@ -285,29 +309,40 @@ fn get_test_details(
     })
 }
 
-fn parse_builtin_macro_name_and_test_name(
+fn parse_builtin_macro_name_and_test_name<T>(
     kwargs: &mut BTreeMap<String, Value>,
     config: &mut BTreeMap<String, Value>,
-    test_inner: &Value,
+    test_inner: T,
     macro_name: &str,
-) -> FsResult<(Option<String>, String)> {
-    let mut args = test_inner
+) -> FsResult<(Option<String>, String)>
+where
+    T: serde::Serialize + std::fmt::Debug + Copy,
+{
+    let test_inner_value = serde_json::to_value(test_inner).map_err(|e| {
+        fs_err!(
+            ErrorCode::SchemaError,
+            "Failed to serialize test properties: {}",
+            e
+        )
+    })?;
+    let mut args = test_inner_value
         .as_object()
         .ok_or(fs_err!(
             ErrorCode::SchemaError,
-            "not_null test is not an object"
+            "{} test is not an object",
+            macro_name
         ))?
         .to_owned();
-    let name = args
+    let custom_name = args
         .remove("name")
         .and_then(|v| v.as_str().map(String::from));
-    let (macro_name, name) = if let Some(name) = name {
-        (Some(name), macro_name.to_string())
+    let (custom_name, macro_name) = if let Some(custom_name) = custom_name {
+        (Some(custom_name), macro_name.to_string())
     } else {
         (None, macro_name.to_string())
     };
     extract_kwargs_and_config(&args, kwargs, config)?;
-    Ok((macro_name, name))
+    Ok((custom_name, macro_name))
 }
 
 fn parse_test_name_and_namespace(test_name: &str) -> (String, Option<String>) {
@@ -328,7 +363,7 @@ static CLEAN_REGEX: LazyLock<Regex> =
 /// * `is_custom_test_name` - Whether a custom name was provided for this test
 fn generate_test_name(
     test_macro_name: &str,
-    is_custom_test_name: bool,
+    custom_test_name: Option<String>,
     project_name: &str,
     test_config: &GenericTestConfig,
     kwargs: &BTreeMap<String, Value>,
@@ -364,8 +399,13 @@ fn generate_test_name(
         flat_args.extend(parts);
     }
 
+    // Include custom_test_name as suffix if provided
+    if let Some(custom_test_name) = custom_test_name {
+        flat_args.push(custom_test_name);
+    }
+
     // Clean args to only allow alphanumeric and underscore
-    let mut clean_flat_args: Vec<String> = flat_args
+    let clean_flat_args: Vec<String> = flat_args
         .iter()
         .map(|arg| {
             CLEAN_REGEX
@@ -374,11 +414,6 @@ fn generate_test_name(
                 .to_string()
         })
         .collect();
-
-    // we don't need to any suffix since a name is explicitly defined using `name` field
-    if is_custom_test_name {
-        clean_flat_args = vec![];
-    }
 
     // Join args with double underscores - empty string if no args
     let suffix = if !clean_flat_args.is_empty() {
@@ -391,7 +426,7 @@ fn generate_test_name(
     let (prefix, resource_name) = match &test_config.source_name {
         Some(source_name) => (
             // handles the test from a source model
-            format!("source_{}", test_macro_name),
+            format!("source_{test_macro_name}"),
             format!("{}_{}", source_name, &test_config.resource_name),
         ),
         None => (
@@ -401,25 +436,25 @@ fn generate_test_name(
     };
 
     let test_identifier = match &test_config.version_num {
-        Some(version_num) => format!("{}_{}_v{}", prefix, resource_name, version_num),
-        None => format!("{}_{}", prefix, resource_name),
+        Some(version_num) => format!("{prefix}_{resource_name}_v{version_num}"),
+        None => format!("{prefix}_{resource_name}"),
     };
 
     let result = match package_name {
         Some(pkg_name) if pkg_name != project_name => {
-            format!("{}_{}_{}", pkg_name, test_identifier, suffix)
+            format!("{pkg_name}_{test_identifier}_{suffix}")
         }
         _ => {
-            format!("{}_{}", test_identifier, suffix)
+            format!("{test_identifier}_{suffix}")
         }
     };
 
-    // linux has 255 bytes limit on filename (251 for file name + 4 for extension)
-    if result.len() >= 251 {
+    // linux has 255 bytes limit on filename (255- 16 = 239 for file name extension .sql or .macro_spans.json)
+    if result.len() >= 239 {
         let mut hasher = DefaultHasher::new();
         result.as_str().hash(&mut hasher);
         let hash = hasher.finish();
-        format!("t_{:X}", hash) // Uppercase hex format is alphanumeric
+        format!("t_{hash:X}") // Uppercase hex format is alphanumeric
     } else {
         result
     }
@@ -492,7 +527,7 @@ struct GenericTestConfig {
     resource_name: String,
     version_num: Option<String>,
     model_tests: Option<Vec<DataTests>>,
-    column_tests: Option<BTreeMap<String, Vec<DataTests>>>,
+    column_tests: Option<BTreeMap<String, (bool, Vec<DataTests>)>>,
     source_name: Option<String>,
 }
 
@@ -515,34 +550,26 @@ fn generate_test_macro(
                 &var_value[2..var_value.len() - 2].trim()
             )
         } else {
-            format!(
-                "{{% set {} %}}\n{}\n{{% endset %}}\n\n",
-                var_name, var_value
-            )
+            format!("{{% set {var_name} %}}\n{var_value}\n{{% endset %}}\n\n")
         };
         sql.push_str(&set_val);
     }
 
     // Add config block if present
     if !config.is_empty() {
-        // Convert config to a DbtConfig and use its to_string method
-        let config_value = serde_json::to_value(config)
-            .map_err(|e| fs_err!(ErrorCode::SchemaError, "Invalid test config: {}", e))?;
-        let dbt_config =
-            dbt_schemas::schemas::manifest::DbtConfig::from_serde_json_value(config_value);
-        let config_str = dbt_config.show_existing_fields();
-        sql.push_str(&format!("{{{{ config({}) }}}}\n", config_str));
+        // Convert config to a DataTestConfig and use its to_string method
+        let config_str = render_config_to_kwargs(config);
+        sql.push_str(&format!("{{{{ config({config_str}) }}}}\n"));
     }
 
     // Build test macro call with namespace
     // dbt allows referencing a macro of test_<name> using just <name> in data_tests
     // via the qualified_name prefix using 'test_'
     let qualified_name = if let Some(ns) = namespace {
-        format!("{}.test_{}", ns, test_macro_name)
+        format!("{ns}.test_{test_macro_name}")
     } else {
-        format!("test_{}", test_macro_name)
+        format!("test_{test_macro_name}")
     };
-
     // Format all kwargs, handling ref calls specially
     let formatted_args: Vec<String> = kwargs
         .iter()
@@ -552,7 +579,6 @@ fn generate_test_macro(
                 if s.starts_with("get_where_subquery(")
                     || s.starts_with("ref(")
                     || s.starts_with("source(")
-                    || (s.starts_with('"') && s.ends_with('"'))
                     || jinja_set_vars.iter().any(|(var_name, _)| var_name == s)
                 // Check if this is a reference to one of our Jinja set variables
                 {
@@ -564,21 +590,109 @@ fn generate_test_macro(
                         .replace('{', "\\{") // Escape curly braces
                         .replace('}', "\\}"); // Escape closing curly braces
 
-                    format!("\"{}\"", escaped) // Do NOT add extra quotes
+                    format!("\"{escaped}\"") // Do NOT add extra quotes
                 }
             } else {
                 v.to_string()
             };
-            format!("{}={}", k, value_str)
+            format!("{k}={value_str}")
         })
         .collect();
-
     sql.push_str(&format!(
         "{{{{ {}({}) }}}}",
         qualified_name,
         formatted_args.join(", ")
     ));
     Ok(sql)
+}
+
+fn render_config_to_kwargs(config: &BTreeMap<String, Value>) -> String {
+    let value = serde_json::to_value(config).unwrap();
+
+    // Convert to a map and filter out None values
+    if let Value::Object(map) = value {
+        let filtered_map: serde_json::Map<String, Value> =
+            map.into_iter().filter(|(_, v)| !v.is_null()).collect();
+
+        let output_str = serde_json::to_string(&Value::Object(filtered_map)).unwrap();
+
+        // Process Jinja expressions more robustly
+        process_jinja_expressions(&output_str)
+    } else {
+        // Fallback in case the value is not an object (shouldn't happen)
+        serde_json::to_string(&value).unwrap()
+    }
+}
+
+/// Processes a JSON string to find quoted Jinja expressions and remove the quotes
+/// while properly handling escaped content within the expressions
+fn process_jinja_expressions(input: &str) -> String {
+    let mut result = String::new();
+    let chars: Vec<char> = input.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        // Look for "{{
+        if i + 2 < chars.len() && chars[i] == '"' && chars[i + 1] == '{' && chars[i + 2] == '{' {
+            // Found start of a potential Jinja expression
+            let start_pos = i;
+            i += 1; // Move past the opening quote
+
+            let mut brace_count = 0;
+            let mut jinja_end = None;
+
+            // Find the matching }} and closing quote
+            while i < chars.len() {
+                if chars[i] == '{' && i + 1 < chars.len() && chars[i + 1] == '{' {
+                    brace_count += 1;
+                    i += 2;
+                } else if chars[i] == '}' && i + 1 < chars.len() && chars[i + 1] == '}' {
+                    brace_count -= 1;
+                    i += 2;
+
+                    // Check if this completes the expression and has a closing quote
+                    if brace_count == 0 && i < chars.len() && chars[i] == '"' {
+                        jinja_end = Some(i);
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+
+            if let Some(end_pos) = jinja_end {
+                // Extract the content between the quotes, excluding the outer {{ and }}
+                let full_content: String = chars[start_pos + 1..end_pos].iter().collect();
+
+                // Remove the outer {{ and }} braces
+                let inner_content =
+                    if full_content.starts_with("{{") && full_content.ends_with("}}") {
+                        &full_content[2..full_content.len() - 2]
+                    } else {
+                        &full_content
+                    };
+
+                // Remove escape sequences within the Jinja expression
+                let unescaped_content = inner_content
+                    .replace("\\\"", "\"") // Unescape double quotes
+                    .replace("\\\\", "\\") // Unescape backslashes
+                    .replace("\\{", "{") // Unescape opening braces
+                    .replace("\\}", "}"); // Unescape closing braces
+
+                result.push_str(&unescaped_content);
+                i = end_pos + 1; // Move past the closing quote
+            } else {
+                // Not a valid Jinja expression, add the original character and continue
+                result.push(chars[start_pos]);
+                i = start_pos + 1;
+            }
+        } else {
+            result.push(chars[i]);
+            i += 1;
+        }
+    }
+
+    result
 }
 
 impl<T> TryFrom<&TestableNode<'_, T>> for Vec<GenericTestConfig>
@@ -667,11 +781,14 @@ fn collect_versioned_model_tests(
             };
 
             // Then handle any explicit column test definitions
-            if let Ok(column_map) = serde_json::from_value::<Vec<ModelProperties>>(columns.clone())
+            if let Ok(column_map) = serde_json::from_value::<Vec<ColumnProperties>>(columns.clone())
             {
                 for col in column_map {
                     if let Some(tests) = col.tests.as_ref() {
-                        column_tests.insert(col.name.clone(), tests.clone());
+                        column_tests.insert(
+                            col.name.clone(),
+                            (col.quote.unwrap_or(false), tests.clone()),
+                        );
                     }
                 }
             }
@@ -734,7 +851,8 @@ pub trait TestableNodeTrait {
     fn base_tests(&self) -> FsResult<Option<Vec<DataTests>>>;
 
     /// Columns, each with optional tests.
-    fn column_tests(&self) -> FsResult<Option<BTreeMap<String, Vec<DataTests>>>>;
+    #[allow(clippy::type_complexity)]
+    fn column_tests(&self) -> FsResult<Option<BTreeMap<String, (bool, Vec<DataTests>)>>>;
 
     /// Versions for models, or None for everything else.
     fn versions(&self) -> Option<&[Versions]> {
@@ -762,7 +880,7 @@ impl TestableNodeTrait for ModelProperties {
         base_tests_inner(self.tests.as_deref(), self.data_tests.as_deref())
     }
 
-    fn column_tests(&self) -> FsResult<Option<BTreeMap<String, Vec<DataTests>>>> {
+    fn column_tests(&self) -> FsResult<Option<BTreeMap<String, (bool, Vec<DataTests>)>>> {
         column_tests_inner(&self.columns)
     }
 
@@ -784,7 +902,7 @@ impl TestableNodeTrait for SeedProperties {
         base_tests_inner(self.tests.as_deref(), self.data_tests.as_deref())
     }
 
-    fn column_tests(&self) -> FsResult<Option<BTreeMap<String, Vec<DataTests>>>> {
+    fn column_tests(&self) -> FsResult<Option<BTreeMap<String, (bool, Vec<DataTests>)>>> {
         column_tests_inner(&self.columns)
     }
 }
@@ -802,7 +920,7 @@ impl TestableNodeTrait for SnapshotProperties {
         base_tests_inner(self.tests.as_deref(), self.data_tests.as_deref())
     }
 
-    fn column_tests(&self) -> FsResult<Option<BTreeMap<String, Vec<DataTests>>>> {
+    fn column_tests(&self) -> FsResult<Option<BTreeMap<String, (bool, Vec<DataTests>)>>> {
         column_tests_inner(&self.columns)
     }
 }
@@ -833,7 +951,7 @@ impl TestableNodeTrait for TestableTable<'_> {
         )
     }
 
-    fn column_tests(&self) -> FsResult<Option<BTreeMap<String, Vec<DataTests>>>> {
+    fn column_tests(&self) -> FsResult<Option<BTreeMap<String, (bool, Vec<DataTests>)>>> {
         column_tests_inner(&self.table.columns)
     }
 }
@@ -904,7 +1022,7 @@ fn process_kwarg(
         if needs_jinja_set_block(s) {
             // Generate a unique var name based on the key with a prefix to avoid collisions
             // Add a random suffix to ensure uniqueness even with the same key name
-            let var_name = format!("dbt_custom_arg_{}", key);
+            let var_name = format!("dbt_custom_arg_{key}");
             jinja_set_vars.insert(var_name.clone(), s.clone());
             kwargs.insert(key.to_string(), Value::String(var_name));
         } else {
@@ -1026,7 +1144,7 @@ mod tests {
         // Verify results - note that BTreeMap sorts keys alphabetically, so arg1 comes before model
         assert_eq!(
             result1,
-            "{{ test_unique(arg1=\"already quoted\", model=ref('my_model')) }}"
+            "{{ test_unique(arg1=\"\\\"already quoted\\\"\", model=ref('my_model')) }}"
         );
         assert_eq!(
             result2,
@@ -1115,8 +1233,7 @@ mod tests {
         let var_name = extracted_var_name.unwrap();
         assert!(
             jinja_set_vars.contains_key(var_name),
-            "upstream_model_cte variable {} not found in set vars",
-            var_name
+            "upstream_model_cte variable {var_name} not found in set vars"
         );
 
         let extracted_sql = jinja_set_vars.get(var_name).unwrap();
@@ -1172,7 +1289,7 @@ mod tests {
         // Generate the test name
         let test_name = generate_test_name(
             test_macro_name,
-            false,
+            None,
             project_name,
             &test_config,
             &kwargs,
@@ -1194,7 +1311,7 @@ mod tests {
         let empty_set_vars = BTreeMap::new();
         let test_name_no_vars = generate_test_name(
             test_macro_name,
-            false,
+            None,
             project_name,
             &test_config,
             &kwargs,
@@ -1206,6 +1323,35 @@ mod tests {
         assert!(
             test_name_no_vars.contains(set_var_name),
             "Test name should contain the variable name when no set vars are provided"
+        );
+    }
+
+    #[test]
+    fn test_generate_test_name_with_custom_test_name() {
+        // Create test inputs
+        let custom_test_name = "custom_test_name";
+        let test_config = GenericTestConfig {
+            resource_type: "model".to_string(),
+            resource_name: "my_model".to_string(),
+            version_num: None,
+            model_tests: None,
+            column_tests: None,
+            source_name: None,
+        };
+
+        let test_name_no_vars = generate_test_name(
+            "test_macro_name",
+            Some(custom_test_name.to_string()),
+            "project_name",
+            &test_config,
+            &BTreeMap::new(),
+            None,
+            &BTreeMap::new(),
+        );
+
+        assert!(
+            test_name_no_vars.contains(custom_test_name),
+            "Test name should contain the custom test name when provided"
         );
     }
 
@@ -1258,10 +1404,9 @@ mod tests {
             match normalize_test_name(input) {
                 Ok(result) => assert_eq!(
                     result, expected,
-                    "Input '{}' should normalize to '{}', got '{}'",
-                    input, expected, result
+                    "Input '{input}' should normalize to '{expected}', got '{result}'"
                 ),
-                Err(e) => panic!("Expected success for input '{}', got error: {:?}", input, e),
+                Err(e) => panic!("Expected success for input '{input}', got error: {e:?}"),
             }
         }
     }

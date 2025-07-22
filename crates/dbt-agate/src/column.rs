@@ -1,10 +1,11 @@
-use crate::table::TableRepr;
 use crate::Tuple;
+use crate::table::TableRepr;
 use crate::{MappedSequence, TupleRepr};
 use core::fmt;
+use minijinja::arg_utils::ArgsIter;
 use minijinja::listener::RenderingEventListener;
 use minijinja::value::{Enumerator, Object, ObjectRepr};
-use minijinja::{Error as MinijinjaError, State, Value};
+use minijinja::{Error as MinijinjaError, State, Value, assert_nullary_args};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -157,28 +158,32 @@ impl Object for Column {
         state: &State<'_, '_>,
         method: &str,
         args: &[Value],
-        listener: Rc<dyn RenderingEventListener>,
+        listeners: &[Rc<dyn RenderingEventListener>],
     ) -> Result<Value, MinijinjaError> {
         match method {
             // Column methods
             "values_distinct" => {
+                assert_nullary_args!("Column.values_distinct", args)?;
                 let distinct = self.values_distinct();
                 Ok(Value::from_object(distinct))
             }
             "values_without_nulls" => {
+                assert_nullary_args!("Column.values_without_nulls", args)?;
                 let without_nulls = self.values_without_nulls();
                 Ok(Value::from_object(without_nulls))
             }
             "values_sorted" => {
+                assert_nullary_args!("Column.values_sorted", args)?;
                 let sorted = self.values_sorted();
                 Ok(Value::from_object(sorted))
             }
             "values_without_nulls_sorted" => {
+                assert_nullary_args!("Column.values_without_nulls_sorted", args)?;
                 let without_nulls_sorted = self.values_without_nulls_sorted();
                 Ok(Value::from_object(without_nulls_sorted))
             }
             // MappedSequence methods
-            _ => MappedSequence::call_method(self, state, method, args, listener),
+            _ => MappedSequence::call_method(self, state, method, args, listeners),
         }
     }
 

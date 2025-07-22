@@ -93,6 +93,25 @@ fn get_offset_and_len<F: FnOnce() -> usize>(
 }
 
 pub fn slice(value: Value, start: Value, stop: Value, step: Value) -> Result<Value, Error> {
+    let step = if step.is_none() {
+        1
+    } else {
+        ok!(i64::try_from(step))
+    };
+    if step == 0 {
+        return Err(Error::new(
+            ErrorKind::InvalidOperation,
+            "cannot slice by step size of 0",
+        ));
+    }
+    let (start, stop) = if step < 0 {
+        (stop, start)
+    } else {
+        (start, stop)
+    };
+    let is_reversed = step < 0;
+    let step: usize = step.unsigned_abs() as usize;
+
     let start: i64 = if start.is_none() {
         0
     } else {
@@ -103,41 +122,39 @@ pub fn slice(value: Value, start: Value, stop: Value, step: Value) -> Result<Val
     } else {
         Some(ok!(i64::try_from(stop)))
     };
-    let step = if step.is_none() {
-        1
-    } else {
-        ok!(u64::try_from(step)) as usize
-    };
-    if step == 0 {
-        return Err(Error::new(
-            ErrorKind::InvalidOperation,
-            "cannot slice by step size of 0",
-        ));
-    }
 
     let kind = value.kind();
     let error = Err(Error::new(
         ErrorKind::InvalidOperation,
-        format!("value of type {} cannot be sliced", kind),
+        format!("value of type {kind} cannot be sliced"),
     ));
 
     match value.0 {
         ValueRepr::String(..) | ValueRepr::SmallStr(_) => {
             let s = value.as_str().unwrap();
             let (start, len) = get_offset_and_len(start, stop, || s.chars().count());
-            Ok(Value::from(
-                s.chars()
-                    .skip(start)
-                    .take(len)
-                    .step_by(step)
-                    .collect::<String>(),
-            ))
+            let chars = s
+                .chars()
+                .skip(start)
+                .take(len)
+                .step_by(step)
+                .collect::<Vec<_>>();
+            let chars = if is_reversed {
+                chars.into_iter().rev().collect::<String>()
+            } else {
+                chars.into_iter().collect::<String>()
+            };
+            Ok(Value::from(chars))
         }
         ValueRepr::Bytes(ref b) => {
             let (start, len) = get_offset_and_len(start, stop, || b.len());
-            Ok(Value::from_bytes(
-                b.get(start..start + len).unwrap_or_default().to_owned(),
-            ))
+            let bytes = b.get(start..start + len).unwrap_or_default().to_owned();
+            let bytes = if is_reversed {
+                bytes.into_iter().rev().collect::<Vec<_>>()
+            } else {
+                bytes
+            };
+            Ok(Value::from_bytes(bytes))
         }
         ValueRepr::Undefined | ValueRepr::None => Ok(Value::from(Vec::<Value>::new())),
         ValueRepr::Object(obj) if matches!(obj.repr(), ObjectRepr::Seq | ObjectRepr::Iterable) => {
@@ -147,7 +164,11 @@ pub fn slice(value: Value, start: Value, stop: Value, step: Value) -> Result<Val
             // The manual matching here is important so that we don't mess up the size hint
             if let Some(iter) = obj.try_iter() {
                 let sliced_iter = iter.skip(start).take(len).step_by(step).collect::<Vec<_>>();
-                let mutable_vec = mutable_vec::MutableVec::from(sliced_iter);
+                let mutable_vec = if is_reversed {
+                    mutable_vec::MutableVec::from(sliced_iter.into_iter().rev().collect::<Vec<_>>())
+                } else {
+                    mutable_vec::MutableVec::from(sliced_iter)
+                };
                 Ok(Value::from_object(mutable_vec))
             } else {
                 Ok(Value::from(Vec::<Value>::new()))
@@ -219,7 +240,7 @@ pub fn format_string(fmt: &str, args: &[Value]) -> Result<Value, Error> {
     vsprintf(fmt, &printfs).map(Value::from).map_err(|e| {
         Error::new(
             ErrorKind::InvalidOperation,
-            format!("Failed to format string: {}", e),
+            format!("Failed to format string: {e}"),
         )
     })
 }
@@ -464,7 +485,7 @@ pub fn rem(lhs: &Value, rhs: &Value) -> Result<Value, Error> {
                     .map_err(|e| {
                         Error::new(
                             ErrorKind::InvalidOperation,
-                            format!("Expected sequence: {}", e),
+                            format!("Expected sequence: {e}"),
                         )
                     })?
                     .collect::<Vec<_>>();
