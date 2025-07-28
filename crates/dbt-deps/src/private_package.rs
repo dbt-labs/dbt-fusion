@@ -116,7 +116,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_private_packages() {
+    fn tests() {
+        // Run the tests sequentially to avoid flakyness when running in parallel due to
+        // manipulation of the DBT_ENV_PRIVATE_GIT_PROVIDER_INFO environment variable.
+        assert_private_packages();
+        assert_local_private_packages_github();
+        assert_local_private_packages_gitlab();
+        assert_local_private_packages_azure();
+        assert_local_private_packages_error();
+    }
+
+    fn assert_private_packages() {
         // Test get_provider_info()
         let json_provider_str = r#"
             [
@@ -154,8 +164,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_local_private_packages_github() {
+    fn assert_local_private_packages_github() {
         // Make sure the variable is not set as we want to simulate a local run.
         unsafe {
             #[allow(clippy::disallowed_methods)]
@@ -178,8 +187,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_local_private_packages_gitlab() {
+    fn assert_local_private_packages_gitlab() {
         // Make sure the variable is not set as we want to simulate a local run.
         unsafe {
             #[allow(clippy::disallowed_methods)]
@@ -204,8 +212,8 @@ mod tests {
                 .to_string()
         );
     }
-    #[test]
-    fn test_local_private_packages_azure() {
+
+    fn assert_local_private_packages_azure() {
         // Make sure the variable is not set as we want to simulate a local run.
         unsafe {
             #[allow(clippy::disallowed_methods)]
@@ -230,8 +238,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_local_private_packages_error() {
+    fn assert_local_private_packages_error() {
         // Make sure the variable is not set as we want to simulate a local run.
         unsafe {
             #[allow(clippy::disallowed_methods)]
