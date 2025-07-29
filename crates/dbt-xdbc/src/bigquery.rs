@@ -51,6 +51,7 @@ pub const QUERY_JOB_TIMEOUT: &str = "adbc.bigquery.sql.query.job_timeout"; // i6
 
 pub const QUERY_RESULT_BUFFER_SIZE: &str = "adbc.bigquery.sql.query.result_buffer_size"; // i64
 pub const QUERY_PREFETCH_CONCURRENCY: &str = "adbc.bigquery.sql.query.prefetch_concurrency"; // i64
+pub const IMPERSONATE_TARGET_PRINCIPAL: &str = "adbc.bigquery.sql.impersonate.target_principal";
 
 // values
 pub const DEFAULT_QUERY_RESULT_BUFFER_SIZE: i64 = 200;
