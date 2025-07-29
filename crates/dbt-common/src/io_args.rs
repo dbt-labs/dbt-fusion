@@ -609,9 +609,8 @@ pub fn check_var(vars: &str) -> Result<BTreeMap<String, Value>, String> {
     // Try parsing as YAML first
     match dbt_serde_yaml::from_str::<BTreeMap<String, Value>>(vars) {
         Ok(btree) => {
-            // Check for flow-style YAML without space after colon, e.g., '{key:value}'
-            // This is an invalid YAML syntax according to the spec but might be leniently parsed by some libraries.
-            // We want to explicitly disallow it to prevent incorrect interpretations (like 'value' being null).
+            // Disallow the '{key:value}' format for flow-style YAML syntax
+            // to prevent key:value: None interpretation: https://stackoverflow.com/a/70909331
             if vars.starts_with('{') && vars.contains(':') {
                 let potential_pairs: Vec<&str> = vars
                     .trim_matches('{')
@@ -631,8 +630,6 @@ pub fn check_var(vars: &str) -> Result<BTreeMap<String, Value>, String> {
                     }
                 }
             }
-            // Disallow the '{key:value}' format for flow-style YAML syntax
-            // to prevent key:value: None interpretation: https://stackoverflow.com/a/70909331
             Ok(btree)
         }
         Err(yaml_err) => {
