@@ -1286,7 +1286,7 @@ mod tests {
         env.add_function("tojson", tojson_fn());
 
         let template_source = r#"{{ tojson({'a': 1, 'b': 'hello'}) }}"#;
-        let tmpl = env.template_from_str(template_source).unwrap();
+        let tmpl = env.template_from_str(template_source, &[]).unwrap();
         let output = tmpl.render(Value::UNDEFINED, &[]).unwrap();
         assert_eq!(output.trim(), r#"{"a":1,"b":"hello"}"#);
     }
