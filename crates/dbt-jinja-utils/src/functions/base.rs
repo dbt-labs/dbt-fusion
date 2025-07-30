@@ -1341,7 +1341,7 @@ mod tests {
         env.add_function("toyaml", toyaml_fn());
 
         let template_source = r#"{{ toyaml({'b': 2, 'a': 1}, sort_keys=True) }}"#;
-        let tmpl = env.template_from_str(template_source).unwrap();
+        let tmpl = env.template_from_str(template_source, &[]).unwrap();
         let output = tmpl.render(Value::UNDEFINED, &[]).unwrap();
         assert_eq!(output.trim(), "a: 1\nb: 2");
     }
