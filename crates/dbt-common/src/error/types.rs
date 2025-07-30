@@ -1,12 +1,6 @@
-use crate::{
-    error::{
-        code_location::AbstractLocation,
-        name_candidate::{format_candidates, NameCandidate},
-    },
-    is_sdf_debug,
-};
+use crate::{cancellation::CancelledError, error::code_location::AbstractLocation, is_sdf_debug};
 use datafusion::{arrow, error::DataFusionError, logical_expr::Expr, parquet};
-use dbt_frontend_common::error::{FrontendError, FrontendResult};
+use dbt_frontend_common::error::{FrontendError, FrontendResult, NameCandidate, format_candidates};
 use itertools::Itertools as _;
 use regex::Regex;
 use std::{
@@ -19,7 +13,7 @@ use std::{
 
 use crate::io_utils::find_enclosed_substring;
 
-use super::{code_location::MiniJinjaErrorWrapper, preprocessor_location::MacroSpan, ErrorCode};
+use super::{ErrorCode, code_location::MiniJinjaErrorWrapper, preprocessor_location::MacroSpan};
 
 pub type FsResult<T, E = Box<FsError>> = Result<T, E>;
 
@@ -644,6 +638,18 @@ impl From<dbt_frontend_common::error::WrappedError> for WrappedError {
 //         WrappedError::Antlr(e.to_string())
 //     }
 // }
+
+impl From<CancelledError> for FsError {
+    fn from(_: CancelledError) -> Self {
+        FsError::new(ErrorCode::OperationCanceled, "Operation cancelled")
+    }
+}
+
+impl From<CancelledError> for Box<FsError> {
+    fn from(value: CancelledError) -> Self {
+        Box::new(value.into())
+    }
+}
 
 impl From<arrow::error::ArrowError> for FsError {
     fn from(e: arrow::error::ArrowError) -> Self {

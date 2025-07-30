@@ -2,8 +2,9 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::types::builtin::Type;
-use crate::types::class::ClassType;
-use crate::types::function::{DynFunctionType, FunctionType};
+use crate::types::class::{ClassType, DynClassType};
+use crate::types::function::{ArgSpec, DynFunctionType, FunctionType};
+use crate::types::model::ModelType;
 
 #[derive(Default, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ExceptionsType;
@@ -63,8 +64,8 @@ impl FunctionType for RaiseNotImplementedFunctionType {
         Ok(Type::None)
     }
 
-    fn arg_names(&self) -> Vec<String> {
-        vec!["message".to_string()]
+    fn arg_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::new("message", false)]
     }
 }
 
@@ -79,23 +80,33 @@ impl fmt::Debug for RaiseCompilerErrorFunctionType {
 
 impl FunctionType for RaiseCompilerErrorFunctionType {
     fn _resolve_arguments(&self, args: &[Type]) -> Result<Type, crate::Error> {
-        if args.len() != 1 {
+        if args.is_empty() || args.len() > 2 {
             return Err(crate::Error::new(
                 crate::error::ErrorKind::InvalidOperation,
-                format!("Expected 1 argument, got {}", args.len()),
+                format!("Expected 1 or 2 arguments, got {}", args.len()),
             ));
         }
-        if !matches!(args[0], Type::String(_)) {
+        if !args[0].is_subtype_of(&Type::String(None)) {
             return Err(crate::Error::new(
                 crate::error::ErrorKind::InvalidOperation,
                 format!("Expected string, got {:?}", args[0]),
             ));
         }
+        if args.len() == 2
+            && !args[1].is_subtype_of(&Type::Class(DynClassType::new(Arc::new(
+                ModelType::default(),
+            ))))
+        {
+            return Err(crate::Error::new(
+                crate::error::ErrorKind::InvalidOperation,
+                format!("Expected model, got {:?}", args[1]),
+            ));
+        }
         Ok(Type::None)
     }
 
-    fn arg_names(&self) -> Vec<String> {
-        vec!["message".to_string()]
+    fn arg_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::new("message", false), ArgSpec::new("model", true)]
     }
 }
 
@@ -128,8 +139,8 @@ impl FunctionType for ColumnTypeMissingFunctionType {
         Ok(Type::None)
     }
 
-    fn arg_names(&self) -> Vec<String> {
-        vec!["column_names".to_string()]
+    fn arg_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::new("column_names", false)]
     }
 }
 
@@ -159,7 +170,7 @@ impl FunctionType for WarnFunctionType {
         Ok(Type::None)
     }
 
-    fn arg_names(&self) -> Vec<String> {
-        vec!["message".to_string()]
+    fn arg_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::new("message", false)]
     }
 }

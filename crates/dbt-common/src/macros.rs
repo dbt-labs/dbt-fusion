@@ -175,18 +175,33 @@ macro_rules! ectx {
 
 #[macro_export]
 macro_rules! show_result {
-    ( $io:expr, $option:expr, $artifact:expr) => {{
+    ( $io:expr, $option:expr, $artifact:expr) => {
+        $crate::show_result!($io, $option, $artifact, columns = Option::<&[String]>::None)
+    };
+
+    ( $io:expr, $option:expr, $artifact:expr, columns = $columns:expr) => {{
         use $crate::io_args::ShowOptions;
         use dbt_common::constants::INLINE_NODE;
         use serde_json::json;
         if $io.should_show($option) {
             let output = format!("\n{}", $artifact);
             // this preview field and name is used by the dbt-cloud CLI to display the result
+            let mut data = json!({
+                "preview": $artifact.to_string(),
+                "unique_id": INLINE_NODE
+            });
+
+            // columns can be used to show column names when the resultset is empty, eg.
+            //   { "preview": "[]", "columns": ["column1", "column2"] }
+            if let Some(cols) = $columns {
+                data["columns"] = json!(cols);
+            }
+
             $crate::_log!(
                 $crate::macros::log_adapter::log::Level::Info,
                 _INVOCATION_ID_ = $io.invocation_id.as_u128(),
                 name= "ShowNode",
-                data:serde = json!({ "preview": $artifact.to_string(), "unique_id": INLINE_NODE });
+                data:serde = data;
                 "{}", output
             );
         }
@@ -276,6 +291,51 @@ macro_rules! show_result_with_title {
 
 #[macro_export]
 macro_rules! show_progress {
+    ( $io:expr, $info:expr) => {{
+        use $crate::io_args::ShowOptions;
+        use $crate::pretty_string::pretty_green;
+        use $crate::logging::{FsInfo, LogEvent};
+
+
+        if let Some(reporter) = &$io.status_reporter {
+            reporter.show_progress($info.event.action().as_str(), &$info.target, $info.desc.as_deref());
+        }
+
+        // TODO: these filtering conditions should be moved to the logger side
+        if (
+            ($io.should_show(ShowOptions::Progress) && $info.is_phase_unknown())
+            || ($io.should_show(ShowOptions::ProgressParse) && $info.is_phase_parse())
+            || ($io.should_show(ShowOptions::ProgressRender) && $info.is_phase_render())
+            || ($io.should_show(ShowOptions::ProgressAnalyze) && $info.is_phase_analyze())
+            || ($io.should_show(ShowOptions::ProgressRun) && $info.is_phase_run())
+        )
+            // Do not show parse/compile generic tests
+            && !($info.target.contains(dbt_common::constants::DBT_GENERIC_TESTS_DIR_NAME)
+                && ($info.event.action().as_str().contains(dbt_common::constants::PARSING)
+                    || $info.event.action().as_str().contains(dbt_common::constants::RENDERING)
+                    || $info.event.action().as_str().contains(dbt_common::constants::ANALYZING)))
+        {
+            let output = pretty_green($info.event.action().as_str(), &$info.target, $info.desc.as_deref());
+            let event = $info.event;
+            if let Some(data_json) = $info.data {
+                $crate::_log!(event.level(),
+                    _INVOCATION_ID_ = $io.invocation_id.as_u128(),
+                    name = event.name(), data:serde = data_json;
+                     "{}", output
+                );
+            } else {
+                $crate::_log!(event.level(),
+                    _INVOCATION_ID_ = $io.invocation_id.as_u128(),
+                    name = event.name();
+                     "{}", output
+                );
+            }
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! show_info {
     ( $io:expr, $info:expr) => {{
         use $crate::io_args::ShowOptions;
         use $crate::pretty_string::pretty_green;
@@ -858,11 +918,19 @@ macro_rules! show_progress_exit {
 
 #[macro_export]
 macro_rules! maybe_interactive_or_exit {
-    ( $arg:expr, $start_time:expr, $resolver_state:expr, $db:expr, $map_compiled_sql:expr, $jinja_env:expr) => {
+    ( $arg:expr, $start_time:expr, $resolver_state:expr, $db:expr, $map_compiled_sql:expr, $jinja_env:expr, $token:expr) => {
         if !$arg.interactive {
             show_progress_exit!($arg, $start_time)
         } else {
-            repl::run($resolver_state, &$arg, $db, $map_compiled_sql, $jinja_env).await
+            repl::run(
+                $resolver_state,
+                &$arg,
+                $db,
+                $map_compiled_sql,
+                $jinja_env,
+                $token,
+            )
+            .await
         }
     };
 }
@@ -881,7 +949,7 @@ macro_rules! checkpoint_maybe_exit {
 
 #[macro_export]
 macro_rules! checkpoint_maybe_interactive_or_exit {
-    ( $phase:expr, $arg:expr, $start_time:expr, $resolver_state:expr, $db:expr, $map_compiled_sql:expr, $jinja_env:expr) => {
+    ( $phase:expr, $arg:expr, $start_time:expr, $resolver_state:expr, $db:expr, $map_compiled_sql:expr, $jinja_env:expr, $cancel_token:expr) => {
         if $arg.phase <= $phase
             || $crate::error_counter::get_error_counter($arg.io.invocation_id.to_string().as_str())
                 > 0
@@ -892,52 +960,11 @@ macro_rules! checkpoint_maybe_interactive_or_exit {
                 $resolver_state,
                 $db,
                 $map_compiled_sql,
-                $jinja_env
+                $jinja_env,
+                $cancel_token
             );
         }
     };
-}
-
-#[macro_export]
-macro_rules! check_cancellation {
-    ($cancel_flag:expr) => {{
-        if let Some(flag) = &$cancel_flag {
-            if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                Err($crate::fs_err!(
-                    $crate::ErrorCode::OperationCanceled,
-                    "Operation cancelled"
-                ))
-            } else {
-                Ok(())
-            }
-        } else {
-            Ok(())
-        }
-    }};
-    (flag: $cancel_flag:expr) => {{
-        if $cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
-            Err($crate::fs_err!(
-                $crate::ErrorCode::OperationCanceled,
-                "Operation cancelled"
-            ))
-        } else {
-            Ok(())
-        }
-    }};
-    ($cancel_flag:expr, $message:expr) => {{
-        if let Some(flag) = &$cancel_flag {
-            if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                Err($crate::fs_err!(
-                    $crate::ErrorCode::OperationCanceled,
-                    $message
-                ))
-            } else {
-                Ok(())
-            }
-        } else {
-            Ok(())
-        }
-    }};
 }
 
 #[cfg(test)]

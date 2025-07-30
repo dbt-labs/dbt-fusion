@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use dbt_common::{err, ErrorCode, FsResult};
+use dbt_common::{ErrorCode, FsResult, err};
 use dbt_serde_yaml::Spanned;
 
 use crate::{constants::DBT_BASE_SCHEMAS_URL, schemas::common::DbtQuoting};
@@ -33,17 +33,24 @@ pub fn get_dbt_schema_version(name: &str, version: i16) -> String {
 /// Resolve package quoting config
 pub fn resolve_package_quoting(quoting: Option<DbtQuoting>, adapter_type: &str) -> DbtQuoting {
     let default_quoting_bool = adapter_type != "snowflake";
+    let default_snowflake_ignore_case = false;
     if let Some(quoting) = quoting {
         DbtQuoting {
             database: Some(quoting.database.unwrap_or(default_quoting_bool)),
             schema: Some(quoting.schema.unwrap_or(default_quoting_bool)),
             identifier: Some(quoting.identifier.unwrap_or(default_quoting_bool)),
+            snowflake_ignore_case: Some(
+                quoting
+                    .snowflake_ignore_case
+                    .unwrap_or(default_snowflake_ignore_case),
+            ),
         }
     } else {
         DbtQuoting {
             database: Some(default_quoting_bool),
             schema: Some(default_quoting_bool),
             identifier: Some(default_quoting_bool),
+            snowflake_ignore_case: Some(default_snowflake_ignore_case),
         }
     }
 }

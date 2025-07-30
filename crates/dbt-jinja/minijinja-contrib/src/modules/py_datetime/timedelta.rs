@@ -15,13 +15,13 @@ pub(crate) struct PyTimeDeltaClass;
 impl PyTimeDeltaClass {
     fn timedelta_new(args: &[Value]) -> Result<PyTimeDelta, Error> {
         let mut parser = ArgParser::new(args, None);
-        let weeks: i64 = parser.get("weeks").unwrap_or(0);
         let days: i64 = parser.get("days").unwrap_or(0);
-        let hours: i64 = parser.get("hours").unwrap_or(0);
-        let minutes: i64 = parser.get("minutes").unwrap_or(0);
         let seconds: i64 = parser.get("seconds").unwrap_or(0);
         let microseconds: i64 = parser.get("microseconds").unwrap_or(0);
         let milliseconds: i64 = parser.get("milliseconds").unwrap_or(0);
+        let minutes: i64 = parser.get("minutes").unwrap_or(0);
+        let hours: i64 = parser.get("hours").unwrap_or(0);
+        let weeks: i64 = parser.get("weeks").unwrap_or(0);
 
         let duration = Duration::weeks(weeks)
             + Duration::days(days)
@@ -318,14 +318,22 @@ mod tests {
         let template = env
             .template_from_str(
                 "{{ timedelta(days=2, hours=3).days }}, {{ timedelta(minutes=90).seconds }}",
+                &[],
             )
             .unwrap();
         let result = template.render(minijinja::context!(), &[]).unwrap();
         assert_eq!(result, "2, 5400");
 
+        // Test positional arguments creation
+        let template = env
+            .template_from_str("{{ timedelta(4).days }}", &[])
+            .unwrap();
+        let result = template.render(minijinja::context!(), &[]).unwrap();
+        assert_eq!(result, "4");
+
         // Test arithmetic
         let template = env
-            .template_from_str("{{ (timedelta(days=2) + timedelta(days=1)).days }}")
+            .template_from_str("{{ (timedelta(days=2) + timedelta(days=1)).days }}", &[])
             .unwrap();
         let result = template.render(minijinja::context!(), &[]).unwrap();
         assert_eq!(result, "3");

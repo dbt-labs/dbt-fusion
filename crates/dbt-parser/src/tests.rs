@@ -1,13 +1,19 @@
 //! Render tests for the dbt-parser crate
 
 #[cfg(test)]
+mod test_macro_dependency_integration;
+
+#[cfg(test)]
+mod test_namespaced_macro_tracking;
+
+#[cfg(test)]
 #[allow(clippy::module_inception)]
 mod tests {
-    use dbt_common::{io_args::IoArgs, FsResult};
+    use dbt_common::{FsResult, io_args::IoArgs};
     use dbt_frontend_common::error::CodeLocation;
     use dbt_fusion_adapter::parse::adapter::create_parse_adapter;
     use dbt_jinja_utils::invocation_args::InvocationArgs;
-    use dbt_jinja_utils::jinja_environment::JinjaEnvironment;
+    use dbt_jinja_utils::jinja_environment::JinjaEnv;
     use dbt_jinja_utils::listener::DefaultListenerFactory;
     use dbt_jinja_utils::phases::parse::build_resolve_model_context;
     use dbt_jinja_utils::phases::parse::init::initialize_parse_jinja_environment;
@@ -60,7 +66,7 @@ mod tests {
     }
 
     fn setup_test_env() -> (
-        JinjaEnvironment<'static>,
+        JinjaEnv,
         Arc<Mutex<Vec<SqlResource<ModelConfig>>>>,
         ModelConfig,
     ) {
@@ -96,6 +102,7 @@ mod tests {
             &invocation_args,
             BTreeSet::from(["common".to_string()]),
             IoArgs::default(),
+            None,
         )
         .unwrap();
 

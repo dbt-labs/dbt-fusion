@@ -1,12 +1,12 @@
-use crate::dbt_project_config::{init_project_config, RootProjectConfigs};
+use crate::dbt_project_config::{RootProjectConfigs, init_project_config};
 use crate::utils::{
-    get_node_fqn, register_duplicate_resource, trigger_duplicate_errors,
-    update_node_relation_components, RelationComponents,
+    RelationComponents, get_node_fqn, register_duplicate_resource, trigger_duplicate_errors,
+    update_node_relation_components,
 };
 use dbt_common::io_args::IoArgs;
-use dbt_common::{fs_err, show_error, stdfs, ErrorCode, FsResult};
+use dbt_common::{ErrorCode, FsResult, fs_err, show_error, stdfs};
 use dbt_frontend_common::Dialect;
-use dbt_jinja_utils::jinja_environment::JinjaEnvironment;
+use dbt_jinja_utils::jinja_environment::JinjaEnv;
 use dbt_jinja_utils::refs_and_sources::RefsAndSources;
 use dbt_jinja_utils::serde::into_typed_with_jinja;
 use dbt_schemas::dbt_utils::validate_delimeter;
@@ -38,7 +38,7 @@ pub fn resolve_seeds(
     schema: &str,
     adapter_type: &str,
     package_name: &str,
-    jinja_env: &JinjaEnvironment<'static>,
+    jinja_env: &JinjaEnv,
     base_ctx: &BTreeMap<String, MinijinjaValue>,
     collected_tests: &mut Vec<DbtAsset>,
     refs_and_sources: &mut RefsAndSources,
@@ -259,12 +259,8 @@ pub fn resolve_seeds(
         match status {
             ModelStatus::Enabled => {
                 seeds.insert(unique_id, Arc::new(dbt_seed));
-                seed.as_testable().persist(
-                    package_name,
-                    &io_args.out_dir,
-                    collected_tests,
-                    adapter_type,
-                )?;
+                seed.as_testable()
+                    .persist(package_name, collected_tests, adapter_type, io_args)?;
             }
             ModelStatus::Disabled => {
                 disabled_seeds.insert(unique_id, Arc::new(dbt_seed));

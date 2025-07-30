@@ -6,26 +6,32 @@ use crate::{
 use std::{collections::BTreeMap, path::Path, time::SystemTime};
 
 use dbt_common::{
+    ErrorCode, FsResult,
+    cancellation::CancellationToken,
     constants::{DBT_PROJECT_YML, REMOVING},
     err, fs_err, fsinfo,
     io_args::{EvalArgs, IoArgs},
-    show_error, show_progress, show_progress_exit, stdfs, ErrorCode, FsResult,
+    show_error, show_progress, show_progress_exit, stdfs,
 };
 use dbt_jinja_utils::{
     invocation_args::InvocationArgs, phases::load::init::initialize_load_jinja_environment,
 };
 
-pub async fn execute_clean_command(arg: &EvalArgs, files: &[String]) -> FsResult<i32> {
+pub async fn execute_clean_command(
+    arg: &EvalArgs,
+    files: &[String],
+    token: &CancellationToken,
+) -> FsResult<i32> {
     let start = SystemTime::now();
 
     let load_args = LoadArgs::from_eval_args(arg);
     let invocation_args = InvocationArgs::from_eval_args(arg);
-    let (dbt_state, num_threads, _dbt_cloud) = load(&load_args, &invocation_args).await?;
+    let (dbt_state, num_threads, _dbt_cloud) = load(&load_args, &invocation_args, token).await?;
     let flags: BTreeMap<String, minijinja::Value> = invocation_args.to_dict();
 
     let arg = arg.with_threads(num_threads);
 
-    let mut env = initialize_load_jinja_environment(
+    let env = initialize_load_jinja_environment(
         &dbt_state.dbt_profile.profile,
         &dbt_state.dbt_profile.target,
         &dbt_state.dbt_profile.db_config.adapter_type(),
@@ -36,7 +42,7 @@ pub async fn execute_clean_command(arg: &EvalArgs, files: &[String]) -> FsResult
     )?;
 
     let dbt_project_path = arg.io.in_dir.join(DBT_PROJECT_YML);
-    let dbt_project = load_project_yml(&arg.io, &mut env, &dbt_project_path, arg.vars.clone())?;
+    let dbt_project = load_project_yml(&arg.io, &env, &dbt_project_path, arg.vars.clone())?;
 
     let protected_paths = collect_protected_paths(&dbt_project)
         .iter()

@@ -1,3 +1,4 @@
+use crate::AdapterType;
 use crate::cast_util::dyn_base_columns_to_value;
 use crate::errors::{AdapterError, AdapterErrorKind};
 use crate::funcs::{execute_macro, none_value};
@@ -5,17 +6,16 @@ use crate::record_batch_utils::get_column_values;
 use crate::relation_object::RelationObject;
 use crate::response::{AdapterResponse, ResultObject};
 use crate::snapshots::SnapshotStrategy;
-use crate::sql_engine::{execute_query_with_retry, SqlEngine};
-use crate::AdapterType;
+use crate::sql_engine::{SqlEngine, execute_query_with_retry};
 use crate::{AdapterResult, AdapterTyping};
 use dbt_agate::AgateTable;
 
 use arrow::array::{RecordBatch, StringArray, TimestampMillisecondArray};
 use arrow_schema::{DataType, Schema};
-use dbt_common::behavior_flags::BehaviorFlag;
 use dbt_common::FsResult;
+use dbt_common::behavior_flags::BehaviorFlag;
 use dbt_frontend_common::dialect::Dialect;
-use dbt_schemas::schemas::columns::base::{string_type, BaseColumn, StdColumn};
+use dbt_schemas::schemas::columns::base::{BaseColumn, StdColumn, string_type};
 use dbt_schemas::schemas::common::Constraint;
 use dbt_schemas::schemas::common::ConstraintSupport;
 use dbt_schemas::schemas::common::ConstraintType;
@@ -28,7 +28,7 @@ use dbt_schemas::schemas::relations::base::{BaseRelation, ComponentName};
 use dbt_schemas::schemas::relations::relation_configs::BaseRelationConfig;
 use dbt_schemas::schemas::{CommonAttributes, InternalDbtNodeAttributes};
 use dbt_xdbc::{Connection, QueryCtx};
-use minijinja::{args, State, Value};
+use minijinja::{State, Value, args};
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -91,15 +91,21 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         engine: Arc<SqlEngine>,
         conn: &'_ mut dyn Connection,
         query_ctx: &QueryCtx,
-        _auto_begin: Option<bool>,
-        _fetch: Option<bool>,
-        _limit: Option<u32>,
+        _auto_begin: bool,
+        _fetch: bool,
+        _limit: Option<i64>,
     ) -> AdapterResult<(AdapterResponse, AgateTable)> {
         let sql = query_ctx.sql().ok_or_else(|| {
             AdapterError::new(AdapterErrorKind::Internal, "Missing query in the context")
         })?;
 
-        let statements = self.self_split_statements(&sql, dialect);
+        // BigQuery API supports multi-statement
+        // https://cloud.google.com/bigquery/docs/reference/standard-sql/procedural-language
+        let statements = if self.adapter_type() == AdapterType::Bigquery {
+            vec![sql]
+        } else {
+            self.self_split_statements(&sql, dialect)
+        };
         let mut last_batch = None;
         for statement in statements {
             last_batch = Some(execute_query_with_retry(
@@ -127,35 +133,74 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         Ok((response, table))
     }
 
-    /// Execute a query
+    /// Query execution implementation for a specific adapter.
     fn execute(
         &self,
         conn: &'_ mut dyn Connection,
         query_ctx: &QueryCtx,
-        auto_begin: Option<bool>,
-        fetch: Option<bool>,
-        limit: Option<u32>,
+        auto_begin: bool,
+        fetch: bool,
+        limit: Option<i64>,
     ) -> AdapterResult<(AdapterResponse, AgateTable)>;
+
+    /// Execute a statement, expect no results.
+    fn exec_stmt(
+        &self,
+        conn: &'_ mut dyn Connection,
+        query_ctx: &QueryCtx,
+        auto_begin: bool,
+    ) -> AdapterResult<AdapterResponse> {
+        // default values are the same as in dispatch_adapter_calls()
+        let (response, _) = self.execute(
+            conn,       // connection
+            query_ctx,  // sql string wrapper
+            auto_begin, // auto_begin
+            false,      // fetch
+            None,       // limit
+        )?;
+        Ok(response)
+    }
+
+    /// Execute a query and get results in an [AgateTable].
+    fn query(
+        &self,
+        conn: &'_ mut dyn Connection,
+        query_ctx: &QueryCtx,
+        limit: Option<i64>,
+    ) -> AdapterResult<(AdapterResponse, AgateTable)> {
+        self.execute(
+            conn,      // connection
+            query_ctx, // sql string wrapper
+            false,     // auto_begin
+            true,      // fetch
+            limit,     // limit
+        )
+    }
 
     /// Execute a query with a new connection
     fn execute_with_new_connection(
         &self,
         query_ctx: &QueryCtx,
-        auto_begin: Option<bool>,
-        fetch: Option<bool>,
-        limit: Option<u32>,
+        auto_begin: bool,
+        fetch: bool,
+        limit: Option<i64>,
     ) -> AdapterResult<(AdapterResponse, AgateTable)> {
         let mut conn = self.new_connection()?;
         self.execute(&mut *conn, query_ctx, auto_begin, fetch, limit)
     }
 
-    /// Add a query to run
+    /// Add a query to run.
+    ///
+    /// ```python
+    /// def add_query(self, sql, auto_begin=True, bindings=None, abridge_sql_log=False):
+    /// ```
     #[allow(clippy::too_many_arguments)]
     fn add_query(
         &self,
         conn: &'_ mut dyn Connection,
         query_ctx: &QueryCtx,
         auto_begin: bool,
+        _bindings: Option<&Value>,
         abridge_sql_log: bool,
     ) -> AdapterResult<()>;
 
@@ -163,7 +208,7 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
     fn quote(&self, identifier: &str) -> String;
 
     /// List schemas
-    fn list_schemas(&self, result: Arc<RecordBatch>) -> Vec<String>;
+    fn list_schemas(&self, result: Arc<RecordBatch>) -> AdapterResult<Vec<String>>;
 
     /// Get relation that represents (database, schema, identifier)
     /// tuple. This function checks that the warehouse has the
@@ -468,8 +513,8 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
     ) -> AdapterResult<BTreeMap<String, Vec<String>>> {
         let record_batch = grants_table.to_record_batch();
 
-        let grantee_cols = get_column_values::<StringArray>(&record_batch, "grantee");
-        let privilege_cols = get_column_values::<StringArray>(&record_batch, "privilege_type");
+        let grantee_cols = get_column_values::<StringArray>(&record_batch, "grantee")?;
+        let privilege_cols = get_column_values::<StringArray>(&record_batch, "privilege_type")?;
 
         let mut result = BTreeMap::new();
         for i in 0..record_batch.num_rows() {
@@ -570,10 +615,10 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         let record_batch = table.to_record_batch();
 
         let identifier_column_values =
-            get_column_values::<StringArray>(&record_batch, "IDENTIFIER");
-        let schema_column_values = get_column_values::<StringArray>(&record_batch, "SCHEMA");
+            get_column_values::<StringArray>(&record_batch, "IDENTIFIER")?;
+        let schema_column_values = get_column_values::<StringArray>(&record_batch, "SCHEMA")?;
         let last_modified_column_values =
-            get_column_values::<TimestampMillisecondArray>(&record_batch, "LAST_MODIFIED");
+            get_column_values::<TimestampMillisecondArray>(&record_batch, "LAST_MODIFIED")?;
 
         let mut result = BTreeMap::new();
         for i in 0..record_batch.num_rows() {
@@ -791,7 +836,7 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
                         return Err(AdapterError::new(
                             AdapterErrorKind::Configuration,
                             format!("Could not find key {column}"),
-                        ))
+                        ));
                     }
                 },
                 None => column.to_string(),
@@ -833,7 +878,7 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         if invalidate_hard_deletes.is_some() && hard_deletes.is_some() {
             return Err(AdapterError::new(
                 AdapterErrorKind::Configuration,
-                "You cannot set both the invalidate_hard_deletes and hard_deletes config properties on the same snapshot."
+                "You cannot set both the invalidate_hard_deletes and hard_deletes config properties on the same snapshot.",
             ));
         }
 

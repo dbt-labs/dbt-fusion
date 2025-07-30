@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use dbt_common::{err, ErrorCode, FsResult};
+use dbt_common::{ErrorCode, FsResult, err};
 use dbt_schemas::schemas::{data_tests::DataTests, dbt_column::ColumnProperties};
 
 type DataTestVec = Vec<DataTests>;
@@ -47,9 +47,9 @@ pub fn column_tests_inner(
                 if col.tests.is_some() && col.data_tests.is_some() {
                     return None; // Error is handled above
                 }
-                (*col.tests)
+                (col.tests)
                     .as_ref()
-                    .or((*col.data_tests).as_ref())
+                    .or((col.data_tests).as_ref())
                     .map(|tests| {
                         (
                             col.name.clone(),

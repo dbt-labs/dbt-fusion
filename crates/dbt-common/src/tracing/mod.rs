@@ -1,5 +1,5 @@
-use crate::io_args::IoArgs;
 use crate::FsResult;
+use crate::io_args::IoArgs;
 
 #[cfg(debug_assertions)]
 use std::fs::File;
@@ -12,7 +12,7 @@ use tracing::subscriber::set_global_default;
 #[cfg(debug_assertions)]
 use tracing_subscriber::fmt::format::FmtSpan;
 #[cfg(debug_assertions)]
-use tracing_subscriber::{fmt::writer::BoxMakeWriter, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt::writer::BoxMakeWriter};
 
 pub struct FsTraceConfig {
     pub file_path: Option<PathBuf>,
@@ -31,9 +31,9 @@ impl From<IoArgs> for FsTraceConfig {
 
 #[allow(unused_variables)]
 pub fn init_tracing(config: FsTraceConfig) -> FsResult<()> {
-    // We ignore the entire setup in non-debug builds
     #[cfg(debug_assertions)]
     if let Some(file_path) = config.file_path {
+        // Set up file-based tracing in debug builds when path is provided
         let file = Arc::new(File::create(file_path)?);
 
         let make_writer = BoxMakeWriter::new({
@@ -61,6 +61,11 @@ pub fn init_tracing(config: FsTraceConfig) -> FsResult<()> {
             .finish();
 
         set_global_default(subscriber).expect("setting default subscriber failed");
+    } else {
+        // Always set up a no-op subscriber to prevent tracing from falling back to stdout
+        use tracing::subscriber::NoSubscriber;
+        // Try to set a no-op subscriber, but don't panic if it fails
+        let _ = set_global_default(NoSubscriber::default());
     }
 
     Ok(())

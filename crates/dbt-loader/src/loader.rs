@@ -1,8 +1,9 @@
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
+use dbt_common::cancellation::CancellationToken;
 use dbt_common::once_cell_vars::DISPATCH_CONFIG;
 use dbt_jinja_utils::invocation_args::InvocationArgs;
-use dbt_jinja_utils::jinja_environment::JinjaEnvironment;
+use dbt_jinja_utils::jinja_environment::JinjaEnv;
 use dbt_jinja_utils::phases::load::init::initialize_load_jinja_environment;
 use dbt_jinja_utils::phases::load::init::initialize_load_profile_jinja_environment;
 use dbt_jinja_utils::serde::from_yaml_error;
@@ -24,8 +25,8 @@ use dbt_common::error::LiftableResult;
 use project::DbtProject;
 
 use dbt_common::stdfs::last_modified;
-use dbt_common::{ectx, err, show_progress, with_progress, ErrorCode};
-use dbt_common::{fs_err, FsResult};
+use dbt_common::{ErrorCode, ectx, err, show_progress, with_progress};
+use dbt_common::{FsResult, fs_err};
 use dbt_schemas::schemas::project::{self, DbtProjectSimplified, ProjectDbtCloudConfig};
 use dbt_schemas::state::{DbtAsset, DbtPackage, DbtState, DbtVars, ResourcePathKind};
 
@@ -45,6 +46,7 @@ use dbt_jinja_utils::var_fn;
 pub async fn load(
     arg: &LoadArgs,
     iarg: &InvocationArgs,
+    token: &CancellationToken,
 ) -> FsResult<(DbtState, Option<usize>, Option<ProjectDbtCloudConfig>)> {
     let _pb = with_progress!(arg.io, spinner => LOADING);
 
@@ -52,7 +54,7 @@ pub async fn load(
     let dbt_project_path = arg.io.in_dir.join(DBT_PROJECT_YML);
 
     let raw_dbt_project_in_val = value_from_file(None, &dbt_project_path)?;
-    let env = initialize_load_profile_jinja_environment(iarg)?;
+    let env = initialize_load_profile_jinja_environment();
     let ctx: BTreeMap<String, minijinja::Value> = BTreeMap::from([
         (
             "env_var".to_owned(),
@@ -175,7 +177,7 @@ pub async fn load(
     )?;
     let flags: BTreeMap<String, minijinja::Value> = iarg.to_dict();
 
-    let mut env = initialize_load_jinja_environment(
+    let env = initialize_load_jinja_environment(
         &dbt_state.dbt_profile.profile,
         &dbt_state.dbt_profile.target,
         &dbt_state.dbt_profile.db_config.adapter_type(),
@@ -187,11 +189,12 @@ pub async fn load(
 
     let (packages_lock, upstream_projects) = get_or_install_packages(
         &arg.io,
-        &mut env,
+        &env,
         &packages_install_path,
         arg.install_deps,
         arg.add_package.clone(),
         arg.vars.clone(),
+        token,
     )
     .await?;
     // get publication artifact for each upstream project
@@ -213,23 +216,24 @@ pub async fn load(
 
         let packages = load_packages(
             &arg,
-            &mut env,
+            &env,
             &mut collected_vars,
             &lookup_map,
             &packages_install_path,
+            token,
         )
         .await?;
         dbt_state.packages = packages;
     }
-
     {
         let _pb = with_progress!( arg.io, spinner => LOADING, item => "internal packages" );
 
         let packages = load_internal_packages(
             &arg,
-            &mut env,
+            &env,
             &mut collected_vars,
             &internal_packages_install_path,
+            token,
         )
         .await?;
         dbt_state.packages.extend(packages);
@@ -240,7 +244,7 @@ pub async fn load(
 
 pub async fn load_inner(
     arg: &LoadArgs,
-    env: &mut JinjaEnvironment<'static>,
+    env: &JinjaEnv,
     package_path: &Path,
     package_lookup_map: &BTreeMap<String, String>,
     collected_vars: &mut Vec<(String, BTreeMap<String, DbtVars>)>,
@@ -418,6 +422,13 @@ pub async fn load_inner(
         &["sql"],
         &all_files,
     );
+    let fixture_files = find_files_by_kind_and_extension(
+        package_path,
+        &dbt_project.name,
+        &ResourcePathKind::FixturePaths,
+        &["csv"],
+        &all_files,
+    );
     let seed_files = find_files_by_kind_and_extension(
         package_path,
         &dbt_project.name,
@@ -439,13 +450,13 @@ pub async fn load_inner(
         &["sql"],
         &all_files,
     );
-
     Ok(DbtPackage {
         dbt_project,
         dbt_properties,
         analysis_files,
         model_sql_files,
         test_files,
+        fixture_files,
         seed_files,
         macro_files,
         docs_files,
@@ -553,6 +564,19 @@ fn collect_paths(dbt_project: &DbtProject) -> HashMap<ResourcePathKind, Vec<Stri
     all_dirs.insert(
         ResourcePathKind::TestPaths,
         dbt_project.test_paths.clone().unwrap_or_default(),
+    );
+    all_dirs.insert(
+        ResourcePathKind::FixturePaths,
+        dbt_project
+            .test_paths
+            .clone()
+            .unwrap_or_default()
+            .iter()
+            .map(|p| {
+                let path = PathBuf::from(p).join("fixtures");
+                path.into_os_string().into_string().unwrap_or_default()
+            })
+            .collect(),
     );
     // Only register docs paths if they are explicitly specified
     if dbt_project.docs_paths.is_some() && !dbt_project.docs_paths.as_ref().unwrap().is_empty() {

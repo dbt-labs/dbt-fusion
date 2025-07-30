@@ -1,12 +1,13 @@
-use dbt_common::{constants::DBT_CTE_PREFIX, error::MacroSpan, tokiofs, FsResult};
-use dbt_common::{fs_err, stdfs, ErrorCode, FsError};
+use dbt_common::{ErrorCode, FsError, fs_err, stdfs};
+use dbt_common::{FsResult, constants::DBT_CTE_PREFIX, error::MacroSpan, tokiofs};
 use dbt_frontend_common::{error::CodeLocation, span::Span};
 use dbt_fusion_adapter::relation_object::create_relation_internal;
 use dbt_fusion_adapter::{AdapterTyping, ParseAdapter};
 use dbt_schemas::schemas::common::ResolvedQuoting;
+use dbt_schemas::schemas::project::DefaultTo;
 use dbt_schemas::schemas::{DbtModel, DbtSeed, DbtSnapshot, DbtTest, DbtUnitTest, InternalDbtNode};
 use minijinja::arg_utils::ArgParser;
-use minijinja::{functions::debug, value::Rest, Error, ErrorKind, MacroSpans, State, Value};
+use minijinja::{Error, ErrorKind, MacroSpans, State, Value, functions::debug, value::Rest};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -17,7 +18,10 @@ use std::{
     sync::Mutex,
 };
 
-use crate::{jinja_environment::JinjaEnvironment, listener::ListenerFactory};
+use crate::{
+    jinja_environment::JinjaEnv, listener::ListenerFactory,
+    phases::parse::sql_resource::SqlResource,
+};
 
 /// The prefix for environment variables that contain secrets
 pub const SECRET_ENV_VAR_PREFIX: &str = "DBT_ENV_SECRET";
@@ -220,17 +224,14 @@ pub async fn inject_and_persist_ephemeral_models(
 
 /// Renders SQL with Jinja macros
 #[allow(clippy::too_many_arguments)]
-pub fn render_sql<'a, E>(
+pub fn render_sql(
     sql: &str,
-    env: E,
+    env: &JinjaEnv,
     ctx: &BTreeMap<String, Value>,
     listener_factory: &dyn ListenerFactory,
     filename: &Path,
-) -> FsResult<String>
-where
-    E: AsRef<JinjaEnvironment<'a>>,
-{
-    let listeners = listener_factory.create_listeners(filename);
+) -> FsResult<String> {
+    let listeners = listener_factory.create_listeners(filename, &CodeLocation::start_of_file());
     let result = env
         .as_ref()
         .render_named_str(filename.to_str().unwrap(), sql, ctx, &listeners)
@@ -293,7 +294,7 @@ pub fn get_method(args: &[Value], map: &BTreeMap<String, Value>) -> Result<Value
 
 /// Generate a component name using the specified macro
 pub fn generate_component_name(
-    env: &JinjaEnvironment,
+    env: &JinjaEnv,
     component: &str,
     root_project_name: &str,
     current_project_name: &str,
@@ -347,7 +348,7 @@ pub fn clear_template_cache() {
 
 /// Find a generate macro by name (database, schema, or alias)
 pub fn find_generate_macro_template(
-    env: &JinjaEnvironment,
+    env: &JinjaEnv,
     component: &str,
     root_project_name: &str,
     current_project_name: &str,
@@ -461,4 +462,19 @@ pub fn node_metadata_from_state(state: &State) -> Option<(NodeId, PathBuf)> {
         }
         None => None,
     }
+}
+
+/// Render a reference or source string and return the corresponding SqlResource
+pub fn render_extract_ref_or_source_expr<T: DefaultTo<T>>(
+    jinja_env: &JinjaEnv,
+    resolve_model_context: &BTreeMap<String, Value>,
+    sql_resources: Arc<Mutex<Vec<SqlResource<T>>>>,
+    ref_str: &str,
+) -> FsResult<SqlResource<T>> {
+    let expr = jinja_env.compile_expression(ref_str)?;
+    let _ = expr.eval(resolve_model_context, &[])?;
+    // Remove from Mutex and return last item
+    let mut sql_resources = sql_resources.lock().unwrap();
+    let sql_resource = sql_resources.pop().unwrap();
+    Ok(sql_resource)
 }

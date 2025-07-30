@@ -1,4 +1,4 @@
-use crate::{ectx, fs_err, ErrorCode, FsResult};
+use crate::{ErrorCode, FsResult, ectx, fs_err};
 
 use crate::error::LiftableResult;
 use std::fs::Metadata;
@@ -39,6 +39,15 @@ pub fn remove_dir_all<P: AsRef<Path>>(path: P) -> FsResult<()> {
 pub fn read_to_string<P: AsRef<Path>>(path: P) -> FsResult<String> {
     let path = path.as_ref();
     std::fs::read_to_string(path).lift(ectx!("Failed to read file: {}", path.display()))
+}
+
+/// Wrapper around [`std::fs::exists`] that returns a useful error in case of failure.
+pub fn exists<P: AsRef<Path>>(path: P) -> FsResult<bool> {
+    let path = path.as_ref();
+    std::fs::exists(path).lift(ectx!(
+        "Failed to check if file/dir exists: {}",
+        path.display()
+    ))
 }
 
 /// Wrapper around [`std::fs::write`] that returns a useful error in case of failure.

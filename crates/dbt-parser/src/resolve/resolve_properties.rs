@@ -1,11 +1,12 @@
 use crate::args::ResolveArgs;
+use dbt_common::cancellation::CancellationToken;
 use dbt_common::io_args::IoArgs;
 use dbt_common::show_warning_soon_to_be_error;
 use dbt_common::{
-    constants::PARSING, fs_err, fsinfo, show_error, show_progress, show_warning, ErrorCode,
-    FsResult,
+    ErrorCode, FsResult, constants::PARSING, fs_err, fsinfo, show_error, show_progress,
+    show_warning,
 };
-use dbt_jinja_utils::jinja_environment::JinjaEnvironment;
+use dbt_jinja_utils::jinja_environment::JinjaEnv;
 use dbt_jinja_utils::serde::{into_typed_raw, into_typed_with_jinja, value_from_file};
 use dbt_schemas::schemas::properties::{
     DbtPropertiesFileValues, MinimalSchemaValue, MinimalTableValue,
@@ -37,6 +38,7 @@ pub struct MinimalProperties {
     pub snapshots: BTreeMap<String, MinimalPropertiesEntry>,
     pub unit_tests: BTreeMap<String, MinimalPropertiesEntry>,
     pub tests: BTreeMap<String, MinimalPropertiesEntry>,
+    pub exposures: BTreeMap<String, MinimalPropertiesEntry>,
 }
 
 // impl try extend from MinimalResolvedProperties
@@ -46,7 +48,7 @@ impl MinimalProperties {
         &mut self,
         io_args: &IoArgs,
         other: DbtPropertiesFileValues,
-        jinja_env: &JinjaEnvironment<'static>,
+        jinja_env: &JinjaEnv,
         properties_path: &Path,
         base_ctx: &BTreeMap<String, MinijinjaValue>,
     ) -> FsResult<()> {
@@ -220,6 +222,29 @@ impl MinimalProperties {
                 }
             }
         }
+        if let Some(exposures) = other.exposures {
+            for exposure_value in exposures {
+                let exposure = into_typed_with_jinja::<MinimalSchemaValue, _>(
+                    Some(io_args),
+                    exposure_value.clone(),
+                    false,
+                    jinja_env,
+                    base_ctx,
+                    &[],
+                )?;
+                self.exposures.insert(
+                    exposure.name.clone(),
+                    MinimalPropertiesEntry {
+                        name: validate_resource_name(&exposure.name)?,
+                        relative_path: properties_path.to_path_buf(),
+                        schema_value: exposure_value,
+                        table_value: None,
+                        version_info: None,
+                        duplicate_paths: vec![],
+                    },
+                );
+            }
+        }
         if let Some(unit_tests) = other.unit_tests {
             for unit_test_value in unit_tests {
                 let unit_test = into_typed_with_jinja::<MinimalSchemaValue, _>(
@@ -329,12 +354,13 @@ fn validate_resource_name(name: &str) -> FsResult<String> {
 pub fn resolve_minimal_properties(
     arg: &ResolveArgs,
     package: &DbtPackage,
-    jinja_env: &JinjaEnvironment<'static>,
+    jinja_env: &JinjaEnv,
     base_ctx: &BTreeMap<String, MinijinjaValue>,
+    token: &CancellationToken,
 ) -> FsResult<MinimalProperties> {
     let mut minimal_resolved_properties = MinimalProperties::default();
     for dbt_asset in package.dbt_properties.iter().dedup() {
-        dbt_common::check_cancellation!(arg.io.should_cancel_compilation)?;
+        token.check_cancellation()?;
         let absolute_path = dbt_asset.base_path.join(&dbt_asset.path);
         show_progress!(
             arg.io,

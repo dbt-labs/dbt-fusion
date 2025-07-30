@@ -30,18 +30,17 @@ pub mod schemas {
         RelationConfigFactory,
     };
 
-    mod nodes;
+    pub mod nodes;
     pub use nodes::{
-        CommonAttributes, DbtModel, DbtModelAttr, DbtSeed, DbtSeedAttr, DbtSnapshot,
-        DbtSnapshotAttr, DbtSource, DbtSourceAttr, DbtTest, DbtTestAttr, DbtUnitTest,
-        DbtUnitTestAttr, InternalDbtNode, InternalDbtNodeAttributes, InternalDbtNodeWrapper,
-        IntrospectionKind, NodeBaseAttributes, Nodes, TestMetadata,
+        CommonAttributes, DbtExposure, DbtExposureAttr, DbtModel, DbtModelAttr, DbtSeed,
+        DbtSeedAttr, DbtSnapshot, DbtSnapshotAttr, DbtSource, DbtSourceAttr, DbtTest, DbtTestAttr,
+        DbtUnitTest, DbtUnitTestAttr, InternalDbtNode, InternalDbtNodeAttributes,
+        InternalDbtNodeWrapper, IntrospectionKind, NodeBaseAttributes, Nodes, TestMetadata,
     };
 
     pub use sources::{FreshnessResultsArtifact, FreshnessResultsMetadata, FreshnessResultsNode};
     pub mod manifest {
         mod bigquery_partition;
-        mod exposure;
         mod group;
         #[allow(clippy::module_inception)]
         mod manifest;
@@ -52,26 +51,33 @@ pub mod schemas {
         mod selector;
         mod semantic_model;
 
+        // Versioned manifest modules
+        pub mod v10;
+        pub mod v11;
+        pub mod v12;
+
         pub mod common;
         pub use bigquery_partition::{
             BigqueryClusterConfig, BigqueryPartitionConfig, BigqueryPartitionConfigInner,
             BigqueryPartitionConfigLegacy, GrantAccessToTarget, Range, RangeConfig, TimeConfig,
         };
-        pub use exposure::DbtExposure;
         pub use group::DbtGroup;
         pub use manifest::{
-            build_manifest, nodes_from_dbt_manifest, BaseMetadata, DbtManifest, DbtNode,
-            ManifestMetadata,
+            BaseMetadata, DbtManifest, DbtNode, ManifestMetadata, build_manifest,
+            nodes_from_dbt_manifest,
         };
         pub use manifest_nodes::{
-            ManifestDataTest, ManifestModel, ManifestSeed, ManifestSnapshot, ManifestSource,
-            ManifestUnitTest,
+            ManifestDataTest, ManifestExposure, ManifestModel, ManifestSeed, ManifestSnapshot,
+            ManifestSource, ManifestUnitTest,
         };
         pub use metric::DbtMetric;
         pub use operation::DbtOperation;
         pub use saved_query::DbtSavedQuery;
         pub use selector::DbtSelector;
         pub use semantic_model::DbtSemanticModel;
+        pub use v10::DbtManifestV10;
+        pub use v11::DbtManifestV11;
+        pub use v12::DbtManifestV12;
     }
     mod dbt_cloud;
     pub use dbt_cloud::{DbtCloudConfig, DbtCloudContext, DbtCloudProject};

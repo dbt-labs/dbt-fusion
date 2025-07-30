@@ -1,12 +1,12 @@
+use crate::AdapterType;
 use crate::errors::AdapterError;
 use crate::errors::{AdapterResult, AsyncAdapterResult};
 use crate::typed_adapter::TypedBaseAdapter;
-use crate::AdapterType;
 
 use arrow::array::RecordBatch;
 use arrow_schema::Schema;
-use dbt_schemas::schemas::relations::base::{BaseRelation, ComponentName, RelationPattern};
 use dbt_schemas::schemas::relations::DEFAULT_DATABRICKS_DATABASE;
+use dbt_schemas::schemas::relations::base::{BaseRelation, ComponentName, RelationPattern};
 use dbt_xdbc::{Connection, MapReduce, QueryCtx};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -17,6 +17,11 @@ pub const MAX_CONNECTIONS: usize = 128;
 
 /// The two ways of representing a relation in a pair.
 pub type RelationSchemaPair = (Arc<dyn BaseRelation>, Arc<Schema>);
+
+pub struct MetadataFreshness {
+    pub last_altered: i128,
+    pub is_view: bool,
+}
 
 /// Allows serializing record batches into maps and Arrow schemas
 pub trait MetadataProcessor {
@@ -31,10 +36,36 @@ pub trait MetadataProcessor {
     fn to_arrow_schema(&self) -> AdapterResult<Arc<Schema>>;
 }
 
-// XXX: we should unify relation representaion as Arrow schemas across the codebase
+/// This represents a UDF downloaded from a remote data warehouse
+#[derive(Debug, Clone)]
+pub struct UDF {
+    pub name: String,
+    pub description: String,
+    pub signature: String,
+    pub adapter_type: AdapterType,
+    pub kind: UDFKind,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum UDFKind {
+    Scalar,
+    Aggregate,
+    Table,
+}
+
+// XXX: we should unify relation representation as Arrow schemas across the codebase
 
 /// Adapter that supports metadata query
 pub trait MetadataAdapter: TypedBaseAdapter + Send + Sync {
+    /// List UDFs under a given set of catalog and schemas
+    fn list_user_defined_functions(
+        &self,
+        _catalog_schemas: &BTreeMap<String, BTreeSet<String>>,
+    ) -> AsyncAdapterResult<Vec<UDF>> {
+        let future = async move { Ok(vec![]) };
+        Box::pin(future)
+    }
+
     /// List relations and their schemas
     fn list_relations_schemas(
         &self,
@@ -66,7 +97,7 @@ pub trait MetadataAdapter: TypedBaseAdapter + Send + Sync {
     fn freshness(
         &self,
         relations: &[Arc<dyn BaseRelation>],
-    ) -> AsyncAdapterResult<BTreeMap<String, i128>>;
+    ) -> AsyncAdapterResult<BTreeMap<String, MetadataFreshness>>;
 }
 
 /// Create catalogs or schemas if they don't exist
@@ -110,7 +141,7 @@ pub fn create_catalogs_schema_if_not_exists(
         // use SHOW DATABASES but this query doesn't return the databases a user doesn't have access to
         // https://github.com/dbt-labs/fs/issues/2789
         let adapter_clone = adapter.clone();
-        match adapter_clone.execute(conn, &query_ctx, None, None, None) {
+        match adapter_clone.exec_stmt(conn, &query_ctx, false) {
             Ok(_) => Ok(Ok(())),
             Err(e) => {
                 if is_tolerable(&e, adapter_type) {
@@ -192,8 +223,11 @@ fn create_schema_sql(adapter: &Arc<dyn MetadataAdapter>, catalog: &str, schema: 
     let schema = adapter.quote_component(schema, ComponentName::Schema);
     let adapter_type = adapter.adapter_type();
     match adapter_type {
-        AdapterType::Snowflake => format!("CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}"),
-        AdapterType::Databricks => format!("CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}"),
+        AdapterType::Snowflake | AdapterType::Databricks => {
+            format!("CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}")
+        }
+        // Redshift connetions are always to a specific database
+        AdapterType::Redshift => format!("CREATE SCHEMA IF NOT EXISTS {schema}"),
         _ => unimplemented!("create_schema_sql for adapter type: {}", adapter_type),
     }
 }

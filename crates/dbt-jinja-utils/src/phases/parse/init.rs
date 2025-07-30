@@ -7,7 +7,7 @@ use std::{
 
 use chrono::DateTime;
 use chrono_tz::Tz;
-use dbt_common::{fs_err, io_args::IoArgs, ErrorCode, FsResult};
+use dbt_common::{ErrorCode, FsResult, fs_err, io_args::IoArgs};
 use dbt_fusion_adapter::parse::adapter::create_parse_adapter;
 use dbt_schemas::{
     schemas::{
@@ -17,17 +17,18 @@ use dbt_schemas::{
     state::DbtVars,
 };
 use minijinja::{
-    dispatch_object::THREAD_LOCAL_DEPENDENCIES, macro_unit::MacroUnit,
-    value::Value as MinijinjaValue, UndefinedBehavior,
+    UndefinedBehavior, dispatch_object::THREAD_LOCAL_DEPENDENCIES, macro_unit::MacroUnit,
+    value::Value as MinijinjaValue,
 };
 use minijinja_contrib::modules::{py_datetime::datetime::PyDateTime, pytz::PytzTimezone};
 
 use crate::{
-    environment_builder::{JinjaEnvironmentBuilder, MacroUnitsWrapper},
+    environment_builder::{JinjaEnvBuilder, MacroUnitsWrapper},
     flags::Flags,
     functions::ConfiguredVar,
     invocation_args::InvocationArgs,
-    jinja_environment::JinjaEnvironment,
+    jinja_environment::JinjaEnv,
+    listener::ListenerFactory,
     phases::utils::build_target_context_map,
 };
 
@@ -48,7 +49,8 @@ pub fn initialize_parse_jinja_environment(
     invocation_args: &InvocationArgs,
     all_package_names: BTreeSet<String>,
     io_args: IoArgs,
-) -> FsResult<JinjaEnvironment<'static>> {
+    listener_factory: Option<Arc<dyn ListenerFactory>>,
+) -> FsResult<JinjaEnv> {
     // Set the thread local dependencies
     THREAD_LOCAL_DEPENDENCIES.get_or_init(|| Mutex::new(all_package_names));
     let target_context = TargetContext::try_from(db_config.clone())
@@ -107,12 +109,12 @@ pub fn initialize_parse_jinja_environment(
         ),
     ]);
 
-    let mut env = JinjaEnvironmentBuilder::new()
+    let mut env = JinjaEnvBuilder::new()
         .with_adapter(create_parse_adapter(adapter_type, package_quoting)?)
         .with_root_package(project_name.to_string())
         .with_globals(globals)
         .with_io_args(io_args)
-        .try_with_macros(MacroUnitsWrapper::new(macro_units))?
+        .try_with_macros(MacroUnitsWrapper::new(macro_units), listener_factory)?
         .build();
     env.set_undefined_behavior(UndefinedBehavior::Dbt);
     Ok(env)

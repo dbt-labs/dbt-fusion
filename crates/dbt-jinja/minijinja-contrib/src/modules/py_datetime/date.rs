@@ -1,4 +1,4 @@
-use chrono::{Datelike, Local, NaiveDate, TimeZone};
+use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, TimeZone};
 use minijinja::arg_utils::ArgParser;
 use minijinja::{value::Object, Error, ErrorKind, Value};
 use std::fmt;
@@ -174,7 +174,13 @@ impl PyDate {
                 "strftime requires one string argument",
             )
         })?;
-        Ok(Value::from(self.date.format(fmt).to_string()))
+
+        // Convert to datetime to allow format codes for hours, minutes and seconds like python does.
+        // See https://docs.python.org/3/library/datetime.html#datetime.date.strftime:
+        // "Format codes referring to hours, minutes or seconds will see 0 values"
+        let datetime: NaiveDateTime = self.date.into();
+
+        Ok(Value::from(datetime.format(fmt).to_string()))
     }
 
     /// Handle date + timedelta or date - timedelta or date - date operations
@@ -350,6 +356,9 @@ mod tests {
         let result = date_arc.strftime(&[Value::from("%A, %B %d, %Y")]).unwrap();
         assert_eq!(result.to_string(), "Monday, May 15, 2023");
 
+        let result = date_arc.strftime(&[Value::from("%H-%M-%S")]).unwrap();
+        assert_eq!(result.to_string(), "00-00-00");
+
         // Test error case - missing format argument
         let error = date_arc.strftime(&[]).unwrap_err();
         assert!(error
@@ -367,14 +376,14 @@ mod tests {
 
         // Create a template that uses date and strftime
         let template = env
-            .template_from_str("{{ date(2023, 5, 15).strftime('%Y-%m-%d') }}")
+            .template_from_str("{{ date(2023, 5, 15).strftime('%Y-%m-%d') }}", &[])
             .unwrap();
         let result = template.render(context!(), &[]).unwrap();
         assert_eq!(result, "2023-05-15");
 
         // Test with a different format
         let template = env
-            .template_from_str("{{ date(2023, 5, 15).strftime('%d/%m/%Y') }}")
+            .template_from_str("{{ date(2023, 5, 15).strftime('%d/%m/%Y') }}", &[])
             .unwrap();
         let result = template.render(context!(), &[]).unwrap();
         assert_eq!(result, "15/05/2023");
@@ -477,21 +486,27 @@ mod tests {
 
         // Test adding days
         let template = env
-            .template_from_str("{{ (date(2023, 5, 15) + timedelta(days=5)).strftime('%Y-%m-%d') }}")
+            .template_from_str(
+                "{{ (date(2023, 5, 15) + timedelta(days=5)).strftime('%Y-%m-%d') }}",
+                &[],
+            )
             .unwrap();
         let result = template.render(context!(), &[]).unwrap();
         assert_eq!(result, "2023-05-20");
 
         // Test subtracting days
         let template = env
-            .template_from_str("{{ (date(2023, 5, 15) - timedelta(days=3)).strftime('%Y-%m-%d') }}")
+            .template_from_str(
+                "{{ (date(2023, 5, 15) - timedelta(days=3)).strftime('%Y-%m-%d') }}",
+                &[],
+            )
             .unwrap();
         let result = template.render(context!(), &[]).unwrap();
         assert_eq!(result, "2023-05-12");
 
         // Test date subtraction
         let template = env
-            .template_from_str("{{ (date(2023, 5, 20) - date(2023, 5, 15)).days }}")
+            .template_from_str("{{ (date(2023, 5, 20) - date(2023, 5, 15)).days }}", &[])
             .unwrap();
         let result = template.render(context!(), &[]).unwrap();
         assert_eq!(result, "5");

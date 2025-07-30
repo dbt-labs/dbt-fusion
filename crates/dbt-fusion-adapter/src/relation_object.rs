@@ -1,12 +1,12 @@
 use dbt_common::{FsError, FsResult};
 use dbt_schemas::dbt_types::RelationType;
+use dbt_schemas::schemas::InternalDbtNodeAttributes;
 use dbt_schemas::schemas::common::{DbtQuoting, ResolvedQuoting};
 use dbt_schemas::schemas::relations::base::{BaseRelation, TableFormat};
-use dbt_schemas::schemas::InternalDbtNodeAttributes;
 use minijinja::arg_utils::ArgParser;
 use minijinja::value::{Enumerator, Object, ValueKind};
-use minijinja::{listener::RenderingEventListener, Value};
 use minijinja::{Error as MinijinjaError, State};
+use minijinja::{Value, listener::RenderingEventListener};
 use serde::Deserialize;
 
 use crate::bigquery::relation::BigqueryRelation;
@@ -20,7 +20,7 @@ use std::{fmt, ops::Deref};
 
 /// A Wrapper type for BaseRelation
 /// for any concrete Relation type to be used as Object in Jinja
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RelationObject(Arc<dyn BaseRelation>);
 
 impl RelationObject {
@@ -34,6 +34,12 @@ impl RelationObject {
 
     pub fn inner(&self) -> Arc<dyn BaseRelation> {
         self.0.clone()
+    }
+}
+
+impl fmt::Debug for RelationObject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.render_self().expect("could not render self"))
     }
 }
 
@@ -252,7 +258,7 @@ impl Object for StaticBaseRelationObject {
     ) -> Result<Value, MinijinjaError> {
         match name {
             "create" => self.create(args),
-            "scd_args" => Ok(Value::from(self.scd_args(args))),
+            "scd_args" => self.scd_args(args),
             _ => Err(minijinja::Error::new(
                 minijinja::ErrorKind::InvalidOperation,
                 format!("Unknown method on StaticBaseRelationObject: '{name}'"),
@@ -305,7 +311,7 @@ pub trait StaticBaseRelation: fmt::Debug + Send + Sync {
     }
 
     /// Get the SCD arguments for the relation
-    fn scd_args(&self, args: &[Value]) -> Vec<String> {
+    fn scd_args(&self, args: &[Value]) -> Result<Value, MinijinjaError> {
         let mut args = ArgParser::new(args, None);
         let primary_key: Value = args.get("primary_key").unwrap();
         let updated_at: String = args.get("updated_at").unwrap();
@@ -327,10 +333,15 @@ pub trait StaticBaseRelation: fmt::Debug + Send + Sync {
                 scd_args.push(primary_key.as_str().unwrap().to_string());
             }
             _ => {
-                panic!("Invalid primary key type");
+                return Err(minijinja::Error::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    format!(
+                        "'primary_key' has a wrong type in StaticBaseRelationObject: '{primary_key}'"
+                    ),
+                ));
             }
         }
         scd_args.push(updated_at);
-        scd_args
+        Ok(Value::from(scd_args))
     }
 }

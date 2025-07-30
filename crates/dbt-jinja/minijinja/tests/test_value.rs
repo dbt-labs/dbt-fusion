@@ -376,7 +376,7 @@ fn test_mutable_vec_in_set_stmt() {
     let rv = minijinja::render!(
         in env,
         "{% set my_arr = [1, 2, 3] %}
-         {% for v in my_arr %}{% set my_arr = my_arr.append(v) %}{% endfor %}
+         {% for v in my_arr %}{% do my_arr.append(v) %}{% endfor %}
          {{ my_arr }}",
     );
     assert_snapshot!(rv, @"[1, 2, 3, 1, 2, 3]");
@@ -557,8 +557,8 @@ fn test_value_cmp() {
 #[test]
 fn test_call_kwargs() {
     let mut env = Environment::new();
-    env.add_template("foo", "").unwrap();
-    let tmpl = env.get_template("foo").unwrap();
+    env.add_template("foo", "", &[]).unwrap();
+    let tmpl = env.get_template("foo", &[]).unwrap();
     let state = tmpl.new_state();
     let val = Value::from_function(|kwargs: Kwargs| kwargs.get::<i32>("foo"));
     let rv = val

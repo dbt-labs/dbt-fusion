@@ -4,7 +4,7 @@ use crate::utils::{get_version_hash, strip_version_hash};
 use crate::{internal_err, make_internal_err};
 use datafusion::sql::{ResolvedTableReference, TableReference};
 use itertools::Itertools;
-use serde::{de, Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, de};
 use std::path::PathBuf;
 
 pub use dbt_ident::{Ident, Identifier};
@@ -92,6 +92,34 @@ impl Default for Qualified<'static> {
         Qualified::Bare {
             table: Ident::default(),
         }
+    }
+}
+
+impl PartialOrd for Qualified<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Qualified<'_> {
+    fn cmp<'a>(&'a self, other: &'a Self) -> std::cmp::Ordering {
+        // Compare them as if tuples of (catalog, schema, table)
+        let cmp_value =
+            |qualified: &'a Self| -> (Option<&'a Ident<'_>>, Option<&'a Ident<'_>>, &'a Ident<'_>) {
+                match qualified {
+                    Qualified::Full {
+                        catalog,
+                        schema,
+                        table,
+                    } => (Some(catalog), Some(schema), table),
+                    Qualified::Partial { schema, table } => (None, Some(schema), table),
+                    Qualified::Bare { table } => (None, None, table),
+                }
+            };
+
+        let self_tuple = cmp_value(self);
+        let other_tuple = cmp_value(other);
+        self_tuple.cmp(&other_tuple)
     }
 }
 

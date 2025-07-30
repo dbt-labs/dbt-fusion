@@ -9,7 +9,7 @@ use std::{
     collections::{BTreeMap, HashSet},
     fmt::{self, Display},
     path::{Path, PathBuf},
-    sync::{atomic::AtomicBool, Arc},
+    sync::Arc,
 };
 use strum::EnumIter;
 use strum_macros::Display;
@@ -21,8 +21,8 @@ use crate::{
     io_utils::StatusReporter,
     logging::LogFormat,
     node_selector::{
-        conjoin_expression, parse_model_specifiers, IndirectSelection, SelectExpression,
-        SelectionCriteria,
+        IndirectSelection, SelectExpression, SelectionCriteria, conjoin_expression,
+        parse_model_specifiers,
     },
     pretty_string::BLUE,
 };
@@ -44,8 +44,22 @@ pub struct IoArgs {
     /// Optional status reporter for reporting status messages during execution
     pub status_reporter: Option<Arc<dyn StatusReporter>>,
     pub send_anonymous_usage_stats: bool,
-    pub should_cancel_compilation: Option<Arc<AtomicBool>>,
+
+    // internal fields
+    pub show_timings: bool, // whether to show timings in the status messages
+    pub build_cache_url: Option<String>,
+    pub build_cache_cas_url: Option<String>,
+    pub build_cache_mode: Option<BuildCacheMode>,
 }
+impl IoArgs {
+    pub fn is_generated_file(&self, rel_path: &Path) -> bool {
+        // Get last component of out_dir (as_os_str returns None if out_dir is empty)
+        let out_dir_last = self.out_dir.components().next_back();
+        let rel_first = rel_path.components().next();
+        out_dir_last == rel_first
+    }
+}
+
 // define a clone for IoArgs
 impl Clone for IoArgs {
     fn clone(&self) -> Self {
@@ -61,7 +75,10 @@ impl Clone for IoArgs {
             log_level: self.log_level,
             status_reporter: self.status_reporter.clone(),
             send_anonymous_usage_stats: self.send_anonymous_usage_stats,
-            should_cancel_compilation: self.should_cancel_compilation.clone(),
+            show_timings: self.show_timings,
+            build_cache_url: self.build_cache_url.clone(),
+            build_cache_cas_url: self.build_cache_cas_url.clone(),
+            build_cache_mode: self.build_cache_mode,
         }
     }
 }
@@ -130,8 +147,21 @@ impl IoArgs {
     pub fn should_show(&self, option: ShowOptions) -> bool {
         self.show.contains(&option) || option == ShowOptions::All
     }
-}
 
+    /// Returns true if the build cache should be used (read or readwrite mode, or --use-build-cache flag).
+    pub fn should_use_build_cache(&self) -> bool {
+        self.build_cache_mode
+            .map(|c| matches!(c, BuildCacheMode::Read | BuildCacheMode::ReadWrite))
+            .unwrap_or_default()
+    }
+
+    /// Returns true if the build cache should be saved (write or readwrite mode).
+    pub fn should_save_build_cache(&self) -> bool {
+        self.build_cache_mode
+            .map(|c| matches!(c, BuildCacheMode::Write | BuildCacheMode::ReadWrite))
+            .unwrap_or_default()
+    }
+}
 // ----------------------------------------------------------------------------------------------
 // System Args
 #[derive(Clone, Debug)]
@@ -225,7 +255,6 @@ pub struct EvalArgs {
     pub skip_unreferenced_table_check: bool,
     pub state: Option<PathBuf>,
     pub defer_state: Option<PathBuf>,
-    pub patterned_dangling_sources: bool,
     pub connection: bool,
     pub macro_name: String,
     pub macro_args: BTreeMap<String, Value>,
@@ -426,6 +455,12 @@ pub enum DisplayFormat {
     Json,
     NdJson,
     Yml,
+    /// Output nodes as selector strings (e.g. "source:pkg.source_name.table_name")
+    Selector,
+    /// Output nodes as search names (node.search_name)
+    Name,
+    /// Output nodes as file paths (node.original_file_path)
+    Path,
 }
 
 #[derive(Debug, Clone)]
@@ -479,6 +514,28 @@ pub enum StaticAnalysisKind {
     Off,
     #[default]
     On,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BuildCacheMode {
+    Read,
+    Write,
+    #[default]
+    ReadWrite,
+}
+
+impl FromStr for StaticAnalysisKind {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "unsafe" => Ok(StaticAnalysisKind::Unsafe),
+            "off" => Ok(StaticAnalysisKind::Off),
+            "on" => Ok(StaticAnalysisKind::On),
+            _ => Err(()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Display, Serialize, Deserialize, ValueEnum, Default)]

@@ -6,24 +6,24 @@ use crate::funcs::{
 };
 use crate::metadata::MetadataAdapter;
 use crate::parse::relation::EmptyRelation;
-use crate::relation_object::{create_relation, RelationObject};
+use crate::relation_object::{RelationObject, create_relation};
 use crate::response::AdapterResponse;
 use crate::typed_adapter::TypedBaseAdapter;
-use crate::SqlEngine;
+use crate::{AdapterResult, SqlEngine};
 
 use dashmap::{DashMap, DashSet};
 use dbt_agate::AgateTable;
 use dbt_common::behavior_flags::Behavior;
-use dbt_common::{current_function_name, FsError, FsResult};
+use dbt_common::{FsError, FsResult, current_function_name};
 use dbt_schemas::schemas::columns::base::StdColumnType;
 use dbt_schemas::schemas::common::{DbtQuoting, ResolvedQuoting};
 use dbt_schemas::schemas::relations::base::{BaseRelation, RelationPattern};
 use dbt_xdbc::Connection;
-use minijinja::arg_utils::{check_num_args, ArgParser};
+use minijinja::Value;
+use minijinja::arg_utils::{ArgParser, check_num_args};
 use minijinja::constants::TARGET_UNIQUE_ID;
 use minijinja::listener::RenderingEventListener;
 use minijinja::value::Object;
-use minijinja::Value;
 use minijinja::{Error as MinijinjaError, ErrorKind as MinijinjaErrorKind, State};
 use serde::Deserialize;
 
@@ -40,8 +40,10 @@ use std::sync::Arc;
 pub struct ParseAdapter {
     /// The type of database adapter (e.g. "snowflake", "postgres", etc.)
     adapter_type: String,
-    /// The dangling sources found during parse
-    dangling_sources: DashMap<String, Vec<Value>>,
+    /// The call_get_relation method calls found during parse
+    call_get_relation: DashMap<String, Vec<Value>>,
+    /// The call_get_columns_in_relation method calls found during parse
+    call_get_columns_in_relation: DashMap<String, Vec<Value>>,
     /// A patterned relation may turn to many dangling sources
     patterned_dangling_sources: DashMap<String, Vec<RelationPattern>>,
     /// A list of unsafe nodes detected during parse (unsafe nodes are nodes that have introspection qualities that make them non-deterministic / stateful)
@@ -52,7 +54,8 @@ pub struct ParseAdapter {
     quoting: ResolvedQuoting,
 }
 
-type DanglingSources = (
+type RelationsToFetch = (
+    Result<BTreeMap<String, Vec<Arc<dyn BaseRelation>>>, FsError>,
     Result<BTreeMap<String, Vec<Arc<dyn BaseRelation>>>, FsError>,
     BTreeMap<String, Vec<RelationPattern>>,
 );
@@ -64,7 +67,8 @@ impl ParseAdapter {
         AdapterType::from_str(&adapter_type).expect("adapter_type is valid");
         Self {
             adapter_type,
-            dangling_sources: DashMap::new(),
+            call_get_relation: DashMap::new(),
+            call_get_columns_in_relation: DashMap::new(),
             patterned_dangling_sources: DashMap::new(),
             unsafe_nodes: DashSet::new(),
             execute_sqls: DashSet::new(),
@@ -78,9 +82,9 @@ impl ParseAdapter {
     /// dangling_sources is a vector of dangling source relations
     /// patterned_dangling_sources is a vector of patterned dangling source relations
     #[allow(clippy::type_complexity)]
-    pub fn dangling_sources(&self) -> DanglingSources {
-        let dangling_sources = self
-            .dangling_sources
+    pub fn relations_to_fetch(&self) -> RelationsToFetch {
+        let relations_to_fetch = self
+            .call_get_relation
             .iter()
             .map(|v| {
                 Ok((
@@ -93,14 +97,34 @@ impl ParseAdapter {
                 ))
             })
             .collect::<Result<BTreeMap<String, Vec<Arc<dyn BaseRelation>>>, MinijinjaError>>()
-            .map_err(|e| FsError::from_jinja_err(e, "Failed to collect dangling sources"));
+            .map_err(|e| FsError::from_jinja_err(e, "Failed to collect get_relation"));
+
+        let relations_to_fetch_columns = self
+            .call_get_columns_in_relation
+            .iter()
+            .map(|v| {
+                Ok((
+                    v.key().to_owned(),
+                    v.value()
+                        .iter()
+                        .cloned()
+                        .map(|v| downcast_value_to_dyn_base_relation(v))
+                        .collect::<Result<Vec<Arc<dyn BaseRelation>>, MinijinjaError>>()?,
+                ))
+            })
+            .collect::<Result<BTreeMap<String, Vec<Arc<dyn BaseRelation>>>, MinijinjaError>>()
+            .map_err(|e| FsError::from_jinja_err(e, "Failed to collect get_columns_in_relation"));
 
         let patterned_dangling_sources: BTreeMap<String, Vec<RelationPattern>> = self
             .patterned_dangling_sources
             .iter()
             .map(|r| (r.key().to_owned(), r.value().to_owned()))
             .collect();
-        (dangling_sources, patterned_dangling_sources)
+        (
+            relations_to_fetch,
+            relations_to_fetch_columns,
+            patterned_dangling_sources,
+        )
     }
 
     /// Returns a DashSet of unsafe nodes
@@ -150,15 +174,14 @@ impl BaseAdapter for ParseAdapter {
         unimplemented!("new_connection is not implemented for ParseAdapter")
     }
 
-    fn execute(&self, state: &State, args: &[Value]) -> Result<Value, MinijinjaError> {
-        let mut parser = ArgParser::new(args, None);
-        check_num_args(current_function_name!(), &parser, 1, 4)?;
-
-        let sql = parser.get::<String>("sql")?;
-        let _ = parser.get_optional::<bool>("auto_begin");
-        let _ = parser.get_optional::<bool>("fetch");
-        let _ = parser.get_optional::<u32>("limit");
-
+    fn execute(
+        &self,
+        state: &State,
+        sql: &str,
+        _auto_begin: bool,
+        _fetch: bool,
+        _limit: Option<i64>,
+    ) -> AdapterResult<(AdapterResponse, AgateTable)> {
         let response = AdapterResponse::default();
         let table = AgateTable::default();
 
@@ -171,17 +194,21 @@ impl BaseAdapter for ParseAdapter {
                         .to_string(),
                 );
             }
-            self.execute_sqls.insert(sql);
+            self.execute_sqls.insert(sql.to_string());
         }
 
-        Ok(Value::from_iter([
-            Value::from_object(response),
-            Value::from_object(table),
-        ]))
+        Ok((response, table))
     }
 
-    fn add_query(&self, _state: &State, _args: &[Value]) -> Result<Value, MinijinjaError> {
-        Ok(none_value())
+    fn add_query(
+        &self,
+        _state: &State,
+        _sql: &str,
+        _auto_begin: bool,
+        _bindings: Option<&Value>,
+        _abridge_sql_log: bool,
+    ) -> AdapterResult<()> {
+        Ok(())
     }
 
     fn get_relation(&self, state: &State, args: &[Value]) -> Result<Value, MinijinjaError> {
@@ -204,7 +231,7 @@ impl BaseAdapter for ParseAdapter {
 
         if state.is_execute() {
             if let Some(unique_id) = state.lookup(TARGET_UNIQUE_ID) {
-                self.dangling_sources
+                self.call_get_relation
                     .entry(unique_id.to_string())
                     .or_default()
                     .push(relation);
@@ -227,9 +254,15 @@ impl BaseAdapter for ParseAdapter {
             .first()
             .expect("get_columns_in_relation requires one argument");
 
+        // validate the relation
+        let base_relation = downcast_value_to_dyn_base_relation(relation.clone())?;
+        if !base_relation.is_database_relation() {
+            return Ok(empty_vec_value());
+        }
+
         if state.is_execute() {
             if let Some(unique_id) = state.lookup(TARGET_UNIQUE_ID) {
-                self.dangling_sources
+                self.call_get_columns_in_relation
                     .entry(unique_id.to_string())
                     .or_default()
                     .push(relation.to_owned());

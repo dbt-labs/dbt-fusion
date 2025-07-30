@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, HashMap};
+use std::str::FromStr;
 
 use dbt_serde_yaml::JsonSchema;
 use serde::{
-    self,
+    self, Deserialize, Deserializer, Serialize,
     de::{self, DeserializeOwned},
-    Deserialize, Deserializer, Serialize,
 };
 use serde_json::Value;
 
@@ -112,6 +112,16 @@ impl Default for StringOrInteger {
         StringOrInteger::String("".to_string())
     }
 }
+impl FromStr for StringOrInteger {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            _ if s.parse::<i64>().is_ok() => Ok(StringOrInteger::Integer(s.parse().unwrap())),
+            _ => Ok(StringOrInteger::String(s.to_string())),
+        }
+    }
+}
 
 impl std::fmt::Display for StringOrInteger {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -169,6 +179,14 @@ impl From<StringOrArrayOfStrings> for Vec<String> {
         }
     }
 }
+impl StringOrArrayOfStrings {
+    pub fn to_strings(&self) -> Vec<String> {
+        match self {
+            StringOrArrayOfStrings::String(s) => vec![s.clone()],
+            StringOrArrayOfStrings::ArrayOfStrings(a) => a.clone(),
+        }
+    }
+}
 
 impl PartialEq for StringOrArrayOfStrings {
     fn eq(&self, other: &Self) -> bool {
@@ -179,18 +197,10 @@ impl PartialEq for StringOrArrayOfStrings {
                 StringOrArrayOfStrings::ArrayOfStrings(a2),
             ) => a1 == a2,
             (StringOrArrayOfStrings::String(s), StringOrArrayOfStrings::ArrayOfStrings(a)) => {
-                if a.len() == 1 {
-                    a[0] == *s
-                } else {
-                    false
-                }
+                if a.len() == 1 { a[0] == *s } else { false }
             }
             (StringOrArrayOfStrings::ArrayOfStrings(a), StringOrArrayOfStrings::String(s)) => {
-                if a.len() == 1 {
-                    a[0] == *s
-                } else {
-                    false
-                }
+                if a.len() == 1 { a[0] == *s } else { false }
             }
         }
     }

@@ -14,7 +14,7 @@ use std::fmt;
 use url::Url;
 
 use crate::database::fingerprint_config;
-use crate::{builder::BuilderIter, Backend, Database, Driver};
+use crate::{Backend, Database, Driver, builder::BuilderIter};
 
 use super::Fingerprint;
 
@@ -343,7 +343,7 @@ impl IntoIterator for Builder {
 
     fn into_iter(self) -> Self::IntoIter {
         let fixed = match self.backend {
-            Backend::Postgres => {
+            Backend::Redshift | Backend::Postgres => {
                 // take username/password options and put them in the URI sent to the driver
                 // https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNSTRING
                 let mut uri = self

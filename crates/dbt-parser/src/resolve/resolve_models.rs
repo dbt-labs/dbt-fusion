@@ -1,38 +1,42 @@
 use crate::args::ResolveArgs;
-use crate::dbt_project_config::init_project_config;
 use crate::dbt_project_config::RootProjectConfigs;
+use crate::dbt_project_config::init_project_config;
+use crate::renderer::RenderCtx;
+use crate::renderer::RenderCtxInner;
+use crate::renderer::SqlFileRenderResult;
 use crate::renderer::collect_adapter_identifiers_detect_unsafe;
 use crate::renderer::render_unresolved_sql_files;
-use crate::renderer::SqlFileRenderResult;
+use crate::utils::RelationComponents;
+use crate::utils::convert_macro_names_to_unique_ids;
 use crate::utils::get_node_fqn;
 use crate::utils::get_original_file_path;
 use crate::utils::get_unique_id;
 use crate::utils::update_node_relation_components;
-use crate::utils::RelationComponents;
 
+use dbt_common::ErrorCode;
+use dbt_common::FsResult;
+use dbt_common::cancellation::CancellationToken;
 use dbt_common::error::AbstractLocation;
 use dbt_common::fs_err;
 use dbt_common::io_args::StaticAnalysisKind;
 use dbt_common::show_error;
 use dbt_common::show_warning;
-use dbt_common::ErrorCode;
-use dbt_common::FsResult;
-use dbt_jinja_utils::jinja_environment::JinjaEnvironment;
+use dbt_jinja_utils::jinja_environment::JinjaEnv;
 use dbt_jinja_utils::refs_and_sources::RefsAndSources;
+use dbt_schemas::schemas::CommonAttributes;
+use dbt_schemas::schemas::DbtModel;
+use dbt_schemas::schemas::DbtModelAttr;
+use dbt_schemas::schemas::IntrospectionKind;
+use dbt_schemas::schemas::NodeBaseAttributes;
 use dbt_schemas::schemas::common::DbtMaterialization;
 use dbt_schemas::schemas::common::DbtQuoting;
-use dbt_schemas::schemas::common::FreshnessRules;
+use dbt_schemas::schemas::common::ModelFreshnessRules;
 use dbt_schemas::schemas::common::NodeDependsOn;
 use dbt_schemas::schemas::dbt_column::process_columns;
 use dbt_schemas::schemas::project::DbtProject;
 use dbt_schemas::schemas::project::ModelConfig;
 use dbt_schemas::schemas::properties::ModelProperties;
 use dbt_schemas::schemas::ref_and_source::{DbtRef, DbtSourceWrapper};
-use dbt_schemas::schemas::CommonAttributes;
-use dbt_schemas::schemas::DbtModel;
-use dbt_schemas::schemas::DbtModelAttr;
-use dbt_schemas::schemas::IntrospectionKind;
-use dbt_schemas::schemas::NodeBaseAttributes;
 use dbt_schemas::state::DbtAsset;
 use dbt_schemas::state::DbtPackage;
 use dbt_schemas::state::DbtRuntimeConfig;
@@ -40,9 +44,7 @@ use dbt_schemas::state::ModelStatus;
 use dbt_schemas::state::RefsAndSourcesTracker;
 use minijinja::MacroSpans;
 
-use std::collections::BTreeMap;
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -62,11 +64,12 @@ pub async fn resolve_models(
     schema: &str,
     adapter_type: &str,
     package_name: &str,
-    env: &JinjaEnvironment<'static>,
+    env: Arc<JinjaEnv>,
     base_ctx: &BTreeMap<String, minijinja::Value>,
     runtime_config: Arc<DbtRuntimeConfig>,
     collected_tests: &mut Vec<DbtAsset>,
     refs_and_sources: &mut RefsAndSources,
+    token: &CancellationToken,
 ) -> FsResult<(
     HashMap<String, Arc<DbtModel>>,
     HashMap<String, (String, MacroSpans)>,
@@ -91,28 +94,36 @@ pub async fn resolve_models(
             },
         )?
     };
-    let mut model_sql_resources_map: Vec<SqlFileRenderResult<ModelConfig, ModelProperties>> =
-        render_unresolved_sql_files::<ModelConfig, ModelProperties>(
-            arg,
-            &package.model_sql_files,
-            package_name,
+
+    let render_ctx = RenderCtx {
+        inner: Arc::new(RenderCtxInner {
+            args: arg.clone(),
+            root_project_name: root_project.name.clone(),
+            root_project_config: root_project_configs.models.clone(),
             package_quoting,
-            adapter_type,
-            database,
-            schema,
-            env,
-            base_ctx,
-            model_properties,
-            root_project.name.as_str(),
-            &root_project_configs.models,
-            &local_project_config,
-            runtime_config.clone(),
-            &package
+            base_ctx: base_ctx.clone(),
+            package_name: package_name.to_string(),
+            adapter_type: adapter_type.to_string(),
+            database: database.to_string(),
+            schema: schema.to_string(),
+            local_project_config: local_project_config.clone(),
+            resource_paths: package
                 .dbt_project
                 .model_paths
                 .as_ref()
                 .unwrap_or(&vec![])
                 .clone(),
+        }),
+        jinja_env: env.clone(),
+        runtime_config: runtime_config.clone(),
+    };
+
+    let mut model_sql_resources_map: Vec<SqlFileRenderResult<ModelConfig, ModelProperties>> =
+        render_unresolved_sql_files::<ModelConfig, ModelProperties>(
+            &render_ctx,
+            &package.model_sql_files,
+            model_properties,
+            token,
         )
         .await?;
     // make deterministic
@@ -131,6 +142,7 @@ pub async fn resolve_models(
         sql_file_info,
         rendered_sql,
         macro_spans,
+        macro_calls,
         properties: maybe_properties,
         status,
         patch_path,
@@ -161,7 +173,7 @@ pub async fn resolve_models(
         model_config.enabled = Some(!(status == ModelStatus::Disabled));
 
         if let Some(freshness) = &model_config.freshness {
-            FreshnessRules::validate(freshness.build_after.as_ref()).map_err(|e| {
+            ModelFreshnessRules::validate(freshness.build_after.as_ref()).map_err(|e| {
                 fs_err!(
                     code => ErrorCode::InvalidConfig,
                     loc => dbt_asset.path.clone(),
@@ -221,7 +233,7 @@ pub async fn resolve_models(
         validate_merge_update_columns_xor(&model_config, &dbt_asset.path)?;
 
         if let Some(freshness) = &model_config.freshness {
-            FreshnessRules::validate(freshness.build_after.as_ref())?;
+            ModelFreshnessRules::validate(freshness.build_after.as_ref())?;
         }
 
         // Create the DbtModel with all properties already set
@@ -253,7 +265,11 @@ pub async fn resolve_models(
                 enabled: model_config.enabled.unwrap_or(true),
                 extended_model: false,
                 columns,
-                depends_on: NodeDependsOn::default(),
+                depends_on: NodeDependsOn {
+                    macros: convert_macro_names_to_unique_ids(&macro_calls),
+                    nodes: vec![],
+                    nodes_with_ref_location: vec![],
+                },
                 refs: sql_file_info
                     .refs
                     .iter()
@@ -282,6 +298,11 @@ pub async fn resolve_models(
                     .expect("quoting is required")
                     .try_into()
                     .expect("quoting is required"),
+                quoting_ignore_case: model_config
+                    .quoting
+                    .unwrap_or_default()
+                    .snowflake_ignore_case
+                    .unwrap_or(false),
                 static_analysis: model_config
                     .static_analysis
                     .unwrap_or(StaticAnalysisKind::On),
@@ -316,7 +337,7 @@ pub async fn resolve_models(
         // update model components using the generate_relation_components function
         update_node_relation_components(
             &mut dbt_model,
-            env,
+            &env,
             &root_project.name,
             package_name,
             base_ctx,
@@ -344,9 +365,9 @@ pub async fn resolve_models(
 
                 properties.as_testable().persist(
                     package_name,
-                    &arg.io.out_dir,
                     collected_tests,
                     adapter_type,
+                    &arg.io,
                 )?;
             }
             ModelStatus::Disabled => {
@@ -410,6 +431,7 @@ pub async fn resolve_models(
         package_name,
         &root_project.name,
         runtime_config,
+        token,
     )
     .await?;
     models.extend(models_with_execute);

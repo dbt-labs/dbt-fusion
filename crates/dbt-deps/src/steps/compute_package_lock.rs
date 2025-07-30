@@ -1,11 +1,12 @@
+use dbt_common::cancellation::CancellationToken;
 use dbt_common::io_args::IoArgs;
-use dbt_common::{err, fs_err, stdfs, ErrorCode, FsResult};
-use dbt_jinja_utils::jinja_environment::JinjaEnvironment;
+use dbt_common::{ErrorCode, FsResult, err, fs_err, stdfs};
+use dbt_jinja_utils::jinja_environment::JinjaEnv;
 use dbt_schemas::schemas::packages::{
     DbtPackageLock, DbtPackages, DbtPackagesLock, GitPackageLock, HubPackageLock, LocalPackageLock,
     PackageVersion, PrivatePackageLock, TarballPackageLock,
 };
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::{
     package_listing::UnpinnedPackage,
@@ -20,23 +21,27 @@ use super::load_dbt_packages;
 
 pub async fn compute_package_lock(
     io: &IoArgs,
-    jinja_env: &JinjaEnvironment<'static>,
+    vars: &BTreeMap<String, dbt_serde_yaml::Value>,
+    jinja_env: &JinjaEnv,
     hub_registry: &mut HubClient,
     dbt_packages: &DbtPackages,
+    token: &CancellationToken,
 ) -> FsResult<DbtPackagesLock> {
     let sha1_hash = sha1_hash_packages(&dbt_packages.packages);
     // First step, is to flatten into a single list of packages
     let mut dbt_packages_lock = DbtPackagesLock::default();
-    let mut package_listing = PackageListing::new(io.clone());
+    let mut package_listing = PackageListing::new(io.clone(), vars.clone());
     package_listing.hydrate_dbt_packages(dbt_packages, jinja_env)?;
-    let mut final_listing = PackageListing::new(io.clone());
+    let mut final_listing = PackageListing::new(io.clone(), vars.clone());
     hub_registry.hydrate_index().await?;
     resolve_packages(
         io,
+        vars,
         hub_registry,
         &mut final_listing,
         &mut package_listing,
         jinja_env,
+        token,
     )
     .await?;
     for package in final_listing.packages.values() {
@@ -95,12 +100,16 @@ pub async fn compute_package_lock(
             UnpinnedPackage::Tarball(tarball_unpinned_package) => {
                 let pinned_package: TarballPinnedPackage =
                     tarball_unpinned_package.clone().try_into()?;
+                let mut unrendered = pinned_package.unrendered;
+                // We remove the 'name' from unrendered so that we don't
+                // end up with two 'name' fields in the package lock.
+                unrendered.remove("name");
                 dbt_packages_lock
                     .packages
                     .push(DbtPackageLock::Tarball(TarballPackageLock {
                         tarball: tarball_unpinned_package.original_entry.tarball.clone(),
                         name: pinned_package.name,
-                        unrendered: pinned_package.unrendered,
+                        unrendered,
                     }));
             }
         }
@@ -129,14 +138,16 @@ pub async fn compute_package_lock(
 
 async fn resolve_packages(
     io: &IoArgs,
+    vars: &BTreeMap<String, dbt_serde_yaml::Value>,
     hub_registry: &mut HubClient,
     final_listing: &mut PackageListing,
     package_listing: &mut PackageListing,
-    jinja_env: &JinjaEnvironment<'static>,
+    jinja_env: &JinjaEnv,
+    token: &CancellationToken,
 ) -> FsResult<()> {
-    let mut next_listing = PackageListing::new(io.clone());
+    let mut next_listing = PackageListing::new(io.clone(), vars.clone());
     for unpinned_package in package_listing.packages.values_mut() {
-        dbt_common::check_cancellation!(io.should_cancel_compilation)?;
+        token.check_cancellation()?;
         match unpinned_package {
             UnpinnedPackage::Hub(hub_unpinned_package) => {
                 let pinned_package = hub_unpinned_package.resolved(hub_registry).await?;
@@ -245,10 +256,12 @@ async fn resolve_packages(
     if !next_listing.packages.is_empty() {
         Box::pin(resolve_packages(
             io,
+            vars,
             hub_registry,
             final_listing,
             &mut next_listing,
             jinja_env,
+            token,
         ))
         .await?;
     }

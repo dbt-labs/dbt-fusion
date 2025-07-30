@@ -6,11 +6,18 @@ use crate::types::{
     api::{ApiColumnType, ApiType},
     builtin::Type,
     class::DynClassType,
+    column_schema::ColumnSchemaType,
+    config::ConfigType,
     dict::DictType,
-    function::{DynFunctionType, UserDefinedFunctionType},
+    function::{DynFunctionType, LambdaType},
+    hook::HookType,
+    information_schema::InformationSchemaType,
     list::ListType,
+    model::ModelType,
+    node::NodeType,
     relation::RelationType,
     struct_::StructType,
+    tuple::TupleType,
     union::UnionType,
 };
 
@@ -236,14 +243,9 @@ fn parse_type(tokens: &[Token], index: usize) -> Result<(Type, usize), ParseErro
         Some(Token::OpenParen(_)) => {
             let (args, ret_type, consumed) = parse_lambda(tokens, index)?;
             Ok((
-                Type::Function(DynFunctionType::new(Arc::new(
-                    UserDefinedFunctionType::new(
-                        "lambda",
-                        args,
-                        ret_type,
-                        crate::CodeLocation::default(),
-                    ),
-                ))),
+                Type::Function(DynFunctionType::new(Arc::new(LambdaType::new(
+                    args, ret_type,
+                )))),
                 consumed,
             ))
         }
@@ -283,6 +285,10 @@ fn parse_type(tokens: &[Token], index: usize) -> Result<(Type, usize), ParseErro
                     ))
                 }
             }
+            "tuple" => {
+                let (elements, consumed) = parse_list(tokens, index + 1)?;
+                Ok((Type::Tuple(TupleType::new(elements)), 1 + consumed))
+            }
             "struct" => {
                 let (fields, consumed) = parse_fields(tokens, index + 1)?;
                 Ok((Type::Struct(StructType::new(fields)), 1 + consumed))
@@ -318,12 +324,39 @@ fn parse_type(tokens: &[Token], index: usize) -> Result<(Type, usize), ParseErro
                 Type::Class(DynClassType::new(Arc::new(ApiColumnType::default()))),
                 1,
             )),
+            "column_schema" => Ok((
+                Type::Class(DynClassType::new(Arc::new(ColumnSchemaType::default()))),
+                1,
+            )),
             "agate_table" => Ok((
                 Type::Class(DynClassType::new(Arc::new(AgateTableType::default()))),
                 1,
             )),
+            "model" => Ok((
+                Type::Class(DynClassType::new(Arc::new(ModelType::default()))),
+                1,
+            )),
             "none" => Ok((Type::None, 1)),
             "any" => Ok((Type::Any { hard: false }, 1)),
+            "information_schema" => Ok((
+                Type::Class(DynClassType::new(
+                    Arc::new(InformationSchemaType::default()),
+                )),
+                1,
+            )),
+            "timestamp" => Ok((Type::TimeStamp, 1)),
+            "config" => Ok((
+                Type::Class(DynClassType::new(Arc::new(ConfigType::default()))),
+                1,
+            )),
+            "hook" => Ok((
+                Type::Class(DynClassType::new(Arc::new(HookType::default()))),
+                1,
+            )),
+            "node" => Ok((
+                Type::Class(DynClassType::new(Arc::new(NodeType::default()))),
+                1,
+            )),
 
             _ => Err(ParseError::new(
                 format!("Unknown type: {id}"),
@@ -758,7 +791,7 @@ mod tests {
         // Third arg should be a function type: (relation, string, list[string]) -> string
         matches!(args[2], Type::Function(_));
         if let Type::Function(func) = &args[2] {
-            let func = func.downcast_ref::<UserDefinedFunctionType>().unwrap();
+            let func = func.downcast_ref::<LambdaType>().unwrap();
 
             // Function should have 3 args: relation, string, list[string]
             assert_eq!(func.args.len(), 3);

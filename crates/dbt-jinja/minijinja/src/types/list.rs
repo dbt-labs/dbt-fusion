@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::types::{
     builtin::Type,
     class::ClassType,
-    function::{DynFunctionType, FunctionType},
+    function::{ArgSpec, DynFunctionType, FunctionType},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -35,6 +35,7 @@ impl ClassType for ListType {
     fn subscript(&self, index: &Type) -> Result<Type, crate::Error> {
         match index {
             Type::Integer(_) => Ok(*self.element.clone()),
+            Type::Any { hard: true } => Ok(Type::Any { hard: true }),
             _ => Err(crate::Error::new(
                 crate::error::ErrorKind::InvalidOperation,
                 format!("Failed to subscript {self:?} with {index:?}"),
@@ -57,7 +58,7 @@ impl FunctionType for ListAppendFunctionType {
         Ok(Type::None)
     }
 
-    fn arg_names(&self) -> Vec<String> {
-        vec!["item".to_string()]
+    fn arg_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::new("value", false)]
     }
 }

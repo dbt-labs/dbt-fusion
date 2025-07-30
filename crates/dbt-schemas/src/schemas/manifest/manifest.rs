@@ -2,29 +2,21 @@ use chrono::{DateTime, Utc};
 use dbt_common::io_args::StaticAnalysisKind;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{
-    collections::{BTreeMap, HashMap},
-    sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
     dbt_utils::get_dbt_schema_version,
     schemas::{
+        CommonAttributes, DbtModel, DbtModelAttr, DbtSeed, DbtSnapshot, DbtSource, DbtTest,
+        DbtUnitTest, DbtUnitTestAttr, IntrospectionKind, NodeBaseAttributes, Nodes,
         common::{DbtChecksum, DbtMaterialization, DbtQuoting, NodeDependsOn},
-        macros::{DbtDocsMacro, DbtMacro},
         manifest::manifest_nodes::{
             ManifestDataTest, ManifestModel, ManifestOperation, ManifestSeed, ManifestSnapshot,
-            ManifestSource, ManifestUnitTest,
         },
         nodes::{DbtSeedAttr, DbtSnapshotAttr, DbtSourceAttr, DbtTestAttr},
-        CommonAttributes, DbtModel, DbtModelAttr, DbtSeed, DbtSnapshot, DbtSource, DbtTest,
-        DbtUnitTest, DbtUnitTestAttr, InternalDbtNode, IntrospectionKind, NodeBaseAttributes,
-        Nodes,
     },
     state::ResolverState,
 };
-
-use super::{DbtExposure, DbtGroup, DbtMetric, DbtSavedQuery, DbtSelector, DbtSemanticModel};
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,184 +74,11 @@ impl PartialEq for ManifestMetadata {
 
 impl Eq for ManifestMetadata {}
 
-/// External representation of the manifest, internal we use Nodes
-#[derive(Debug, Default, Deserialize)]
-pub struct DbtManifest {
-    pub metadata: ManifestMetadata,
-    pub nodes: BTreeMap<String, DbtNode>,
-    pub sources: BTreeMap<String, ManifestSource>,
-    pub macros: BTreeMap<String, DbtMacro>,
-    pub unit_tests: BTreeMap<String, ManifestUnitTest>,
-    pub docs: BTreeMap<String, DbtDocsMacro>,
-    pub semantic_models: BTreeMap<String, DbtSemanticModel>,
-    pub saved_queries: BTreeMap<String, DbtSavedQuery>,
-    pub exposures: BTreeMap<String, DbtExposure>,
-    pub metrics: BTreeMap<String, DbtMetric>,
-    pub child_map: BTreeMap<String, Vec<String>>,
-    pub parent_map: BTreeMap<String, Vec<String>>,
-    pub group_map: BTreeMap<String, Vec<String>>,
-    pub disabled: BTreeMap<String, Vec<Value>>,
-    pub selectors: BTreeMap<String, DbtSelector>,
-    pub groups: BTreeMap<String, DbtGroup>,
-}
+// Re-export the current version (V12) as the default
+pub use super::v12::DbtManifestV12;
 
-impl DbtManifest {
-    pub fn into_map_compiled_sql(self) -> HashMap<String, Option<String>> {
-        self.nodes
-            .into_iter()
-            .filter_map(|(id, node)| match node {
-                DbtNode::Model(model) => Some((id, model.base_attr.compiled_code)),
-                DbtNode::Test(test) => Some((id, test.base_attr.compiled_code)),
-                DbtNode::Snapshot(snapshot) => Some((id, snapshot.base_attr.compiled_code)),
-                DbtNode::Seed(seed) => Some((id, seed.base_attr.compiled_code)),
-                DbtNode::Operation(_operation) => None,
-                DbtNode::Analysis(analysis) => Some((id, analysis.base_attr.compiled_code)),
-            })
-            .collect::<HashMap<_, _>>()
-    }
-}
-
-impl Serialize for DbtManifest {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let mut map = BTreeMap::new();
-        map.insert(
-            "metadata".to_string(),
-            serde_json::to_value(&self.metadata).map_err(serde::ser::Error::custom)?,
-        );
-        map.insert(
-            "nodes".to_string(),
-            serde_json::to_value(&self.nodes).map_err(serde::ser::Error::custom)?,
-        );
-
-        // Serialize sources using InternalDbtNode trait
-        let sources_serialized: BTreeMap<String, Value> = self
-            .sources
-            .iter()
-            .map(|(k, v)| {
-                Ok((
-                    k.clone(),
-                    serialize_with_resource_type(
-                        serde_json::to_value(v).map_err(serde::ser::Error::custom)?,
-                        "source",
-                    ),
-                ))
-            })
-            .collect::<Result<_, _>>()?;
-        map.insert(
-            "sources".to_string(),
-            serde_json::to_value(sources_serialized).map_err(serde::ser::Error::custom)?,
-        );
-
-        // Serialize macros using InternalDbtNode trait
-        let macros_serialized: BTreeMap<String, Value> = self
-            .macros
-            .iter()
-            .map(|(k, v)| (k.clone(), InternalDbtNode::serialize(v)))
-            .collect();
-        map.insert(
-            "macros".to_string(),
-            serde_json::to_value(macros_serialized).map_err(serde::ser::Error::custom)?,
-        );
-
-        // Serialize unit_tests using InternalDbtNode trait
-        let unit_tests_serialized: BTreeMap<String, Value> = self
-            .unit_tests
-            .iter()
-            .map(|(k, v)| {
-                Ok((
-                    k.clone(),
-                    serialize_with_resource_type(
-                        serde_json::to_value(v).map_err(serde::ser::Error::custom)?,
-                        "unit_test",
-                    ),
-                ))
-            })
-            .collect::<Result<_, _>>()?;
-        map.insert(
-            "unit_tests".to_string(),
-            serde_json::to_value(unit_tests_serialized).map_err(serde::ser::Error::custom)?,
-        );
-
-        map.insert(
-            "docs".to_string(),
-            serde_json::to_value(&self.docs).map_err(serde::ser::Error::custom)?,
-        );
-
-        // Serialize semantic_models using InternalDbtNode trait
-        let semantic_models_serialized: BTreeMap<String, Value> = self
-            .semantic_models
-            .iter()
-            .map(|(k, v)| (k.clone(), InternalDbtNode::serialize(v)))
-            .collect();
-        map.insert(
-            "semantic_models".to_string(),
-            serde_json::to_value(semantic_models_serialized).map_err(serde::ser::Error::custom)?,
-        );
-
-        // Serialize saved_queries using InternalDbtNode trait
-        let saved_queries_serialized: BTreeMap<String, Value> = self
-            .saved_queries
-            .iter()
-            .map(|(k, v)| (k.clone(), InternalDbtNode::serialize(v)))
-            .collect();
-        map.insert(
-            "saved_queries".to_string(),
-            serde_json::to_value(saved_queries_serialized).map_err(serde::ser::Error::custom)?,
-        );
-
-        // Serialize exposures using InternalDbtNode trait
-        let exposures_serialized: BTreeMap<String, Value> = self
-            .exposures
-            .iter()
-            .map(|(k, v)| (k.clone(), InternalDbtNode::serialize(v)))
-            .collect();
-        map.insert(
-            "exposures".to_string(),
-            serde_json::to_value(exposures_serialized).map_err(serde::ser::Error::custom)?,
-        );
-
-        // Serialize metrics using InternalDbtNode trait
-        let metrics_serialized: BTreeMap<String, Value> = self
-            .metrics
-            .iter()
-            .map(|(k, v)| (k.clone(), InternalDbtNode::serialize(v)))
-            .collect();
-        map.insert(
-            "metrics".to_string(),
-            serde_json::to_value(metrics_serialized).map_err(serde::ser::Error::custom)?,
-        );
-
-        map.insert(
-            "child_map".to_string(),
-            serde_json::to_value(&self.child_map).map_err(serde::ser::Error::custom)?,
-        );
-        map.insert(
-            "parent_map".to_string(),
-            serde_json::to_value(&self.parent_map).map_err(serde::ser::Error::custom)?,
-        );
-        map.insert(
-            "group_map".to_string(),
-            serde_json::to_value(&self.group_map).map_err(serde::ser::Error::custom)?,
-        );
-        map.insert(
-            "disabled".to_string(),
-            serde_json::to_value(&self.disabled).map_err(serde::ser::Error::custom)?,
-        );
-        map.insert(
-            "selectors".to_string(),
-            serde_json::to_value(&self.selectors).map_err(serde::ser::Error::custom)?,
-        );
-        map.insert(
-            "groups".to_string(),
-            serde_json::to_value(&self.groups).map_err(serde::ser::Error::custom)?,
-        );
-
-        map.serialize(serializer)
-    }
-}
+// Type aliases for backwards compatibility
+pub type DbtManifest = DbtManifestV12;
 
 pub fn serialize_with_resource_type(mut value: Value, resource_type: &str) -> Value {
     if let Value::Object(ref mut map) = value {
@@ -337,6 +156,12 @@ pub fn build_manifest(invocation_id: &str, resolver_state: &ResolverState) -> Db
             .iter()
             .map(|(id, source)| (id.clone(), (**source).clone().into()))
             .collect(),
+        exposures: resolver_state
+            .nodes
+            .exposures
+            .iter()
+            .map(|(id, exposure)| (id.clone(), (**exposure).clone().into()))
+            .collect(),
         unit_tests: resolver_state
             .nodes
             .unit_tests
@@ -401,6 +226,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                                 .unwrap_or(dbt_quoting)
                                 .try_into()
                                 .expect("DbtQuoting should be set"),
+                            quoting_ignore_case: false,
                             columns: model.base_attr.columns,
                             depends_on: model.base_attr.depends_on,
                             refs: model.base_attr.refs,
@@ -470,6 +296,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                                 .unwrap_or(dbt_quoting)
                                 .try_into()
                                 .expect("DbtQuoting should be set"),
+                            quoting_ignore_case: false,
                             columns: test.base_attr.columns,
                             depends_on: test.base_attr.depends_on,
                             refs: test.base_attr.refs,
@@ -534,6 +361,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                                 .unwrap_or(dbt_quoting)
                                 .try_into()
                                 .expect("DbtQuoting should be set"),
+                            quoting_ignore_case: false,
                             columns: snapshot.base_attr.columns,
                             depends_on: snapshot.base_attr.depends_on,
                             refs: snapshot.base_attr.refs,
@@ -596,6 +424,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                                 .unwrap_or(dbt_quoting)
                                 .try_into()
                                 .expect("DbtQuoting should be set"),
+                            quoting_ignore_case: false,
                             extended_model: false,
                             columns: seed.base_attr.columns,
                             depends_on: seed.base_attr.depends_on,
@@ -660,6 +489,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                         .unwrap_or(dbt_quoting)
                         .try_into()
                         .expect("DbtQuoting should be set"),
+                    quoting_ignore_case: false,
                     columns: source.columns,
                     depends_on: NodeDependsOn::default(),
                     refs: vec![],
@@ -677,6 +507,55 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                 },
                 deprecated_config: source.config,
                 other: source.other,
+            }),
+        );
+    }
+    for (unique_id, exposure) in manifest.exposures {
+        nodes.exposures.insert(
+            unique_id,
+            Arc::new(crate::schemas::nodes::DbtExposure {
+                common_attr: CommonAttributes {
+                    name: exposure.common_attr.name,
+                    package_name: exposure.common_attr.package_name,
+                    path: exposure.common_attr.path,
+                    original_file_path: exposure.common_attr.original_file_path,
+                    patch_path: None,
+                    unique_id: exposure.common_attr.unique_id,
+                    fqn: exposure.common_attr.fqn,
+                    description: exposure.common_attr.description,
+                    checksum: Default::default(),
+                    language: None,
+                    raw_code: None,
+                    tags: vec![],
+                    meta: BTreeMap::new(),
+                },
+                base_attr: NodeBaseAttributes {
+                    database: "".to_string(),
+                    schema: "".to_string(),
+                    alias: "".to_string(),
+                    relation_name: None,
+                    quoting: Default::default(),
+                    materialized: Default::default(),
+                    static_analysis: Default::default(),
+                    enabled: true,
+                    extended_model: false,
+                    columns: BTreeMap::new(),
+                    refs: exposure.base_attr.refs,
+                    sources: exposure.base_attr.sources,
+                    metrics: exposure.base_attr.metrics,
+                    depends_on: exposure.base_attr.depends_on,
+                    quoting_ignore_case: false,
+                },
+                exposure_attr: crate::schemas::nodes::DbtExposureAttr {
+                    owner: exposure.owner,
+                    label: exposure.label,
+                    maturity: exposure.maturity,
+                    type_: exposure.type_,
+                    url: exposure.url,
+                    unrendered_config: exposure.base_attr.unrendered_config,
+                    created_at: exposure.base_attr.created_at,
+                },
+                deprecated_config: exposure.config,
             }),
         );
     }
@@ -712,6 +591,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                     materialized: DbtMaterialization::Table,
                     static_analysis: StaticAnalysisKind::On,
                     quoting: dbt_quoting.try_into().expect("DbtQuoting should be set"),
+                    quoting_ignore_case: false,
                     enabled: unit_test.config.enabled.unwrap_or(true),
                     extended_model: false,
                     columns: unit_test.base_attr.columns,

@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::{collections::BTreeMap, sync::Arc};
 
+use dbt_common::cancellation::CancellationToken;
 use dbt_common::io_args::StaticAnalysisKind;
 use dbt_common::show_error;
-use dbt_common::{error::AbstractLocation, FsResult};
-use dbt_jinja_utils::{jinja_environment::JinjaEnvironment, refs_and_sources::RefsAndSources};
+use dbt_common::{FsResult, error::AbstractLocation};
+use dbt_jinja_utils::{jinja_environment::JinjaEnv, refs_and_sources::RefsAndSources};
 use dbt_schemas::schemas::common::{Access, DbtMaterialization, DbtQuoting, ResolvedQuoting};
 use dbt_schemas::schemas::dbt_column::process_columns;
 use dbt_schemas::schemas::project::ModelConfig;
@@ -12,22 +13,26 @@ use dbt_schemas::schemas::{DbtModelAttr, IntrospectionKind};
 use dbt_schemas::state::{ModelStatus, RefsAndSourcesTracker};
 use dbt_schemas::{
     schemas::{
+        CommonAttributes, DbtModel, NodeBaseAttributes,
         common::NodeDependsOn,
         project::DbtProject,
         properties::ModelProperties,
         ref_and_source::{DbtRef, DbtSourceWrapper},
-        CommonAttributes, DbtModel, NodeBaseAttributes,
     },
     state::{DbtPackage, DbtRuntimeConfig},
 };
 use minijinja::MacroSpans;
 
-use crate::dbt_project_config::{init_project_config, RootProjectConfigs};
+use crate::dbt_project_config::{RootProjectConfigs, init_project_config};
+use crate::renderer::{RenderCtx, RenderCtxInner};
 use crate::utils::RelationComponents;
 use crate::{
     args::ResolveArgs,
-    renderer::{render_unresolved_sql_files, SqlFileRenderResult},
-    utils::{get_node_fqn, get_original_file_path, get_unique_id, update_node_relation_components},
+    renderer::{SqlFileRenderResult, render_unresolved_sql_files},
+    utils::{
+        convert_macro_names_to_unique_ids, get_node_fqn, get_original_file_path, get_unique_id,
+        update_node_relation_components,
+    },
 };
 
 use super::resolve_properties::MinimalPropertiesEntry;
@@ -44,10 +49,11 @@ pub async fn resolve_analyses(
     schema: &str,
     adapter_type: &str,
     package_name: &str,
-    env: &JinjaEnvironment<'static>,
+    env: Arc<JinjaEnv>,
     base_ctx: &BTreeMap<String, minijinja::Value>,
     runtime_config: Arc<DbtRuntimeConfig>,
     refs_and_sources: &mut RefsAndSources,
+    token: &CancellationToken,
 ) -> FsResult<(
     HashMap<String, Arc<DbtModel>>,
     HashMap<String, (String, MacroSpans)>,
@@ -69,28 +75,35 @@ pub async fn resolve_analyses(
         )?
     };
 
-    let mut analysis_sql_resources_map =
-        render_unresolved_sql_files::<ModelConfig, ModelProperties>(
-            arg,
-            &package.analysis_files,
-            package_name,
+    let render_ctx = RenderCtx {
+        inner: Arc::new(RenderCtxInner {
+            args: arg.clone(),
+            root_project_name: root_project.name.clone(),
+            root_project_config: root_project_configs.models.clone(),
             package_quoting,
-            adapter_type,
-            database,
-            schema,
-            env,
-            base_ctx,
-            model_properties,
-            root_project.name.as_str(),
-            &root_project_configs.models,
-            &local_project_config,
-            runtime_config.clone(),
-            &package
+            base_ctx: base_ctx.clone(),
+            package_name: package_name.to_string(),
+            adapter_type: adapter_type.to_string(),
+            database: database.to_string(),
+            schema: schema.to_string(),
+            local_project_config: local_project_config.clone(),
+            resource_paths: package
                 .dbt_project
                 .analysis_paths
                 .as_ref()
                 .unwrap_or(&vec![])
                 .clone(),
+        }),
+        jinja_env: env.clone(),
+        runtime_config: runtime_config.clone(),
+    };
+
+    let mut analysis_sql_resources_map =
+        render_unresolved_sql_files::<ModelConfig, ModelProperties>(
+            &render_ctx,
+            &package.analysis_files,
+            model_properties,
+            token,
         )
         .await?;
     // make deterministic
@@ -107,6 +120,7 @@ pub async fn resolve_analyses(
         sql_file_info,
         rendered_sql,
         macro_spans,
+        macro_calls,
         properties: maybe_properties,
         status,
         patch_path,
@@ -173,9 +187,14 @@ pub async fn resolve_analyses(
                 extended_model: false,
                 materialized: DbtMaterialization::Analysis,
                 quoting: ResolvedQuoting::trues(),
+                quoting_ignore_case: false,
                 static_analysis: StaticAnalysisKind::On,
                 columns,
-                depends_on: NodeDependsOn::default(),
+                depends_on: NodeDependsOn {
+                    macros: convert_macro_names_to_unique_ids(&macro_calls),
+                    nodes: vec![],
+                    nodes_with_ref_location: vec![],
+                },
                 refs: sql_file_info
                     .refs
                     .iter()
@@ -228,7 +247,7 @@ pub async fn resolve_analyses(
         // update model components using the generate_relation_components function
         update_node_relation_components(
             &mut dbt_model,
-            env,
+            &env,
             &root_project.name,
             package_name,
             base_ctx,

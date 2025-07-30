@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::types::{
     builtin::Type,
     class::ClassType,
-    function::{DynFunctionType, FunctionType},
+    function::{ArgSpec, DynFunctionType, FunctionType},
     iterable::IterableType,
     tuple::TupleType,
 };
@@ -39,6 +39,7 @@ impl ClassType for DictType {
     fn subscript(&self, index: &Type) -> Result<Type, crate::Error> {
         match index {
             Type::String(_) | Type::Integer(_) => Ok(*self.value.clone()),
+            Type::Any { hard: true } => Ok(Type::Any { hard: true }),
             _ => Err(crate::Error::new(
                 crate::error::ErrorKind::InvalidOperation,
                 format!("Failed to subscript {self:?} with {index:?}"),
@@ -75,7 +76,7 @@ impl FunctionType for DictItemsFunction {
         Ok(Type::Iterable(IterableType::new(element_type)))
     }
 
-    fn arg_names(&self) -> Vec<String> {
+    fn arg_specs(&self) -> Vec<ArgSpec> {
         vec![]
     }
 }

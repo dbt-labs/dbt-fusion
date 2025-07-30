@@ -1,3 +1,4 @@
+// use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::{collections::HashMap, fmt::Display};
 
 use dbt_proc_macros::include_frontend_error_codes;
@@ -105,6 +106,7 @@ pub enum ErrorCode {
 
     DependencyWarning = 1065,
 
+    AccessDenied = 1066,
     // --------------------------------------------------------------------------------------------
     // Jinja
     MacroUnsupportedValueType = 1500,
@@ -157,6 +159,7 @@ pub enum ErrorCode {
     NotImplemented = 9003,
     InvalidTableNameInCLI = 9004,
     CoalesceHasOnlyNulls = 9005,
+    CacheWarning = 9010,
     // ExitRepl is not really an error, but a special error code that is used to
     // signal the repl to exit gracefully:
     ExitRepl = 9006,

@@ -1,25 +1,28 @@
-use crate::dbt_project_config::init_project_config;
 use crate::dbt_project_config::RootProjectConfigs;
+use crate::dbt_project_config::init_project_config;
 use crate::resolve::resolve_properties::MinimalPropertiesEntry;
 use crate::utils::get_node_fqn;
 use crate::utils::get_unique_id;
+use dbt_common::CodeLocation;
+use dbt_common::ErrorCode;
+use dbt_common::FsResult;
 use dbt_common::err;
 use dbt_common::error::AbstractLocation;
 use dbt_common::fs_err;
 use dbt_common::io_args::IoArgs;
 use dbt_common::io_args::StaticAnalysisKind;
-use dbt_common::CodeLocation;
-use dbt_common::ErrorCode;
-use dbt_common::FsResult;
-use dbt_jinja_utils::jinja_environment::JinjaEnvironment;
+use dbt_jinja_utils::jinja_environment::JinjaEnv;
 use dbt_jinja_utils::phases::parse::build_resolve_model_context;
-use dbt_jinja_utils::phases::parse::render_extract_ref_or_source_expr;
 use dbt_jinja_utils::phases::parse::sql_resource::SqlResource;
 use dbt_jinja_utils::serde::into_typed_with_jinja;
+use dbt_jinja_utils::utils::render_extract_ref_or_source_expr;
+use dbt_schemas::schemas::DbtModel;
+use dbt_schemas::schemas::DbtUnitTestAttr;
 use dbt_schemas::schemas::common::DbtChecksum;
 use dbt_schemas::schemas::common::DbtMaterialization;
 use dbt_schemas::schemas::common::DbtQuoting;
 use dbt_schemas::schemas::common::Expect;
+use dbt_schemas::schemas::common::Formats;
 use dbt_schemas::schemas::common::Given;
 use dbt_schemas::schemas::common::NodeDependsOn;
 use dbt_schemas::schemas::packages::DeprecatedDbtPackageLock;
@@ -29,8 +32,6 @@ use dbt_schemas::schemas::project::UnitTestConfig;
 use dbt_schemas::schemas::properties::UnitTestProperties;
 use dbt_schemas::schemas::ref_and_source::DbtRef;
 use dbt_schemas::schemas::ref_and_source::DbtSourceWrapper;
-use dbt_schemas::schemas::DbtModel;
-use dbt_schemas::schemas::DbtUnitTestAttr;
 use dbt_schemas::schemas::{CommonAttributes, DbtUnitTest, NodeBaseAttributes};
 use dbt_schemas::state::DbtPackage;
 use dbt_schemas::state::DbtRuntimeConfig;
@@ -39,9 +40,9 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn resolve_unit_tests(
@@ -53,7 +54,7 @@ pub fn resolve_unit_tests(
     root_project_configs: &RootProjectConfigs,
     adapter_type: &str,
     package_name: &str,
-    jinja_env: &JinjaEnvironment<'static>,
+    jinja_env: &JinjaEnv,
     base_ctx: &BTreeMap<String, minijinja::Value>,
     model_properties: &BTreeMap<String, MinimalPropertiesEntry>,
     runtime_config: Arc<DbtRuntimeConfig>,
@@ -197,6 +198,53 @@ pub fn resolve_unit_tests(
                 }
             }
         }
+
+        let mut file_map: BTreeMap<String, String> = BTreeMap::new();
+
+        for asset in package.fixture_files.iter() {
+            asset.path.file_name().map(|file_name| {
+                file_map.insert(
+                    file_name.to_string_lossy().to_string(),
+                    asset.path.to_string_lossy().to_string(),
+                )
+            });
+        }
+
+        let given = unit_test.given.as_ref().map_or(vec![], |vec| {
+            vec.iter()
+                .map(|given| {
+                    let full_path: Option<String> = match given.fixture {
+                        Some(ref fixture) if given.format == Formats::Csv => {
+                            file_map.get(&(fixture.clone() + ".csv")).cloned()
+                        }
+                        _ => given.fixture.clone(),
+                    };
+
+                    Given {
+                        fixture: full_path,
+                        input: given.input.clone(),
+                        rows: given.rows.clone(),
+                        format: given.format.clone(),
+                    }
+                })
+                .collect::<Vec<_>>()
+        });
+
+        let expect = {
+            let full_path: Option<String> = match unit_test.expect.fixture {
+                Some(ref fixture) if unit_test.expect.format == Formats::Csv => {
+                    file_map.get(&(fixture.clone() + ".csv")).cloned()
+                }
+                _ => unit_test.expect.fixture.clone(),
+            };
+
+            Expect {
+                fixture: full_path,
+                rows: unit_test.expect.rows.clone(),
+                format: unit_test.expect.format.clone(),
+            }
+        };
+
         let base_unit_test = DbtUnitTest {
             common_attr: CommonAttributes {
                 name: unit_test_name.to_owned(),
@@ -228,6 +276,7 @@ pub fn resolve_unit_tests(
                 enabled,
                 extended_model: false,
                 quoting: package_quoting.try_into()?,
+                quoting_ignore_case: package_quoting.snowflake_ignore_case.unwrap_or(false),
                 materialized: DbtMaterialization::Unit,
                 static_analysis: properties_config
                     .static_analysis
@@ -237,8 +286,8 @@ pub fn resolve_unit_tests(
             },
             unit_test_attr: DbtUnitTestAttr {
                 model: unit_test.model.to_owned(),
-                given: unit_test.given.clone().unwrap_or_default(),
-                expect: unit_test.expect.clone(),
+                given,
+                expect,
                 versions: None,
                 version: None,
                 overrides: unit_test.overrides.clone(),

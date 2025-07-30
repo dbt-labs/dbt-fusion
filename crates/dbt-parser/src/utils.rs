@@ -1,20 +1,20 @@
 //! Utility functions for the resolver
 use crate::resolve::resolve_properties::MinimalPropertiesEntry;
 use dbt_common::io_args::IoArgs;
-use dbt_common::{fs_err, show_error, ErrorCode, FsError, FsResult};
-use dbt_jinja_utils::jinja_environment::JinjaEnvironment;
+use dbt_common::{ErrorCode, FsError, FsResult, fs_err, show_error};
+use dbt_jinja_utils::jinja_environment::JinjaEnv;
 use dbt_jinja_utils::phases::parse::sql_resource::SqlResource;
 use dbt_jinja_utils::utils::{generate_component_name, generate_relation_name};
-use dbt_schemas::schemas::common::{normalize_quoting, DbtMaterialization, ResolvedQuoting};
+use dbt_schemas::schemas::InternalDbtNodeAttributes;
+use dbt_schemas::schemas::common::{DbtMaterialization, ResolvedQuoting, normalize_quoting};
 use dbt_schemas::schemas::project::DefaultTo;
 use dbt_schemas::schemas::properties::ModelProperties;
-use dbt_schemas::schemas::InternalDbtNodeAttributes;
 use minijinja::compiler::ast::{MacroKind, Stmt};
 use minijinja::compiler::parser::Parser;
 use minijinja::machinery::WhitespaceConfig;
 use minijinja::syntax::SyntaxConfig;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -193,7 +193,7 @@ pub fn trigger_duplicate_errors(io: &IoArgs, duplicate_errors: &mut Vec<FsError>
 /// Returns components that can be used to update a node
 /// https://github.com/dbt-labs/dbt-core/blob/a1958c119399f765ad43e49b8b12c88cf3ec1245/core/dbt/parser/base.py#L287
 pub fn generate_relation_components(
-    env: &JinjaEnvironment<'static>,
+    env: &JinjaEnv,
     root_project_name: &str,
     current_project_name: &str,
     base_ctx: &BTreeMap<String, minijinja::Value>,
@@ -304,7 +304,7 @@ pub struct RelationComponents {
 /// This consolidates a common pattern across resolver modules.
 pub fn update_node_relation_components(
     node: &mut dyn InternalDbtNodeAttributes,
-    jinja_env: &JinjaEnvironment<'static>,
+    jinja_env: &JinjaEnv,
     root_project_name: &str,
     package_name: &str,
     base_ctx: &BTreeMap<String, minijinja::Value>,
@@ -432,4 +432,23 @@ fn parse_macro_ast<T: DefaultTo<T>>(ast: &Stmt, sql_resources: &mut Vec<SqlResou
         }
         _ => {}
     }
+}
+
+/// Convert macro names to unique IDs
+/// For now, we'll use a simple heuristic to determine the package name
+/// In the future, this should be improved to look up macros in the macro registry
+pub fn convert_macro_names_to_unique_ids(macro_calls: &HashSet<String>) -> Vec<String> {
+    macro_calls
+        .iter()
+        .filter_map(|name| {
+            // Check if the macro name already contains a package prefix
+            if name.contains('.') {
+                // It's already in the format package.macro_name
+                Some(format!("macro.{name}"))
+            } else {
+                // If name doesn't contain '.', assume it's a function in context, don't collect
+                None
+            }
+        })
+        .collect()
 }

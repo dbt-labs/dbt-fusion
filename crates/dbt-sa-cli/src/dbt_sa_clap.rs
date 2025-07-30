@@ -1,4 +1,4 @@
-use clap::{builder::BoolishValueParser, ArgAction};
+use clap::{ArgAction, builder::BoolishValueParser};
 use console::Style;
 use dbt_common::logging::LogFormat;
 use dbt_serde_yaml::Value;
@@ -12,15 +12,15 @@ use std::{
 use strum::IntoEnumIterator;
 
 use dbt_common::io_args::{
-    check_selector, check_var, ClapResourceType, DisplayFormat, EvalArgs, IoArgs, JsonSchemaTypes,
-    Phases, ShowOptions, SystemArgs,
+    ClapResourceType, DisplayFormat, EvalArgs, IoArgs, JsonSchemaTypes, Phases, ShowOptions,
+    SystemArgs, check_selector, check_var,
 };
 use dbt_common::row_limit::RowLimit;
 
 use clap::arg;
 use clap::{Parser, Subcommand};
 
-use dbt_common::node_selector::{parse_model_specifiers, IndirectSelection};
+use dbt_common::node_selector::{IndirectSelection, parse_model_specifiers};
 
 const DEFAULT_LIMIT: &str = "10";
 static DEFAULT_FORMAT: LazyLock<String> = LazyLock::new(|| DisplayFormat::Table.to_string());
@@ -130,7 +130,7 @@ pub struct ListArgs {
     #[arg(long, default_value=DEFAULT_LIMIT, allow_hyphen_values = true, hide = true)]
     pub limit: RowLimit,
 
-    /// Display rows in different formats, only table and json supported...
+    /// Display rows in different formats. Supports table, json, selector, name, and path formats.
     #[arg(global = true, long, aliases = ["format"])]
     pub output: Option<DisplayFormat>,
 
@@ -237,7 +237,7 @@ pub struct CommonArgs {
     /// Write JSON artifacts to disk [env: DBT_WRITE_JSON=]. Use --no-write-json to suppress writing JSON artifacts.
     #[arg(global = true, long,  default_value_t=true,  action = ArgAction::SetTrue, env = "DBT_WRITE_JSON", value_parser = BoolishValueParser::new())]
     pub write_json: bool,
-    #[arg(global = true,long,action = ArgAction::SetTrue,  default_value_t=false, env = "DBT_WRITE_JSON",value_parser = BoolishValueParser::new(),hide = true,conflicts_with = "write_json")]
+    #[arg(global = true,long,action = ArgAction::SetTrue,  default_value_t=false, value_parser = BoolishValueParser::new(),hide = true)]
     pub no_write_json: bool,
 
     /// Set 'log-path' for the current run, overriding 'DBT_LOG_PATH'.
@@ -259,9 +259,11 @@ pub struct CommonArgs {
     #[arg(global = true, long, env = "DBT_LOG_LEVEL_FILE")]
     pub log_level_file: Option<LevelFilter>,
 
-    /// Set send_anonymous_usage_stats for sending vortex events
-    #[arg(global = true, long, default_value = "true", env = "SEND_ANONYMOUS_USAGE_STATE", value_parser = BoolishValueParser::new())]
+    // Send anonymous usage stats to dbt Labs.
+    #[arg(global = true, long, default_value_t=true, action = ArgAction::SetTrue, env = "DBT_SEND_ANONYMOUS_USAGE_STATS", value_parser = BoolishValueParser::new())]
     pub send_anonymous_usage_stats: bool,
+    #[arg(global = true, long, default_value_t=false, action = ArgAction::SetTrue, value_parser = BoolishValueParser::new())]
+    pub no_send_anonymous_usage_stats: bool,
 
     /// Debug flag
     #[arg(global = true, long, short = 'd', default_value = "false", action = ArgAction::SetTrue,  env = "DBT_DEBUG", value_parser = BoolishValueParser::new(),hide = true)]
@@ -402,12 +404,15 @@ impl InitArgs {
                 invocation_id: arg.io.invocation_id,
                 send_anonymous_usage_stats: self.common_args.send_anonymous_usage_stats,
                 status_reporter: arg.io.status_reporter.clone(),
-                should_cancel_compilation: arg.io.should_cancel_compilation.clone(),
                 log_format: self.common_args.log_format,
                 log_level: self.common_args.log_level,
                 log_level_file: self.common_args.log_level_file,
                 log_path: self.common_args.log_path.clone(),
                 trace_path: self.common_args.trace_path.clone(),
+                show_timings: arg.from_main,
+                build_cache_mode: arg.io.build_cache_mode,
+                build_cache_url: arg.io.build_cache_url,
+                build_cache_cas_url: arg.io.build_cache_cas_url,
             },
             ..Default::default()
         }
@@ -483,12 +488,15 @@ impl CommonArgs {
                 out_dir: out_dir.to_path_buf(),
                 send_anonymous_usage_stats: arg.io.send_anonymous_usage_stats,
                 status_reporter: arg.io.status_reporter.clone(),
-                should_cancel_compilation: arg.io.should_cancel_compilation.clone(),
                 log_format: self.log_format,
                 log_level: self.log_level,
                 log_level_file: self.log_level_file,
                 log_path: self.log_path.clone(),
                 trace_path: self.trace_path.clone(),
+                show_timings: arg.from_main,
+                build_cache_mode: arg.io.build_cache_mode,
+                build_cache_url: arg.io.build_cache_url,
+                build_cache_cas_url: arg.io.build_cache_cas_url,
             },
             profiles_dir: self.profiles_dir.clone(),
             packages_install_path: self.packages_install_path.clone(),
@@ -529,9 +537,21 @@ impl CommonArgs {
             log_path: self.log_path.clone(),
             project_dir: self.project_dir.clone(),
             quiet: self.quiet,
-            write_json: !self.no_write_json,
+            write_json: if self.no_write_json {
+                false
+            } else {
+                self.write_json
+            },
             target_path: self.target_path.clone(),
             ..Default::default()
+        }
+    }
+
+    pub fn get_send_anonymous_usage_stats(&self) -> bool {
+        if self.no_send_anonymous_usage_stats {
+            false
+        } else {
+            self.send_anonymous_usage_stats
         }
     }
 }
@@ -544,9 +564,8 @@ pub fn from_main(cli: &Cli) -> SystemArgs {
             show: cli.common_args().show.iter().cloned().collect(),
             in_dir: PathBuf::new(),
             out_dir: PathBuf::new(),
-            send_anonymous_usage_stats: cli.common_args().send_anonymous_usage_stats,
+            send_anonymous_usage_stats: cli.common_args().get_send_anonymous_usage_stats(),
             status_reporter: None,
-            should_cancel_compilation: None,
             log_format: cli.common_args().log_format,
             log_level: match (cli.common_args().debug, cli.common_args().log_level) {
                 (true, Some(LevelFilter::Trace)) => Some(LevelFilter::Trace),
@@ -560,6 +579,10 @@ pub fn from_main(cli: &Cli) -> SystemArgs {
             },
             log_path: cli.common_args().log_path,
             trace_path: cli.common_args().trace_path,
+            show_timings: true, // always true for main
+            build_cache_mode: None,
+            build_cache_url: None,
+            build_cache_cas_url: None,
         },
         from_main: true,
 
@@ -576,14 +599,17 @@ pub fn from_lib(cli: &Cli) -> SystemArgs {
             show: cli.common_args().show.iter().cloned().collect(),
             in_dir: PathBuf::new(),
             out_dir: PathBuf::new(),
-            send_anonymous_usage_stats: cli.common_args().send_anonymous_usage_stats,
+            send_anonymous_usage_stats: cli.common_args().get_send_anonymous_usage_stats(),
             status_reporter: None,
-            should_cancel_compilation: None,
             log_format: cli.common_args().log_format,
             log_level: cli.common_args().log_level,
             log_level_file: cli.common_args().log_level_file,
             log_path: cli.common_args().log_path,
             trace_path: cli.common_args().trace_path,
+            show_timings: false, // always false for lib
+            build_cache_mode: None,
+            build_cache_url: None,
+            build_cache_cas_url: None,
         },
         from_main: false,
         target: cli.common_args().target,

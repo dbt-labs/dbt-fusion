@@ -1,9 +1,10 @@
 use core::fmt;
+use std::str::FromStr;
 use std::{any::Any, collections::BTreeMap, fmt::Display, path::PathBuf, sync::Arc};
 
-use dbt_common::{err, io_args::StaticAnalysisKind, ErrorCode, FsResult};
+use dbt_common::{ErrorCode, FsResult, err, io_args::StaticAnalysisKind};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use serde_with::skip_serializing_none;
 
 use crate::schemas::{
@@ -13,10 +14,11 @@ use crate::schemas::{
     },
     dbt_column::DbtColumn,
     macros::DbtMacro,
-    manifest::{DbtExposure, DbtMetric, DbtSavedQuery, DbtSemanticModel},
+    manifest::common::DbtOwner,
+    manifest::{DbtMetric, DbtSavedQuery, DbtSemanticModel},
     project::{
-        DataTestConfig, ModelConfig, SeedConfig, SnapshotConfig, SnapshotMetaColumnNames,
-        SourceConfig, UnitTestConfig,
+        DataTestConfig, ExposureConfig, ModelConfig, SeedConfig, SnapshotConfig,
+        SnapshotMetaColumnNames, SourceConfig, UnitTestConfig,
     },
     properties::{ModelConstraint, ModelFreshness, UnitTestOverrides},
     ref_and_source::{DbtRef, DbtSourceWrapper},
@@ -26,6 +28,7 @@ use crate::schemas::{
 #[derive(
     Default, Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum IntrospectionKind {
     #[default]
     None,
@@ -45,6 +48,21 @@ impl Display for IntrospectionKind {
             IntrospectionKind::InternalSchema => write!(f, "internal_schema"),
             IntrospectionKind::ExternalSchema => write!(f, "external_schema"),
             IntrospectionKind::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
+impl FromStr for IntrospectionKind {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "none" => Ok(IntrospectionKind::None),
+            "execute" => Ok(IntrospectionKind::Execute),
+            "upstream_schema" => Ok(IntrospectionKind::UpstreamSchema),
+            "internal_schema" => Ok(IntrospectionKind::InternalSchema),
+            "external_schema" => Ok(IntrospectionKind::ExternalSchema),
+            _ => Err(()),
         }
     }
 }
@@ -198,6 +216,26 @@ pub trait InternalDbtNodeAttributes: InternalDbtNode {
         None
     }
 
+    /// Returns the search name for this node, following Python dbt patterns:
+    /// - Models: name (or name.v{version} if versioned)
+    /// - Sources: source_name.name  
+    /// - Others: name
+    fn search_name(&self) -> String;
+
+    /// Returns the selector string for this node, following Python dbt patterns:
+    /// - Models/Seeds/Tests/Snapshots: use fqn joined with "."
+    /// - Sources: "source:pkg.source_name.table_name"
+    /// - Unit tests: "unit_test:pkg.versioned_name"
+    fn selector_string(&self) -> String;
+
+    /// Returns the file path for this node
+    fn file_path(&self) -> String {
+        self.common()
+            .original_file_path
+            .to_string_lossy()
+            .to_string()
+    }
+
     // TO BE DEPRECATED
     fn serialized_config(&self) -> Value;
 }
@@ -254,6 +292,10 @@ impl InternalDbtNode for DbtModel {
     }
 
     fn has_same_content(&self, other: &dyn InternalDbtNode) -> bool {
+        // TODO: the checksum for extended model is always different in mantle and fusion, dig more into this
+        if self.is_extended_model() {
+            return true;
+        }
         if let Some(other_model) = other.as_any().downcast_ref::<DbtModel>() {
             self.common_attr.checksum == other_model.common_attr.checksum
         } else {
@@ -307,6 +349,19 @@ impl InternalDbtNodeAttributes for DbtModel {
     fn get_group(&self) -> Option<String> {
         self.model_attr.group.clone()
     }
+
+    fn search_name(&self) -> String {
+        if let Some(version) = &self.model_attr.version {
+            format!("{}.v{}", self.common_attr.name, version)
+        } else {
+            self.common_attr.name.clone()
+        }
+    }
+
+    fn selector_string(&self) -> String {
+        self.common_attr.fqn.join(".")
+    }
+
     fn serialized_config(&self) -> Value {
         serde_json::to_value(&self.deprecated_config).expect("Failed to serialize DbtModel")
     }
@@ -348,12 +403,14 @@ impl InternalDbtNode for DbtSeed {
         }
     }
 
-    fn has_same_content(&self, other: &dyn InternalDbtNode) -> bool {
-        if let Some(other_model) = other.as_any().downcast_ref::<DbtSeed>() {
-            self.common_attr.checksum == other_model.common_attr.checksum
-        } else {
-            false
-        }
+    fn has_same_content(&self, _other: &dyn InternalDbtNode) -> bool {
+        //TODO: the checksum for seed is different between mantle and fusion.
+        true
+        // if let Some(other_model) = other.as_any().downcast_ref::<DbtSeed>() {
+        //     self.common_attr.checksum == other_model.common_attr.checksum
+        // } else {
+        //     false
+        // }
     }
     fn set_detected_introspection(&mut self, _introspection: IntrospectionKind) {
         panic!("DbtSeed does not support setting detected_unsafe");
@@ -379,6 +436,15 @@ impl InternalDbtNodeAttributes for DbtSeed {
     fn meta(&self) -> BTreeMap<String, Value> {
         self.common_attr.meta.clone()
     }
+
+    fn search_name(&self) -> String {
+        self.common_attr.name.clone()
+    }
+
+    fn selector_string(&self) -> String {
+        self.common_attr.fqn.join(".")
+    }
+
     fn serialized_config(&self) -> Value {
         serde_json::to_value(&self.deprecated_config).expect("Failed to serialize DbtModel")
     }
@@ -429,12 +495,9 @@ impl InternalDbtNode for DbtTest {
         }
     }
 
-    fn has_same_content(&self, other: &dyn InternalDbtNode) -> bool {
-        if let Some(other) = other.as_any().downcast_ref::<DbtTest>() {
-            self.common().fqn == other.common().fqn
-        } else {
-            false
-        }
+    fn has_same_content(&self, _other: &dyn InternalDbtNode) -> bool {
+        // TODO: test currently is not supported for state selector due to the difference of test name generation between fusion and dbt-mantle.
+        true
     }
     fn set_detected_introspection(&mut self, _introspection: IntrospectionKind) {
         panic!("DbtTest does not support setting detected_unsafe");
@@ -460,6 +523,15 @@ impl InternalDbtNodeAttributes for DbtTest {
     fn meta(&self) -> BTreeMap<String, Value> {
         self.common_attr.meta.clone()
     }
+
+    fn search_name(&self) -> String {
+        self.common_attr.name.clone()
+    }
+
+    fn selector_string(&self) -> String {
+        self.common_attr.fqn.join(".")
+    }
+
     fn serialized_config(&self) -> Value {
         serde_json::to_value(&self.deprecated_config).expect("Failed to serialize DbtModel")
     }
@@ -504,7 +576,15 @@ impl InternalDbtNode for DbtUnitTest {
 
     fn has_same_content(&self, other: &dyn InternalDbtNode) -> bool {
         if let Some(other) = other.as_any().downcast_ref::<DbtUnitTest>() {
-            self.common().fqn == other.common().fqn
+            let same_fqn = self.common().fqn == other.common().fqn;
+            if !same_fqn {
+                println!(
+                    "FQN differs: self={:?}, other={:?}",
+                    self.common().fqn,
+                    other.common().fqn
+                );
+            }
+            same_fqn
         } else {
             false
         }
@@ -533,6 +613,24 @@ impl InternalDbtNodeAttributes for DbtUnitTest {
     fn meta(&self) -> BTreeMap<String, Value> {
         self.common_attr.meta.clone()
     }
+
+    fn search_name(&self) -> String {
+        // Based on Python implementation, unit tests can have a versioned name
+        if let Some(version) = &self.unit_test_attr.version {
+            format!("{}_v{}", self.common_attr.name, version)
+        } else {
+            self.common_attr.name.clone()
+        }
+    }
+
+    fn selector_string(&self) -> String {
+        format!(
+            "unit_test:{}.{}",
+            self.common_attr.package_name,
+            self.search_name()
+        )
+    }
+
     fn serialized_config(&self) -> Value {
         serde_json::to_value(&self.deprecated_config).expect("Failed to serialize DbtModel")
     }
@@ -577,13 +675,12 @@ impl InternalDbtNode for DbtSource {
 
     fn has_same_content(&self, other: &dyn InternalDbtNode) -> bool {
         if let Some(other_source) = other.as_any().downcast_ref::<DbtSource>() {
-            self.base_attr.database == other_source.base_attr.database
-                && self.base_attr.schema == other_source.base_attr.schema
-                && self.common_attr.name == other_source.common_attr.name
-                && self.source_attr.identifier == other_source.source_attr.identifier
+            // Relation name capture database, schema and identifier
+            self.base_attr.relation_name == other_source.base_attr.relation_name
                 && self.common_attr.fqn == other_source.common_attr.fqn
-                && self.deprecated_config == other_source.deprecated_config
-                && self.base_attr.quoting == other_source.base_attr.quoting
+                //TODO: uncomment this when we have a way to compare the config
+                // && self.deprecated_config == other_source.deprecated_config
+                // && self.base_attr.quoting == other_source.base_attr.quoting
                 && self.source_attr.loader == other_source.source_attr.loader
         } else {
             false
@@ -616,6 +713,18 @@ impl InternalDbtNodeAttributes for DbtSource {
     fn meta(&self) -> BTreeMap<String, Value> {
         self.common_attr.meta.clone()
     }
+
+    fn search_name(&self) -> String {
+        format!("{}.{}", self.source_attr.source_name, self.common_attr.name)
+    }
+
+    fn selector_string(&self) -> String {
+        format!(
+            "source:{}.{}.{}",
+            self.common_attr.package_name, self.source_attr.source_name, self.common_attr.name
+        )
+    }
+
     fn serialized_config(&self) -> Value {
         serde_json::to_value(&self.deprecated_config).expect("Failed to serialize DbtModel")
     }
@@ -650,12 +759,14 @@ impl InternalDbtNode for DbtSnapshot {
             false
         }
     }
-    fn has_same_content(&self, other: &dyn InternalDbtNode) -> bool {
-        if let Some(other_snapshot) = other.as_any().downcast_ref::<DbtSnapshot>() {
-            self.common_attr.checksum == other_snapshot.common_attr.checksum
-        } else {
-            false
-        }
+    fn has_same_content(&self, _other: &dyn InternalDbtNode) -> bool {
+        // TODO: support snapshot state comparison by generate the same hash.
+        true
+        // if let Some(other_snapshot) = other.as_any().downcast_ref::<DbtSnapshot>() {
+        //     self.common_attr.checksum == other_snapshot.common_attr.checksum
+        // } else {
+        //     false
+        // }
     }
     fn set_detected_introspection(&mut self, _introspection: IntrospectionKind) {
         panic!("DbtSnapshot does not support setting detected_unsafe");
@@ -684,6 +795,15 @@ impl InternalDbtNodeAttributes for DbtSnapshot {
     fn meta(&self) -> BTreeMap<String, Value> {
         self.common_attr.meta.clone()
     }
+
+    fn search_name(&self) -> String {
+        self.common_attr.name.clone()
+    }
+
+    fn selector_string(&self) -> String {
+        self.common_attr.fqn.join(".")
+    }
+
     fn serialized_config(&self) -> Value {
         serde_json::to_value(&self.deprecated_config).expect("Failed to serialize DbtModel")
     }
@@ -728,16 +848,16 @@ impl InternalDbtNode for DbtSemanticModel {
 
 impl InternalDbtNode for DbtExposure {
     fn common(&self) -> &CommonAttributes {
-        unimplemented!()
+        &self.common_attr
     }
     fn base(&self) -> &NodeBaseAttributes {
-        unimplemented!()
+        &self.base_attr
     }
     fn base_mut(&mut self) -> &mut NodeBaseAttributes {
-        unimplemented!()
+        &mut self.base_attr
     }
     fn common_mut(&mut self) -> &mut CommonAttributes {
-        unimplemented!()
+        &mut self.common_attr
     }
     fn resource_type(&self) -> &str {
         "exposure"
@@ -748,15 +868,54 @@ impl InternalDbtNode for DbtExposure {
     fn serialize_inner(&self) -> Value {
         serde_json::to_value(self).expect("Failed to serialize DbtExposure")
     }
-    fn has_same_config(&self, _other: &dyn InternalDbtNode) -> bool {
-        unimplemented!()
+    fn has_same_config(&self, other: &dyn InternalDbtNode) -> bool {
+        if let Some(other_exposure) = other.as_any().downcast_ref::<DbtExposure>() {
+            self.deprecated_config == other_exposure.deprecated_config
+        } else {
+            false
+        }
     }
 
-    fn has_same_content(&self, _other: &dyn InternalDbtNode) -> bool {
-        unimplemented!()
+    fn has_same_content(&self, other: &dyn InternalDbtNode) -> bool {
+        if let Some(other_exposure) = other.as_any().downcast_ref::<DbtExposure>() {
+            self.common_attr.name == other_exposure.common_attr.name
+                && self.common_attr.fqn == other_exposure.common_attr.fqn
+        } else {
+            false
+        }
     }
     fn set_detected_introspection(&mut self, _introspection: IntrospectionKind) {
         panic!("DbtExposure does not support setting detected_unsafe");
+    }
+}
+
+impl InternalDbtNodeAttributes for DbtExposure {
+    fn materialized(&self) -> DbtMaterialization {
+        self.base_attr.materialized.clone()
+    }
+    fn quoting(&self) -> ResolvedQuoting {
+        self.base_attr.quoting
+    }
+    fn set_quoting(&mut self, quoting: ResolvedQuoting) {
+        self.base_attr.quoting = quoting;
+    }
+    fn set_static_analysis(&mut self, static_analysis: StaticAnalysisKind) {
+        self.base_attr.static_analysis = static_analysis;
+    }
+    fn tags(&self) -> Vec<String> {
+        self.common_attr.tags.clone()
+    }
+    fn meta(&self) -> BTreeMap<String, Value> {
+        self.common_attr.meta.clone()
+    }
+    fn serialized_config(&self) -> Value {
+        serde_json::to_value(&self.deprecated_config).expect("Failed to serialize DbtExposure")
+    }
+    fn search_name(&self) -> String {
+        self.common_attr.name.clone()
+    }
+    fn selector_string(&self) -> String {
+        self.common_attr.fqn.join(".")
     }
 }
 
@@ -872,6 +1031,7 @@ pub struct Nodes {
     pub sources: BTreeMap<String, Arc<DbtSource>>,
     pub snapshots: BTreeMap<String, Arc<DbtSnapshot>>,
     pub analyses: BTreeMap<String, Arc<DbtModel>>,
+    pub exposures: BTreeMap<String, Arc<DbtExposure>>,
 }
 
 impl Nodes {
@@ -911,6 +1071,11 @@ impl Nodes {
             .iter()
             .map(|(id, node)| (id.clone(), Arc::new((**node).clone())))
             .collect();
+        let exposures = self
+            .exposures
+            .iter()
+            .map(|(id, node)| (id.clone(), Arc::new((**node).clone())))
+            .collect();
         Nodes {
             models,
             seeds,
@@ -919,6 +1084,7 @@ impl Nodes {
             sources,
             snapshots,
             analyses,
+            exposures,
         }
     }
 
@@ -966,6 +1132,42 @@ impl Nodes {
                 self.analyses
                     .get(unique_id)
                     .map(|n| Arc::as_ref(n) as &dyn InternalDbtNodeAttributes)
+            })
+    }
+
+    pub fn get_node_owned(&self, unique_id: &str) -> Option<Arc<dyn InternalDbtNodeAttributes>> {
+        self.models
+            .get(unique_id)
+            .map(|n| n.clone() as Arc<dyn InternalDbtNodeAttributes>)
+            .or_else(|| {
+                self.seeds
+                    .get(unique_id)
+                    .map(|n| n.clone() as Arc<dyn InternalDbtNodeAttributes>)
+            })
+            .or_else(|| {
+                self.tests
+                    .get(unique_id)
+                    .map(|n| n.clone() as Arc<dyn InternalDbtNodeAttributes>)
+            })
+            .or_else(|| {
+                self.unit_tests
+                    .get(unique_id)
+                    .map(|n| n.clone() as Arc<dyn InternalDbtNodeAttributes>)
+            })
+            .or_else(|| {
+                self.sources
+                    .get(unique_id)
+                    .map(|n| n.clone() as Arc<dyn InternalDbtNodeAttributes>)
+            })
+            .or_else(|| {
+                self.snapshots
+                    .get(unique_id)
+                    .map(|n| n.clone() as Arc<dyn InternalDbtNodeAttributes>)
+            })
+            .or_else(|| {
+                self.analyses
+                    .get(unique_id)
+                    .map(|n| n.clone() as Arc<dyn InternalDbtNodeAttributes>)
             })
     }
 
@@ -1087,6 +1289,10 @@ impl Nodes {
             .analyses
             .values_mut()
             .map(|arc| Arc::make_mut(arc) as &mut dyn InternalDbtNodeAttributes);
+        let map_exposures = self
+            .exposures
+            .values_mut()
+            .map(|arc| Arc::make_mut(arc) as &mut dyn InternalDbtNodeAttributes);
 
         map_models
             .chain(map_seeds)
@@ -1095,6 +1301,7 @@ impl Nodes {
             .chain(map_sources)
             .chain(map_snapshots)
             .chain(map_analyses)
+            .chain(map_exposures)
     }
 
     pub fn get_value_mut(&mut self, unique_id: &str) -> Option<&mut dyn InternalDbtNodeAttributes> {
@@ -1128,6 +1335,11 @@ impl Nodes {
             })
             .or_else(|| {
                 self.analyses
+                    .get_mut(unique_id)
+                    .map(|arc| Arc::make_mut(arc) as &mut dyn InternalDbtNodeAttributes)
+            })
+            .or_else(|| {
+                self.exposures
                     .get_mut(unique_id)
                     .map(|arc| Arc::make_mut(arc) as &mut dyn InternalDbtNodeAttributes)
             })
@@ -1193,6 +1405,7 @@ impl Nodes {
         self.sources.extend(other.sources);
         self.snapshots.extend(other.snapshots);
         self.analyses.extend(other.analyses);
+        self.exposures.extend(other.exposures);
     }
 
     pub fn warn_on_custom_materializations(&self) -> FsResult<()> {
@@ -1272,6 +1485,8 @@ pub struct NodeBaseAttributes {
 
     // Resolved Quoting
     pub quoting: ResolvedQuoting,
+    // TODO: Potentially add ignore_case to ResolvedQuoting
+    pub quoting_ignore_case: bool,
     pub materialized: DbtMaterialization,
     pub static_analysis: StaticAnalysisKind,
     pub enabled: bool,
@@ -1295,7 +1510,7 @@ pub struct NodeBaseAttributes {
 }
 
 #[skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub struct DbtSeed {
     #[serde(flatten)]
@@ -1333,6 +1548,38 @@ fn is_false(b: &bool) -> bool {
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub struct DbtExposure {
+    #[serde(flatten)]
+    pub common_attr: CommonAttributes,
+
+    #[serde(flatten)]
+    pub base_attr: NodeBaseAttributes,
+
+    #[serde(flatten)]
+    pub exposure_attr: DbtExposureAttr,
+
+    // To be deprecated
+    #[serde(rename = "config")]
+    pub deprecated_config: ExposureConfig,
+}
+
+#[skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub struct DbtExposureAttr {
+    pub owner: DbtOwner,
+    pub label: Option<String>,
+    pub maturity: Option<String>,
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub url: Option<String>,
+    pub unrendered_config: BTreeMap<String, Value>,
+    pub created_at: Option<f64>,
+}
+
+#[skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
 pub struct DbtUnitTest {
     #[serde(flatten)]
     pub common_attr: CommonAttributes,
@@ -1351,6 +1598,7 @@ pub struct DbtUnitTest {
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub struct DbtUnitTestAttr {
     pub model: String,
     pub given: Vec<Given>,
@@ -1361,7 +1609,7 @@ pub struct DbtUnitTestAttr {
 }
 
 #[skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub struct DbtTest {
     #[serde(flatten)]
@@ -1399,7 +1647,7 @@ pub struct TestMetadata {
 }
 
 #[skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub struct DbtSnapshot {
     #[serde(flatten)]
@@ -1429,7 +1677,7 @@ pub struct DbtSnapshotAttr {
 }
 
 #[skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub struct DbtSource {
     #[serde(flatten)]
@@ -1451,7 +1699,7 @@ pub struct DbtSource {
 }
 
 #[skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub struct DbtSourceAttr {
     pub identifier: String,
@@ -1486,7 +1734,7 @@ impl DbtSource {
 }
 
 #[skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub struct DbtModel {
     #[serde(flatten)]

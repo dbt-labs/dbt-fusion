@@ -11,15 +11,17 @@ mod tarball_client;
 pub mod types;
 pub mod utils;
 
+use dbt_common::cancellation::CancellationToken;
 use dbt_common::fsinfo;
 use dbt_common::io_args::IoArgs;
 use dbt_common::{
+    ErrorCode, FsResult,
     constants::{FETCHING, INSTALLING, LOADING},
-    err, show_progress, stdfs, ErrorCode, FsResult,
+    err, show_progress, stdfs,
 };
-use dbt_jinja_utils::{jinja_environment::JinjaEnvironment, phases::load::RenderSecretScope};
+use dbt_jinja_utils::jinja_environment::JinjaEnv;
 use dbt_schemas::schemas::packages::{DbtPackagesLock, UpstreamProject};
-use hub_client::{HubClient, DBT_HUB_URL};
+use hub_client::{DBT_HUB_URL, HubClient};
 use std::{collections::BTreeMap, path::Path};
 use steps::{
     compute_package_lock, install_packages, load_dbt_packages, try_load_valid_dbt_packages_lock,
@@ -29,15 +31,26 @@ use steps::{
 /// Loads and installs packages, and returns the packages lock and the dependencies map
 pub async fn get_or_install_packages(
     io: &IoArgs,
-    env: &mut JinjaEnvironment<'static>,
+    env: &JinjaEnv,
     packages_install_path: &Path,
     install_deps: bool,
     add_package: Option<String>,
     vars: BTreeMap<String, dbt_serde_yaml::Value>,
+    token: &CancellationToken,
 ) -> FsResult<(DbtPackagesLock, Vec<UpstreamProject>)> {
-    let mut hub_registry = HubClient::new(DBT_HUB_URL);
-
-    let package_render_scope = RenderSecretScope::new(env, vars);
+    let hub_url_from_env = std::env::var("DBT_PACKAGE_HUB_URL");
+    let hub_url = hub_url_from_env
+        .as_deref()
+        .map(|s| {
+            if s.ends_with('/') {
+                // dbt-core required a trailing slash - here we support but do not require it.
+                &s[0..s.len() - 1]
+            } else {
+                s
+            }
+        })
+        .unwrap_or(DBT_HUB_URL);
+    let mut hub_registry = HubClient::new(hub_url);
 
     // Add package first if specified, then load the package definition
     if let Some(add_package) = add_package {
@@ -61,13 +74,7 @@ pub async fn get_or_install_packages(
             dbt_packages_lock
         } else {
             show_progress!(io, fsinfo!(FETCHING.into(), package_yml_name.to_string()));
-            compute_package_lock(
-                io,
-                package_render_scope.jinja_env,
-                &mut hub_registry,
-                dbt_packages,
-            )
-            .await?
+            compute_package_lock(io, &vars, env, &mut hub_registry, dbt_packages, token).await?
         }
     } else {
         DbtPackagesLock::default()
@@ -83,8 +90,9 @@ pub async fn get_or_install_packages(
         }
         install_packages(
             io,
+            &vars,
             &mut hub_registry,
-            package_render_scope.jinja_env,
+            env,
             &dbt_packages_lock,
             packages_install_path,
         )
@@ -111,8 +119,9 @@ pub async fn get_or_install_packages(
             show_progress!(io, fsinfo!(INSTALLING.into(), "packages".to_string()));
             install_packages(
                 io,
+                &vars,
                 &mut hub_registry,
-                package_render_scope.jinja_env,
+                env,
                 &dbt_packages_lock,
                 packages_install_path,
             )

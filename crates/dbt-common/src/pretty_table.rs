@@ -13,11 +13,11 @@ use arrow::{
 };
 use arrow_schema::{Field, Schema};
 use comfy_table::*;
-use comfy_table::{presets::UTF8_FULL_CONDENSED, Table};
+use comfy_table::{Table, presets::UTF8_FULL_CONDENSED};
 use term_size;
 
-use crate::fs_err;
 use crate::FsResult;
+use crate::fs_err;
 
 pub fn make_table_name<T: AsRef<str>>(catalog: T, schema: T, table: T) -> String {
     [catalog.as_ref(), schema.as_ref(), table.as_ref()].join(".")
@@ -62,6 +62,12 @@ pub enum DisplayFormat {
     Json,
     NdJson,
     Yml,
+    /// Output nodes as selector strings (e.g. "source:pkg.source_name.table_name")
+    Selector,
+    /// Output nodes as search names (node.search_name)
+    Name,
+    /// Output nodes as file paths (node.original_file_path)
+    Path,
 }
 
 // originally defined in print_data_format.rs
@@ -228,7 +234,7 @@ pub fn pretty_data_table(
             if limit.is_some_and(|l| row_count >= l) {
                 if include_ellipsis {
                     out.push_str(&format!(
-                        "{} rows, {} columns, showing only {} rows and only {} columns. Run with --limit 0 to show all rows. Run with a terminal width of at least {} to show all columns.",
+                        "{} rows, {} columns, showing only {} rows and only {} columns. Run with --limit -1 to show all rows. Run with a terminal width of at least {} to show all columns.",
                         row_count,
                         column_names.len(),
                         limit.expect("is some"),
@@ -237,7 +243,7 @@ pub fn pretty_data_table(
                     ));
                 } else {
                     out.push_str(&format!(
-                        "{} rows, showing only {} rows. Run with --limit 0 to show all rows.",
+                        "{} rows, showing only {} rows. Run with --limit -1 to show all rows.",
                         row_count,
                         limit.expect("is some")
                     ));
@@ -253,6 +259,18 @@ pub fn pretty_data_table(
             } else if show_footer {
                 out.push_str(&format!("{row_count} rows."));
             }
+        }
+        // The new DisplayFormat variants are handled differently - they output node information rather than tabular data
+        // These should be handled at a higher level in the list command logic, not in this pretty_table function
+        DisplayFormat::Selector | DisplayFormat::Name | DisplayFormat::Path => {
+            // These formats are not applicable for tabular data display
+            // They should be handled by the list command's show_dbt_nodes method
+            // For now, we'll treat them as unsupported in this context
+            return err!(
+                crate::ErrorCode::UnsupportedFeature,
+                "DisplayFormat::{:?} is not supported for tabular data display",
+                display_format
+            );
         }
     };
     Ok(out)

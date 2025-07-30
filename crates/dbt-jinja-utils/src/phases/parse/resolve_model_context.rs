@@ -6,39 +6,39 @@ use std::{
     path::PathBuf,
     rc::Rc,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
     },
 };
 
 use chrono::TimeZone;
 use chrono_tz::{Europe::London, Tz};
-use dbt_common::{io_args::StaticAnalysisKind, serde_utils::convert_json_to_map, FsResult};
+use dbt_common::{io_args::StaticAnalysisKind, serde_utils::convert_json_to_map};
 use dbt_frontend_common::error::CodeLocation;
 use dbt_fusion_adapter::{load_store::ResultStore, relation_object::create_relation};
 use dbt_schemas::schemas::{
+    DbtModelAttr, InternalDbtNode, IntrospectionKind,
     common::{Access, DbtMaterialization, ResolvedQuoting},
     project::{DefaultTo, ModelConfig},
-    DbtModelAttr, InternalDbtNode, IntrospectionKind,
 };
 use dbt_schemas::{
     dbt_types::RelationType,
     schemas::{
-        common::{DbtChecksum, DbtQuoting, NodeDependsOn},
         CommonAttributes, DbtModel, NodeBaseAttributes,
+        common::{DbtChecksum, DbtQuoting, NodeDependsOn},
     },
     state::DbtRuntimeConfig,
 };
 use minijinja::{
+    Error as MinijinjaError, ErrorKind as MinijinjaErrorKind, State,
     arg_utils::ArgParser,
     constants::TARGET_UNIQUE_ID,
     listener::RenderingEventListener,
     value::{Object, ObjectRepr, Value as MinijinjaValue, ValueKind},
-    Error as MinijinjaError, ErrorKind as MinijinjaErrorKind, State,
 };
 use minijinja_contrib::modules::{py_datetime::datetime::PyDateTime, pytz::PytzTimezone};
 
-use crate::{jinja_environment::JinjaEnvironment, phases::MacroLookupContext};
+use crate::phases::MacroLookupContext;
 
 use super::sql_resource::SqlResource;
 
@@ -207,6 +207,7 @@ pub fn build_resolve_model_context<T: DefaultTo<T> + 'static>(
             enabled: true,
             extended_model: false,
             quoting: ResolvedQuoting::trues(),
+            quoting_ignore_case: false,
             columns: BTreeMap::new(),
             depends_on: NodeDependsOn {
                 macros: vec![],
@@ -625,21 +626,6 @@ impl<T: DefaultTo<T>> Object for ParseConfig<T> {
     }
 }
 
-/// Render a reference or source string and return the corresponding SqlResource
-pub fn render_extract_ref_or_source_expr<T: DefaultTo<T>>(
-    jinja_env: &JinjaEnvironment<'static>,
-    resolve_model_context: &BTreeMap<String, MinijinjaValue>,
-    sql_resources: Arc<Mutex<Vec<SqlResource<T>>>>,
-    ref_str: &str,
-) -> FsResult<SqlResource<T>> {
-    let expr = jinja_env.compile_expression(ref_str)?;
-    let _ = expr.eval(resolve_model_context, &[])?;
-    // Remove from Mutex and return last item
-    let mut sql_resources = sql_resources.lock().unwrap();
-    let sql_resource = sql_resources.pop().unwrap();
-    Ok(sql_resource)
-}
-
 #[cfg(test)]
 mod test {
     use dbt_schemas::schemas::relations::DEFAULT_DBT_QUOTING;
@@ -665,7 +651,7 @@ mod test {
 
         // Create a template that uses the source function
         let template = env
-            .template_from_str("{{ source('my_source', 'my_table').render() }}")
+            .template_from_str("{{ source('my_source', 'my_table').render() }}", &[])
             .unwrap();
 
         // Render the template

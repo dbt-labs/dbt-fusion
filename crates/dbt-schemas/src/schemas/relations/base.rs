@@ -3,10 +3,10 @@ use crate::dbt_types::RelationType;
 use crate::schemas::common::ResolvedQuoting;
 
 use dbt_common::constants::DBT_CTE_PREFIX;
-use dbt_common::{current_function_name, FsResult};
-use minijinja::arg_utils::{check_num_args, ArgParser};
-use minijinja::{invalid_argument, invalid_argument_inner, jinja_err};
+use dbt_common::{FsResult, current_function_name};
+use minijinja::arg_utils::{ArgParser, check_num_args};
 use minijinja::{Error as MinijinjaError, ErrorKind as MinijinjaErrorKind, State, Value};
+use minijinja::{invalid_argument, invalid_argument_inner, jinja_err};
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString};
 
@@ -98,6 +98,10 @@ pub struct RelationPath {
 }
 
 pub trait BaseRelationProperties {
+    fn is_database_relation(&self) -> bool {
+        true
+    }
+
     fn include_policy(&self) -> Policy;
 
     fn quote_policy(&self) -> Policy;
@@ -114,6 +118,11 @@ pub trait BaseRelationProperties {
 
 /// Base trait for all fs adapter objects
 pub trait BaseRelation: BaseRelationProperties + Any + Send + Sync + fmt::Debug {
+    /// Whether the relation is a system table or not
+    fn is_system(&self) -> bool {
+        false
+    }
+
     /// as_any
     fn as_any(&self) -> &dyn Any;
 

@@ -7,6 +7,7 @@ use dbt_serde_yaml::JsonSchema;
 use merge::Merge;
 use serde_derive::Deserialize;
 use serde_derive::Serialize;
+use serde_json::Value;
 
 use std::collections::HashMap;
 use std::convert::TryFrom;
@@ -92,6 +93,13 @@ impl DbConfig {
 
     pub fn is_execute_local(&self) -> bool {
         matches!(self.get_execute_mode(), Execute::Local)
+    }
+
+    pub fn get_execution_timezone(&self) -> Option<String> {
+        match self {
+            DbConfig::Snowflake(config) => config.execution_timezone.clone(),
+            _ => None,
+        }
     }
 
     pub fn get_credential_value(&self) -> serde_json::Value {
@@ -482,11 +490,15 @@ pub struct SnowflakeDbConfig {
     #[merge(strategy = merge_strategies_extend::overwrite_always)]
     pub execute: Execute,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_timezone: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub oauth_client_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oauth_client_secret: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s3_stage_vpce_dns_name: Option<String>,
     #[serde(flatten)]
     #[merge(strategy = merge_strategies_extend::overwrite_always)]
     pub ignored_properties: HashMap<String, serde_json::Value>,
@@ -565,14 +577,15 @@ pub struct BigqueryDbConfig {
     pub keyfile_json: Option<StringOrMap>,
     pub execution_project: Option<String>,
     pub compute_region: Option<String>,
-    pub dataproc_batch: Option<String>,
+    // TODO: support this https://docs.getdbt.com/docs/core/connect-data-platform/bigquery-setup
+    pub dataproc_batch: Option<Value>,
     pub dataproc_cluster_name: Option<String>,
     pub dataproc_region: Option<String>,
     pub gcs_bucket: Option<String>,
-    pub job_creation_timeout_seconds: Option<String>,
-    pub job_execution_timeout_seconds: Option<String>,
+    pub job_creation_timeout_seconds: Option<i64>,
+    pub job_execution_timeout_seconds: Option<i64>,
     pub job_retries: Option<i64>,
-    pub job_retry_deadline_seconds: Option<String>,
+    pub job_retry_deadline_seconds: Option<i64>,
     pub target_name: Option<String>,
 
     #[serde(flatten)]
@@ -704,16 +717,16 @@ pub struct BigqueryTargetEnv {
     pub dataset: String,
     pub client_id: Option<String>,
     pub compute_region: Option<String>,
-    pub dataproc_batch: Option<String>,
+    pub dataproc_batch: Option<Value>,
     pub dataproc_cluster_name: Option<String>,
     pub dataproc_region: Option<String>,
     pub execution_project: Option<String>,
     pub gcs_bucket: Option<String>,
     pub impersonate_service_account: Option<String>,
-    pub job_creation_timeout_seconds: Option<String>,
-    pub job_execution_timeout_seconds: Option<String>,
+    pub job_creation_timeout_seconds: Option<i64>,
+    pub job_execution_timeout_seconds: Option<i64>,
     pub job_retries: Option<i64>,
-    pub job_retry_deadline_seconds: Option<String>,
+    pub job_retry_deadline_seconds: Option<i64>,
     pub location: Option<String>,
     pub maximum_bytes_billed: Option<i64>,
     pub method: Option<String>,
@@ -864,10 +877,10 @@ impl TryFrom<DbConfig> for TargetContext {
                     execution_project: config.execution_project.clone(),
                     gcs_bucket: config.gcs_bucket.clone(),
                     impersonate_service_account: config.impersonate_service_account.clone(),
-                    job_creation_timeout_seconds: config.job_creation_timeout_seconds.clone(),
-                    job_execution_timeout_seconds: config.job_execution_timeout_seconds.clone(),
+                    job_creation_timeout_seconds: config.job_creation_timeout_seconds,
+                    job_execution_timeout_seconds: config.job_execution_timeout_seconds,
                     job_retries: config.job_retries,
-                    job_retry_deadline_seconds: config.job_retry_deadline_seconds.clone(),
+                    job_retry_deadline_seconds: config.job_retry_deadline_seconds,
                     location: config.location.clone(),
                     maximum_bytes_billed: config.maximum_bytes_billed,
                     method: config.method.clone(),
@@ -941,5 +954,23 @@ mod tests {
 
         assert_eq!(config.get_unique_field(), None);
         assert_eq!(config.get_adapter_unique_id(), None);
+    }
+
+    #[test]
+    fn test_bigquery_adapter_config_parsing() {
+        let config: DbConfig = dbt_serde_yaml::from_str(
+            "type: bigquery\n\
+             job_creation_timeout_seconds: 123\n\
+             job_execution_timeout_seconds: 456\n\
+             job_retry_deadline_seconds: 789",
+        )
+        .unwrap();
+        if let DbConfig::Bigquery(bigquery_config) = config {
+            assert_eq!(bigquery_config.job_creation_timeout_seconds, Some(123));
+            assert_eq!(bigquery_config.job_execution_timeout_seconds, Some(456));
+            assert_eq!(bigquery_config.job_retry_deadline_seconds, Some(789));
+        } else {
+            panic!("Expected DbConfig::Bigquery, got {config:?}",);
+        }
     }
 }

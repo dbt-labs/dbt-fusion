@@ -8,11 +8,11 @@ use std::{
 };
 
 use dbt_common::{
-    fs_err, io_args::IoArgs, show_error, show_warning_soon_to_be_error, ErrorCode, FsResult,
+    ErrorCode, FsResult, fs_err, io_args::IoArgs, show_error, show_warning_soon_to_be_error,
 };
 use dbt_schemas::schemas::project::{
-    DataTestConfig, DefaultTo, IterChildren, ModelConfig, SeedConfig, SnapshotConfig, SourceConfig,
-    UnitTestConfig,
+    DataTestConfig, DefaultTo, ExposureConfig, IterChildren, ModelConfig, SeedConfig,
+    SnapshotConfig, SourceConfig, UnitTestConfig,
 };
 use dbt_schemas::schemas::{common::DbtQuoting, project::DbtProject};
 use dbt_serde_yaml::ShouldBe;
@@ -89,6 +89,40 @@ impl<T: DefaultTo<T>> DbtProjectConfig<T> {
         &current_config.config
     }
 
+    /// Get the configuration for a fully qualified name (fqn)
+    ///
+    /// This method is recommended for nodes that don't derive from SQL files or where
+    /// the node name doesn't match the filename. Examples include:
+    /// - Exposures (defined in YAML files)
+    /// - Unit tests (where the test name is separate from the model filename)
+    /// - Sources (where the source and table names don't match file paths)
+    /// - Any node where the fqn provides a more accurate representation than the file path
+    ///
+    /// The fqn should contain [package_name, path_component1, path_component2, ..., node_name]
+    ///
+    /// # Example
+    /// ```rust
+    /// // For an exposure defined in models/exposures.yml:
+    /// // exposure_name: "weekly_revenue_report"
+    /// // package_name: "analytics"
+    /// let fqn = vec!["analytics".to_string(), "weekly_revenue_report".to_string()];
+    /// let config = project_config.get_config_for_fqn(&fqn);
+    /// ```
+    pub fn get_config_for_fqn(&self, fqn: &[String]) -> &T {
+        let mut current_config = self;
+
+        // Traverse through all components in the fqn
+        for component in fqn {
+            if let Some(child) = current_config.children.get(component) {
+                current_config = child;
+            } else {
+                break;
+            }
+        }
+
+        &current_config.config
+    }
+
     /// Set the configuration for the root [GlobalProjectConfig]
     pub fn with_config(&mut self, config: T) {
         self.config = config;
@@ -116,10 +150,16 @@ pub fn recur_build_dbt_project_config<T: DefaultTo<T>, S: Into<T> + IterChildren
         let child_config_variant = match maybe_child_config_variant {
             ShouldBe::AndIs(config) => config,
             ShouldBe::ButIsnt { raw, .. } => {
+                let trimmed_key = key.trim();
+                let suggestion = if !trimmed_key.starts_with("+") {
+                    format!(" Try '+{trimmed_key}' instead.")
+                } else {
+                    "".to_string()
+                };
                 let err = fs_err!(
                     code => ErrorCode::UnusedConfigKey,
                     loc => raw.as_ref().map(|r| r.span()).unwrap_or_default(),
-                    "Ignored unexpected key `{:?}`. YAML path: `{}`.", key.trim(), key_path
+                    "Ignored unexpected key '{trimmed_key}'.{suggestion} YAML path: '{key_path}'."
                 );
                 if std::env::var("_DBT_FUSION_STRICT_MODE").is_ok() {
                     show_error!(io, err);
@@ -143,6 +183,7 @@ pub fn recur_build_dbt_project_config<T: DefaultTo<T>, S: Into<T> + IterChildren
 }
 
 /// Config wrapping propagated configs for the root project
+#[derive(Debug)]
 pub struct RootProjectConfigs {
     /// Model configs
     pub models: DbtProjectConfig<ModelConfig>,
@@ -156,6 +197,8 @@ pub struct RootProjectConfigs {
     pub tests: DbtProjectConfig<DataTestConfig>,
     /// Unit test configs
     pub unit_tests: DbtProjectConfig<UnitTestConfig>,
+    /// Exposure configs
+    pub exposures: DbtProjectConfig<ExposureConfig>,
 }
 
 /// Build the [RootProjectConfigs] from a [DbtProject]
@@ -223,6 +266,14 @@ pub fn build_root_project_configs(
             io_args,
             &root_project.unit_tests,
             UnitTestConfig {
+                enabled: Some(true),
+                ..Default::default()
+            },
+        )?,
+        exposures: init_project_config(
+            io_args,
+            &root_project.exposures,
+            ExposureConfig {
                 enabled: Some(true),
                 ..Default::default()
             },
@@ -722,5 +773,294 @@ mod tests {
             &["src/models".to_string()],
         );
         assert_eq!(result5, PathBuf::from("src/models_new/customers.sql"));
+    }
+
+    #[test]
+    fn test_get_config_for_fqn_basic() {
+        let mut config = DbtProjectConfig {
+            config: ModelConfig::default(),
+            children: HashMap::new(),
+        };
+        config.config.enabled = Some(true);
+
+        // Add a child config for project "test_project"
+        let mut project_config = DbtProjectConfig {
+            config: ModelConfig::default(),
+            children: HashMap::new(),
+        };
+        project_config.config.enabled = Some(false);
+        config
+            .children
+            .insert("test_project".to_string(), project_config);
+
+        let fqn = vec!["test_project".to_string()];
+        let result = config.get_config_for_fqn(&fqn);
+
+        assert_eq!(result.enabled, Some(false));
+    }
+
+    #[test]
+    fn test_get_config_for_fqn_nested() {
+        let mut config = DbtProjectConfig {
+            config: ModelConfig::default(),
+            children: HashMap::new(),
+        };
+        config.config.enabled = Some(true);
+
+        // Add project config
+        let mut project_config = DbtProjectConfig {
+            config: ModelConfig::default(),
+            children: HashMap::new(),
+        };
+        project_config.config.enabled = Some(false);
+
+        // Add staging subdirectory config
+        let mut staging_config = DbtProjectConfig {
+            config: ModelConfig::default(),
+            children: HashMap::new(),
+        };
+        staging_config.config.enabled = Some(true);
+        staging_config.config.materialized =
+            Some(dbt_schemas::schemas::common::DbtMaterialization::Table);
+
+        project_config
+            .children
+            .insert("staging".to_string(), staging_config);
+        config
+            .children
+            .insert("test_project".to_string(), project_config);
+
+        let fqn = vec!["test_project".to_string(), "staging".to_string()];
+        let result = config.get_config_for_fqn(&fqn);
+
+        assert_eq!(result.enabled, Some(true));
+        assert_eq!(
+            result.materialized,
+            Some(dbt_schemas::schemas::common::DbtMaterialization::Table)
+        );
+    }
+
+    #[test]
+    fn test_get_config_for_fqn_node_specific() {
+        let mut config = DbtProjectConfig {
+            config: ModelConfig::default(),
+            children: HashMap::new(),
+        };
+        config.config.enabled = Some(true);
+
+        // Add project config
+        let mut project_config = DbtProjectConfig {
+            config: ModelConfig::default(),
+            children: HashMap::new(),
+        };
+        project_config.config.enabled = Some(false);
+
+        // Add staging subdirectory config
+        let mut staging_config = DbtProjectConfig {
+            config: ModelConfig::default(),
+            children: HashMap::new(),
+        };
+        staging_config.config.enabled = Some(true);
+
+        // Add node-specific config
+        let mut node_config = DbtProjectConfig {
+            config: ModelConfig::default(),
+            children: HashMap::new(),
+        };
+        node_config.config.enabled = Some(false);
+        node_config.config.materialized =
+            Some(dbt_schemas::schemas::common::DbtMaterialization::Incremental);
+
+        staging_config
+            .children
+            .insert("stg_customers".to_string(), node_config);
+        project_config
+            .children
+            .insert("staging".to_string(), staging_config);
+        config
+            .children
+            .insert("test_project".to_string(), project_config);
+
+        let fqn = vec![
+            "test_project".to_string(),
+            "staging".to_string(),
+            "stg_customers".to_string(),
+        ];
+        let result = config.get_config_for_fqn(&fqn);
+
+        assert_eq!(result.enabled, Some(false));
+        assert_eq!(
+            result.materialized,
+            Some(dbt_schemas::schemas::common::DbtMaterialization::Incremental)
+        );
+    }
+
+    #[test]
+    fn test_get_config_for_fqn_partial_match() {
+        let mut config = DbtProjectConfig {
+            config: ModelConfig::default(),
+            children: HashMap::new(),
+        };
+        config.config.enabled = Some(true);
+
+        // Add project config
+        let mut project_config = DbtProjectConfig {
+            config: ModelConfig::default(),
+            children: HashMap::new(),
+        };
+        project_config.config.enabled = Some(false);
+
+        // Add staging subdirectory config - only staging exists, not finance
+        let mut staging_config = DbtProjectConfig {
+            config: ModelConfig::default(),
+            children: HashMap::new(),
+        };
+        staging_config.config.enabled = Some(false);
+        staging_config.config.materialized =
+            Some(dbt_schemas::schemas::common::DbtMaterialization::View);
+
+        project_config
+            .children
+            .insert("staging".to_string(), staging_config);
+        config
+            .children
+            .insert("test_project".to_string(), project_config);
+
+        // FQN has staging/finance but only staging config exists
+        let fqn = vec![
+            "test_project".to_string(),
+            "staging".to_string(),
+            "finance".to_string(),
+            "customers".to_string(),
+        ];
+        let result = config.get_config_for_fqn(&fqn);
+
+        // Should get staging config since finance doesn't exist
+        assert_eq!(result.enabled, Some(false));
+        assert_eq!(
+            result.materialized,
+            Some(dbt_schemas::schemas::common::DbtMaterialization::View)
+        );
+    }
+
+    #[test]
+    fn test_get_config_for_fqn_nonexistent_project() {
+        let mut config = DbtProjectConfig {
+            config: ModelConfig::default(),
+            children: HashMap::new(),
+        };
+        config.config.enabled = Some(true);
+        config.config.materialized = Some(dbt_schemas::schemas::common::DbtMaterialization::Table);
+
+        let fqn = vec![
+            "nonexistent_project".to_string(),
+            "staging".to_string(),
+            "customers".to_string(),
+        ];
+        let result = config.get_config_for_fqn(&fqn);
+
+        // Should return root config
+        assert_eq!(result.enabled, Some(true));
+        assert_eq!(
+            result.materialized,
+            Some(dbt_schemas::schemas::common::DbtMaterialization::Table)
+        );
+    }
+
+    #[test]
+    fn test_get_config_for_fqn_empty() {
+        let mut config = DbtProjectConfig {
+            config: ModelConfig::default(),
+            children: HashMap::new(),
+        };
+        config.config.enabled = Some(true);
+        config.config.materialized = Some(dbt_schemas::schemas::common::DbtMaterialization::View);
+
+        let fqn: Vec<String> = vec![];
+        let result = config.get_config_for_fqn(&fqn);
+
+        // Should return root config
+        assert_eq!(result.enabled, Some(true));
+        assert_eq!(
+            result.materialized,
+            Some(dbt_schemas::schemas::common::DbtMaterialization::View)
+        );
+    }
+
+    #[test]
+    fn test_get_config_for_fqn_complex_hierarchy() {
+        // Test a complex hierarchy that might occur with non-file-based nodes
+        let mut config = DbtProjectConfig {
+            config: ModelConfig::default(),
+            children: HashMap::new(),
+        };
+        config.config.enabled = Some(true);
+
+        // Set up: my_project -> marts -> finance -> revenue_reports -> monthly_revenue
+        let mut project_config = DbtProjectConfig {
+            config: ModelConfig::default(),
+            children: HashMap::new(),
+        };
+        project_config.config.enabled = Some(true);
+
+        let mut marts_config = DbtProjectConfig {
+            config: ModelConfig::default(),
+            children: HashMap::new(),
+        };
+        marts_config.config.materialized =
+            Some(dbt_schemas::schemas::common::DbtMaterialization::Table);
+
+        let mut finance_config = DbtProjectConfig {
+            config: ModelConfig::default(),
+            children: HashMap::new(),
+        };
+        finance_config.config.enabled = Some(false);
+
+        let mut revenue_reports_config = DbtProjectConfig {
+            config: ModelConfig::default(),
+            children: HashMap::new(),
+        };
+        revenue_reports_config.config.materialized =
+            Some(dbt_schemas::schemas::common::DbtMaterialization::View);
+
+        let mut monthly_revenue_config = DbtProjectConfig {
+            config: ModelConfig::default(),
+            children: HashMap::new(),
+        };
+        monthly_revenue_config.config.enabled = Some(true);
+        monthly_revenue_config.config.materialized =
+            Some(dbt_schemas::schemas::common::DbtMaterialization::Incremental);
+
+        revenue_reports_config
+            .children
+            .insert("monthly_revenue".to_string(), monthly_revenue_config);
+        finance_config
+            .children
+            .insert("revenue_reports".to_string(), revenue_reports_config);
+        marts_config
+            .children
+            .insert("finance".to_string(), finance_config);
+        project_config
+            .children
+            .insert("marts".to_string(), marts_config);
+        config
+            .children
+            .insert("my_project".to_string(), project_config);
+
+        let fqn = vec![
+            "my_project".to_string(),
+            "marts".to_string(),
+            "finance".to_string(),
+            "revenue_reports".to_string(),
+            "monthly_revenue".to_string(),
+        ];
+        let result = config.get_config_for_fqn(&fqn);
+
+        // Should get the most specific config (node-level)
+        assert_eq!(result.enabled, Some(true));
+        assert_eq!(
+            result.materialized,
+            Some(dbt_schemas::schemas::common::DbtMaterialization::Incremental)
+        );
     }
 }

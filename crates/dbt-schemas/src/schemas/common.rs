@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 
-use dbt_common::{err, fs_err, CodeLocation, ErrorCode, FsError, FsResult};
+use dbt_common::{CodeLocation, ErrorCode, FsError, FsResult, err, fs_err};
 use dbt_frontend_common::Dialect;
 use dbt_serde_yaml::{JsonSchema, UntaggedEnumDeserialize, Verbatim};
 use hex;
@@ -16,7 +16,6 @@ use strum::{Display, EnumIter, EnumString};
 use crate::dbt_types::RelationType;
 
 use super::serde::StringOrArrayOfStrings;
-#[skip_serializing_none]
 #[derive(Default, Deserialize, Serialize, Debug, Clone, JsonSchema, PartialEq, Eq)]
 pub struct FreshnessRules {
     pub count: Option<i64>,
@@ -33,12 +32,80 @@ impl FreshnessRules {
             return Err(fs_err!(
                 ErrorCode::InvalidArgument,
                 "count and period are required when freshness is provided, count: {:?}, period: {:?}",
-                rule.count, rule.period
+                rule.count,
+                rule.period
             ));
         }
         Ok(())
     }
 }
+
+#[derive(Deserialize, Serialize, Debug, Clone, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdatesOn {
+    #[default]
+    Any,
+    All,
+}
+
+impl std::fmt::Display for UpdatesOn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UpdatesOn::Any => write!(f, "any"),
+            UpdatesOn::All => write!(f, "all"),
+        }
+    }
+}
+
+impl FromStr for UpdatesOn {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "any" => Ok(UpdatesOn::Any),
+            "all" => Ok(UpdatesOn::All),
+            _ => Err(format!("Unknown UpdatesOn value: {s}")),
+        }
+    }
+}
+
+#[derive(Default, Deserialize, Serialize, Debug, Clone, JsonSchema, PartialEq, Eq)]
+pub struct ModelFreshnessRules {
+    pub count: Option<i64>,
+    pub period: Option<FreshnessPeriod>,
+    pub updates_on: Option<UpdatesOn>,
+}
+
+impl ModelFreshnessRules {
+    pub fn validate(rule: Option<&Self>) -> FsResult<()> {
+        if rule.is_none() {
+            return Ok(());
+        }
+        let rule = rule.expect("rule should be Some now");
+        if rule.count.is_none() || rule.period.is_none() {
+            return Err(fs_err!(
+                ErrorCode::InvalidArgument,
+                "count and period are required when freshness is provided, count: {:?}, period: {:?}",
+                rule.count,
+                rule.period
+            ));
+        }
+        Ok(())
+    }
+
+    /// Convert the freshness duration to seconds
+    pub fn to_seconds(&self) -> i64 {
+        let count = self.count.expect("count is required");
+        let period = self.period.as_ref().expect("period is required");
+        count
+            * match period {
+                FreshnessPeriod::minute => 60,
+                FreshnessPeriod::hour => 60 * 60,
+                FreshnessPeriod::day => 60 * 60 * 24,
+            }
+    }
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone, JsonSchema, PartialEq, Eq)]
 #[allow(non_camel_case_types)]
 pub enum FreshnessPeriod {
@@ -46,15 +113,53 @@ pub enum FreshnessPeriod {
     hour,
     day,
 }
+impl FromStr for FreshnessPeriod {
+    type Err = ();
 
-#[skip_serializing_none]
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "minute" => Ok(FreshnessPeriod::minute),
+            "hour" => Ok(FreshnessPeriod::hour),
+            "day" => Ok(FreshnessPeriod::day),
+            _ => Err(()),
+        }
+    }
+}
+impl std::fmt::Display for FreshnessPeriod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let period_str = match self {
+            FreshnessPeriod::minute => "minute",
+            FreshnessPeriod::hour => "hour",
+            FreshnessPeriod::day => "day",
+        };
+        write!(f, "{period_str}")
+    }
+}
+
+// We don't skip serializing none here because dbt project evaluator checks for the presence of either error_after or warn_after
+// https://github.com/dbt-labs/dbt-project-evaluator/blob/94768b117573705e95a9456273de8e358efadb00/macros/unpack/get_source_values.sql#L27-L28
 #[derive(Default, Deserialize, Serialize, Debug, Clone, JsonSchema, PartialEq, Eq)]
 pub struct FreshnessDefinition {
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_freshness_rule")]
     pub error_after: Option<FreshnessRules>,
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_freshness_rule")]
     pub warn_after: Option<FreshnessRules>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub filter: Option<String>,
+}
+
+/// Custom serializer to ensure FreshnessRules are always objects, never null
+fn serialize_freshness_rule<S>(
+    rule: &Option<FreshnessRules>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match rule {
+        Some(rule) => rule.serialize(serializer),
+        None => FreshnessRules::default().serialize(serializer),
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, JsonSchema, PartialEq, Eq)]
@@ -101,7 +206,25 @@ pub enum DbtMaterialization {
     #[serde(untagged)]
     Unknown(String),
 }
+impl FromStr for DbtMaterialization {
+    type Err = ();
 
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "view" => Ok(DbtMaterialization::View),
+            "table" => Ok(DbtMaterialization::Table),
+            "incremental" => Ok(DbtMaterialization::Incremental),
+            "materialized_view" => Ok(DbtMaterialization::MaterializedView),
+            "external" => Ok(DbtMaterialization::External),
+            "test" => Ok(DbtMaterialization::Test),
+            "ephemeral" => Ok(DbtMaterialization::Ephemeral),
+            "unit" => Ok(DbtMaterialization::Unit),
+            "analysis" => Ok(DbtMaterialization::Analysis),
+            "streaming_table" => Ok(DbtMaterialization::StreamingTable),
+            other => Ok(DbtMaterialization::Unknown(other.to_string())),
+        }
+    }
+}
 impl From<DbtMaterialization> for String {
     fn from(materialization: DbtMaterialization) -> Self {
         materialization.to_string()
@@ -146,9 +269,7 @@ impl From<DbtMaterialization> for RelationType {
     }
 }
 
-#[derive(
-    Default, Debug, Clone, Serialize, Deserialize, PartialEq, Eq, EnumString, Display, JsonSchema,
-)]
+#[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Display, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum Access {
@@ -156,6 +277,19 @@ pub enum Access {
     #[default]
     Protected,
     Public,
+}
+
+impl FromStr for Access {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "private" => Ok(Access::Private),
+            "protected" => Ok(Access::Protected),
+            "public" => Ok(Access::Public),
+            _ => Err(()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -179,7 +313,11 @@ pub struct ResolvedQuoting {
 
 impl Default for ResolvedQuoting {
     fn default() -> Self {
+        // dbt rules
         Self::trues()
+        // todo: however a much more sensible rule would be
+        // Self::falses()
+        // ... since SQL is case insensitive -- so let the dialect dictate and not the user...
     }
 }
 
@@ -227,6 +365,8 @@ pub struct DbtQuoting {
     pub database: Option<bool>,
     pub identifier: Option<bool>,
     pub schema: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snowflake_ignore_case: Option<bool>,
 }
 
 impl DbtQuoting {
@@ -512,7 +652,7 @@ pub struct IncludeExclude {
     pub include: Option<StringOrArrayOfStrings>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema, Default)]
 pub struct Expect {
     pub rows: Option<Rows>,
     #[serde(default)]
@@ -520,7 +660,9 @@ pub struct Expect {
     pub fixture: Option<String>,
 }
 
-#[derive(Debug, Serialize, Default, Deserialize, Clone, EnumString, Display, JsonSchema)]
+#[derive(
+    Debug, Serialize, Default, Deserialize, Clone, EnumString, Display, JsonSchema, PartialEq,
+)]
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]
 pub enum Formats {

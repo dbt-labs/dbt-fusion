@@ -1,11 +1,12 @@
 use dbt_common::io_args::IoArgs;
 use dbt_common::stdfs::File;
 use dbt_common::{
-    constants::DBT_PACKAGES_LOCK_FILE, err, fs_err, show_warning, stdfs, ErrorCode, FsResult,
+    ErrorCode, FsResult, constants::DBT_PACKAGES_LOCK_FILE, err, fs_err, show_warning, stdfs,
 };
-use dbt_jinja_utils::jinja_environment::JinjaEnvironment;
+use dbt_jinja_utils::jinja_environment::JinjaEnv;
 use dbt_schemas::schemas::packages::DbtPackagesLock;
 use flate2::read::GzDecoder;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use vortex_events::package_install_event;
 
@@ -20,8 +21,9 @@ use crate::{
 
 pub async fn install_packages(
     io_args: &IoArgs,
+    vars: &BTreeMap<String, dbt_serde_yaml::Value>,
     hub_registry: &mut HubClient,
-    jinja_env: &JinjaEnvironment<'static>,
+    jinja_env: &JinjaEnv,
     dbt_packages_lock: &DbtPackagesLock,
     packages_install_path: &Path,
 ) -> FsResult<()> {
@@ -57,7 +59,7 @@ pub async fn install_packages(
     if dbt_packages_lock.packages.is_empty() {
         return Ok(());
     }
-    let mut package_listing = PackageListing::new(io_args.clone());
+    let mut package_listing = PackageListing::new(io_args.clone(), vars.clone());
     package_listing.hydrate_dbt_packages_lock(dbt_packages_lock, jinja_env)?;
 
     for package in package_listing.packages.values() {
@@ -122,8 +124,7 @@ pub async fn install_packages(
                         pinned_package.name.clone(),
                         pinned_package.version.clone(),
                         "hub".to_string(),
-                    )
-                    .await;
+                    );
                 }
             }
             UnpinnedPackage::Git(git_unpinned_package) => {
@@ -147,8 +148,7 @@ pub async fn install_packages(
                         .unwrap_or("none".to_string()),
                     commit_sha,
                     "git".to_string(),
-                )
-                .await;
+                );
             }
             UnpinnedPackage::Local(local_unpinned_package) => {
                 let package_path = &io_args.in_dir.join(&local_unpinned_package.local);
@@ -164,8 +164,7 @@ pub async fn install_packages(
                         .unwrap_or("none".to_string()),
                     "".to_string(),
                     "local".to_string(),
-                )
-                .await;
+                );
             }
             UnpinnedPackage::Private(private_unpinned_package) => {
                 let (tmp_dir, checkout_path, commit_sha) = handle_git_like_package(
@@ -188,8 +187,7 @@ pub async fn install_packages(
                         .unwrap_or("none".to_string()),
                     commit_sha,
                     "private".to_string(),
-                )
-                .await;
+                );
             }
             UnpinnedPackage::Tarball(tarball_unpinned_package) => {
                 // Download and extract the tarball
@@ -246,8 +244,7 @@ pub async fn install_packages(
                         .unwrap_or("none".to_string()),
                     "tarball".to_string(),
                     "tarball".to_string(),
-                )
-                .await;
+                );
             }
         }
     }

@@ -3,6 +3,7 @@
 members = [
 
   # Source Available
+  "crates/dbt-test-primitives",
   "crates/dbt-agate",
   "crates/dbt-common",
   "crates/dbt-frontend-common",
@@ -10,6 +11,7 @@ members = [
   "crates/dbt-jinja/minijinja-contrib",
   "crates/dbt-dag",
   "crates/dbt-loader",
+  "crates/dbt-test-containers",
   "crates/dbt-parser",
   "crates/dbt-schemas",
   "crates/dbt-selector-parser",
@@ -25,6 +27,7 @@ members = [
   "crates/vortex-events",
   "crates/proto-rust",
   "crates/dbt-env",
+  "crates/dbt-test-utils",
 ]
 
 resolver = "2"
@@ -32,12 +35,12 @@ resolver = "2"
 [workspace.package]
 authors = ["dbt Labs <info@getdbt.com>"]
 description = "Fusion: A fast dbt engine, SQL compiler, local development framework, and in-memory analytical database"
-edition = "2021"
+edition = "2024"
 homepage = "https://getdbt.com"
 keywords = ["sql", "parquet", "json", "csv", "dbt"]
 license = "<>"
 repository = "https://github.com/dbt-labs/dbt-fusion"
-version = "2.0.0-beta.37"
+version = "2.0.0-beta.53"
 
 # We currently need a fork of apache/arrow-datafusion with a few patches.
 # However, note that we declare dependencies in our crates with the same version
@@ -46,7 +49,7 @@ version = "2.0.0-beta.37"
 [patch.crates-io]
 datafusion = { git = "https://github.com/sdf-labs/arrow-datafusion", rev = "09350586040a748931f07931ca395df6ef627756" } # @ sdf/45
 # OR, when working locally
-#datafusion = { path = "../arrow-datafusion/datafusion/core" }
+# datafusion = { path = "../arrow-datafusion/datafusion/core" }
 
 # All arrow dependencies (run `cargo tree --prefix none | grep ^arrow | cut -d ' ' -f1 | sort -u` to get this list)
 arrow = { git = "https://github.com/sdf-labs/arrow-rs", rev = "ad6ab6fcf06156ae084de4d49625ca52c66b310f" } # @ sdf/54.2.1
@@ -64,20 +67,20 @@ arrow-schema = { git = "https://github.com/sdf-labs/arrow-rs", rev = "ad6ab6fcf0
 arrow-select = { git = "https://github.com/sdf-labs/arrow-rs", rev = "ad6ab6fcf06156ae084de4d49625ca52c66b310f" } # @ sdf/54.2.1
 arrow-string = { git = "https://github.com/sdf-labs/arrow-rs", rev = "ad6ab6fcf06156ae084de4d49625ca52c66b310f" } # @ sdf/54.2.1
 # OR, when working locally
-#arrow = { path = "../arrow-rs/arrow" }
-#arrow-arith = { path = "../arrow-rs/arrow-arith" }
-#arrow-array = { path = "../arrow-rs/arrow-array" }
-#arrow-buffer = { path = "../arrow-rs/arrow-buffer" }
-#arrow-cast = { path = "../arrow-rs/arrow-cast" }
-#arrow-csv = { path = "../arrow-rs/arrow-csv" }
-#arrow-data = { path = "../arrow-rs/arrow-data" }
-#arrow-ipc = { path = "../arrow-rs/arrow-ipc" }
-#arrow-json = { path = "../arrow-rs/arrow-json" }
-#arrow-ord = { path = "../arrow-rs/arrow-ord" }
-#arrow-row = { path = "../arrow-rs/arrow-row" }
-#arrow-schema = { path = "../arrow-rs/arrow-schema" }
-#arrow-select = { path = "../arrow-rs/arrow-select" }
-#arrow-string = { path = "../arrow-rs/arrow-string" }
+# arrow = { path = "../arrow-rs/arrow" }
+# arrow-arith = { path = "../arrow-rs/arrow-arith" }
+# arrow-array = { path = "../arrow-rs/arrow-array" }
+# arrow-buffer = { path = "../arrow-rs/arrow-buffer" }
+# arrow-cast = { path = "../arrow-rs/arrow-cast" }
+# arrow-csv = { path = "../arrow-rs/arrow-csv" }
+# arrow-data = { path = "../arrow-rs/arrow-data" }
+# arrow-ipc = { path = "../arrow-rs/arrow-ipc" }
+# arrow-json = { path = "../arrow-rs/arrow-json" }
+# arrow-ord = { path = "../arrow-rs/arrow-ord" }
+# arrow-row = { path = "../arrow-rs/arrow-row" }
+# arrow-schema = { path = "../arrow-rs/arrow-schema" }
+# arrow-select = { path = "../arrow-rs/arrow-select" }
+# arrow-string = { path = "../arrow-rs/arrow-string" }
 
 [profile.dev.package."*"]
 # Enable basic optimizations for all non-member dependencies. This greatly
@@ -86,7 +89,7 @@ opt-level = 1
 
 [profile.dev.build-override]
 # Some libraries (e.g. syn, proc-macro2 and all their dependencies) are compiled
-# *for* the build, and also dependend by tests (because we have proc-macro crates).
+# *for* the build, and also depended-on by tests (because we have proc-macro crates).
 # Tests compile with debug symbols enabled, otherwise debug symbols are disabled by default.
 # Force debug symbols to be always enabled to increase cache reuse between `cargo xtask`
 # and `cargo build/run --bin` invocations.
@@ -138,9 +141,25 @@ dbt-parser = { path = "crates/dbt-parser" }
 dbt-proc-macros = { path = "crates/dbt-proc-macros" }
 dbt-schemas = { path = "crates/dbt-schemas" }
 dbt-selector-parser = { path = "crates/dbt-selector-parser" }
+dbt-test-containers = { path = "crates/dbt-test-containers" }
+dbt-test-primitives = { path = "crates/dbt-test-primitives" }
+dbt-test-utils = { path = "crates/dbt-test-utils" }
 proto-rust = { path = "crates/proto-rust" }
 vortex-client = { path = "crates/vortex-client" }
 vortex-events = { path = "crates/vortex-events" }
+
+# fs dbt metadata available dependencies
+dbt-meta-cli = { path = "fs/dbt-meta/crates/cli" }
+dbt-meta-common = { path = "fs/dbt-meta/crates/shared/common" }
+dbt-meta-db = { path = "fs/dbt-meta/crates/shared/db" }
+dbt-meta-db-derive = { path = "fs/dbt-meta/crates/shared/db-derive" }
+dbt-meta-environment = { path = "fs/dbt-meta/crates/commands/meta-environment" }
+dbt-meta-feature-flag = { path = "fs/dbt-meta/crates/shared/feature-flag" }
+dbt-meta-job = { path = "fs/dbt-meta/crates/commands/meta-job" }
+dbt-meta-metrics = { path = "fs/dbt-meta/crates/shared/metrics" }
+dbt-meta-migration = { path = "fs/dbt-meta/crates/shared/migration" }
+dbt-meta-object-store-clients = { path = "fs/dbt-meta/crates/shared/object-store-clients" }
+dbt-meta-rabbit = { path = "fs/dbt-meta/crates/shared/rabbit" }
 
 # jinja dependencies
 minijinja = { path = "crates/dbt-jinja/minijinja", features = [
@@ -180,6 +199,7 @@ arrow-ipc = { version = "=54.2.1" }
 arrow-json = { version = "=54.2.1" }
 arrow-schema = { version = "=54.2.1", features = ["serde"] }
 parquet = { version = "=54.2.1" }
+serde_arrow = { version = "0.13.4", features = ["arrow-54"] }
 
 # xdbc
 adbc-core = { git = "https://github.com/dbt-labs/arrow-adbc", package = "adbc_core", version = "0.18.0", features = [
@@ -192,7 +212,6 @@ antlr-rust = { git = "https://github.com/sdf-labs/antlr4", rev = "b8179d265532a5
 
 # datafusion
 datafusion = { version = "45.0.0", default-features = false, features = [
-  "compression",
   "crypto_expressions",
   "datetime_expressions",
   "encoding_expressions",
@@ -280,6 +299,7 @@ async-trait = "0.1.83"
 crossbeam-queue = "0.3.12"
 futures = "0.3.31"
 futures-core = "0.3"
+futures-lite = "2.0"
 futures-util = "0.3"
 once_cell = "1.18"
 parking_lot = { version = "0.12.3" }
@@ -352,8 +372,18 @@ phf_shared = { version = "0.11" }
 
 # error handling
 anyhow = { version = "1.0.74" }
+thiserror = "1.0"
+
+# database / orms
+sea-orm = { version = "~1.1.13", features = [
+  "sqlx-postgres",
+  "runtime-async-std-native-tls",
+  "macros",
+] }
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-native-tls"] }
 
 # logging
+env_logger = "0.10" # To be removed
 log = { version = "0.4.27", features = ["kv_serde"] }
 
 # tracing (observability)

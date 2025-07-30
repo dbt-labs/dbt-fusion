@@ -1,0 +1,90 @@
+name: Copybara - Auto Public PR Migration
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, labeled, unlabeled]
+    paths-ignore:
+      - '.github/**'
+      - '**/dbt-parser/src/resolver.rs'
+
+# only run this once per PR at a time
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.number }}
+  cancel-in-progress: true
+
+# ensures that no permissions are granted globally, only to the specific jobs that need them
+permissions: {}
+
+env:
+  CI_LABEL: "ci:approve-public-fork-ci"
+
+jobs:
+  check-run-approval:
+      permissions:
+          pull-requests: write
+          contents: read
+      # to prevent CI from running against public forks without us looking at the code, we will check for the presence of the proper label
+      runs-on: ubuntu-latest
+      steps:
+          -   name: "If the event is to synchronize, we should remove the label from the PR"
+              # also triggers on reopen to avoid a user closing, pushing changes and then reopening the PR
+              if: ${{ github.event_name == 'pull_request_target' && (github.event.action == 'synchronize' || github.event.action == 'reopened') && github.event.pull_request.head.repo.full_name != github.repository && contains(github.event.pull_request.labels.*.name, env.CI_LABEL) }}
+              run: |
+                  echo "Synchronizing PR, removing '${{ env.CI_LABEL }}' label"
+                  gh pr edit ${{ github.event.pull_request.number }} --remove-label ${{ env.CI_LABEL }} --repo ${{ github.repository }}
+                  msg="All pull request updates require re-approval of CI.  No CI will be run."
+                  echo "::error::$msg"
+                  exit 1
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+          -   name: "Check that forks have the '${{ env.CI_LABEL }}' label"
+              if: ${{ github.event.pull_request.head.repo.full_name != github.repository && !contains(github.event.pull_request.labels.*.name, env.CI_LABEL) }}
+              run: |
+                  msg="Pull request is from a public fork but does not have the '${{ env.CI_LABEL }}' label.  No CI will be run."
+                  echo "::error::$msg"
+                  exit 1
+
+  test_fusion:
+    needs: check_run_approval
+    name: "Test Fusion"
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/dbt-labs/fs-cli-x86_64:latest-with-datasets
+      credentials:
+        username: fa-assistant
+        password: ${{ secrets.IT_DBT_FUSION_READONLY_PULLREQUESTS }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure GitHub auth via ~/.netrc
+        run: |
+          cat > ~/.netrc <<EOF
+          machine github.com
+            login fa-assistant
+            password ${{ secrets.IT_DBT_FUSION_READONLY_PULLREQUESTS }}
+          EOF
+
+      - name: Test Fusion
+        run: |
+          RUST_MIN_STACK="8388608" cargo nextest run
+
+  copybara:
+      needs: test_fusion
+      runs-on: ubuntu-latest
+      container:
+        image: ghcr.io/dbt-labs/fs-cli-copybara:latest
+        credentials:
+          username: fa-assistant
+          password: ${{ secrets.IT_DBT_FUSION_READONLY_PULLREQUESTS }}
+      steps:
+        - name: Public PR Copybara Trigger
+          run: |    
+            curl -L \
+              -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${{ secrets.IT_DBT_FUSION_READONLY_PULLREQUESTS }}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              https://api.github.com/repos/dbt-labs/fs/dispatches \
+              -d "{\"event_type\": \"public-pr-copybara-trigger\", \"client_payload\": {\"copybara_pr\": \"${{ github.event.number }}\", \"unit\": false, \"integration\": true}}"

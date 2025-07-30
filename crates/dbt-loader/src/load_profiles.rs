@@ -1,8 +1,8 @@
-use dbt_jinja_utils::jinja_environment::JinjaEnvironment;
+use dbt_jinja_utils::jinja_environment::JinjaEnv;
 
 use dbt_common::constants::{DBT_PROFILES_YML, LOADING};
 use dbt_common::stdfs::canonicalize;
-use dbt_common::{err, fs_err, fsinfo, show_progress, show_warning, ErrorCode, FsResult};
+use dbt_common::{ErrorCode, FsResult, err, fs_err, fsinfo, show_progress, show_warning};
 
 use pathdiff::diff_paths;
 use std::path::PathBuf;
@@ -19,7 +19,7 @@ use serde::Serialize;
 pub fn load_profiles<S: Serialize>(
     arg: &LoadArgs,
     raw_dbt_project: &DbtProjectSimplified,
-    jinja_env: &JinjaEnvironment<'static>,
+    jinja_env: &JinjaEnv,
     ctx: &S,
 ) -> FsResult<DbtProfile> {
     // The profile name comes either from dbt_project.yml or the --profile arg.

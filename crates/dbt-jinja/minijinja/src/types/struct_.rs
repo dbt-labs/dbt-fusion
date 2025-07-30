@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use crate::types::{
     builtin::Type,
     class::ClassType,
-    function::{DynFunctionType, FunctionType},
+    function::{ArgSpec, DynFunctionType, FunctionType},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -25,10 +25,16 @@ impl ClassType for StructType {
                     fields: self.fields.clone(),
                 },
             )))),
-            _ => Err(crate::Error::new(
-                crate::error::ErrorKind::InvalidOperation,
-                format!("Struct does not have field {key}"),
-            )),
+            key => {
+                if let Some(field_type) = self.fields.get(key) {
+                    Ok(field_type.clone())
+                } else {
+                    Err(crate::Error::new(
+                        crate::error::ErrorKind::InvalidOperation,
+                        format!("Struct does not have field {key}"),
+                    ))
+                }
+            }
         }
     }
 
@@ -36,6 +42,7 @@ impl ClassType for StructType {
         match index {
             Type::String(Some(index)) => self.get_attribute(index),
             Type::String(None) => Ok(Type::Any { hard: true }),
+            Type::Any { hard: true } => Ok(Type::Any { hard: true }),
             _ => Err(crate::Error::new(
                 crate::error::ErrorKind::InvalidOperation,
                 format!("Failed to subscript {self:?} with {index:?}"),
@@ -82,7 +89,7 @@ impl FunctionType for StructGetFunctionType {
         }
     }
 
-    fn arg_names(&self) -> Vec<String> {
-        vec!["field_name".to_string()]
+    fn arg_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::new("field_name", false)]
     }
 }

@@ -1,16 +1,16 @@
 //! Module containing the entrypoint for the resolve phase.
-use crate::dbt_project_config::{init_project_config, RootProjectConfigs};
+use crate::dbt_project_config::{RootProjectConfigs, init_project_config};
 use crate::utils::get_node_fqn;
 
 use dbt_common::io_args::{IoArgs, StaticAnalysisKind};
-use dbt_common::{err, show_error, ErrorCode, FsResult};
-use dbt_jinja_utils::jinja_environment::JinjaEnvironment;
+use dbt_common::{ErrorCode, FsResult, err, show_error};
+use dbt_jinja_utils::jinja_environment::JinjaEnv;
 use dbt_jinja_utils::refs_and_sources::RefsAndSources;
-use dbt_jinja_utils::serde::{into_typed_with_jinja, Omissible};
+use dbt_jinja_utils::serde::{Omissible, into_typed_with_jinja};
 use dbt_jinja_utils::utils::generate_relation_name;
 use dbt_schemas::schemas::common::{
-    merge_meta, merge_tags, normalize_quoting, DbtChecksum, DbtMaterialization, DbtQuoting,
-    FreshnessDefinition, FreshnessRules, NodeDependsOn,
+    DbtChecksum, DbtMaterialization, DbtQuoting, FreshnessDefinition, FreshnessRules,
+    NodeDependsOn, merge_meta, merge_tags, normalize_quoting,
 };
 use dbt_schemas::schemas::dbt_column::process_columns;
 use dbt_schemas::schemas::project::{DefaultTo, SourceConfig};
@@ -36,7 +36,7 @@ pub fn resolve_sources(
     database: &str,
     adapter_type: &str,
     base_ctx: &BTreeMap<String, MinijinjaValue>,
-    jinja_env: &JinjaEnvironment<'static>,
+    jinja_env: &JinjaEnv,
     collected_tests: &mut Vec<DbtAsset>,
     refs_and_sources: &mut RefsAndSources,
 ) -> FsResult<(
@@ -83,11 +83,23 @@ pub fn resolve_sources(
             .unwrap_or(database.to_owned());
         let schema = source.schema.clone().unwrap_or(source.name.clone());
 
-        let global_config =
-            local_project_config.get_config_for_path(&mpe.relative_path, package_name, &[]);
+        // sources exist within the context of the model paths so we need to pass this into get config for path to get the config relative to the model paths
+        let model_resource_paths = package
+            .dbt_project
+            .model_paths
+            .as_ref()
+            .unwrap_or(&vec![])
+            .clone();
+
+        let global_config = local_project_config.get_config_for_path(
+            &mpe.relative_path,
+            package_name,
+            &model_resource_paths,
+        );
+
         let mut project_config = root_project_configs
             .sources
-            .get_config_for_path(&mpe.relative_path, package_name, &[])
+            .get_config_for_path(&mpe.relative_path, package_name, &model_resource_paths)
             .clone();
         project_config.default_to(global_config);
 
@@ -113,7 +125,7 @@ pub fn resolve_sources(
         let fqn = get_node_fqn(
             package_name,
             mpe.relative_path.clone(),
-            vec![table_name.to_owned()],
+            vec![source_name.to_owned(), table_name.to_owned()],
         );
 
         let merged_loaded_at_field = Some(
@@ -155,6 +167,7 @@ pub fn resolve_sources(
 
         let mut table_quoting = table.quoting.unwrap_or_default();
         table_quoting.default_to(&source_quoting);
+        let quoting_ignore_case = table_quoting.snowflake_ignore_case.unwrap_or(false);
 
         let (database, schema, identifier, quoting) = normalize_quoting(
             &table_quoting.try_into()?,
@@ -226,6 +239,7 @@ pub fn resolve_sources(
                 alias: identifier.to_owned(),
                 relation_name: Some(relation_name),
                 quoting,
+                quoting_ignore_case,
                 enabled: is_enabled,
                 extended_model: false,
                 materialized: DbtMaterialization::External,
@@ -272,12 +286,7 @@ pub fn resolve_sources(
                     table: &table.clone(),
                 }
                 .as_testable()
-                .persist(
-                    package_name,
-                    &io_args.out_dir,
-                    collected_tests,
-                    adapter_type,
-                )?;
+                .persist(package_name, collected_tests, adapter_type, io_args)?;
             }
             ModelStatus::Disabled => {
                 disabled_sources.insert(unique_id, Arc::new(dbt_source));

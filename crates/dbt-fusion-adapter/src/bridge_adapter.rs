@@ -14,12 +14,13 @@ use crate::record_batch_utils::extract_first_value_as_i64;
 use crate::render_constraint::render_model_constraint;
 use crate::snapshots::SnapshotStrategy;
 use crate::typed_adapter::TypedBaseAdapter;
-use crate::{BaseAdapter, SqlEngine};
+use crate::{AdapterResponse, AdapterResult, BaseAdapter, SqlEngine};
 
 use dbt_agate::AgateTable;
 use dbt_common::adapter::SchemaRegistry;
 use dbt_common::behavior_flags::{Behavior, BehaviorFlag};
-use dbt_common::{current_function_name, FsError, FsResult};
+use dbt_common::{FsError, FsResult, current_function_name};
+use dbt_schemas::schemas::InternalDbtNodeWrapper;
 use dbt_schemas::schemas::columns::base::StdColumn;
 use dbt_schemas::schemas::common::{DbtIncrementalStrategy, ResolvedQuoting};
 use dbt_schemas::schemas::dbt_column::DbtColumn;
@@ -30,14 +31,13 @@ use dbt_schemas::schemas::manifest::{
 use dbt_schemas::schemas::project::ModelConfig;
 use dbt_schemas::schemas::properties::ModelConstraint;
 use dbt_schemas::schemas::relations::base::{BaseRelation, ComponentName};
-use dbt_schemas::schemas::InternalDbtNodeWrapper;
 use dbt_xdbc::Connection;
-use minijinja::arg_utils::{check_num_args, ArgParser};
+use minijinja::arg_utils::{ArgParser, check_num_args};
 use minijinja::dispatch_object::DispatchObject;
 use minijinja::listener::RenderingEventListener;
 use minijinja::value::{Kwargs, Object};
-use minijinja::{invalid_argument, invalid_argument_inner, jinja_err, Value};
 use minijinja::{Error as MinijinjaError, ErrorKind as MinijinjaErrorKind, State};
+use minijinja::{Value, invalid_argument, invalid_argument_inner, jinja_err};
 use serde::Deserialize;
 use tracing;
 use tracy_client::span;
@@ -394,43 +394,39 @@ impl BaseAdapter for BridgeAdapter {
     }
 
     #[tracing::instrument(skip(self, state))]
-    fn execute(&self, state: &State, args: &[Value]) -> Result<Value, MinijinjaError> {
-        let mut parser = ArgParser::new(args, None);
-        check_num_args(current_function_name!(), &parser, 1, 4)?;
-
-        let sql = parser.get::<String>("sql")?;
-        let auto_begin = parser.get_optional::<bool>("auto_begin");
-        let fetch = parser.get_optional::<bool>("fetch");
-        let limit = parser.get_optional::<u32>("limit");
-
+    fn execute(
+        &self,
+        state: &State,
+        sql: &str,
+        auto_begin: bool,
+        fetch: bool,
+        limit: Option<i64>,
+    ) -> AdapterResult<(AdapterResponse, AgateTable)> {
         let mut conn = self.borrow_tlocal_connection()?;
         let query_ctx =
             query_ctx_from_state_with_sql(state, sql)?.with_desc("execute adapter call");
         let (response, table) =
             self.typed_adapter
                 .execute(conn.as_mut(), &query_ctx, auto_begin, fetch, limit)?;
-        Ok(Value::from_iter([
-            Value::from_object(response),
-            Value::from_object(table),
-        ]))
+        Ok((response, table))
     }
 
     #[tracing::instrument(skip(self, state))]
-    fn add_query(&self, state: &State, args: &[Value]) -> Result<Value, MinijinjaError> {
-        let mut parser = ArgParser::new(args, None);
-
-        let sql = parser.get::<String>("sql")?;
-        let auto_begin = parser.get_optional::<bool>("auto_begin");
-        let bindings = parser.get_optional::<Value>("bindings");
-        let abridge_sql_log = parser.get_optional::<bool>("abridge_sql_log");
-
+    fn add_query(
+        &self,
+        state: &State,
+        sql: &str,
+        auto_begin: bool,
+        bindings: Option<&Value>,
+        abridge_sql_log: bool,
+    ) -> AdapterResult<()> {
         let adapter_type = self.typed_adapter.adapter_type();
         let formatter = create_sql_literal_formatter(adapter_type);
 
         let formatted_sql = if let Some(bindings) = bindings {
-            format_sql_with_bindings(&sql, &bindings, formatter)?
+            format_sql_with_bindings(sql, bindings, formatter)?
         } else {
-            sql
+            sql.to_string()
         };
 
         let mut conn = self.borrow_tlocal_connection()?;
@@ -440,10 +436,11 @@ impl BaseAdapter for BridgeAdapter {
         self.typed_adapter.add_query(
             conn.as_mut(),
             &query_ctx,
-            auto_begin.unwrap_or(true),
-            abridge_sql_log.unwrap_or(false),
+            auto_begin,
+            bindings,
+            abridge_sql_log,
         )?;
-        Ok(Value::UNDEFINED)
+        Ok(())
     }
 
     #[tracing::instrument(skip(self, state))]
@@ -504,7 +501,7 @@ impl BaseAdapter for BridgeAdapter {
         let kwargs = Kwargs::from_iter([("database", Value::from(database))]);
 
         let result = execute_macro_wrapper(state, &[Value::from(kwargs)], "list_schemas")?;
-        let result = self.typed_adapter.list_schemas(result);
+        let result = self.typed_adapter.list_schemas(result)?;
 
         Ok(Value::from_iter(result))
     }
@@ -856,7 +853,8 @@ impl BaseAdapter for BridgeAdapter {
 
     /// reference: https://github.com/dbt-labs/dbt-adapters/blob/main/dbt-bigquery/src/dbt/adapters/bigquery/impl.py#L443-L444
     /// Shares the same input and output as get_column_schema_from_query, simply delegate to the other for now
-    /// TODO: but it's implemented in a different way, investigate if this matters.
+    /// FIXME(harry): unlike get_column_schema_from_query which only works when returning a non-empty result
+    /// get_columns_in_select_sql returns a schema using the BigQuery Job and GetTable APIs
     #[tracing::instrument(skip(self, state))]
     fn get_columns_in_select_sql(
         &self,
@@ -1023,8 +1021,11 @@ impl BaseAdapter for BridgeAdapter {
         let columns = parser.get::<Value>("columns")?;
 
         let partition_by =
-            BigqueryPartitionConfigLegacy::deserialize(partition_by).map_err(|e| {
-                MinijinjaError::new(MinijinjaErrorKind::SerdeDeserializeError, e.to_string())
+            BigqueryPartitionConfigLegacy::deserialize(partition_by.clone()).map_err(|e| {
+                MinijinjaError::new(
+                    MinijinjaErrorKind::SerdeDeserializeError,
+                    format!("adapter.add_time_ingestion_partition_column failed on partition_by {partition_by:?}: {e}"),
+                )
             })?;
 
         let result = self
