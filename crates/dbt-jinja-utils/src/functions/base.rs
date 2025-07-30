@@ -1330,7 +1330,7 @@ mod tests {
         env.add_function("toyaml", toyaml_fn());
 
         let template_source = r#"{{ toyaml({'a': 1, 'b': {'c': 3}}) }}"#;
-        let tmpl = env.template_from_str(template_source).unwrap();
+        let tmpl = env.template_from_str(template_source, &[]).unwrap();
         let output = tmpl.render(Value::UNDEFINED, &[]).unwrap();
         assert_eq!(output.trim(), "a: 1\nb:\n  c: 3");
     }
