@@ -1,32 +1,28 @@
-name: Check that PR has either "needs-docs" or "no-docs"
+# opens an issue in https://github.com/dbt-labs/docs-internal when a pr labeled with "needs-docs" is merged 
+
+name: Open issues in docs-internal repo when a PR is merged
+run-name: "Create an issue in docs-internal for PR #${{ github.event.pull_request.number }}"
 
 on:
-  pull_request: 
-    types: [opened, reopened, labeled, unlabeled, synchronize]
+  pull_request_target:
+    types: [closed]
 
 permissions:
-  pull-requests: read
+  issues: write
 
 jobs:
-  check-tag:
-    runs-on: ubuntu-24.04
-    steps:
-      - name: check if PR has tag
-        shell: bash
-        run: |
-          labels=$(gh api --jq '.labels.[].name' "/repos/$REPOSITORY/pulls/$PR_NUMBER")
-          echo "Found labels: $labels"
-          has_needs_docs=$(echo "$labels" | (grep "needs-docs" || true))
-          has_no_docs=$(echo "$labels" | (grep "no-docs" || true))
-          if [[ "$has_needs_docs" != "" && "$has_no_docs" != "" ]]; then
-            echo "PR must either have label 'no-docs' or 'needs-docs', not both"
-            exit 1;
-          elif [[ "$has_needs_docs" = "" && "$has_no_docs" = "" ]]; then
-            echo "PR must either have label 'no-docs' or 'needs-docs'"
-            exit 1;
-          fi
-          exit 0;
-        env:
-          REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
-          PR_NUMBER: ${{ github.event.number }}
-          GH_TOKEN: ${{ github.token }}
+  create-issue:
+    # Only run this job when a PR is merged and has the 'needs-docs' label
+    if: |
+      github.event.pull_request.merged == true &&
+      contains(github.event.pull_request.labels.*.name, 'needs-docs')
+    uses: dbt-labs/actions/.github/workflows/open-issue-in-repo.yml@main
+    with:
+      issue_repository: "dbt-labs/docs-internal"
+      issue_title: "Release Note: Changes from ${{ github.event.repository.name }} PR #${{ github.event.pull_request.number }}"
+      issue_body: |
+        Please review the merged PR and create appropriate release notes or updates in the documentation. 
+        Feel free to ping the author (@${{ github.event.pull_request.user.login }}) directly if you have any questions! 
+        Link to the merged PR: ${{ github.event.pull_request.html_url }}
+    secrets:
+      FISHTOWN_BOT_PAT: ${{ secrets.FA_ASSISTANT_CI_WORKFLOW_PAT_TOKEN }}
