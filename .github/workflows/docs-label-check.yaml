@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   check-tag:
-    runs-on: depot-ubuntu-24.04
+    runs-on: ubuntu-24.04
     steps:
       - name: check if PR has tag
         shell: bash
