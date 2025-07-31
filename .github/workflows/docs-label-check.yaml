@@ -1,0 +1,32 @@
+name: Check that PR has either "needs-docs" or "no-docs"
+
+on:
+  pull_request: 
+    types: [opened, reopened, labeled, unlabeled, synchronize]
+
+permissions:
+  pull-requests: read
+
+jobs:
+  check-tag:
+    runs-on: depot-ubuntu-24.04
+    steps:
+      - name: check if PR has tag
+        shell: bash
+        run: |
+          labels=$(gh api --jq '.labels.[].name' "/repos/$REPOSITORY/pulls/$PR_NUMBER")
+          echo "Found labels: $labels"
+          has_needs_docs=$(echo "$labels" | (grep "needs-docs" || true))
+          has_no_docs=$(echo "$labels" | (grep "no-docs" || true))
+          if [[ "$has_needs_docs" != "" && "$has_no_docs" != "" ]]; then
+            echo "PR must either have label 'no-docs' or 'needs-docs', not both"
+            exit 1;
+          elif [[ "$has_needs_docs" = "" && "$has_no_docs" = "" ]]; then
+            echo "PR must either have label 'no-docs' or 'needs-docs'"
+            exit 1;
+          fi
+          exit 0;
+        env:
+          REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_NUMBER: ${{ github.event.number }}
+          GH_TOKEN: ${{ github.token }}
