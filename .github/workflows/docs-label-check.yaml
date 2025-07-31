@@ -1,4 +1,4 @@
-# opens an issue in https://github.com/dbt-labs/docs-internal when a pr labeled with "needs-docs" is merged 
+# opens an issue in https://github.com/dbt-labs/docs-internal when a pr labeled with "needs-docs" is merged.
 
 name: Open issues in docs-internal repo when a PR is merged
 run-name: "Create an issue in docs-internal for PR #${{ github.event.pull_request.number }}"
