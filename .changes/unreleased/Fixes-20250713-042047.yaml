@@ -1,0 +1,3 @@
+kind: Fixes
+body: Fix misleading warning when evaluating Jinja in dbt_project.yml fails
+time: 2025-07-13T04:20:47.898266+02:00
