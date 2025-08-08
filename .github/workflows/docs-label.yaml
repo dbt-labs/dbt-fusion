@@ -5,7 +5,7 @@ run-name: "Create an issue in docs-internal for PR #${{ github.event.pull_reques
 
 on:
   pull_request_target:
-    types: [closed]
+    types: [labeled, closed]
 
 permissions:
   issues: write
