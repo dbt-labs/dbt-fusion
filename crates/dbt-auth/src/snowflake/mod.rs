@@ -445,7 +445,7 @@ impl SnowflakeAuth {
                             builder.with_named_option(snowflake::CLIENT_CACHE_MFA_TOKEN, "true")
                         } else {
                             Err(AuthError::config(format!(
-                                "'{value}' for authenticator is not supported. If using authenticator, it must be set to exactly one of {{'externalbrowser', 'oauth', 'username_password_mfa'}}."
+                                "'{value}' for authenticator is not supported. If using authenticator, it must be set to exactly one of {{'externalbrowser', 'oauth', 'username_password_mfa', 'jwt'}}."
                             )))?
                         }
                     }
