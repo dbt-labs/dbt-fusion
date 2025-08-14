@@ -381,6 +381,35 @@ impl ProfileSetup {
                     "method".to_string(),
                     serde_json::Value::String("oauth".to_string()),
                 );
+
+                let impersonate: bool = Confirm::new()
+                    .with_prompt("Do you want to impersonate a service account?")
+                    .default(false)
+                    .interact()
+                    .map_err(|e| {
+                        fs_err!(
+                            ErrorCode::IoError,
+                            "Failed to get impersonation choice: {}",
+                            e
+                        )
+                    })?;
+
+                if impersonate {
+                    let impersonate_service_account: String = Input::new()
+                        .with_prompt("impersonate_service_account (dbt-runner@your-project.iam.gserviceaccount.com)")
+                        .interact_text()
+                        .map_err(|e| {
+                            fs_err!(
+                                ErrorCode::IoError,
+                                "Failed to get impersonate_service_account: {}",
+                                e
+                            )
+                        })?;
+                    config.insert(
+                        "impersonate_service_account".to_string(),
+                        serde_json::Value::String(impersonate_service_account),
+                    );
+                }
             }
             1 => {
                 config.insert(
