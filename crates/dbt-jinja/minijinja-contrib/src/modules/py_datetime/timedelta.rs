@@ -1,5 +1,5 @@
 use chrono::Duration;
-use minijinja::{arg_utils::ArgParser, value::Object, Error, ErrorKind, Value};
+use minijinja::{Error, ErrorKind, Value, arg_utils::ArgParser, value::Object};
 use std::fmt;
 use std::sync::Arc;
 
@@ -263,9 +263,9 @@ impl Object for PyTimeDelta {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use minijinja::args;
     use minijinja::Environment;
     use minijinja::Value;
+    use minijinja::args;
 
     #[test]
     fn test_timedelta_creation() {

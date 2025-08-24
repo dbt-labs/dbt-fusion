@@ -6,7 +6,7 @@
 //! pattern-oriented usage consistent with MiniJinja's function/value approach.
 
 use fancy_regex::{Captures, Expander, Regex}; // like python regex, fancy_regex supports lookadheds/lookbehinds
-use minijinja::{value::Object, Error, ErrorKind, Value};
+use minijinja::{Error, ErrorKind, Value, value::Object};
 use std::{collections::BTreeMap, iter, sync::Arc};
 
 /// Create a namespace with `re`-like functions for pattern matching.

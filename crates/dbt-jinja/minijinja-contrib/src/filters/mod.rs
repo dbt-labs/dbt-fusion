@@ -1,7 +1,7 @@
 use std::convert::TryFrom;
 
-use minijinja::value::{Kwargs, Value, ValueKind};
 use minijinja::State;
+use minijinja::value::{Kwargs, Value, ValueKind};
 use minijinja::{Error, ErrorKind};
 
 #[cfg(feature = "datetime")]
@@ -262,7 +262,7 @@ pub fn wordcount(value: &Value) -> Result<Value, Error> {
 #[cfg(feature = "wordwrap")]
 #[cfg_attr(docsrs, doc(any(cfg(feature = "wordwrap"), cfg = "unicode_wordwrap")))]
 pub fn wordwrap(value: &Value, kwargs: Kwargs) -> Result<Value, Error> {
-    use textwrap::{wrap, Options as WrapOptions, WordSplitter};
+    use textwrap::{Options as WrapOptions, WordSplitter, wrap};
     let s = value.as_str().unwrap_or_default();
 
     let width = kwargs.get::<Option<usize>>("width")?.unwrap_or(79);

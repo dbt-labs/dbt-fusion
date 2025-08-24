@@ -1,5 +1,5 @@
 use insta::assert_snapshot;
-use minijinja::{render, Environment};
+use minijinja::{Environment, render};
 use minijinja_contrib::globals::{cycler, joiner};
 
 #[test]

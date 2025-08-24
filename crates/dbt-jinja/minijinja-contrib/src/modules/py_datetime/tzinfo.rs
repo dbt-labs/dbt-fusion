@@ -1,4 +1,4 @@
-use minijinja::{value::Object, Error, ErrorKind, Value};
+use minijinja::{Error, ErrorKind, Value, value::Object};
 use std::fmt;
 use std::rc::Rc;
 use std::sync::Arc;

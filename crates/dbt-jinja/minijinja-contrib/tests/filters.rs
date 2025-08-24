@@ -1,4 +1,4 @@
-use minijinja::{context, Environment};
+use minijinja::{Environment, context};
 use minijinja_contrib::filters::pluralize;
 use similar_asserts::assert_eq;
 

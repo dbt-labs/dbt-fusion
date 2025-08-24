@@ -1,11 +1,11 @@
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use minijinja::listener::RenderingEventListener;
 #[allow(unused)]
 use minijinja::value::Value;
-use minijinja::value::{from_args, Object, ObjectRepr};
+use minijinja::value::{Object, ObjectRepr, from_args};
 use minijinja::{Error, ErrorKind, State};
 
 /// Returns the current time in UTC as unix timestamp.
@@ -137,8 +137,8 @@ pub fn joiner(sep: Option<Value>) -> Value {
 /// Returns the rng for the state
 #[cfg(feature = "rand")]
 pub(crate) fn get_rng(state: &State) -> rand::rngs::SmallRng {
-    use rand::rngs::SmallRng;
     use rand::SeedableRng;
+    use rand::rngs::SmallRng;
 
     if let Some(seed) = state
         .lookup("RAND_SEED")
@@ -189,8 +189,8 @@ pub fn lipsum(
     n: Option<usize>,
     kwargs: minijinja::value::Kwargs,
 ) -> Result<Value, Error> {
-    use rand::seq::SliceRandom;
     use rand::Rng;
+    use rand::seq::SliceRandom;
 
     #[rustfmt::skip]
     const LIPSUM_WORDS: &[&str] = &[

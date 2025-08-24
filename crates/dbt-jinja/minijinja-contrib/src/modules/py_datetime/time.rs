@@ -1,5 +1,5 @@
 use chrono::{Local, NaiveDate, NaiveTime, Timelike};
-use minijinja::{arg_utils::ArgParser, value::Object, Error, ErrorKind, Value};
+use minijinja::{Error, ErrorKind, Value, arg_utils::ArgParser, value::Object};
 use std::fmt;
 use std::sync::Arc;
 
@@ -92,7 +92,7 @@ impl PyTimeClass {
                 return Err(Error::new(
                     ErrorKind::InvalidArgument,
                     format!("Invalid iso time format: {iso_str}: {e}"),
-                ))
+                ));
             }
         };
 
@@ -318,8 +318,8 @@ impl Object for PyTime {
 mod tests {
     use super::*;
     use crate::modules::py_datetime::timedelta::PyTimeDelta;
-    use minijinja::context;
     use minijinja::Environment;
+    use minijinja::context;
 
     #[test]
     fn test_time_strftime() {
@@ -342,9 +342,11 @@ mod tests {
 
         // Test error case - missing format argument
         let error = time_arc.strftime(&[]).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("strftime requires one string argument"));
+        assert!(
+            error
+                .to_string()
+                .contains("strftime requires one string argument")
+        );
     }
 
     #[test]
