@@ -295,13 +295,19 @@ fn get_or_compile_regex_and_text(args: &[Value]) -> Result<(Box<Regex>, &str), E
     }
 
     // First arg: either compiled or raw pattern
-    let pattern = args[0].to_string();
-    let compiled = Box::new(Regex::new(&pattern).map_err(|e| {
-        Error::new(
-            ErrorKind::InvalidOperation,
-            format!("Failed to compile regex: {e}"),
-        )
-    })?);
+    let compiled = if let Some(object) = args[0].as_object()
+        && let Some(pattern) = object.downcast_ref::<Pattern>()
+    {
+        Box::new(pattern._compiled.clone())
+    } else {
+        let pattern = args[0].to_string();
+        Box::new(Regex::new(&pattern).map_err(|e| {
+            Error::new(
+                ErrorKind::InvalidOperation,
+                format!("Failed to compile regex: {e}"),
+            )
+        })?)
+    };
 
     // Second arg: the text to match against
     let text = args[1].to_string();
@@ -412,5 +418,19 @@ mod tests {
         ])
         .unwrap();
         assert!(!result.is_true());
+    }
+
+    #[test]
+    fn test_re_search() {
+        let result = re_search(&[
+            Value::from(".*".to_string()),
+            Value::from("xyz".to_string()),
+        ])
+        .unwrap();
+        assert!(result.is_true());
+
+        let compiled_pattern = re_compile(&[Value::from(".*".to_string())]).unwrap();
+        let result = re_search(&[compiled_pattern, Value::from("xyz".to_string())]).unwrap();
+        assert!(result.is_true());
     }
 }
