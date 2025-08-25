@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -730,6 +731,11 @@ impl DynObject {
     /// Checks if this dyn object is the same as another.
     pub(crate) fn is_same_object(&self, other: &DynObject) -> bool {
         self.ptr == other.ptr && self.vtable == other.vtable
+    }
+
+    /// Checks if the two dyn objects are of the same type.
+    pub(crate) fn is_same_object_type(&self, other: &DynObject) -> bool {
+        self.type_id() == other.type_id()
     }
 }
 
