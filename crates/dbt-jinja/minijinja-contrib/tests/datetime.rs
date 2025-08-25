@@ -366,12 +366,10 @@ fn test_datetime_comparison_with_incompatible_types() {
     ).unwrap();
     
     let output = tmpl.render(context!{}, &[]).unwrap();
-    println!("Test output:\n{}", output);
     assert!(output.contains("dt_vs_num: false"));
     assert!(output.contains("dt_vs_str: false"));
     assert!(output.contains("dt_vs_none: false"));
-    // TODO: this should return false as dt and date are different types
-    // assert!(output.contains("dt_vs_date: false"));
+    assert!(output.contains("dt_vs_date: false"));
 }
 
 #[test]

@@ -5,7 +5,7 @@ use std::cmp::Ordering;
 
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
-use minijinja::{arg_utils::ArgParser, value::Object, Error, ErrorKind, Value};
+use minijinja::{arg_utils::ArgParser, value::{Object, ObjectRepr}, Error, ErrorKind, Value};
 
 use crate::modules::py_datetime::date::PyDate; // your date
 use crate::modules::py_datetime::time::PyTime;
@@ -825,6 +825,10 @@ impl PyDateTime {
 // Implement the `Object` trait for PyDateTime so Jinja can call methods
 //
 impl Object for PyDateTime {
+    fn repr(self: &Arc<Self>) -> ObjectRepr {
+        ObjectRepr::Plain
+    }
+    
     fn is_true(self: &Arc<Self>) -> bool {
         true
     }
