@@ -1,6 +1,7 @@
 use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::cmp::Ordering;
 
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
@@ -826,6 +827,16 @@ impl PyDateTime {
 impl Object for PyDateTime {
     fn is_true(self: &Arc<Self>) -> bool {
         true
+    }
+
+    fn custom_cmp(self: &Arc<Self>, other: &minijinja::value::DynObject) -> Option<Ordering> {
+        // try to downcast the other object to PyDateTime
+        if let Some(other_dt) = other.downcast_ref::<PyDateTime>() {
+            // compare using timestamps
+            self.timestamp().partial_cmp(&other_dt.timestamp())
+        } else {
+            None
+        }
     }
 
     fn call_method(
