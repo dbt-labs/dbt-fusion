@@ -4,6 +4,7 @@ use std::fmt;
 use std::hash::Hash;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::cmp::Ordering;
 
 use crate::error::{Error, ErrorKind};
 use crate::listener::RenderingEventListener;
@@ -263,6 +264,35 @@ pub trait Object: fmt::Debug + Send + Sync {
         }
 
         Err(Error::from(ErrorKind::UnknownMethod))
+    }
+
+    /// Custom comparison of this object against another object of the same type.
+    ///
+    /// This must return either `None` or `Some(Ordering)`.  When implemented this
+    /// must guarantee a total ordering as otherwise sort functions will crash.
+    /// This will only compare against other objects of the same type, not
+    /// anything else.  Objects of different types are given an absolute
+    /// ordering outside the scope of this method.
+    ///
+    /// The requirement is that an implementer downcasts the other [`DynObject`]
+    /// to itself, and it that cannot be accomplished `None` must be returned.
+    ///
+    /// ```rust
+    /// # use std::sync::Arc;
+    /// # use std::cmp::Ordering;
+    /// # use minijinja::value::{DynObject, Object};
+    /// # #[derive(Debug)]
+    /// # struct Thing { num: u32 };
+    /// impl Object for Thing {
+    ///     fn custom_cmp(self: &Arc<Self>, other: &DynObject) -> Option<Ordering> {
+    ///         let other = other.downcast_ref::<Self>()?;
+    ///         Some(self.num.cmp(&other.num))
+    ///     }
+    /// }
+    /// ```
+    fn custom_cmp(self: &Arc<Self>, other: &DynObject) -> Option<Ordering> {
+        let _ = other;
+        None
     }
 
     /// Formats the object for stringification.
@@ -680,6 +710,8 @@ type_erase! {
             args: &[Value],
             listeners: &[Rc<dyn RenderingEventListener>]
         ) -> Result<Value, Error>;
+
+        fn custom_cmp(&self, other: &DynObject) -> Option<Ordering>;
 
         fn render(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result;
 
