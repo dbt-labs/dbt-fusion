@@ -59,15 +59,16 @@ Legend:
 | 2025-06-09  | Databricks Adapter release  | Databricks ADBC driver, and adapter for Fusion |
 | 2025-06-30  | BigQuery Adapter release    | BigQuery ADBC driver, and adapter for Fusion |
 | 2025-07-31  | Redshift Adapter release    | Redshift ADBC driver, and adapter for Fusion |
-| 2025-08-30  | ANTLR Grammars release + SQL Parser  | The SQL grammar used by the ANTLR parser generator.  |
+| 2025-10-01  | OSS Adapters                | Adapter components published under Apache 2.0 license |
+| 2025-12-01  | ANTLR Grammars release + SQL Parser  | The SQL grammar used by the ANTLR parser generator.  |
 
 ### Top Level Components Released to Date
 Releases of various Fusion components will be iterative as each component reaches maturity & readiness for contribution.
 
 - [x] `dbt-jinja` - All Rust extension of mini-jinja to support dbt's jinja functions & other capabilities
 - [x] `dbt-parser` - Rust parser for dbt projects
-- [x] `dbt-snowflake` - database driver
 - [x] `dbt-schemas` - complete, correct, machine generated json schemas for dbt's authoring surface
+- [ ] `dbt-fusion-adapter` - ADBC drivers & adapters for supported data warehouses (in progress!)
 - [ ] `dbt-sql` - ANTLR grammars and generated parsers
   - [ ] snowflake.g4 
   - [ ] bigquery.g4
