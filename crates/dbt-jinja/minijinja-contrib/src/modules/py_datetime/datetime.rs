@@ -837,7 +837,7 @@ impl Object for PyDateTime {
         // try to downcast the other object to PyDateTime
         if let Some(other_dt) = other.downcast_ref::<PyDateTime>() {
             // compare using timestamps
-            self.timestamp().total_cmp(&other_dt.timestamp())
+            self.timestamp().partial_cmp(&other_dt.timestamp())
         } else {
             None
         }
