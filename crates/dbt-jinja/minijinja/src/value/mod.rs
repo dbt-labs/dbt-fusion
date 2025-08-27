@@ -633,6 +633,7 @@ impl Ord for Value {
                 Some(ops::CoerceResult::I128(a, b)) => a.cmp(&b),
                 Some(ops::CoerceResult::Str(a, b)) => a.cmp(b),
                 None => {
+                    // if coerce fails and kinds match, both must be objects
                     let a = self.as_object().unwrap();
                     let b = other.as_object().unwrap();
 
