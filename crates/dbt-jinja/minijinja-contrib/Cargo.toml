@@ -1,7 +1,7 @@
 [package]
 name = "minijinja-contrib"
 version = "2.5.0"
-edition = "2021"
+edition = "2024"
 license = "Apache-2.0"
 authors = ["Armin Ronacher <armin.ronacher@active-4.com>"]
 description = "Extra utilities for MiniJinja"
@@ -9,7 +9,7 @@ homepage = "https://github.com/mitsuhiko/minijinja"
 repository = "https://github.com/mitsuhiko/minijinja"
 keywords = ["jinja", "jinja2", "templates"]
 readme = "README.md"
-rust-version = "1.70"
+rust-version = "1.88.0"
 
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "docsrs", "--html-in-header", "doc-header.html"]

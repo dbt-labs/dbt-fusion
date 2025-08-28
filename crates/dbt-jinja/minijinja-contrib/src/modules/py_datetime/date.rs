@@ -1,6 +1,6 @@
 use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, TimeZone};
 use minijinja::arg_utils::ArgParser;
-use minijinja::{value::Object, Error, ErrorKind, Value};
+use minijinja::{Error, ErrorKind, Value, value::Object};
 use std::fmt;
 use std::sync::Arc;
 
@@ -336,9 +336,9 @@ impl Object for PyDate {
 mod tests {
     use super::*;
     use crate::modules::py_datetime::timedelta::PyTimeDelta;
+    use minijinja::Environment;
     use minijinja::args;
     use minijinja::context;
-    use minijinja::Environment;
 
     #[test]
     fn test_date_strftime() {
@@ -361,9 +361,11 @@ mod tests {
 
         // Test error case - missing format argument
         let error = date_arc.strftime(&[]).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("strftime requires one string argument"));
+        assert!(
+            error
+                .to_string()
+                .contains("strftime requires one string argument")
+        );
     }
 
     #[test]
@@ -546,9 +548,11 @@ mod tests {
         // Test invalid date
         let result = date_arc.replace(args!(month => 13));
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid date: year=2023, month=13, day=15"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid date: year=2023, month=13, day=15")
+        );
     }
 }

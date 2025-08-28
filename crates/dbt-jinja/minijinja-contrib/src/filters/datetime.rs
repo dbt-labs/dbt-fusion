@@ -2,10 +2,10 @@ use std::convert::TryFrom;
 
 use minijinja::value::{Kwargs, Value, ValueKind};
 use minijinja::{Error, ErrorKind, State};
-use serde::de::value::SeqDeserializer;
 use serde::Deserialize;
+use serde::de::value::SeqDeserializer;
 use time::format_description::well_known::iso8601::Iso8601;
-use time::{format_description, Date, OffsetDateTime, PrimitiveDateTime};
+use time::{Date, OffsetDateTime, PrimitiveDateTime, format_description};
 
 fn handle_serde_error(err: serde::de::value::Error) -> Error {
     Error::new(ErrorKind::InvalidOperation, "not a valid date or timestamp").with_source(err)
@@ -39,7 +39,7 @@ fn value_to_datetime(
                             ErrorKind::InvalidOperation,
                             "not a valid date or timestamp",
                         )
-                        .with_source(original_err))
+                        .with_source(original_err));
                     }
                 },
             },

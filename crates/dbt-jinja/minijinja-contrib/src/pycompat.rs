@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use minijinja::tuple;
 use minijinja::value::mutable_vec::MutableVec;
-use minijinja::value::{from_args, ValueKind};
+use minijinja::value::{ValueKind, from_args};
 use minijinja::{Error, ErrorKind, State, Value};
 use regex::Regex;
 

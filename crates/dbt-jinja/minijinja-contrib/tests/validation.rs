@@ -10,27 +10,35 @@ fn test_validation() {
     let mut env = Environment::new();
     env.add_global("validation", create_validation_namespace());
 
-    assert!(eval_expr(
-        &env,
-        "validation.any['compound', 'interleaved']('compound')"
-    )
-    .unwrap()
-    .is_true());
-    assert!(eval_expr(
-        &env,
-        "validation.any['compound', 'interleaved']('interleaved')"
-    )
-    .unwrap()
-    .is_true());
-    assert!(eval_expr(
-        &env,
-        "validation.any['compound', 'interleaved']('something_else')"
-    )
-    .is_err());
-
-    assert!(eval_expr(&env, "validation.any['compound']('compound')")
+    assert!(
+        eval_expr(
+            &env,
+            "validation.any['compound', 'interleaved']('compound')"
+        )
         .unwrap()
-        .is_true());
+        .is_true()
+    );
+    assert!(
+        eval_expr(
+            &env,
+            "validation.any['compound', 'interleaved']('interleaved')"
+        )
+        .unwrap()
+        .is_true()
+    );
+    assert!(
+        eval_expr(
+            &env,
+            "validation.any['compound', 'interleaved']('something_else')"
+        )
+        .is_err()
+    );
+
+    assert!(
+        eval_expr(&env, "validation.any['compound']('compound')")
+            .unwrap()
+            .is_true()
+    );
     assert!(eval_expr(&env, "validation.any['compound']('something_else')").is_err());
     // compound here is a type, we should always return true when type is used
     assert!(
@@ -38,10 +46,14 @@ fn test_validation() {
             .unwrap()
             .is_true()
     );
-    assert!(eval_expr(&env, "validation.any[anytype](1)")
-        .unwrap()
-        .is_true());
-    assert!(eval_expr(&env, "validation.any['test', anytype](1)")
-        .unwrap()
-        .is_true());
+    assert!(
+        eval_expr(&env, "validation.any[anytype](1)")
+            .unwrap()
+            .is_true()
+    );
+    assert!(
+        eval_expr(&env, "validation.any['test', anytype](1)")
+            .unwrap()
+            .is_true()
+    );
 }

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
-use minijinja::{arg_utils::ArgParser, value::Object, Error, ErrorKind, Value};
+use minijinja::{Error, ErrorKind, Value, arg_utils::ArgParser, value::Object};
 
 use crate::modules::py_datetime::date::PyDate; // your date
 use crate::modules::py_datetime::time::PyTime;
