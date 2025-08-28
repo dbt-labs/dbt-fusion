@@ -18,6 +18,8 @@ impl Auth for DatabricksAuth {
         }
     }
 
+    // code changes
+
     fn configure(&self, config: &AdapterConfig) -> Result<database::Builder, AuthError> {
         let mut builder = database::Builder::new(self.backend());
 
