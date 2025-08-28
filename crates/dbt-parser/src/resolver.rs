@@ -243,7 +243,6 @@ pub async fn resolve(
     // Check access
     check_access(arg, &nodes, &all_runtime_configs);
 
-
     Ok((
         ResolverState {
             root_project_name: root_project_name.to_string(),
