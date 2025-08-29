@@ -29,25 +29,42 @@ jobs:
   enforce_signed_commits:
     runs-on: ubuntu-latest
     steps:
-      - name: "Enforce signed commits"
+      # For pull_request_target, checkout the base repo first
+      - name: "Checkout base repo"
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          # We only need enough history to get to the PR's base commit
+          fetch-depth: 1
+          persist-credentials: false  # don't persist credentials for security
+
+      # Fetch (but don't checkout) the PR commits since this may be a fork with untrusted code
+      - name: "Fetch PR commits"
+        run: |
+          git remote add fork ${{ github.event.pull_request.head.repo.clone_url }}
+          git fetch fork ${{ github.event.pull_request.head.sha }}
+
+      - name: "Check for signed commits"
         id: signed-commits
+        shell: bash
         run: |
-            git log --show-signature
+          # Check all commits in the PR using the fork remote
+          PR_RANGE="${{ github.event.pull_request.base.sha }}..fork/${{ github.event.pull_request.head.ref }}"
+          echo "Checking commits in range: $PR_RANGE"
 
-      - name: "Print status of signed commits"
-        if: steps.signed-commits.outputs.signed-commits == 'true'
-        run: |
-          echo "All commits in this PR are signed"
-
-      - name: "List unverified commits"
-        if: steps.signed-commits.outputs.signed-commits == 'false'
-        run: |
-          git log --show-signature
+          if ! git log "$PR_RANGE" --show-signature | grep -q "^[^[:space:]].*Signature made.*Good signature"; then
+            echo "signed-commits=false" >> $GITHUB_OUTPUT
+            echo "Found unsigned commits:"
+            git log "$PR_RANGE" --show-signature
+          else
+            echo "signed-commits=true" >> $GITHUB_OUTPUT
+            echo "All commits are signed"
+          fi
 
       - name: "Check for comment"
         if: steps.signed-commits.outputs.signed-commits == 'false'
         id: signed_comment
-        uses: peter-evans/find-comment@v3
+        uses: peter-evans/find-comment@3eae4d37986fb5a8592848f6a574fdf654e61f9e
         with:
             issue-number: ${{ github.event.pull_request.number }}
             comment-author: "github-actions[bot]"
@@ -72,8 +89,8 @@ jobs:
             steps.comment_check.outputs.exists == 'false'
         run: |
             gh issue comment ${{ github.event.pull_request.number }} --repo ${{ github.repository }} --body "${{ env.SIGNED_COMMITS_COMMENT }}"
-            env:
-                GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: "Fail job if signed commits are missing"
         if: steps.signed-commits.outputs.signed-commits == 'false'
