@@ -1,0 +1,3 @@
+kind: Fixes
+body: '`parent_map` and `child_map` are now correctly populated (#499)'
+time: 2025-08-17T09:50:48.012744+01:00
