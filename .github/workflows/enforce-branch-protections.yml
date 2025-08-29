@@ -1,0 +1,82 @@
+# **what?**
+# Since we don't merge most PRs in this repo, we need 
+# a visible way to enforce branch protections to ensure
+# changes can be properly merged and deployed.
+
+# **why?**
+# For security hardening.
+
+# **when?**
+# This will run for all PRs targetting main.
+
+
+name: Enforce Branch Protections
+
+on:
+  pull_request_target:
+    types: [opened, reopened, labeled, unlabeled, synchronize]
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  SIGNED_COMMITS_COMMENT: >
+    This repository enforces signed commits. Please sign your commits by adding the `-s` flag to your commit message.
+
+jobs:
+  enforce_signed_commits:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Enforce signed commits"
+        id: signed-commits
+        run: |
+            git log --show-signature
+
+      - name: "Print status of signed commits"
+        if: steps.signed-commits.outputs.signed-commits == 'true'
+        run: |
+          echo "All commits in this PR are signed"
+
+      - name: "List unverified commits"
+        if: steps.signed-commits.outputs.signed-commits == 'false'
+        run: |
+          git log --show-signature
+
+      - name: "Check for comment"
+        if: steps.signed-commits.outputs.signed-commits == 'false'
+        id: signed_comment
+        uses: peter-evans/find-comment@v3
+        with:
+            issue-number: ${{ github.event.pull_request.number }}
+            comment-author: "github-actions[bot]"
+            body-includes: ${{ env.SIGNED_COMMITS_COMMENT }}
+
+      - name: "Set if comment already exists"
+        if: steps.signed-commits.outputs.signed-commits == 'false'
+        shell: bash
+        id: comment_check
+        run: |
+            if [ '${{ steps.signed_comment.outputs.comment-body }}' = '' ]; then
+                echo "exists=false" >> $GITHUB_OUTPUT
+                echo "Comment does not exist for this PR"
+            else
+                echo "exists=true" >> $GITHUB_OUTPUT
+                echo "Comment already exists for this PR"
+            fi
+
+      - name: "Create PR comment if signed commits are missing"
+        if: |
+            steps.signed-commits.outputs.signed-commits == 'false' &&
+            steps.comment_check.outputs.exists == 'false'
+        run: |
+            gh issue comment ${{ github.event.pull_request.number }} --repo ${{ github.repository }} --body "${{ env.SIGNED_COMMITS_COMMENT }}"
+            env:
+                GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: "Fail job if signed commits are missing"
+        if: steps.signed-commits.outputs.signed-commits == 'false'
+        uses: actions/github-script@v7
+        with:
+            script: core.setFailed('Signed commits are required to merge.')
