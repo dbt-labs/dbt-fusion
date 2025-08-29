@@ -29,38 +29,23 @@ jobs:
   enforce_signed_commits:
     runs-on: ubuntu-latest
     steps:
-      # For pull_request_target, checkout the base repo first
-      - name: "Checkout base repo"
-        uses: actions/checkout@v5
-        with:
-          ref: ${{ github.event.pull_request.base.sha }}
-          # We only need enough history to get to the PR's base commit
-          fetch-depth: 1
-          persist-credentials: false  # don't persist credentials for security
-
-      # Fetch (but don't checkout) the PR commits since this may be a fork with untrusted code
-      - name: "Fetch PR commits"
-        run: |
-          git remote add fork ${{ github.event.pull_request.head.repo.clone_url }}
-          git fetch fork ${{ github.event.pull_request.head.sha }}
-
-      - name: "Check for signed commits"
+      - name: "Check commit signatures"
         id: signed-commits
         shell: bash
         env:
           PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Check all commits in the PR using the fork remote
-          PR_RANGE="${{ github.event.pull_request.base.sha }}..fork/$PR_HEAD_REF"
-          echo "Checking commits in range: $PR_RANGE"
-
-          if ! git log "$PR_RANGE" --show-signature | grep -q "^[^[:space:]].*Signature made.*Good signature"; then
+          # Get list of commits in PR and check their verification status
+          if gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/commits" | \
+             jq -e '.[] | select(.commit.verification.verified != true)' > /dev/null; then
+            echo "Found unsigned commits"
             echo "signed-commits=false" >> $GITHUB_OUTPUT
-            echo "Found unsigned commits:"
-            git log "$PR_RANGE" --show-signature
+            gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/commits" | \
+              jq -r '.[] | select(.commit.verification.verified != true) | "SHA: \(.sha)\nMessage: \(.commit.message)\nReason: \(.commit.verification.reason)\n"'
           else
-            echo "signed-commits=true" >> $GITHUB_OUTPUT
             echo "All commits are signed"
+            echo "signed-commits=true" >> $GITHUB_OUTPUT
           fi
 
       - name: "Check for comment"
