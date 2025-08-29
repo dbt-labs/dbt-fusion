@@ -47,9 +47,11 @@ jobs:
       - name: "Check for signed commits"
         id: signed-commits
         shell: bash
+        env:
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
         run: |
           # Check all commits in the PR using the fork remote
-          PR_RANGE="${{ github.event.pull_request.base.sha }}..fork/${{ github.event.pull_request.head.ref }}"
+          PR_RANGE="${{ github.event.pull_request.base.sha }}..fork/$PR_HEAD_REF"
           echo "Checking commits in range: $PR_RANGE"
 
           if ! git log "$PR_RANGE" --show-signature | grep -q "^[^[:space:]].*Signature made.*Good signature"; then
