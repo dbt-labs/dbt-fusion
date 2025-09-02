@@ -15,7 +15,6 @@ name: Enforce Branch Protections
 on:
   pull_request_target:
     types: [opened, reopened, labeled, unlabeled, synchronize]
-    branches: [main]
 
 permissions:
   contents: read
