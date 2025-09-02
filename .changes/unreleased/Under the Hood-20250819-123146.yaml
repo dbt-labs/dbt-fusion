@@ -1,3 +1,7 @@
 kind: Under the Hood
 body: Move need_quotes to AdapterType
 time: 2025-08-19T12:31:46.979303408-07:00
+custom:
+  author: ""
+  issue: ""
+  project: dbt-fusion

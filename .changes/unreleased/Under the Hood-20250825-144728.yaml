@@ -1,3 +1,7 @@
 kind: Under the Hood
-body: add extract-sources subcommand
+body: "add extract-sources subcommand"
 time: 2025-08-25T14:47:28.502700463-07:00
+custom:
+  author: "wizardxz"
+  issue: ""
+  project: dbt-fusion
