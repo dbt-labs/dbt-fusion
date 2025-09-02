@@ -387,6 +387,7 @@ impl Object for Capture {
             if let Some((start, end)) = self.span {
                 write!(f, "span = ({start}, {end}), ")?;
             }
+            // TODO: escape quotes in g
             write!(f, "match = '{g}'")?;
         }
         write!(f, ">")
