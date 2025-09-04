@@ -62,6 +62,11 @@ impl TryFrom<BigQueryAuthConfig> for database::Builder {
                     )?;
                     builder
                         .with_named_option(bigquery::AUTH_CREDENTIALS, expanded_path.as_str())?;
+                    // Add Google Drive scope for accessing Google Sheets as external tables
+                    builder.with_named_option(
+                        bigquery::IMPERSONATE_SCOPES,
+                        "https://www.googleapis.com/auth/bigquery,https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/drive",
+                    )?;
                     Ok(builder)
                 } else {
                     Err(AuthError::config(format!(
@@ -84,6 +89,11 @@ impl TryFrom<BigQueryAuthConfig> for database::Builder {
                     bigquery::auth_type::JSON_CREDENTIAL_STRING,
                 )?;
                 builder.with_named_option(bigquery::AUTH_CREDENTIALS, value)?;
+                // Add Google Drive scope for accessing Google Sheets as external tables
+                builder.with_named_option(
+                    bigquery::IMPERSONATE_SCOPES,
+                    "https://www.googleapis.com/auth/bigquery,https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/drive",
+                )?;
 
                 Ok(builder)
             }
@@ -295,6 +305,9 @@ mod tests {
                             bigquery::LOCATION => {
                                 assert_eq!(value, "my_location".to_string())
                             }
+                            bigquery::IMPERSONATE_SCOPES => {
+                                assert_eq!(value, "https://www.googleapis.com/auth/bigquery,https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/drive".to_string())
+                            }
                             _ => panic!("Unexpected BigQuery auth option for service account json"),
                         },
                         _ => panic!("Unexpected option field: {:?}", option.0),
@@ -328,6 +341,8 @@ mod tests {
         match result {
             Ok(builder) => {
                 let other_options = builder.other;
+                
+                // Check AUTH_CREDENTIALS
                 let option_value = &other_options
                     .iter()
                     .find(|(k, _)| {
@@ -338,9 +353,23 @@ mod tests {
                     .unwrap()
                     .1;
                 let value: String = value_option_to_string(option_value.clone());
+                assert_eq!(value, long_path);
+                
+                // Check IMPERSONATE_SCOPES
+                let scopes_option = &other_options
+                    .iter()
+                    .find(|(k, _)| {
+                        k == &adbc_core::options::OptionDatabase::Other(
+                            bigquery::IMPERSONATE_SCOPES.to_string(),
+                        )
+                    })
+                    .unwrap()
+                    .1;
+                let scopes_value: String = value_option_to_string(scopes_option.clone());
+                assert_eq!(scopes_value, "https://www.googleapis.com/auth/bigquery,https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/drive");
+                
                 #[allow(unused_must_use)]
                 remove_file(long_path.to_string());
-                assert_eq!(value, long_path);
             }
             Err(err) => {
                 #[allow(unused_must_use)]
