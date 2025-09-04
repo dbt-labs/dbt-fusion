@@ -25,7 +25,7 @@ impl<'env: 'source, 'source> JinjaExpression<'env, 'source> {
         listeners: &[Rc<dyn RenderingEventListener>],
     ) -> FsResult<Value> {
         let result = self.0.eval(ctx, listeners).map_err(|e| {
-            FsError::from_jinja_err(e, "Failed to eval the compiled Jinja expression")
+            FsError::from_jinja_err(e, "Failed to eval Jinja expression")
         })?;
         Ok(result)
     }
