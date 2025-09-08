@@ -414,6 +414,7 @@ location: my_location
                     _ => panic!("Unexpected BigQuery auth option for service account json"),
                 },
                 _ => panic!("Unexpected option field: {:?}", option.0),
+            }
         }
     }
 
