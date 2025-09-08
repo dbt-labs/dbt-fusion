@@ -607,7 +607,7 @@ fn test_functions() {
     );
     assert_snapshot!(
         render!("{{ f() }}", f => Value::from_function(|| -> Option<i32> { None })),
-        @"none"
+        @"None"
     );
     assert_snapshot!(
         render!("{{ f() }}", f => Value::from_function(|| -> Result<i32, Error> { Ok(23) })),
