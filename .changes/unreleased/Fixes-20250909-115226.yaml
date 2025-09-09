@@ -1,0 +1,7 @@
+kind: Fixes
+body: Use the correct home directory on Windows.
+time: 2025-09-09T11:52:26.2001804-04:00
+custom:
+    author: johnedmonds
+    issue: ""
+    project: dbt-fusion
