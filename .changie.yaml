@@ -10,10 +10,10 @@ kindFormat: "### {{.Kind}}"
 
 custom:
   - key: issue
-    label: dbt-fusion issue number (leave empty if not applicable)
+    label: "[Optional] dbt-fusion issue number (separated by a single space if multiple)"
     type: string
   - key: author
-    label: Your GitHub handle (without the @ symbol)
+    label: "[Optional] Author's GitHub handle without the @ symbol (separated by a single space if multiple)"
     type: string
 
 kinds:
