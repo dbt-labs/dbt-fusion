@@ -129,7 +129,7 @@ impl ProjectStore {
         format!("https://{}", self.config.context.active_host)
     }
 
-    pub fn try_load_profile(&self, profiles_dir: &PathBuf, profile_name: &str) -> Option<DbConfig> {
+    pub fn try_load_profile(&self, profiles_dir: &Path, profile_name: &str) -> Option<DbConfig> {
         load_profile_with_loader(Some(profiles_dir), profile_name, None).ok()
     }
 }
