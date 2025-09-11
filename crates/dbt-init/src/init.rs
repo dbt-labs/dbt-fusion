@@ -230,7 +230,7 @@ fn update_dbt_project_profile(profile_name: &str) -> FsResult<()> {
 }
 
 /// Check if a profile exists in profiles.yml
-pub fn check_if_profile_exists(profile_name: &str, profiles_dir: &PathBuf) -> FsResult<bool> {
+pub fn check_if_profile_exists(profile_name: &str, profiles_dir: &Path) -> FsResult<bool> {
     let profiles_file = profiles_dir.join("profiles.yml");
     if !profiles_file.exists() {
         return Ok(false);
