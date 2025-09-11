@@ -30,7 +30,7 @@ pub type Profiles = HashMap<String, ProfileTarget>;
 
 /// Load profile using the standard dbt-loader infrastructure
 fn load_profile_with_loader(
-    profiles_dir: Option<&PathBuf>,
+    profiles_dir: Option<&Path>,
     profile_name: &str,
     target: Option<&str>,
 ) -> FsResult<DbConfig> {
