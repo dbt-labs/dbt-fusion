@@ -1,0 +1,12 @@
+kind: Fixes
+body: |-
+    Add Google Drive scope for service account authentication in BigQuery adapter
+
+    Service accounts can now access Google Sheets as external tables by including the necessary Google Drive OAuth scope (https://www.googleapis.com/auth/drive) alongside BigQuery and Cloud Platform scopes. This resolves the "Permission denied while getting Drive credentials" error when using service account authentication with Google Sheets external tables.
+
+    This change brings dbt-fusion's service account authentication in line with dbt-core's implementation for accessing Google Drive resources through BigQuery.
+time: 2025-09-04T14:39:47.645135+01:00
+custom:
+    author: timvyas
+    issue: "691"
+    project: dbt-fusion
