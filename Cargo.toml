@@ -398,6 +398,7 @@ chrono-tz = { version = "0.10" }
 clap = { version = "4.4.4", features = ["derive"] }
 counter = "0.6.0"
 dashmap = "6.1.0"
+dotenvy = "0.15.7"
 fancy-regex = "0.14.0"
 hex = { version = "0.4.3" }
 humantime = "2.1.0"

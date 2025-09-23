@@ -24,6 +24,9 @@ fn main() -> ExitCode {
     // TODO(felipecrv): cancel the token (through the cst) on Ctrl-C
     let token = cst.token();
 
+    // Load .env-file if it exists. Ignore the result since we don't care about its absence.
+    let _ = dotenvy::dotenv();
+
     let cli = match Cli::try_parse() {
         Ok(cli) => {
             // Continue as normal
