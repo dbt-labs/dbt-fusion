@@ -1,0 +1,7 @@
+kind: Features
+body: Parse .env files when running the CLI
+time: 2025-09-23T09:14:42.204484979+02:00
+custom:
+    author: glennib
+    issue: ""
+    project: dbt-fusion
