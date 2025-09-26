@@ -53,6 +53,10 @@ pub const QUERY_JOB_TIMEOUT: &str = "adbc.bigquery.sql.query.job_timeout"; // i6
 pub const QUERY_RESULT_BUFFER_SIZE: &str = "adbc.bigquery.sql.query.result_buffer_size"; // i64
 pub const QUERY_PREFETCH_CONCURRENCY: &str = "adbc.bigquery.sql.query.prefetch_concurrency"; // i64
 
+// Impersonation scopes for service account authentication
+// Instructs the driver to impersonate using the given comma-separated list of OAuth 2.0 scopes
+pub const IMPERSONATE_SCOPES: &str = "adbc.bigquery.sql.impersonate.scopes";
+
 // values
 pub const DEFAULT_QUERY_RESULT_BUFFER_SIZE: i64 = 200;
 pub const DEFAULT_QUERY_PREFETCH_CONCURRENCY: i64 = 10;
