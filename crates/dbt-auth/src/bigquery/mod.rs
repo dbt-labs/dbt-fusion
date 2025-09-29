@@ -79,6 +79,11 @@ impl BigqueryAuth {
         if Path::new(&expanded_path).exists() {
             builder.with_named_option(bigquery::AUTH_TYPE, auth_type::JSON_CREDENTIAL_FILE)?;
             builder.with_named_option(bigquery::AUTH_CREDENTIALS, expanded_path.as_str())?;
+            // Add Google Drive scope for accessing Google Sheets as external tables
+            builder.with_named_option(
+                bigquery::IMPERSONATE_SCOPES,
+                "https://www.googleapis.com/auth/bigquery,https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/drive",
+            )?;
             Ok(())
         } else {
             Err(AuthError::config(format!(
@@ -137,6 +142,11 @@ impl BigqueryAuth {
 
         builder.with_named_option(bigquery::AUTH_TYPE, auth_type::JSON_CREDENTIAL_STRING)?;
         builder.with_named_option(bigquery::AUTH_CREDENTIALS, keyfile_json_string)?;
+        // Add Google Drive scope for accessing Google Sheets as external tables
+        builder.with_named_option(
+            bigquery::IMPERSONATE_SCOPES,
+            "https://www.googleapis.com/auth/bigquery,https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/drive",
+        )?;
         Ok(())
     }
 
@@ -318,6 +328,40 @@ mod tests {
     }
 
     #[test]
+    fn test_service_account_keyfile_with_scopes() {
+        use std::fs::{File, remove_file};
+        
+        // Create a temporary test file
+        let short_path = "~/unit_test_keyfile.json";
+        let expanded_path = shellexpand::tilde(short_path).to_string();
+        let _file = File::create(&expanded_path).unwrap();
+        
+        let config = Mapping::from_iter([
+            ("method".into(), "service-account".into()),
+            ("database".into(), "my_db".into()),
+            ("schema".into(), "my_schema".into()),
+            ("keyfile".into(), short_path.into()),
+        ]);
+        
+        let builder = try_configure(config).unwrap();
+        
+        // Check that the expanded path is used
+        assert_eq!(
+            other_option_value(&builder, bigquery::AUTH_CREDENTIALS).unwrap(),
+            expanded_path
+        );
+        
+        // Check that Google Drive scope is added
+        assert_eq!(
+            other_option_value(&builder, bigquery::IMPERSONATE_SCOPES).unwrap(),
+            "https://www.googleapis.com/auth/bigquery,https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/drive"
+        );
+        
+        // Clean up
+        let _ = remove_file(expanded_path);
+    }
+
+    #[test]
     fn test_builder_from_auth_config_keyfile_json() {
         let yaml_doc = r#"
 method: service-account-json
@@ -365,12 +409,16 @@ location: my_location
                     bigquery::LOCATION => {
                         assert_eq!(value, "my_location".to_string())
                     }
+                    bigquery::IMPERSONATE_SCOPES => {
+                        assert_eq!(value, "https://www.googleapis.com/auth/bigquery,https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/drive".to_string())
+                    }
                     _ => panic!("Unexpected BigQuery auth option for service account json"),
                 },
                 _ => panic!("Unexpected option field: {:?}", option.0),
             }
         }
     }
+
 
     #[test]
     fn test_builder_from_auth_config_oauth_secrets_temporary_token() {
