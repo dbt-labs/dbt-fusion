@@ -40,19 +40,24 @@ pub fn format_duration_concise(duration: std::time::Duration, show_millis: bool)
     }
 }
 
-/// Format duration with fixed width for alignment (5 characters total)
+/// Format duration with fixed width for alignment (7 characters total)
 /// Supports ns, μs, ms, s, m, h for materializations
 pub fn format_duration_fixed_width(duration: std::time::Duration) -> String {
     let total_secs = duration.as_secs_f64();
 
-    if total_secs >= 999.0 {
-        // >= 999 seconds: show fixed indicator for very long operations
-        "LONG!!!".to_string()
+    if total_secs > 86400.0 {
+        // > 1 day: show fixed indicator for very long operations
+        "   >24h".to_string()
     } else if total_secs == 0.0 {
         "-------".to_string()
-    } else {
-        // 0-999 seconds: always show in seconds with 2 decimal places, right-aligned with spaces
+    } else if total_secs < 60.0 {
         format!("{total_secs:6.2}s")
+    } else if total_secs < 3600.0 {
+        let total_minutes = total_secs / 60.0;
+        format!("{total_minutes:6.2}m")
+    } else {
+        let total_hours = total_secs / 3600.0;
+        format!("{total_hours:6.2}h")
     }
 }
 
@@ -1220,6 +1225,8 @@ macro_rules! checkpoint_maybe_interactive_or_exit {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     // top-level function test
     fn test_function_1() -> &'static str {
         current_function_short_name!()
@@ -1259,6 +1266,19 @@ mod tests {
             closure_name,
             "dbt_common::macros::tests::test_current_function_name"
         );
+    }
+
+    #[test]
+    fn test_format_duration_fixed_width() {
+        use std::time::Duration;
+        assert_eq!(format_duration_fixed_width(Duration::from_secs(90061)), "   >24h");
+        assert_eq!(format_duration_fixed_width(Duration::from_secs(0)), "-------");
+        assert_eq!(format_duration_fixed_width(Duration::from_millis(760)), "  0.76s");
+        assert_eq!(format_duration_fixed_width(Duration::from_millis(52760)), " 52.76s");
+        assert_eq!(format_duration_fixed_width(Duration::from_secs(301)), "  5.02m");
+        assert_eq!(format_duration_fixed_width(Duration::from_secs(342)), "  5.70m");
+        assert_eq!(format_duration_fixed_width(Duration::from_secs(3900)), "  1.08h");
+        assert_eq!(format_duration_fixed_width(Duration::from_secs(83400)), " 23.17h");
     }
 }
 

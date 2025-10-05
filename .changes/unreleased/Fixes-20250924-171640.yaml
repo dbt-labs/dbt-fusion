@@ -1,0 +1,7 @@
+kind: Fixes
+body: update format_duration_fixed_width to support >999s
+time: 2025-09-24T17:16:40.185511756Z
+custom:
+    author: vdfaller
+    issue: "778"
+    project: dbt-fusion
