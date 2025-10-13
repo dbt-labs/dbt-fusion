@@ -19,7 +19,7 @@ env:
   CI_LABEL: "ci:approve-public-fork-ci"
 
 jobs:
-  check-run-approval:
+  check_run_approval:
       permissions:
           pull-requests: write
           contents: read
