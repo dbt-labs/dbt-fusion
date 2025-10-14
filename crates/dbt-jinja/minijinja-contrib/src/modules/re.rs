@@ -462,7 +462,7 @@ mod tests {
         ])
         .unwrap();
         assert!(!result.is_true());
-        assert_eq!(result.to_string(), "none");
+        assert_eq!(result.to_string(), "None");
     }
 
     #[test]
@@ -484,7 +484,7 @@ mod tests {
         ])
         .unwrap();
         assert!(!result.is_true());
-        assert_eq!(result.to_string(), "none");
+        assert_eq!(result.to_string(), "None");
     }
 
     #[test]
