@@ -499,6 +499,8 @@ static CONFIG_ARGS: &[&str] = &[
     "alias",
     "database",
     "schema",
+    "project",
+    "dataset",
     "group",
     "meta",
     "store_failures",
