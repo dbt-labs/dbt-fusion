@@ -1,0 +1,7 @@
+kind: Fixes
+body: Added fs_err! + loc => test.span().clone() to various error various parsing errors. This adds the pretty path to the errors in the terminal.
+time: 2025-10-16T20:43:02.883401-05:00
+custom:
+    author: lord-skinner
+    issue: ""
+    project: dbt-fusion
