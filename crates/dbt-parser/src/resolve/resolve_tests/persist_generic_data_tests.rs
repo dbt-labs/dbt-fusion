@@ -177,23 +177,25 @@ fn persist_inner(
     if !seen_tests.insert(full_name.clone()) {
         match column_name {
             Some(column_name) => {
-                return err!(
-                    ErrorCode::SchemaError,
+                return Err(fs_err!(
+                    code => ErrorCode::SchemaError,
+                    loc => test.span().clone(),
                     "dbt found two data_tests with the same name \"{}\" on column \"{}\" in \"{}\" in the file \"{}\"",
                     full_name,
                     column_name,
                     test_config.resource_name,
                     original_file_path.display()
-                );
+                ));
             }
             None => {
-                return err!(
-                    ErrorCode::SchemaError,
+                return Err(fs_err!(
+                    code => ErrorCode::SchemaError,
+                    loc => test.span().clone(),
                     "dbt found two data_tests with the same name \"{}\" in \"{}\" in the file \"{}\"",
                     full_name,
                     test_config.resource_name,
                     original_file_path.display()
-                );
+                ));
             }
         }
     }
@@ -262,10 +264,11 @@ fn get_test_details(
                     source_name, &test_config.resource_name
                 )
             } else {
-                return err!(
-                    ErrorCode::SchemaError,
+                return Err(fs_err!(
+                    code => ErrorCode::SchemaError,
+                    loc => test.span().clone(),
                     "Source identifiers are missing for a source resource",
-                );
+                ));
             }
         }
         _ => {
@@ -307,10 +310,11 @@ fn get_test_details(
             }
             CustomTest::SimpleKeyValue(sk) => {
                 if sk.len() != 1 {
-                    return err!(
-                        ErrorCode::SchemaError,
+                    return Err(fs_err!(
+                        code => ErrorCode::SchemaError,
+                        loc => test.span().clone(),
                         "Simple key-value custom test must contain exactly one test"
-                    );
+                    ));
                 }
                 let (full_name, inner) = sk.iter().next().unwrap();
                 let (test_name, namespace) = parse_test_name_and_namespace(full_name);
@@ -331,7 +335,7 @@ fn get_test_details(
     };
 
     Ok(TestDetails {
-        test_macro_name: normalize_test_name(&test_macro_name)?,
+        test_macro_name: normalize_test_name(&test_macro_name, test.span())?,
         custom_test_name,
         kwargs,
         namespace,
@@ -435,11 +439,12 @@ fn extract_kwargs_and_jinja_vars_and_dep_kwarg_and_configs(
         if let Value::Object(existing_map) = &existing_config_json {
             for key in config_from_deprecated.keys() {
                 if existing_map.contains_key(key) {
-                    return err!(
-                        ErrorCode::SchemaError,
+                    return Err(fs_err!(
+                        code => ErrorCode::SchemaError,
+                        loc => deprecated.get(key).map(|v| v.span()).unwrap_or_default(),
                         "Test cannot have the same key '{}' at the top-level and in config",
                         key
-                    );
+                    ));
                 }
             }
         }
@@ -461,10 +466,25 @@ fn extract_kwargs_and_jinja_vars_and_dep_kwarg_and_configs(
 
     // Check for reserved "model" argument in combined args
     if combined_args.contains_key("model") {
-        return err!(
-            ErrorCode::SchemaError,
+        // Try to get span from deprecated args first, then from arguments
+        let span = deprecated
+            .get("model")
+            .map(|v| v.span())
+            .or_else(|| arguments.0.as_ref().and_then(|args| {
+                // Try to get span from arguments if it's a mapping with "model" key
+                if let dbt_serde_yaml::Value::Mapping(map, _) = args {
+                    map.get(&dbt_serde_yaml::Value::from("model")).map(|v| v.span())
+                } else {
+                    None
+                }
+            }))
+            .unwrap_or_default();
+        
+        return Err(fs_err!(
+            code => ErrorCode::SchemaError,
+            loc => span,
             "Test arguments include \"model\", which is a reserved argument",
-        );
+        ));
     }
 
     let mut kwargs = BTreeMap::new();
@@ -1018,13 +1038,18 @@ impl TestableNodeTrait for TestableTable<'_> {
 
 /// Normalizes a test name following the existing dbt behavior
 /// https://github.com/dbt-labs/dbt-core/blob/main/core/dbt/parser/generic_test_builders.py#L121-L122
-fn normalize_test_name(input: &str) -> FsResult<String> {
+fn normalize_test_name(input: &str, span: &dbt_serde_yaml::Span) -> FsResult<String> {
     let name_pattern = Regex::new(r"^([a-zA-Z_][0-9a-zA-Z_]*)+").expect("Valid test name pattern");
     name_pattern
         .captures(input)
         .and_then(|caps| caps.get(1))
         .map(|m| m.as_str().to_string())
-        .ok_or_else(|| fs_err!(ErrorCode::InvalidConfig, "Invalid test name: {}", input))
+        .ok_or_else(|| fs_err!(
+            code => ErrorCode::InvalidConfig,
+            loc => span.clone(),
+            "Invalid test name: {}",
+            input
+        ))
 }
 
 #[cfg(test)]
@@ -1457,8 +1482,9 @@ mod tests {
             ("test+++", "test"),
         ];
 
+        let default_span = dbt_serde_yaml::Span::default();
         for (input, expected) in input_expected_pairs {
-            match normalize_test_name(input) {
+            match normalize_test_name(input, &default_span) {
                 Ok(result) => assert_eq!(
                     result, expected,
                     "Input '{input}' should normalize to '{expected}', got '{result}'"
@@ -1474,8 +1500,9 @@ mod tests {
             "", "+test", "123test", "=test", ":test", "+++", "::::", "====", " test", "\ntest",
         ];
 
+        let default_span = dbt_serde_yaml::Span::default();
         for input in invalid_cases {
-            assert!(normalize_test_name(input).is_err());
+            assert!(normalize_test_name(input, &default_span).is_err());
         }
     }
 }
