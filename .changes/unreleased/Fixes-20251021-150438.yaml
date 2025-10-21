@@ -1,0 +1,7 @@
+kind: Fixes
+body: Remove `identifier` from Model Properties. It's not in the schema.
+time: 2025-10-21T15:04:38.262705141Z
+custom:
+    author: VDFaller
+    issue: ""
+    project: dbt-fusion
