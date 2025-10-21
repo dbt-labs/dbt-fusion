@@ -389,7 +389,7 @@ rustyline = { version = "15.0.0", default-features = false, features = [
 
 # datatypes and algos
 base64 = "0.22.1"
-bigdecimal = "0.4.7"
+bigdecimal = "0.4.9"
 bitflags = "2.9.4"
 blake3 = "1.5.0"
 chrono = { version = "0.4.41", features = ["std", "clock", "serde"] }
