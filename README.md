@@ -186,7 +186,13 @@ cd target/debug && pwd
 
 ## Running Tests
 
-To run tests, increase the stack size and use nextest.
+Install [`cargo-nextest`](https://nexte.st/docs/getting-started/install/)/the Nextest runner first (required for the commands below):
+
+```
+cargo install cargo-nextest --locked
+```
+
+Then increase the stack size and run the suite with Nextest.
 
 ```
  RUST_MIN_STACK=8388608 cargo nextest run --no-fail-fast
