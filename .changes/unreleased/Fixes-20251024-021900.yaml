@@ -1,0 +1,7 @@
+kind: Fixes
+body: 'dbt-sa-cli: handle Ctrl-C by cancelling the runtime token'
+time: 2025-10-24T02:19:00Z
+custom:
+    author: RyutoYoda
+    issue: ""
+    project: dbt-fusion
