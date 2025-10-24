@@ -858,12 +858,7 @@ pub fn print_fn() -> impl Fn(&[Value], Kwargs) -> Result<Value, Error> {
             ));
         }
 
-        // TODO: fusion print is different from dbt print due to this is printing Debug
-        // for example print('string')
-        // fusion: 'string' // things are always wrapped in single quotes
-        // dbt: string
-        // changed to log::info!("{}", args[0]); if we have to make them consistent
-        log::info!("{:?}", args[0]);
+        log::info!("{}", args[0]);
         Ok(Value::from(""))
     }
 }
