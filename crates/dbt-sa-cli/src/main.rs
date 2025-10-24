@@ -9,6 +9,7 @@ use dbt_sa_lib::dbt_sa_clap::from_main;
 use dbt_sa_lib::dbt_sa_lib::execute_fs;
 use std::io::{self, Write};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 const FS_DEFAULT_STACK_SIZE: usize = 8 * 1024 * 1024;
 
@@ -20,8 +21,7 @@ const FS_DEFAULT_STACK_SIZE: usize = 8 * 1024 * 1024;
 const FS_DEFAULT_MAX_BLOCKING_THREADS: usize = 512;
 
 fn main() -> ExitCode {
-    let cst = CancellationTokenSource::new();
-    // TODO(felipecrv): cancel the token (through the cst) on Ctrl-C
+    let cst = Arc::new(CancellationTokenSource::new());
     let token = cst.token();
 
     let cli = match Cli::try_parse() {
@@ -101,6 +101,16 @@ fn main() -> ExitCode {
                 .expect("failed to initialize default multi-threaded tokio runtime")
         }
     };
+
+    {
+        let ctrlc_source = Arc::clone(&cst);
+        tokio_rt.spawn(async move {
+            match tokio::signal::ctrl_c().await {
+                Ok(()) => ctrlc_source.cancel(),
+                Err(err) => log::warn!("Failed to listen for Ctrl-C: {err}"),
+            }
+        });
+    }
 
     // If execution panics, exit with a status 2 (but not if RUST_BACKTRACE is
     // set to 1, in which case we want to see the backtrace):
