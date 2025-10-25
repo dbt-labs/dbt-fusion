@@ -5,7 +5,9 @@ The dbt Fusion Monorepo uses multiple licenses, shown below.
 Unless otherwise specified, every folder and file in this repository is licensed under the Elastic License 2.0 (ELv2).
 
 **Folders covered by the Apache 2 License:**
-* `dbt-jinja`
+
+* `crates/dbt-jinja`
+* `crates/dbt-sql`
 
 **Folders covered by the ELv2 License:**
 * All other folders
