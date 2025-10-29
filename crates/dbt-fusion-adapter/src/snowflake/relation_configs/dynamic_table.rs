@@ -499,18 +499,22 @@ impl RelationChangeSet for SnowflakeDynamicTableTargetLagConfigChange {
         false
     }
 
-    // TODO(anna)
     fn changes(
         &self,
     ) -> &std::collections::BTreeMap<String, Arc<dyn dbt_schemas::schemas::ComponentConfig>> {
-        todo!()
+        // This implementation returns an empty map since SnowflakeDynamicTableTargetLagConfigChange
+        // doesn't implement ComponentConfig and represents a single change rather than a collection
+        static EMPTY_MAP: std::collections::BTreeMap<String, Arc<dyn dbt_schemas::schemas::ComponentConfig>> = std::collections::BTreeMap::new();
+        &EMPTY_MAP
     }
 
     fn get_change(
         &self,
         _component_name: &str,
     ) -> Option<&dyn dbt_schemas::schemas::ComponentConfig> {
-        todo!()
+        // This implementation returns None since SnowflakeDynamicTableTargetLagConfigChange
+        // doesn't implement ComponentConfig 
+        None
     }
 }
 
