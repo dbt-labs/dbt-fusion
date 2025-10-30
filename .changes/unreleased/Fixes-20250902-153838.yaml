@@ -1,0 +1,7 @@
+kind: Fixes
+body: Implement support for the second optional argument to dict.pop() in jinja
+time: 2025-09-02T15:38:38.362214+02:00
+custom:
+    author: fornwall
+    issue: "659"
+    project: dbt-fusion
