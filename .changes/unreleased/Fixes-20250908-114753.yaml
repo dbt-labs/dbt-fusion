@@ -1,0 +1,7 @@
+kind: Fixes
+body: Render None instead of none
+time: 2025-09-08T11:47:53.920202+02:00
+custom:
+    author: fornwall
+    issue: "715"
+    project: dbt-fusion
