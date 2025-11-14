@@ -1,0 +1,7 @@
+kind: Features
+body: Add a new Python API that can invoke dbt commands. Currently does not support return values.
+time: 2025-11-14T13:43:13.614955-06:00
+custom:
+    author: jakemarchewitz-8451
+    issue: "10"
+    project: dbt-fusion
