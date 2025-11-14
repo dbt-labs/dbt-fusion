@@ -28,6 +28,7 @@ members = [
   "crates/dbt-adapter",
   "crates/dbt-ident",
   "crates/dbt-jinja-utils",
+  "crates/dbt-py",
   "crates/dbt-sa-cli",
   "crates/dbt-xdbc",
   "crates/dbt-deps",
@@ -179,6 +180,7 @@ dbt-jinja-utils = { path = "crates/dbt-jinja-utils" }
 dbt-loader = { path = "crates/dbt-loader" }
 dbt-parser = { path = "crates/dbt-parser" }
 dbt-proc-macros = { path = "crates/dbt-proc-macros" }
+dbt-sa-cli = {path = "crates/dbt-sa-cli" }
 
 dbt-sample = { path = "crates/dbt-sample" }
 dbt-schema-store = { path = "crates/dbt-schema-store" }
