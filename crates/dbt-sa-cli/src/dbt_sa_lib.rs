@@ -48,8 +48,6 @@ use dbt_parser::{args::ResolveArgs, resolver::resolve};
 
 use serde_json::to_string_pretty;
 
-
-// JAKE:
 use std::io::{self, Write};
 
 // Vars

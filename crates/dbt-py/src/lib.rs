@@ -9,7 +9,6 @@ use pyo3::exceptions::{PySystemExit, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyString};
 
-// JAKE: `from dbt_fusion import dbtRunner; dbtRunner().invoke(["deps", "--project-dir", "/Users/j293015/Repos/insightsos-dbt"])`
 #[allow(non_camel_case_types, unused)]
 #[pyclass(unsendable)]
 struct dbtResult {
@@ -123,7 +122,6 @@ impl dbtRunner {
     }
 }
 
-/// A Python module implemented in Rust.
 #[pymodule]
 fn dbt_fusion(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<dbtRunner>()?;
