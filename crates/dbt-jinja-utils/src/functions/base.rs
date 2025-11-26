@@ -871,12 +871,29 @@ pub fn print_fn() -> impl Fn(&State<'_, '_>, &[Value], Kwargs) -> Result<Value, 
             ));
         }
 
-        // TODO: fusion print is different from dbt print due to this is printing Debug
-        // for example print('string')
-        // fusion: 'string' // things are always wrapped in single quotes
-        // dbt: string
-        // changed to log::info!("{}", args[0]); if we have to make them consistent
-        log::info!("{:?}", args[0]);
+        // Format the message using Display formatting (not Debug) to match dbt's behavior
+        // This ensures strings aren't wrapped in quotes (e.g., "string" instead of "'string'")
+        let msg = format!("{}", args[0]);
+
+        // Get metadata for the event
+        let current_package_name = state
+            .lookup(TARGET_PACKAGE_NAME)
+            .and_then(|v| v.as_str().map(|s| s.to_string()));
+        let line = state.current_span().start_line;
+        let column = state.current_span().start_col;
+        let cur_file_path = state.current_path().to_str().map(str::to_string);
+
+        // Emit UserLogMessage event for print
+        emit_info_event(
+            UserLogMessage::print(
+                current_package_name,
+                Some(line),
+                Some(column),
+                cur_file_path,
+            ),
+            Some(&msg),
+        );
+
         Ok(Value::from(""))
     }
 }
