@@ -6,16 +6,19 @@ use std::{
 };
 
 use dashmap::DashMap;
+use dbt_adapter::{AdapterType, load_store::ResultStore, relation_object::create_relation};
 use dbt_common::io_args::StaticAnalysisKind;
 use dbt_common::serde_utils::convert_yml_to_dash_map;
-use dbt_fusion_adapter::{AdapterType, load_store::ResultStore, relation_object::create_relation};
 use dbt_schemas::{
     schemas::{InternalDbtNodeAttributes, telemetry::NodeType},
     state::{DbtRuntimeConfig, NodeResolverTracker, ResolverState},
 };
+use dbt_serde_yaml::Spanned;
 use minijinja::{
     Value as MinijinjaValue,
-    constants::{CURRENT_PATH, CURRENT_SPAN, TARGET_PACKAGE_NAME, TARGET_UNIQUE_ID},
+    constants::{
+        CURRENT_EXECUTION_PHASE, CURRENT_PATH, CURRENT_SPAN, TARGET_PACKAGE_NAME, TARGET_UNIQUE_ID,
+    },
     machinery::Span,
 };
 
@@ -25,13 +28,16 @@ use crate::phases::compile_and_run_context::FunctionFunction;
 use super::super::compile_and_run_context::RefFunction;
 use super::compile_config::CompileConfig;
 
+/// The name of the repl model
+pub const REPL_MODEL_NAME: &str = "__repl__";
+
 /// Build a compile model context (wrapper for build_compile_node_context_inner)
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub fn build_compile_node_context<T>(
     model: &T,
     resolver_state: &ResolverState,
     base_context: &BTreeMap<String, MinijinjaValue>,
-    global_static_analysis: StaticAnalysisKind,
+    global_static_analysis: Spanned<StaticAnalysisKind>,
     skip_ref_validation: bool,
 ) -> (
     BTreeMap<String, MinijinjaValue>,
@@ -62,7 +68,7 @@ pub fn build_compile_node_context_inner<T>(
     root_project_name: &str,
     node_resolver: Arc<dyn NodeResolverTracker>,
     runtime_config: Arc<DbtRuntimeConfig>,
-    global_static_analysis: StaticAnalysisKind,
+    global_static_analysis: Spanned<StaticAnalysisKind>,
     skip_ref_validation: bool,
 ) -> (
     BTreeMap<String, MinijinjaValue>,
@@ -83,11 +89,9 @@ where
     };
     let mut ctx = base_context.clone();
 
-    // Create a relation for 'this' using config values
     let this_relation = match model.resource_type() {
         NodeType::UnitTest => {
-            // Get the model name from the dependencies
-            let this_relation_name = model
+            let ref_name = model
                 .base()
                 .refs
                 .first()
@@ -97,12 +101,50 @@ where
             let (_, this_relation, _, _) = node_resolver
                 .lookup_ref(
                     &Some(model.common().package_name.clone()),
-                    &this_relation_name,
+                    &ref_name,
                     &None,
                     &None,
                 )
                 .expect("Ref must exist");
             this_relation
+        }
+        NodeType::Model => {
+            let ref_name = model.common().name.clone();
+            // for repl, we use the just create a relation on spot using model passed in.
+            if ref_name == REPL_MODEL_NAME {
+                create_relation(
+                    adapter_type,
+                    model.base().database.clone(),
+                    model.base().schema.clone(),
+                    Some(model.base().alias.clone()),
+                    None,
+                    model.base().quoting,
+                )
+                .unwrap()
+                .as_value()
+            } else {
+                let (_, this_relation, _, deferred_relation) = node_resolver
+                    .lookup_ref(
+                        &Some(model.common().package_name.clone()),
+                        &ref_name,
+                        &model.version().map(|v| v.to_string()),
+                        &Some(model.common().package_name.clone()),
+                    )
+                    .expect("Ref must exist");
+
+                if let Some(deferred_relation_value) = deferred_relation
+                    && (matches!(
+                        model.base().static_analysis.clone().into_inner(),
+                        StaticAnalysisKind::Unsafe
+                    ) || global_static_analysis.clone().into_inner()
+                        == StaticAnalysisKind::Unsafe
+                        || model.introspection().is_unsafe())
+                {
+                    deferred_relation_value
+                } else {
+                    this_relation
+                }
+            }
         }
         _ => create_relation(
             adapter_type,
@@ -154,8 +196,10 @@ where
         allowed_dependencies.clone(),
         skip_ref_validation,
         // Update to use introspection kind
-        (matches!(model.base().static_analysis, StaticAnalysisKind::Unsafe)
-            || global_static_analysis == StaticAnalysisKind::Unsafe)
+        (matches!(
+            model.base().static_analysis.clone().into_inner(),
+            StaticAnalysisKind::Unsafe
+        ) || global_static_analysis.into_inner() == StaticAnalysisKind::Unsafe)
             || model.introspection().is_unsafe(),
     );
 
@@ -233,5 +277,9 @@ where
         MinijinjaValue::from_serialize(Span::default()),
     );
 
+    ctx.insert(
+        CURRENT_EXECUTION_PHASE.to_string(),
+        MinijinjaValue::from("render"),
+    );
     (ctx, config_map)
 }

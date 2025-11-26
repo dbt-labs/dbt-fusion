@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use dbt_common::{Span, adapter::AdapterType, io_args::StaticAnalysisKind};
-use dbt_serde_yaml::UntaggedEnumDeserialize;
+use dbt_serde_yaml::{Spanned, UntaggedEnumDeserialize};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf, str::FromStr as _, sync::Arc};
 // Type aliases for clarity
@@ -12,7 +12,10 @@ use crate::{
         CommonAttributes, DbtFunction, DbtFunctionAttr, DbtModel, DbtModelAttr, DbtSeed,
         DbtSnapshot, DbtSource, DbtTest, DbtUnitTest, DbtUnitTestAttr, IntrospectionKind,
         NodeBaseAttributes, Nodes, TimeSpine, TimeSpinePrimaryColumn,
-        common::{Access, DbtChecksum, DbtMaterialization, DbtQuoting, NodeDependsOn},
+        common::{
+            Access, DbtChecksum, DbtMaterialization, DbtQuoting, NodeDependsOn,
+            conform_normalized_snapshot_raw_code_to_mantle_format, normalize_sql,
+        },
         manifest::{
             ManifestExposure, ManifestGroup, ManifestSavedQuery, ManifestUnitTest,
             manifest_nodes::{
@@ -26,6 +29,7 @@ use crate::{
             AdapterAttr, DbtAnalysis, DbtAnalysisAttr, DbtGroup, DbtGroupAttr, DbtSeedAttr,
             DbtSnapshotAttr, DbtSourceAttr, DbtTestAttr,
         },
+        relations::default_dbt_quoting_for,
     },
     state::ResolverState,
 };
@@ -473,21 +477,15 @@ fn build_parent_and_child_maps(
     }
 
     for (id, semantic_model) in &nodes.semantic_models {
-        all_nodes.push((
-            id.clone(),
-            semantic_model.__semantic_model_attr__.depends_on.clone(),
-        ));
+        all_nodes.push((id.clone(), semantic_model.__base_attr__.depends_on.clone()));
     }
 
     for (id, metric) in &nodes.metrics {
-        all_nodes.push((id.clone(), metric.__metric_attr__.depends_on.clone()));
+        all_nodes.push((id.clone(), metric.__base_attr__.depends_on.clone()));
     }
 
     for (id, saved_query) in &nodes.saved_queries {
-        all_nodes.push((
-            id.clone(),
-            saved_query.__saved_query_attr__.depends_on.clone(),
-        ));
+        all_nodes.push((id.clone(), saved_query.__base_attr__.depends_on.clone()));
     }
 
     for (id, function) in &nodes.functions {
@@ -539,6 +537,17 @@ fn build_parent_and_child_maps(
 
 pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -> Nodes {
     let mut nodes = Nodes::default();
+
+    let adapter_type =
+        AdapterType::from_str(&manifest.metadata.adapter_type).unwrap_or_else(|_| {
+            panic!(
+                "Invalid adapter_type in manifest {}",
+                &manifest.metadata.adapter_type
+            )
+        });
+
+    let source_default_quoting = default_dbt_quoting_for(adapter_type);
+
     // Do not put disabled nodes into the nodes, because all things in Nodes object should be enabled.
     for (unique_id, node) in manifest.nodes.clone() {
         match node {
@@ -552,15 +561,30 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                 nodes.tests.insert(
                     unique_id,
                     Arc::new(DbtTest {
-                        defined_at: None,
+                        // TODO: persist the line/column info through the manifest as well
+                        defined_at: Some(test.__common_attr__.original_file_path.clone().into()),
+
+                        manifest_original_file_path: test
+                            .__common_attr__
+                            .original_file_path
+                            .clone(),
+
                         __common_attr__: CommonAttributes {
                             unique_id: test.__common_attr__.unique_id,
                             name: test.__common_attr__.name,
                             package_name: test.__common_attr__.package_name,
                             path: test.__common_attr__.path,
                             name_span: Span::default(),
-                            original_file_path: test.__common_attr__.original_file_path,
+
+                            original_file_path: test.generated_sql_file.map_or_else(
+                                // Note: for fusion generated manifests, the
+                                // `generated_sql_file` field should really never be
+                                // None (see [ManifestDataTest])
+                                || test.__common_attr__.original_file_path.clone(),
+                                PathBuf::from,
+                            ),
                             patch_path: test.__common_attr__.patch_path,
+
                             fqn: test.__common_attr__.fqn,
                             description: test.__common_attr__.description,
                             raw_code: test.__base_attr__.raw_code,
@@ -580,7 +604,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                             alias: test.__base_attr__.alias,
                             relation_name: test.__base_attr__.relation_name,
                             materialized: DbtMaterialization::Test,
-                            static_analysis: StaticAnalysisKind::On,
+                            static_analysis: StaticAnalysisKind::On.into(),
                             static_analysis_off_reason: None,
                             enabled: test.config.enabled.unwrap_or(true),
                             extended_model: false,
@@ -608,6 +632,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                             attached_node: test.attached_node,
                             test_metadata: test.test_metadata,
                             file_key_name: test.file_key_name,
+                            introspection: IntrospectionKind::None,
                         },
                         deprecated_config: test.config,
                         __other__: test.__other__,
@@ -615,6 +640,22 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                 );
             }
             DbtNode::Snapshot(snapshot) => {
+                let recalculated_checksum = match snapshot.__base_attr__.raw_code.clone() {
+                    Some(raw_code) => {
+                        // Recalculate checksum that eliminates whitespace and case differences.
+                        let normalized_raw_code = normalize_sql(&raw_code);
+                        let normalized_mantle_conforming_raw_code =
+                            conform_normalized_snapshot_raw_code_to_mantle_format(
+                                normalized_raw_code.as_str(),
+                            );
+                        recalculate_checksum(
+                            Some(normalized_mantle_conforming_raw_code.as_str()),
+                            snapshot.__base_attr__.checksum.clone(),
+                        )
+                    }
+                    None => snapshot.__base_attr__.checksum.clone(),
+                };
+
                 nodes.snapshots.insert(
                     unique_id,
                     Arc::new(DbtSnapshot {
@@ -629,7 +670,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                             fqn: snapshot.__common_attr__.fqn,
                             description: snapshot.__common_attr__.description,
                             raw_code: snapshot.__base_attr__.raw_code,
-                            checksum: snapshot.__base_attr__.checksum,
+                            checksum: recalculated_checksum,
                             language: snapshot.__base_attr__.language,
                             tags: snapshot
                                 .config
@@ -651,7 +692,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                                 .materialized
                                 .clone()
                                 .unwrap_or(DbtMaterialization::Table),
-                            static_analysis: StaticAnalysisKind::On,
+                            static_analysis: StaticAnalysisKind::On.into(),
                             static_analysis_off_reason: None,
                             quoting: snapshot
                                 .config
@@ -678,6 +719,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                                 .snapshot_meta_column_names
                                 .clone()
                                 .unwrap_or_default(),
+                            introspection: IntrospectionKind::None,
                         },
                         __adapter_attr__: AdapterAttr::from_config_and_dialect(
                             &snapshot.config.__warehouse_specific_config__,
@@ -722,7 +764,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                             alias: seed.__base_attr__.alias,
                             relation_name: seed.__base_attr__.relation_name,
                             materialized: DbtMaterialization::Table,
-                            static_analysis: StaticAnalysisKind::On,
+                            static_analysis: StaticAnalysisKind::On.into(),
                             static_analysis_off_reason: None,
                             enabled: seed.config.enabled.unwrap_or(true),
                             quoting: seed
@@ -751,7 +793,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                             delimiter: seed.config.delimiter.clone().map(|d| d.into_inner()),
                             root_path: seed.root_path,
                         },
-                        deprecated_config: seed.config,
+                        deprecated_config: seed.config.into(),
                         __other__: seed.__other__,
                     }),
                 );
@@ -760,60 +802,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
             DbtNode::Function(function) => {
                 nodes.functions.insert(
                     unique_id,
-                    Arc::new(DbtFunction {
-                        __common_attr__: CommonAttributes {
-                            unique_id: function.__common_attr__.unique_id,
-                            name: function.__common_attr__.name,
-                            package_name: function.__common_attr__.package_name,
-                            path: function.__common_attr__.path,
-                            name_span: Span::default(),
-                            original_file_path: function.__common_attr__.original_file_path,
-                            patch_path: function.__common_attr__.patch_path,
-                            fqn: function.__common_attr__.fqn,
-                            description: function.__common_attr__.description,
-                            raw_code: None,
-                            checksum: DbtChecksum::default(),
-                            language: function.language.clone(),
-                            tags: function
-                                .config
-                                .tags
-                                .clone()
-                                .map(|tags| tags.into())
-                                .unwrap_or_default(),
-                            meta: function.config.meta.clone().unwrap_or_default(),
-                        },
-                        __base_attr__: NodeBaseAttributes {
-                            database: function.__common_attr__.database,
-                            schema: function.__common_attr__.schema,
-                            alias: function.__base_attr__.alias,
-                            relation_name: function.__base_attr__.relation_name,
-                            materialized: DbtMaterialization::Function,
-                            static_analysis: StaticAnalysisKind::On,
-                            static_analysis_off_reason: None,
-                            quoting: dbt_quoting.try_into().expect("DbtQuoting should be set"),
-                            quoting_ignore_case: false,
-                            enabled: function.config.enabled.unwrap_or(true),
-                            extended_model: false,
-                            persist_docs: None,
-                            columns: BTreeMap::new(),
-                            depends_on: function.__base_attr__.depends_on,
-                            refs: function.__base_attr__.refs,
-                            sources: function.__base_attr__.sources,
-                            functions: function.__base_attr__.functions,
-                            metrics: function.__base_attr__.metrics,
-                        },
-                        __function_attr__: DbtFunctionAttr {
-                            access: function.access,
-                            group: function.group,
-                            language: function.language,
-                            on_configuration_change: function.on_configuration_change,
-                            returns: function.returns,
-                            arguments: function.arguments,
-                            function_kind: function.function_kind.unwrap_or_default(),
-                        },
-                        deprecated_config: function.config,
-                        __other__: function.__other__,
-                    }),
+                    Arc::new(manifest_function_to_dbt_function(function, dbt_quoting)),
                 );
             }
             DbtNode::Analysis(analysis) => {
@@ -824,6 +813,17 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                     .map(|tags| tags.into())
                     .unwrap_or_default();
                 let meta = config.meta.clone().unwrap_or_default();
+
+                let recalculated_checksum = match analysis.__base_attr__.raw_code.clone() {
+                    Some(raw_code) => {
+                        let normalized_raw_code = normalize_sql(&raw_code);
+                        recalculate_checksum(
+                            Some(normalized_raw_code.as_str()),
+                            analysis.__base_attr__.checksum.clone(),
+                        )
+                    }
+                    None => analysis.__base_attr__.checksum.clone(),
+                };
                 nodes.analyses.insert(
                     unique_id,
                     Arc::new(DbtAnalysis {
@@ -838,7 +838,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                             fqn: analysis.__common_attr__.fqn,
                             description: analysis.__common_attr__.description,
                             raw_code: analysis.__base_attr__.raw_code,
-                            checksum: analysis.__base_attr__.checksum,
+                            checksum: recalculated_checksum,
                             language: analysis.__base_attr__.language,
                             tags,
                             meta,
@@ -849,7 +849,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                             alias: analysis.__base_attr__.alias,
                             relation_name: analysis.__base_attr__.relation_name,
                             materialized: analysis.materialized,
-                            static_analysis: analysis.static_analysis,
+                            static_analysis: Spanned::new(analysis.static_analysis),
                             enabled: analysis.enabled,
                             static_analysis_off_reason: None,
                             extended_model: false,
@@ -910,17 +910,17 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                     alias: source.identifier.clone(),
                     relation_name: source.relation_name,
                     materialized: DbtMaterialization::Table,
-                    static_analysis: StaticAnalysisKind::On,
+                    static_analysis: StaticAnalysisKind::On.into(),
                     static_analysis_off_reason: None,
                     enabled: source.config.enabled.unwrap_or(true),
                     extended_model: false,
                     quoting: source
                         .quoting
                         .map(|mut quoting| {
-                            quoting.default_to(&dbt_quoting);
+                            quoting.default_to(&source_default_quoting);
                             quoting
                         })
-                        .unwrap_or(dbt_quoting)
+                        .unwrap_or(source_default_quoting)
                         .try_into()
                         .expect("DbtQuoting should be set"),
                     quoting_ignore_case: false,
@@ -978,7 +978,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                     enabled: true,
                     extended_model: false,
                     persist_docs: None,
-                    columns: BTreeMap::new(),
+                    columns: vec![],
                     refs: exposure.__base_attr__.refs,
                     sources: exposure.__base_attr__.sources,
                     functions: vec![],
@@ -1030,7 +1030,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                     alias: unit_test.__base_attr__.alias,
                     relation_name: unit_test.__base_attr__.relation_name,
                     materialized: DbtMaterialization::Table,
-                    static_analysis: StaticAnalysisKind::On,
+                    static_analysis: StaticAnalysisKind::On.into(),
                     static_analysis_off_reason: None,
                     quoting: dbt_quoting.try_into().expect("DbtQuoting should be set"),
                     quoting_ignore_case: false,
@@ -1091,14 +1091,32 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                         .unwrap_or_default(),
                     meta: saved_query.config.meta.clone().unwrap_or_default(),
                 },
+                __base_attr__: NodeBaseAttributes {
+                    database: "".to_string(),
+                    schema: "".to_string(),
+                    alias: "".to_string(),
+                    relation_name: None,
+                    quoting: Default::default(),
+                    materialized: Default::default(),
+                    static_analysis: Default::default(),
+                    static_analysis_off_reason: None,
+                    enabled: true,
+                    extended_model: false,
+                    persist_docs: None,
+                    columns: Default::default(),
+                    refs: saved_query.__base_attr__.refs,
+                    sources: vec![],
+                    functions: vec![],
+                    metrics: vec![],
+                    depends_on: saved_query.__base_attr__.depends_on,
+                    quoting_ignore_case: false,
+                },
                 __saved_query_attr__: DbtSavedQueryAttr {
                     query_params: saved_query.query_params,
                     exports: saved_query.exports,
                     label: saved_query.label,
                     metadata: saved_query.metadata,
                     unrendered_config: saved_query.__base_attr__.unrendered_config,
-                    depends_on: saved_query.__base_attr__.depends_on,
-                    refs: saved_query.__base_attr__.refs,
                     created_at: saved_query.__base_attr__.created_at,
                     group: saved_query.group,
                 },
@@ -1139,7 +1157,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                     enabled: true,
                     extended_model: false,
                     persist_docs: None,
-                    columns: BTreeMap::new(),
+                    columns: vec![],
                     depends_on: NodeDependsOn::default(),
                     quoting_ignore_case: false,
                     refs: vec![],
@@ -1156,69 +1174,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
     for (unique_id, function) in manifest.functions {
         nodes.functions.insert(
             unique_id,
-            Arc::new(DbtFunction {
-                __common_attr__: CommonAttributes {
-                    unique_id: function.__common_attr__.unique_id,
-                    name: function.__common_attr__.name,
-                    package_name: function.__common_attr__.package_name,
-                    path: function.__common_attr__.path,
-                    name_span: Span::default(),
-                    original_file_path: function.__common_attr__.original_file_path,
-                    patch_path: None,
-                    fqn: function.__common_attr__.fqn,
-                    description: function.__common_attr__.description,
-                    raw_code: None,
-                    checksum: DbtChecksum::default(),
-                    language: function.language.clone(),
-                    tags: function
-                        .config
-                        .tags
-                        .clone()
-                        .map(|tags| tags.into())
-                        .unwrap_or_default(),
-                    meta: function.config.meta.clone().unwrap_or_default(),
-                },
-                __base_attr__: NodeBaseAttributes {
-                    database: String::new(),
-                    schema: String::new(),
-                    alias: function.__base_attr__.alias,
-                    relation_name: function.__base_attr__.relation_name,
-                    materialized: DbtMaterialization::View,
-                    static_analysis: StaticAnalysisKind::On,
-                    static_analysis_off_reason: None,
-                    enabled: function.config.enabled.unwrap_or(true),
-                    extended_model: false,
-                    quoting: function
-                        .config
-                        .quoting
-                        .map(|mut quoting| {
-                            quoting.default_to(&dbt_quoting);
-                            quoting
-                        })
-                        .unwrap_or(dbt_quoting)
-                        .try_into()
-                        .expect("DbtQuoting should be set"),
-                    quoting_ignore_case: false,
-                    persist_docs: None,
-                    columns: function.__base_attr__.columns,
-                    depends_on: function.__base_attr__.depends_on,
-                    refs: function.__base_attr__.refs,
-                    sources: function.__base_attr__.sources,
-                    functions: function.__base_attr__.functions,
-                    metrics: vec![],
-                },
-                __function_attr__: DbtFunctionAttr {
-                    access: function.access,
-                    group: function.group,
-                    language: function.language,
-                    on_configuration_change: function.on_configuration_change,
-                    returns: function.returns,
-                    arguments: function.arguments,
-                    function_kind: function.function_kind.unwrap_or_default(),
-                },
-                deprecated_config: function.config,
-                __other__: function.__other__,
-            }),
+            Arc::new(manifest_function_to_dbt_function(function, dbt_quoting)),
         );
     }
 
@@ -1253,6 +1209,17 @@ pub fn manifest_model_to_dbt_model(
         custom_granularities: ts.custom_granularities.unwrap_or_default(),
     });
 
+    let recalculated_checksum = match model.__base_attr__.raw_code.clone() {
+        Some(raw_code) => {
+            let normalized_raw_code = normalize_sql(&raw_code);
+            recalculate_checksum(
+                Some(normalized_raw_code.as_str()),
+                model.__base_attr__.checksum.clone(),
+            )
+        }
+        None => model.__base_attr__.checksum.clone(),
+    };
+
     DbtModel {
         __common_attr__: CommonAttributes {
             unique_id: model.__common_attr__.unique_id,
@@ -1265,7 +1232,7 @@ pub fn manifest_model_to_dbt_model(
             fqn: model.__common_attr__.fqn,
             description: model.__common_attr__.description,
             raw_code: model.__base_attr__.raw_code,
-            checksum: model.__base_attr__.checksum,
+            checksum: recalculated_checksum,
             language: model.__base_attr__.language,
             tags: model
                 .config
@@ -1285,7 +1252,7 @@ pub fn manifest_model_to_dbt_model(
                 .materialized
                 .clone()
                 .unwrap_or(DbtMaterialization::View),
-            static_analysis: StaticAnalysisKind::On,
+            static_analysis: StaticAnalysisKind::On.into(),
             static_analysis_off_reason: None,
             enabled: model.config.enabled.unwrap_or(true),
             extended_model: false,
@@ -1322,14 +1289,112 @@ pub fn manifest_model_to_dbt_model(
             primary_key: model.primary_key.unwrap_or_default(),
             time_spine,
             event_time: model.config.event_time.clone(),
+            catalog_name: model.config.catalog_name.clone(),
+            table_format: model.config.table_format.clone(),
         },
         __adapter_attr__: AdapterAttr::from_config_and_dialect(
             &model.config.__warehouse_specific_config__,
             AdapterType::from_str(&manifest.metadata.adapter_type)
                 .expect("Unknown or unsupported adapter type"),
         ),
-        deprecated_config: model.config,
+        deprecated_config: model.config.into(),
         __other__: model.__other__,
+    }
+}
+
+/// Convert a ManifestFunction to a DbtFunction.
+/// Inverse of From<DbtFunction> for ManifestFunction.
+pub fn manifest_function_to_dbt_function(
+    function: ManifestFunction,
+    dbt_quoting: DbtQuoting,
+) -> DbtFunction {
+    let recalculated_checksum = match function.__base_attr__.raw_code.clone() {
+        Some(raw_code) => {
+            // Recalculate checksum that eliminates whitespace and case differences.
+            let normalized_raw_code = normalize_sql(&raw_code);
+            recalculate_checksum(
+                Some(normalized_raw_code.as_str()),
+                function.__base_attr__.checksum.clone(),
+            )
+        }
+        None => function.__base_attr__.checksum.clone(),
+    };
+
+    DbtFunction {
+        __common_attr__: CommonAttributes {
+            unique_id: function.__common_attr__.unique_id,
+            name: function.__common_attr__.name,
+            package_name: function.__common_attr__.package_name,
+            path: function.__common_attr__.path,
+            name_span: Span::default(),
+            original_file_path: function.__common_attr__.original_file_path,
+            patch_path: function.__common_attr__.patch_path,
+            fqn: function.__common_attr__.fqn,
+            description: function.__common_attr__.description,
+            raw_code: function.__base_attr__.raw_code,
+            checksum: recalculated_checksum,
+            language: function.language.clone(),
+            tags: function
+                .config
+                .tags
+                .clone()
+                .map(|tags| tags.into())
+                .unwrap_or_default(),
+            meta: function.config.meta.clone().unwrap_or_default(),
+        },
+        __base_attr__: NodeBaseAttributes {
+            database: function.__common_attr__.database,
+            schema: function.__common_attr__.schema,
+            alias: function.__base_attr__.alias,
+            relation_name: function.__base_attr__.relation_name,
+            materialized: DbtMaterialization::Function,
+            static_analysis: StaticAnalysisKind::On.into(),
+            static_analysis_off_reason: None,
+            quoting: function
+                .config
+                .quoting
+                .map(|mut quoting| {
+                    quoting.default_to(&dbt_quoting);
+                    quoting
+                })
+                .unwrap_or(dbt_quoting)
+                .try_into()
+                .expect("DbtQuoting should be set"),
+            quoting_ignore_case: false,
+            enabled: function.config.enabled.unwrap_or(true),
+            extended_model: false,
+            persist_docs: None,
+            columns: function.__base_attr__.columns,
+            depends_on: function.__base_attr__.depends_on,
+            refs: function.__base_attr__.refs,
+            sources: function.__base_attr__.sources,
+            functions: function.__base_attr__.functions,
+            metrics: function.__base_attr__.metrics,
+        },
+        __function_attr__: DbtFunctionAttr {
+            access: function.access,
+            group: function.group,
+            language: function.language,
+            on_configuration_change: function.on_configuration_change,
+            returns: function.returns,
+            arguments: function.arguments,
+        },
+        deprecated_config: function.config,
+        __other__: function.__other__,
+    }
+}
+
+/// Recalculate checksum for a snapshot/model based on normalized raw code.
+/// If the normalized code is the placeholder, use the original checksum.
+/// Otherwise, hash the normalized code.
+pub fn recalculate_checksum(
+    normalized_raw_code: Option<&str>,
+    original_checksum: DbtChecksum,
+) -> DbtChecksum {
+    match normalized_raw_code {
+        Some("--placeholder--") => original_checksum,
+        Some(code) => DbtChecksum::hash(code.as_bytes()),
+        None => original_checksum,
     }
 }
 

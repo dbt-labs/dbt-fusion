@@ -23,6 +23,7 @@ pub const AUTH_CLIENT_SECRET: &str = "adbc.bigquery.sql.auth.client_secret";
 pub const AUTH_REFRESH_TOKEN: &str = "adbc.bigquery.sql.auth.refresh_token";
 pub const AUTH_ACCESS_TOKEN_ENDPOINT: &str = "adbc.bigquery.sql.auth.access_token_endpoint";
 pub const AUTH_ACCESS_TOKEN_SERVER_NAME: &str = "adbc.bigquery.sql.auth.access_token_server_name";
+pub const AUTH_QUOTA_PROJECT: &str = "adbc.bigquery.sql.auth.quota_project";
 
 pub const IMPERSONATE_TARGET_PRINCIPAL: &str = "adbc.bigquery.sql.impersonate.target_principal";
 pub const IMPERSONATE_SCOPES: &str = "adbc.bigquery.sql.impersonate.scopes";
@@ -64,6 +65,8 @@ pub const QUERY_JOB_TIMEOUT: &str = "adbc.bigquery.sql.query.job_timeout"; // i6
 pub const QUERY_RESULT_BUFFER_SIZE: &str = "adbc.bigquery.sql.query.result_buffer_size"; // i64
 pub const QUERY_PREFETCH_CONCURRENCY: &str = "adbc.bigquery.sql.query.prefetch_concurrency"; // i64
 
+pub const QUERY_LINK_FAILED_JOB: &str = "adbc.bigquery.sql.query.link_failed_job";
+
 // values
 pub const DEFAULT_QUERY_RESULT_BUFFER_SIZE: i64 = 200;
 pub const DEFAULT_QUERY_PREFETCH_CONCURRENCY: i64 = 10;
@@ -76,3 +79,16 @@ pub const INGEST_SCHEMA: &str = "adbc.bigquery.ingest.csv_schema";
 pub const UPDATE_TABLE_COLUMNS_DESCRIPTION: &str = "adbc.bigquery.table.update_columns_description";
 pub const UPDATE_DATASET_AUTHORIZE_VIEW_TO_DATASETS: &str =
     "adbc.bigquery.dataset.authorize_view_to_datasets";
+
+pub const DATAPROC_REGION: &str = "adbc.bigquery.dataproc.compute_region";
+pub const DATAPROC_PROJECT: &str = "adbc.bigquery.dataproc.project";
+pub const DATAPROC_POOLING_TIMEOUT: &str = "adbc.bigquery.dataproc.pooling_timeout";
+pub const CREATE_BATCH_REQ_PARENT: &str = "adbc.bigquery.create_batch.parent";
+pub const CREATE_BATCH_REQ_BATCH_YML: &str = "adbc.bigquery.create_batch.batch_yml";
+pub const CREATE_BATCH_REQ_BATCH_ID: &str = "adbc.bigquery.create_batch.batch_id";
+pub const DATAPROC_SUBMIT_JOB_REQ_CLUSTER_NAME: &str =
+    "adbc.bigquery.dataproc.submit_job.cluster_name";
+pub const DATAPROC_SUBMIT_JOB_REQ_GCS_PATH: &str = "adbc.bigquery.dataproc.submit_job.gcs_path";
+pub const WRITE_GCS_BUCKET: &str = "adbc.bigquery.write_gcs.bucket";
+pub const WRITE_GCS_OBJECT_NAME: &str = "adbc.bigquery.write_gcs.object_name";
+pub const WRITE_GCS_CONTENT: &str = "adbc.bigquery.write_gcs.content";

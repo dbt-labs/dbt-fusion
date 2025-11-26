@@ -12,11 +12,12 @@ pub mod schemas {
     pub mod data_tests;
     pub mod dbt_catalogs;
     pub mod dbt_column;
+    pub mod serialization_utils;
 
     pub use dbt_catalogs::{
-        AdapterPropsView, BuiltInPropsView, CatalogSpecView, CatalogType, DbtCatalogsView,
-        RestPropsView, SerializationPolicy, TableFormat, TargetFileSize, WriteIntegrationView,
-        validate_catalogs,
+        AdapterPropsView, CatalogSpecView, CatalogType, DatabricksUnityPropsView, DbtCatalogsView,
+        FileFormat, SerializationPolicy, SnowflakeBuiltInPropsView, SnowflakeRestPropsView,
+        TableFormat, TargetFileSize, WriteIntegrationView, validate_catalogs,
     };
     pub mod macros;
     pub mod packages;
@@ -78,7 +79,7 @@ pub mod schemas {
         pub mod v11;
         pub mod v12;
 
-        pub(crate) mod common;
+        pub mod common;
         pub use bigquery_partition::{
             BigqueryClusterConfig, BigqueryPartitionConfig, BigqueryPartitionConfigInner,
             GrantAccessToTarget, PartitionConfig, Range, RangeConfig, TimeConfig,
@@ -103,7 +104,7 @@ pub mod schemas {
         pub use v12::DbtManifestV12;
     }
     mod dbt_cloud;
-    pub use dbt_cloud::{DbtCloudConfig, DbtCloudContext, DbtCloudProject};
+    pub use dbt_cloud::{DbtCloudConfig, DbtCloudContext, DbtCloudProject, DbtCloudProjectConfig};
 
     pub mod semantic_layer {
         pub mod metric;
@@ -133,7 +134,7 @@ pub mod schemas {
         }
 
         pub use configs::analysis_config::{AnalysesConfig, ProjectAnalysisConfig};
-        pub use configs::common::WarehouseSpecificNodeConfig;
+        pub use configs::common::{WarehouseSpecificNodeConfig, same_warehouse_config};
         pub use configs::data_test_config::{DataTestConfig, ProjectDataTestConfig};
         pub use configs::exposure_config::{ExposureConfig, ProjectExposureConfig};
         pub use configs::function_config::{FunctionConfig, ProjectFunctionConfig};
@@ -150,8 +151,8 @@ pub mod schemas {
         pub use configs::source_config::{ProjectSourceConfig, SourceConfig};
         pub use configs::unit_test_config::{ProjectUnitTestConfig, UnitTestConfig};
         pub use dbt_project::{
-            DbtProject, DbtProjectNameOnly, DbtProjectSimplified, DefaultTo, IterChildren,
-            ProjectDbtCloudConfig, QueryComment,
+            DbtProject, DbtProjectNameOnly, DbtProjectSimplified, DefaultTo, ProjectDbtCloudConfig,
+            QueryComment, TypedRecursiveConfig,
         };
     }
 
@@ -174,7 +175,7 @@ pub mod schemas {
         pub use data_test_properties::DataTestProperties;
         pub use exposure_properties::ExposureProperties;
         pub use function_properties::{
-            FunctionArgument, FunctionKind, FunctionProperties, FunctionReturnType,
+            FunctionArgument, FunctionKind, FunctionProperties, FunctionReturnType, Volatility,
         };
         pub use metrics_properties::MetricsProperties;
         pub use model_properties::ModelConstraint;

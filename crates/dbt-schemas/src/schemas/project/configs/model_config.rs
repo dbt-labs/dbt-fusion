@@ -1,11 +1,11 @@
 use dbt_common::io_args::StaticAnalysisKind;
 use dbt_common::serde_utils::Omissible;
 use dbt_serde_yaml::JsonSchema;
+use dbt_serde_yaml::Spanned;
 use dbt_serde_yaml::Verbatim;
 use serde::{Deserialize, Serialize};
 // Type aliases for clarity
 type YmlValue = dbt_serde_yaml::Value;
-use serde_with::skip_serializing_none;
 use std::collections::BTreeMap;
 use std::collections::btree_map::Iter;
 
@@ -20,18 +20,21 @@ use crate::schemas::common::DbtUniqueKey;
 use crate::schemas::common::PersistDocsConfig;
 use crate::schemas::common::{Access, DbtQuoting, ScheduleConfig};
 use crate::schemas::common::{DocsConfig, OnConfigurationChange};
-use crate::schemas::common::{Hooks, OnSchemaChange};
+use crate::schemas::common::{Hooks, OnSchemaChange, hooks_equal};
 use crate::schemas::manifest::GrantAccessToTarget;
 use crate::schemas::manifest::postgres::PostgresIndex;
 use crate::schemas::manifest::{BigqueryClusterConfig, PartitionConfig};
-use crate::schemas::project::configs::common::WarehouseSpecificNodeConfig;
 use crate::schemas::project::configs::common::default_column_types;
 use crate::schemas::project::configs::common::default_hooks;
 use crate::schemas::project::configs::common::default_meta_and_tags;
 use crate::schemas::project::configs::common::default_quoting;
 use crate::schemas::project::configs::common::default_to_grants;
+use crate::schemas::project::configs::common::{
+    WarehouseSpecificNodeConfig, access_eq, docs_eq, grants_eq, meta_eq, omissible_option_eq,
+    same_warehouse_config,
+};
 use crate::schemas::project::dbt_project::DefaultTo;
-use crate::schemas::project::dbt_project::IterChildren;
+use crate::schemas::project::dbt_project::TypedRecursiveConfig;
 use crate::schemas::properties::ModelFreshness;
 use crate::schemas::serde::StringOrArrayOfStrings;
 use crate::schemas::serde::{
@@ -39,7 +42,7 @@ use crate::schemas::serde::{
 };
 use dbt_serde_yaml::ShouldBe;
 
-#[skip_serializing_none]
+// NOTE: No #[skip_serializing_none] - we handle None serialization in serialize_with_mode
 #[derive(Deserialize, Serialize, Debug, Clone, JsonSchema)]
 pub struct ProjectModelConfig {
     #[serde(rename = "+access")]
@@ -89,7 +92,7 @@ pub struct ProjectModelConfig {
     #[serde(rename = "+clustered_by")]
     pub clustered_by: Option<String>,
     #[serde(rename = "+column_types")]
-    pub column_types: Option<BTreeMap<String, String>>,
+    pub column_types: Option<BTreeMap<Spanned<String>, String>>,
     #[serde(
         default,
         rename = "+concurrent_batches",
@@ -112,6 +115,8 @@ pub struct ProjectModelConfig {
     pub databricks_compute: Option<String>,
     #[serde(rename = "+databricks_tags")]
     pub databricks_tags: Option<BTreeMap<String, YmlValue>>,
+
+    // NOTE: This is only for BigQuery materialized views
     #[serde(rename = "+description")]
     pub description: Option<String>,
     #[serde(rename = "+dist")]
@@ -188,6 +193,14 @@ pub struct ProjectModelConfig {
     pub materialized: Option<DbtMaterialization>,
     #[serde(rename = "+max_staleness")]
     pub max_staleness: Option<String>,
+    #[serde(rename = "+jar_file_uri")]
+    pub jar_file_uri: Option<String>,
+    #[serde(rename = "+timeout")]
+    pub timeout: Option<u64>,
+    #[serde(rename = "+batch_id")]
+    pub batch_id: Option<String>,
+    #[serde(rename = "+dataproc_cluster_name")]
+    pub dataproc_cluster_name: Option<String>,
     #[serde(rename = "+merge_exclude_columns")]
     pub merge_exclude_columns: Option<StringOrArrayOfStrings>,
     #[serde(rename = "+merge_update_columns")]
@@ -199,7 +212,7 @@ pub struct ProjectModelConfig {
     )]
     pub merge_with_schema_evolution: Option<bool>,
     #[serde(rename = "+meta")]
-    pub meta: Option<BTreeMap<String, YmlValue>>,
+    pub meta: Verbatim<Option<BTreeMap<String, YmlValue>>>,
     #[serde(rename = "+not_matched_by_source_action")]
     pub not_matched_by_source_action: Option<String>,
     #[serde(rename = "+not_matched_by_source_condition")]
@@ -216,6 +229,8 @@ pub struct ProjectModelConfig {
     pub on_schema_change: Option<OnSchemaChange>,
     #[serde(rename = "+packages")]
     pub packages: Option<StringOrArrayOfStrings>,
+    #[serde(rename = "+imports")]
+    pub imports: Option<StringOrArrayOfStrings>,
     #[serde(rename = "+partition_by")]
     pub partition_by: Option<PartitionConfig>,
     #[serde(
@@ -250,6 +265,8 @@ pub struct ProjectModelConfig {
         deserialize_with = "f64_or_string_f64"
     )]
     pub refresh_interval_minutes: Option<f64>,
+    #[serde(rename = "+resource_tags")]
+    pub resource_tags: Option<BTreeMap<String, String>>,
     #[serde(
         default,
         rename = "+require_partition_filter",
@@ -281,7 +298,7 @@ pub struct ProjectModelConfig {
     #[serde(rename = "+sql_header")]
     pub sql_header: Option<String>,
     #[serde(rename = "+static_analysis")]
-    pub static_analysis: Option<StaticAnalysisKind>,
+    pub static_analysis: Option<Spanned<StaticAnalysisKind>>,
     #[serde(rename = "+table_format")]
     pub table_format: Option<String>,
     #[serde(rename = "+tags")]
@@ -338,7 +355,11 @@ pub enum DataLakeObjectCategory {
     Other,
 }
 
-impl IterChildren<ProjectModelConfig> for ProjectModelConfig {
+impl TypedRecursiveConfig for ProjectModelConfig {
+    fn type_name() -> &'static str {
+        "model"
+    }
+
     fn iter_children(&self) -> Iter<'_, String, ShouldBe<Self>> {
         self.__additional_properties__.iter()
     }
@@ -369,7 +390,7 @@ pub struct ModelConfig {
     pub post_hook: Verbatim<Option<Hooks>>,
     pub pre_hook: Verbatim<Option<Hooks>>,
     pub quoting: Option<DbtQuoting>,
-    pub column_types: Option<BTreeMap<String, String>>,
+    pub column_types: Option<BTreeMap<Spanned<String>, String>>,
     #[serde(default, deserialize_with = "bool_or_string_bool")]
     pub full_refresh: Option<bool>,
     pub unique_key: Option<DbtUniqueKey>,
@@ -378,6 +399,7 @@ pub struct ModelConfig {
     pub grants: Option<BTreeMap<String, StringOrArrayOfStrings>>,
     pub packages: Option<StringOrArrayOfStrings>,
     pub docs: Option<DocsConfig>,
+    pub imports: Option<StringOrArrayOfStrings>,
     pub contract: Option<DbtContract>,
     pub event_time: Option<String>,
     #[serde(default, deserialize_with = "bool_or_string_bool")]
@@ -386,12 +408,11 @@ pub struct ModelConfig {
     pub merge_exclude_columns: Option<StringOrArrayOfStrings>,
     pub access: Option<Access>,
     pub table_format: Option<String>,
-    pub static_analysis: Option<StaticAnalysisKind>,
+    pub static_analysis: Option<Spanned<StaticAnalysisKind>>,
     pub freshness: Option<ModelFreshness>,
     pub sql_header: Option<String>,
     pub location: Option<String>,
     pub predicates: Option<Vec<String>>,
-    pub description: Option<String>,
     // Adapter specific configs
     pub __warehouse_specific_config__: WarehouseSpecificNodeConfig,
 }
@@ -403,7 +424,7 @@ impl From<ProjectModelConfig> for ModelConfig {
             alias: config.alias,
             batch_size: config.batch_size,
             begin: config.begin,
-            catalog_name: config.catalog_name,
+            catalog_name: config.catalog_name.clone(),
             column_types: config.column_types,
             concurrent_batches: config.concurrent_batches,
             contract: config.contract,
@@ -422,10 +443,11 @@ impl From<ProjectModelConfig> for ModelConfig {
             materialized: config.materialized,
             merge_exclude_columns: config.merge_exclude_columns,
             merge_update_columns: config.merge_update_columns,
-            meta: config.meta,
+            meta: (*config.meta).clone(),
             on_configuration_change: config.on_configuration_change,
             on_schema_change: config.on_schema_change,
             packages: config.packages,
+            imports: config.imports,
             persist_docs: config.persist_docs,
             post_hook: config.post_hook,
             pre_hook: config.pre_hook,
@@ -437,8 +459,8 @@ impl From<ProjectModelConfig> for ModelConfig {
             table_format: config.table_format,
             tags: config.tags.into_inner(),
             unique_key: config.unique_key,
-            description: config.description,
             __warehouse_specific_config__: WarehouseSpecificNodeConfig {
+                description: config.description,
                 adapter_properties: config.adapter_properties,
                 external_volume: config.external_volume,
                 base_location_root: config.base_location_root,
@@ -467,10 +489,16 @@ impl From<ProjectModelConfig> for ModelConfig {
                 grant_access_to: config.grant_access_to,
                 partitions: config.partitions,
                 enable_refresh: config.enable_refresh,
+                resource_tags: config.resource_tags,
                 refresh_interval_minutes: config.refresh_interval_minutes,
                 max_staleness: config.max_staleness,
+                jar_file_uri: config.jar_file_uri,
+                timeout: config.timeout,
+                batch_id: config.batch_id,
+                dataproc_cluster_name: config.dataproc_cluster_name,
 
                 file_format: config.file_format,
+                catalog_name: config.catalog_name,
                 location_root: config.location_root,
                 tblproperties: config.tblproperties,
                 include_full_name_in_path: config.include_full_name_in_path,
@@ -527,6 +555,7 @@ impl From<ModelConfig> for ProjectModelConfig {
             concurrent_batches: config.concurrent_batches,
             contract: config.contract,
             database: config.database,
+            description: config.__warehouse_specific_config__.description,
             docs: config.docs,
             enabled: config.enabled,
             event_time: config.event_time,
@@ -541,10 +570,11 @@ impl From<ModelConfig> for ProjectModelConfig {
             materialized: config.materialized,
             merge_exclude_columns: config.merge_exclude_columns,
             merge_update_columns: config.merge_update_columns,
-            meta: config.meta,
+            meta: Verbatim::from(config.meta),
             on_configuration_change: config.on_configuration_change,
             on_schema_change: config.on_schema_change,
             packages: config.packages,
+            imports: config.imports,
             persist_docs: config.persist_docs,
             post_hook: config.post_hook,
             pre_hook: config.pre_hook,
@@ -570,6 +600,10 @@ impl From<ModelConfig> for ProjectModelConfig {
             table_tag: config.__warehouse_specific_config__.table_tag,
             row_access_policy: config.__warehouse_specific_config__.row_access_policy,
             automatic_clustering: config.__warehouse_specific_config__.automatic_clustering,
+            jar_file_uri: config.__warehouse_specific_config__.jar_file_uri,
+            timeout: config.__warehouse_specific_config__.timeout,
+            batch_id: config.__warehouse_specific_config__.batch_id,
+            dataproc_cluster_name: config.__warehouse_specific_config__.dataproc_cluster_name,
             copy_grants: config.__warehouse_specific_config__.copy_grants,
             secure: config.__warehouse_specific_config__.secure,
             partition_by: config.__warehouse_specific_config__.partition_by,
@@ -577,6 +611,7 @@ impl From<ModelConfig> for ProjectModelConfig {
             hours_to_expiration: config.__warehouse_specific_config__.hours_to_expiration,
             labels: config.__warehouse_specific_config__.labels,
             labels_from_meta: config.__warehouse_specific_config__.labels_from_meta,
+            resource_tags: config.__warehouse_specific_config__.resource_tags,
             kms_key_name: config.__warehouse_specific_config__.kms_key_name,
             require_partition_filter: config
                 .__warehouse_specific_config__
@@ -627,7 +662,6 @@ impl From<ModelConfig> for ProjectModelConfig {
             table_type: config.__warehouse_specific_config__.table_type,
             indexes: config.__warehouse_specific_config__.indexes,
             schedule: config.__warehouse_specific_config__.schedule,
-            description: config.description,
             primary_key: config.__warehouse_specific_config__.primary_key,
             category: config.__warehouse_specific_config__.category,
             __additional_properties__: BTreeMap::new(),
@@ -677,6 +711,7 @@ impl DefaultTo<ModelConfig> for ModelConfig {
             on_configuration_change,
             grants,
             packages,
+            imports,
             docs,
             contract,
             event_time,
@@ -690,7 +725,6 @@ impl DefaultTo<ModelConfig> for ModelConfig {
             sql_header,
             location,
             predicates,
-            description,
         } = self;
 
         // Handle flattened configs
@@ -737,6 +771,7 @@ impl DefaultTo<ModelConfig> for ModelConfig {
                 on_schema_change,
                 on_configuration_change,
                 packages,
+                imports,
                 docs,
                 contract,
                 event_time,
@@ -750,7 +785,6 @@ impl DefaultTo<ModelConfig> for ModelConfig {
                 sql_header,
                 location,
                 predicates,
-                description,
             ]
         );
     }
@@ -785,23 +819,28 @@ impl DefaultTo<ModelConfig> for ModelConfig {
 }
 
 impl ModelConfig {
+    pub fn same_database_representation(&self, other: &ModelConfig) -> bool {
+        omissible_option_eq(&self.database, &other.database) && self.alias == other.alias
+    }
+
     /// Custom comparison that treats Omitted and Present(None) as equivalent for schema/database fields
     pub fn same_config(&self, other: &ModelConfig) -> bool {
         // Compare all fields,
         self.enabled == other.enabled
-            && omissible_option_eq(&self.schema, &other.schema)
-            && omissible_option_eq(&self.database, &other.database)
             && self.catalog_name == other.catalog_name
             && meta_eq(&self.meta, &other.meta)  // Custom comparison for meta
-            && self.materialized == other.materialized
+            && materialized_eq(&self.materialized, &other.materialized)
             && self.incremental_strategy == other.incremental_strategy
-            && self.incremental_predicates == other.incremental_predicates
+            // incremental_predicates can differ because of environment, i.e. dev vs prod
+            // so we don't compare them. To compare them we will need a SQL AST whose 
+            // shape and node types can be compared rather contents of each node.
+            // && self.incremental_predicates == other.incremental_predicates
             && self.batch_size == other.batch_size
             && lookback_eq(&self.lookback, &other.lookback)  // Custom comparison for lookback
             && self.begin == other.begin
             && persist_docs_eq(&self.persist_docs, &other.persist_docs)  // Custom comparison for persist_docs
-            && self.post_hook == other.post_hook
-            && self.pre_hook == other.pre_hook
+            && hooks_equal(&self.post_hook, &other.post_hook)
+            && hooks_equal(&self.pre_hook, &other.pre_hook)
             // && self.quoting == other.quoting // TODO: re-enable when no longer using mantle/core manifests in IA
             && column_types_eq(&self.column_types, &other.column_types)  // Custom comparison for column_types
             && self.full_refresh == other.full_refresh
@@ -809,9 +848,12 @@ impl ModelConfig {
             && on_schema_change_eq(&self.on_schema_change, &other.on_schema_change)  // Custom comparison for on_schema_change
             && on_configuration_change_eq(&self.on_configuration_change, &other.on_configuration_change)  // Custom comparison for on_configuration_change
             && grants_eq(&self.grants, &other.grants)  // Custom comparison for grants
-            && packages_eq(&self.packages, &other.packages)  // Custom comparison for packages
+            && packages_and_imports_eq(&self.packages, &other.packages)  // Custom comparison for packages
+            && packages_and_imports_eq(&self.imports, &other.imports)  // Custom comparison for imports (same function as packages)
             && docs_eq(&self.docs, &other.docs)  // Custom comparison for docs
-            && self.event_time == other.event_time
+            // This is a project level config that can differ between environments,
+            // so we don't compare them.
+            // && self.event_time == other.event_time
             && self.concurrent_batches == other.concurrent_batches
             && self.merge_update_columns == other.merge_update_columns
             && self.merge_exclude_columns == other.merge_exclude_columns
@@ -822,43 +864,7 @@ impl ModelConfig {
             && self.sql_header == other.sql_header
             && self.location == other.location
             && self.predicates == other.predicates
-            && self.description == other.description
-            && self.__warehouse_specific_config__ == other.__warehouse_specific_config__
-    }
-}
-// Helper function to compare Omissible<Option<T>> fields
-fn omissible_option_eq<T: PartialEq>(a: &Omissible<Option<T>>, b: &Omissible<Option<T>>) -> bool {
-    match (a, b) {
-        // Both omitted
-        (Omissible::Omitted, Omissible::Omitted) => true,
-        // Both present
-        (Omissible::Present(a_val), Omissible::Present(b_val)) => a_val == b_val,
-        // One omitted, one present with None - treat as equivalent
-        (Omissible::Omitted, Omissible::Present(None)) => true,
-        (Omissible::Present(None), Omissible::Omitted) => true,
-        // Any other combination is not equal
-        _ => false,
-    }
-}
-
-// Helper function to compare docs fields, treating None and default DocsConfig as equivalent
-fn docs_eq(a: &Option<DocsConfig>, b: &Option<DocsConfig>) -> bool {
-    use crate::schemas::common::DocsConfig;
-    // Default value in dbt-core
-    // See https://github.com/dbt-labs/dbt-core/blob/b75d5e701ef4dc2d7a98c5301ef63ecfc02eae15/core/dbt/artifacts/resources/base.py#L65
-    let default_docs = DocsConfig {
-        show: true,
-        node_color: None,
-    };
-
-    match (a, b) {
-        // Both None
-        (None, None) => true,
-        // Both Some - direct comparison
-        (Some(a_docs), Some(b_docs)) => a_docs == b_docs,
-        // One None, one Some - check if the Some value equals default
-        (None, Some(b_docs)) => b_docs == &default_docs,
-        (Some(a_docs), None) => a_docs == &default_docs,
+            && same_warehouse_config(&self.__warehouse_specific_config__, &other.__warehouse_specific_config__)
     }
 }
 
@@ -880,23 +886,6 @@ fn on_schema_change_eq(a: &Option<OnSchemaChange>, b: &Option<OnSchemaChange>) -
     }
 }
 
-// Helper function to compare access fields, treating None and default Access as equivalent
-fn access_eq(a: &Option<Access>, b: &Option<Access>) -> bool {
-    use crate::schemas::common::Access;
-    // Default value in dbt-core is "protected"
-    // See https://github.com/dbt-labs/dbt-core/blob/main/core/dbt/artifacts/resources/v1/model.py#L72-L75
-    let default_access = Access::Protected;
-
-    match (a, b) {
-        // Both None
-        (None, None) => true,
-        // Both Some - direct comparison
-        (Some(a_val), Some(b_val)) => a_val == b_val,
-        // One None, one Some - check if the Some value equals default
-        (None, Some(b_val)) => b_val == &default_access,
-        (Some(a_val), None) => a_val == &default_access,
-    }
-}
 // Helper function to compare persist_docs fields, treating None and default PersistDocsConfig as equivalent
 fn persist_docs_eq(a: &Option<PersistDocsConfig>, b: &Option<PersistDocsConfig>) -> bool {
     use crate::schemas::common::PersistDocsConfig;
@@ -935,23 +924,10 @@ fn lookback_eq(a: &Option<i32>, b: &Option<i32>) -> bool {
     }
 }
 
-// Helper function to compare meta fields, treating None and empty BTreeMap as equivalent
-fn meta_eq(a: &Option<BTreeMap<String, YmlValue>>, b: &Option<BTreeMap<String, YmlValue>>) -> bool {
-    match (a, b) {
-        // Both None
-        (None, None) => true,
-        // Both Some - direct comparison
-        (Some(a_val), Some(b_val)) => a_val == b_val,
-        // One None, one Some - check if the Some value is empty (equals default)
-        (None, Some(b_val)) => b_val.is_empty(),
-        (Some(a_val), None) => a_val.is_empty(),
-    }
-}
-
 // Helper function to compare column_types fields, treating None and empty BTreeMap as equivalent
 fn column_types_eq(
-    a: &Option<BTreeMap<String, String>>,
-    b: &Option<BTreeMap<String, String>>,
+    a: &Option<BTreeMap<Spanned<String>, String>>,
+    b: &Option<BTreeMap<Spanned<String>, String>>,
 ) -> bool {
     match (a, b) {
         // Both None
@@ -964,24 +940,11 @@ fn column_types_eq(
     }
 }
 
-// Helper function to compare grants fields, treating None and empty BTreeMap as equivalent
-fn grants_eq(
-    a: &Option<BTreeMap<String, StringOrArrayOfStrings>>,
-    b: &Option<BTreeMap<String, StringOrArrayOfStrings>>,
+// Helper function to compare packages and imports fields, treating None and empty ArrayOfStrings as equivalent
+fn packages_and_imports_eq(
+    a: &Option<StringOrArrayOfStrings>,
+    b: &Option<StringOrArrayOfStrings>,
 ) -> bool {
-    match (a, b) {
-        // Both None
-        (None, None) => true,
-        // Both Some - direct comparison
-        (Some(a_val), Some(b_val)) => a_val == b_val,
-        // One None, one Some - check if the Some value is empty (equals default)
-        (None, Some(b_val)) => b_val.is_empty(),
-        (Some(a_val), None) => a_val.is_empty(),
-    }
-}
-
-// Helper function to compare packages fields, treating None and empty ArrayOfStrings as equivalent
-fn packages_eq(a: &Option<StringOrArrayOfStrings>, b: &Option<StringOrArrayOfStrings>) -> bool {
     use crate::schemas::serde::StringOrArrayOfStrings;
 
     match (a, b) {
@@ -997,6 +960,7 @@ fn packages_eq(a: &Option<StringOrArrayOfStrings>, b: &Option<StringOrArrayOfStr
         (Some(StringOrArrayOfStrings::String(_)), None) => false,
     }
 }
+
 // Helper function to compare on_configuration_change fields, treating None and default OnConfigurationChange as equivalent
 fn on_configuration_change_eq(
     a: &Option<OnConfigurationChange>,
@@ -1016,5 +980,17 @@ fn on_configuration_change_eq(
         // One None, one Some - check if the Some value equals default
         (None, Some(b_val)) => b_val == &default_on_configuration_change,
         (Some(a_val), None) => a_val == &default_on_configuration_change,
+    }
+}
+
+// Helper function to compare materialized fields, treating None as View (the default)
+fn materialized_eq(a: &Option<DbtMaterialization>, b: &Option<DbtMaterialization>) -> bool {
+    let default_materialized = DbtMaterialization::View;
+
+    match (a, b) {
+        (None, None) => true,
+        (Some(a_val), Some(b_val)) => a_val == b_val,
+        (None, Some(b_val)) => b_val == &default_materialized,
+        (Some(a_val), None) => a_val == &default_materialized,
     }
 }

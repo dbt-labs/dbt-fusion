@@ -63,10 +63,42 @@ fn test_parser() {
             (line!(), "CHar(20)     ", Char(Some(20))),
             (line!(), "chARACter    ", Char(None)),
             (line!(), "chARACter(20)", Char(Some(20))),
-            (line!(), "charaCTER VARying      ", Varchar(None)),
-            (line!(), "charaCTER VARying (20 )", Varchar(Some(20))),
+            (
+                line!(),
+                "charaCTER VARying      ",
+                Varchar(None, Default::default()),
+            ),
+            (
+                line!(),
+                "charaCTER VARying (20 )",
+                Varchar(Some(20), Default::default()),
+            ),
             (line!(), "natioNAL CHar          ", Char(None)),
-            (line!(), "natioNAL CHar vaRying  ", Varchar(None)),
+            (
+                line!(),
+                "natioNAL CHar vaRying  ",
+                Varchar(None, Default::default()),
+            ),
+            (
+                line!(),
+                "VARCHAR COLLATE 'utf8'",
+                Varchar(
+                    None,
+                    StringAttrs {
+                        collate_spec: Some("'utf8'".to_string()),
+                    },
+                ),
+            ),
+            (
+                line!(),
+                "STRING COLLATE UNICODE_CI",
+                Varchar(
+                    None,
+                    StringAttrs {
+                        collate_spec: Some("UNICODE_CI".to_string()),
+                    },
+                ),
+            ),
             (line!(), "charactER LARge  object", Clob),
             (line!(), "  binaRY   LARge object", Blob),
             (line!(), "binary     ", Binary(None)),
@@ -166,43 +198,115 @@ fn test_parser() {
             (line!(), "interval minute", Interval(Some((Minute, None)))),
             (line!(), "jSON", Json),
             (line!(), "jSONb", Jsonb),
-            (line!(), "geoMETRY", Geometry),
-            (line!(), "geoGRAPHy", Geography),
-            (line!(), "arrAY", Array(None)),
-            (line!(), "arrAY<INTeger>", Array(Some(Box::new(Integer)))),
+            (line!(), "geoMETRY", Geometry(None)),
+            (line!(), "geoGRAPHy", Geography(None)),
+            (line!(), "geoMETRY(ANy)", Geometry(Some("ANY".to_string()))),
             (
                 line!(),
-                "arrAY<Array<CHARACTER VARYING>>",
-                Array(Some(Box::new(Array(Some(Box::new(Varchar(None))))))),
+                "geoGRAPHy(ANy)",
+                Geography(Some("ANY".to_string())),
+            ),
+            (line!(), "geoMETRY(123)", Geometry(Some("123".to_string()))),
+            (
+                line!(),
+                "geoGRAPHy(123)",
+                Geography(Some("123".to_string())),
+            ),
+            (line!(), "arrAY", Array(None)),
+            (
+                line!(),
+                if backend == Snowflake {
+                    "arrAY(INTeger)"
+                } else {
+                    "arrAY<INTeger>"
+                },
+                Array(Some(Box::new(Integer))),
+            ),
+            (
+                line!(),
+                if backend == Snowflake {
+                    "arrAY(Array(CHARACTER VARYING))"
+                } else {
+                    "arrAY<Array<CHARACTER VARYING>>"
+                },
+                Array(Some(Box::new(Array(Some(Box::new(SqlType::varchar(
+                    None,
+                ))))))),
             ),
             (line!(), "struct", Struct(None)),
-            (line!(), "struct<>", Struct(Some(vec![]))),
             (
                 line!(),
-                "STRUCT<name varchar, age int NOT NULL>",
+                if backend == Snowflake {
+                    "object()"
+                } else {
+                    "struct<>"
+                },
+                Struct(Some(vec![])),
+            ),
+            (
+                line!(),
+                if backend == Snowflake {
+                    "OBJECT(name varchar, age int NOT NULL)"
+                } else {
+                    "STRUCT<name VARchar, age int NOT NULL>"
+                },
                 Struct(Some(vec![
-                    (Ident::new("name", backend), Varchar(None), true),
-                    (Ident::new("age", backend), Integer, false),
+                    StructField::new(Ident::new("name", backend), SqlType::varchar(None), true),
+                    StructField::new(Ident::new("age", backend), Integer, false),
                 ])),
             ),
             (
                 line!(),
-                r#"strUCT<name VARchar, age int NULLABLE>"#,
+                if backend == Snowflake {
+                    r#"objECT(name VARchar, age int NULLABLE)"#
+                } else {
+                    r#"strUCT<name VARchar, age int NULLABLE>"#
+                },
                 Struct(Some(vec![
-                    (Ident::new("name", backend), Varchar(None), true),
-                    (Ident::new("age", backend), Integer, true),
+                    StructField::new(Ident::new("name", backend), SqlType::varchar(None), true),
+                    StructField::new(Ident::new("age", backend), Integer, true),
                 ])),
             ),
             (
                 line!(),
-                "struct<name varchar, info struct<id int, value varchar>>",
+                if backend == Snowflake {
+                    r#"OBJECT(name VARCHAR COLLATE UNICODE_CI NOT NULL COMMENT 'the comment', age int)"#
+                } else {
+                    "STRUCT<name STRING COLLATE UNICODE_CI NOT NULL COMMENT 'the comment', age int>"
+                },
                 Struct(Some(vec![
-                    (Ident::new("name", backend), Varchar(None), true),
-                    (
+                    StructField::new(
+                        Ident::new("name", backend),
+                        Varchar(
+                            None,
+                            StringAttrs {
+                                collate_spec: Some("UNICODE_CI".to_string()),
+                            },
+                        ),
+                        false,
+                    )
+                    .with_comment("'the comment'".to_string()),
+                    StructField::new(Ident::new("age", backend), Integer, true),
+                ])),
+            ),
+            (
+                line!(),
+                if backend == Snowflake {
+                    "object(name varchar, info object(id int, value varchar))"
+                } else {
+                    "struct<name varchar, info struct<id int, value varchar>>"
+                },
+                Struct(Some(vec![
+                    StructField::new(Ident::new("name", backend), SqlType::varchar(None), true),
+                    StructField::new(
                         Ident::new("info", backend),
                         Struct(Some(vec![
-                            (Ident::new("id", backend), Integer, true),
-                            (Ident::new("value", backend), Varchar(None), true),
+                            StructField::new(Ident::new("id", backend), Integer, true),
+                            StructField::new(
+                                Ident::new("value", backend),
+                                SqlType::varchar(None),
+                                true,
+                            ),
                         ])),
                         true,
                     ),
@@ -211,9 +315,10 @@ fn test_parser() {
             (
                 line!(),
                 "MAP<VARchar, int>",
-                Map(Some((Box::new(Varchar(None)), Box::new(Integer)))),
+                Map(Some((Box::new(SqlType::varchar(None)), Box::new(Integer)))),
             ),
             (line!(), "Variant", Variant),
+            (line!(), "SUPER", Variant),
             (line!(), " void  ", Void),
             (line!(), "other", Other("other".to_string())),
             (
@@ -291,12 +396,13 @@ fn assert_roundtrip(line: u32, ty: &SqlType, s: &str, backend: Backend) {
 
 /// Returns a vector of triplets with a line number, SQL type, and its rendering for a given backend.
 fn expected_type_rendering_for(backend: Backend) -> Vec<(u32, SqlType, &'static str)> {
-    // | # | SQLType | - | BigQuery | Snowflake | Postgres | Databricks | generic |
+    // | # | SQLType | - | BigQuery | Snowflake | Postgres | Redshift | Databricks | generic |
     let sqltype_bg_generic_snow_table = vec![
         (
             line!(),
             Boolean,
             "BOOL",
+            "BOOLEAN",
             "BOOLEAN",
             "BOOLEAN",
             "BOOLEAN",
@@ -307,6 +413,7 @@ fn expected_type_rendering_for(backend: Backend) -> Vec<(u32, SqlType, &'static 
             TinyInt,
             "INT64",
             "TINYINT",
+            "SMALLINT",
             "SMALLINT",
             "TINYINT",
             "TINYINT",
@@ -319,8 +426,9 @@ fn expected_type_rendering_for(backend: Backend) -> Vec<(u32, SqlType, &'static 
             "SMALLINT",
             "SMALLINT",
             "SMALLINT",
+            "SMALLINT",
         ),
-        (line!(), Integer, "INT64", "INT", "INT", "INT", "INT"),
+        (line!(), Integer, "INT64", "INT", "INT", "INT", "INT", "INT"),
         (
             line!(),
             BigInt,
@@ -329,13 +437,24 @@ fn expected_type_rendering_for(backend: Backend) -> Vec<(u32, SqlType, &'static 
             "BIGINT",
             "BIGINT",
             "BIGINT",
+            "BIGINT",
         ),
-        (line!(), Real, "FLOAT64", "REAL", "REAL", "FLOAT", "REAL"),
+        (
+            line!(),
+            Real,
+            "FLOAT64",
+            "REAL",
+            "REAL",
+            "REAL",
+            "FLOAT",
+            "REAL",
+        ),
         (
             line!(),
             Float(None),
             "FLOAT64",
             "FLOAT",
+            "REAL",
             "REAL",
             "FLOAT",
             "FLOAT",
@@ -346,6 +465,7 @@ fn expected_type_rendering_for(backend: Backend) -> Vec<(u32, SqlType, &'static 
             "FLOAT64",
             "FLOAT",
             "REAL",
+            "REAL",
             "FLOAT",
             "FLOAT(3)",
         ),
@@ -353,6 +473,7 @@ fn expected_type_rendering_for(backend: Backend) -> Vec<(u32, SqlType, &'static 
             line!(),
             Double,
             "FLOAT64",
+            "DOUBLE PRECISION",
             "DOUBLE PRECISION",
             "DOUBLE PRECISION",
             "DOUBLE",
@@ -364,6 +485,7 @@ fn expected_type_rendering_for(backend: Backend) -> Vec<(u32, SqlType, &'static 
             "NUMERIC",
             "NUMBER",
             "NUMERIC",
+            "NUMERIC",
             "DECIMAL",
             "NUMERIC",
         ),
@@ -372,6 +494,7 @@ fn expected_type_rendering_for(backend: Backend) -> Vec<(u32, SqlType, &'static 
             Numeric(Some((20, None))),
             "NUMERIC(20)",
             "NUMBER(20)",
+            "NUMERIC(20)",
             "NUMERIC(20)",
             "DECIMAL(20)",
             "NUMERIC(20)",
@@ -382,13 +505,15 @@ fn expected_type_rendering_for(backend: Backend) -> Vec<(u32, SqlType, &'static 
             "NUMERIC(60, 2)",
             "NUMBER(60, 2)",
             "NUMERIC(60, 2)",
+            "NUMERIC(60, 2)",
             "DECIMAL(60, 2)",
             "NUMERIC(60, 2)",
         ),
         (
             line!(),
-            Varchar(None),
+            SqlType::varchar(None),
             "STRING",
+            "VARCHAR",
             "VARCHAR",
             "VARCHAR",
             "STRING",
@@ -396,21 +521,50 @@ fn expected_type_rendering_for(backend: Backend) -> Vec<(u32, SqlType, &'static 
         ),
         (
             line!(),
-            Varchar(Some(255)),
+            SqlType::varchar(Some(255)),
             "STRING",
+            "VARCHAR(255)",
             "VARCHAR(255)",
             "VARCHAR(255)",
             "STRING",
             "VARCHAR(255)",
         ),
-        (line!(), Text, "STRING", "TEXT", "TEXT", "STRING", "TEXT"),
-        (line!(), Clob, "STRING", "TEXT", "TEXT", "STRING", "CLOB"),
-        (line!(), Blob, "BYTES", "BINARY", "BYTEA", "BINARY", "BLOB"),
+        (
+            line!(),
+            Text,
+            "STRING",
+            "TEXT",
+            "TEXT",
+            "TEXT",
+            "STRING",
+            "TEXT",
+        ),
+        (
+            line!(),
+            Clob,
+            "STRING",
+            "TEXT",
+            "TEXT",
+            "TEXT",
+            "STRING",
+            "CLOB",
+        ),
+        (
+            line!(),
+            Blob,
+            "BYTES",
+            "BINARY",
+            "BYTEA",
+            "BYTEA",
+            "BINARY",
+            "BLOB",
+        ),
         (
             line!(),
             Binary(None),
             "BYTES",
             "BINARY",
+            "BYTEA",
             "BYTEA",
             "BINARY",
             "BINARY",
@@ -421,6 +575,7 @@ fn expected_type_rendering_for(backend: Backend) -> Vec<(u32, SqlType, &'static 
             "BYTES",
             "BINARY(16)",
             "BYTEA",
+            "BYTEA",
             "BINARY",
             "BINARY(16)",
         ),
@@ -430,16 +585,27 @@ fn expected_type_rendering_for(backend: Backend) -> Vec<(u32, SqlType, &'static 
             "BYTES",
             "BINARY(255)",
             "BYTEA",
+            "BYTEA",
             "BINARY",
             "BINARY(255)",
         ),
-        (line!(), Date, "DATE", "DATE", "DATE", "DATE", "DATE"),
+        (
+            line!(),
+            Date,
+            "DATE",
+            "DATE",
+            "DATE",
+            "DATE",
+            "DATE",
+            "DATE",
+        ),
         (
             line!(),
             Time {
                 precision: None,
                 time_zone_spec: TimeZoneSpec::Without,
             },
+            "TIME",
             "TIME",
             "TIME",
             "TIME",
@@ -455,6 +621,7 @@ fn expected_type_rendering_for(backend: Backend) -> Vec<(u32, SqlType, &'static 
             "TIME",
             "TIME(0)",
             "TIME(0)",
+            "TIME(0)",
             "TIME(0) WITHOUT TIME ZONE", // Databricks doesn't actually have a TIME type
             "TIME(0) WITHOUT TIME ZONE",
         ),
@@ -465,6 +632,7 @@ fn expected_type_rendering_for(backend: Backend) -> Vec<(u32, SqlType, &'static 
                 time_zone_spec: TimeZoneSpec::Without,
             },
             "TIME",
+            "TIME(5)",
             "TIME(5)",
             "TIME(5)",
             "TIME(5) WITHOUT TIME ZONE", // Databricks doesn't actually have a TIME type
@@ -479,6 +647,7 @@ fn expected_type_rendering_for(backend: Backend) -> Vec<(u32, SqlType, &'static 
             "TIME",
             "TIME(9)",
             "TIME(9)",
+            "TIME(9)",
             "TIME(9) WITHOUT TIME ZONE", // Databricks doesn't actually have a TIME type
             "TIME(9) WITHOUT TIME ZONE",
         ),
@@ -491,6 +660,7 @@ fn expected_type_rendering_for(backend: Backend) -> Vec<(u32, SqlType, &'static 
             "TIME WITH TIME ZONE",
             "TIME(9) WITH TIME ZONE",
             "TIME(9) WITH TIME ZONE",
+            "TIME(9) WITH TIME ZONE",
             "TIME(9) WITH TIME ZONE", // Databricks doesn't actually have a TIME type
             "TIME(9) WITH TIME ZONE",
         ),
@@ -499,6 +669,7 @@ fn expected_type_rendering_for(backend: Backend) -> Vec<(u32, SqlType, &'static 
             DateTime,
             "DATETIME",
             "TIMESTAMP_NTZ",
+            "TIMESTAMP",
             "TIMESTAMP",
             "TIMESTAMP_NTZ",
             "DATETIME",
@@ -511,6 +682,7 @@ fn expected_type_rendering_for(backend: Backend) -> Vec<(u32, SqlType, &'static 
             },
             "TIMESTAMP",
             "TIMESTAMP_NTZ",
+            "TIMESTAMP",
             "TIMESTAMP",
             "TIMESTAMP_NTZ",
             "TIMESTAMP WITHOUT TIME ZONE",
@@ -524,6 +696,7 @@ fn expected_type_rendering_for(backend: Backend) -> Vec<(u32, SqlType, &'static 
             "TIMESTAMP WITH TIME ZONE",
             "TIMESTAMP_TZ",
             "TIMESTAMPTZ",
+            "TIMESTAMPTZ",
             "TIMESTAMP",
             "TIMESTAMP WITH TIME ZONE",
         ),
@@ -535,6 +708,7 @@ fn expected_type_rendering_for(backend: Backend) -> Vec<(u32, SqlType, &'static 
             },
             "TIMESTAMP",
             "TIMESTAMP_NTZ(3)",
+            "TIMESTAMP(3)",
             "TIMESTAMP(3)",
             "TIMESTAMP_NTZ",
             "TIMESTAMP(3) WITHOUT TIME ZONE",
@@ -548,12 +722,14 @@ fn expected_type_rendering_for(backend: Backend) -> Vec<(u32, SqlType, &'static 
             "TIMESTAMP WITH TIME ZONE",
             "TIMESTAMP_TZ(3)",
             "TIMESTAMP(3) WITH TIME ZONE",
+            "TIMESTAMP(3) WITH TIME ZONE",
             "TIMESTAMP",
             "TIMESTAMP(3) WITH TIME ZONE",
         ),
         (
             line!(),
             Interval(None),
+            "INTERVAL",
             "INTERVAL",
             "INTERVAL",
             "INTERVAL",
@@ -568,12 +744,14 @@ fn expected_type_rendering_for(backend: Backend) -> Vec<(u32, SqlType, &'static 
             "INTERVAL SECOND",
             "INTERVAL SECOND",
             "INTERVAL SECOND",
+            "INTERVAL SECOND",
         ),
         (
             line!(),
             Interval(Some((Millisecond, None))),
             "INTERVAL MILLISECOND",
             "INTERVAL MILLISECOND",
+            "INTERVAL SECOND(3)",
             "INTERVAL SECOND(3)",
             "INTERVAL MILLISECOND",
             "INTERVAL MILLISECOND",
@@ -584,12 +762,14 @@ fn expected_type_rendering_for(backend: Backend) -> Vec<(u32, SqlType, &'static 
             "INTERVAL DAY TO MICROSECOND",
             "INTERVAL DAY TO MICROSECOND",
             "INTERVAL DAY TO SECOND(6)",
+            "INTERVAL DAY TO SECOND(6)",
             "INTERVAL DAY TO MICROSECOND",
             "INTERVAL DAY TO MICROSECOND",
         ),
         (
             line!(),
             Interval(Some((Year, None))),
+            "INTERVAL YEAR",
             "INTERVAL YEAR",
             "INTERVAL YEAR",
             "INTERVAL YEAR",
@@ -604,10 +784,12 @@ fn expected_type_rendering_for(backend: Backend) -> Vec<(u32, SqlType, &'static 
             "INTERVAL DAY TO HOUR",
             "INTERVAL DAY TO HOUR",
             "INTERVAL DAY TO HOUR",
+            "INTERVAL DAY TO HOUR",
         ),
         (
             line!(),
             Interval(Some((Day, Some(Minute)))),
+            "INTERVAL DAY TO MINUTE",
             "INTERVAL DAY TO MINUTE",
             "INTERVAL DAY TO MINUTE",
             "INTERVAL DAY TO MINUTE",
@@ -622,10 +804,12 @@ fn expected_type_rendering_for(backend: Backend) -> Vec<(u32, SqlType, &'static 
             "INTERVAL DAY TO SECOND",
             "INTERVAL DAY TO SECOND",
             "INTERVAL DAY TO SECOND",
+            "INTERVAL DAY TO SECOND",
         ),
         (
             line!(),
             Interval(Some((Hour, Some(Minute)))),
+            "INTERVAL HOUR TO MINUTE",
             "INTERVAL HOUR TO MINUTE",
             "INTERVAL HOUR TO MINUTE",
             "INTERVAL HOUR TO MINUTE",
@@ -640,10 +824,12 @@ fn expected_type_rendering_for(backend: Backend) -> Vec<(u32, SqlType, &'static 
             "INTERVAL HOUR TO SECOND",
             "INTERVAL HOUR TO SECOND",
             "INTERVAL HOUR TO SECOND",
+            "INTERVAL HOUR TO SECOND",
         ),
         (
             line!(),
             Interval(Some((Minute, Some(Second)))),
+            "INTERVAL MINUTE TO SECOND",
             "INTERVAL MINUTE TO SECOND",
             "INTERVAL MINUTE TO SECOND",
             "INTERVAL MINUTE TO SECOND",
@@ -658,10 +844,12 @@ fn expected_type_rendering_for(backend: Backend) -> Vec<(u32, SqlType, &'static 
             "INTERVAL MONTH TO DAY",
             "INTERVAL MONTH TO DAY",
             "INTERVAL MONTH TO DAY",
+            "INTERVAL MONTH TO DAY",
         ),
         (
             line!(),
             Interval(Some((Month, Some(Hour)))),
+            "INTERVAL MONTH TO HOUR",
             "INTERVAL MONTH TO HOUR",
             "INTERVAL MONTH TO HOUR",
             "INTERVAL MONTH TO HOUR",
@@ -676,10 +864,12 @@ fn expected_type_rendering_for(backend: Backend) -> Vec<(u32, SqlType, &'static 
             "INTERVAL MONTH TO MINUTE",
             "INTERVAL MONTH TO MINUTE",
             "INTERVAL MONTH TO MINUTE",
+            "INTERVAL MONTH TO MINUTE",
         ),
         (
             line!(),
             Interval(Some((Month, Some(Second)))),
+            "INTERVAL MONTH TO SECOND",
             "INTERVAL MONTH TO SECOND",
             "INTERVAL MONTH TO SECOND",
             "INTERVAL MONTH TO SECOND",
@@ -694,10 +884,12 @@ fn expected_type_rendering_for(backend: Backend) -> Vec<(u32, SqlType, &'static 
             "INTERVAL YEAR TO DAY",
             "INTERVAL YEAR TO DAY",
             "INTERVAL YEAR TO DAY",
+            "INTERVAL YEAR TO DAY",
         ),
         (
             line!(),
             Interval(Some((Year, Some(Hour)))),
+            "INTERVAL YEAR TO HOUR",
             "INTERVAL YEAR TO HOUR",
             "INTERVAL YEAR TO HOUR",
             "INTERVAL YEAR TO HOUR",
@@ -712,10 +904,12 @@ fn expected_type_rendering_for(backend: Backend) -> Vec<(u32, SqlType, &'static 
             "INTERVAL YEAR TO MINUTE",
             "INTERVAL YEAR TO MINUTE",
             "INTERVAL YEAR TO MINUTE",
+            "INTERVAL YEAR TO MINUTE",
         ),
         (
             line!(),
             Interval(Some((Year, Some(Month)))),
+            "INTERVAL YEAR TO MONTH",
             "INTERVAL YEAR TO MONTH",
             "INTERVAL YEAR TO MONTH",
             "INTERVAL YEAR TO MONTH",
@@ -730,41 +924,49 @@ fn expected_type_rendering_for(backend: Backend) -> Vec<(u32, SqlType, &'static 
             "INTERVAL YEAR TO SECOND",
             "INTERVAL YEAR TO SECOND",
             "INTERVAL YEAR TO SECOND",
+            "INTERVAL YEAR TO SECOND",
         ),
         (
             line!(),
             Array(Some(Box::new(Json))),
             "ARRAY<JSON>",
-            "ARRAY<JSON>",
+            "ARRAY(JSON)",
+            "JSON[]",
             "JSON[]",
             "ARRAY<JSON>",
             "ARRAY<JSON>",
         ),
         (
             line!(),
-            Struct(Some(vec![(Ident::plain("a"), Float(None), true)])),
+            Struct(Some(vec![StructField::new(
+                Ident::plain("a"),
+                Float(None),
+                true,
+            )])),
             "STRUCT<a FLOAT64>",
-            "STRUCT<a FLOAT>",
+            "OBJECT(a FLOAT)",
             "(a REAL)",
-            "STRUCT<a FLOAT>",
+            "(a REAL)",
+            "STRUCT<a: FLOAT>",
             "STRUCT<a FLOAT>",
         ),
         (
             line!(),
             Struct(Some(vec![
-                (Ident::plain("name"), Varchar(None), true),
-                (Ident::plain("age"), Integer, false),
+                StructField::new(Ident::plain("name"), SqlType::varchar(None), true),
+                StructField::new(Ident::plain("age"), Integer, false),
             ])),
             "STRUCT<name STRING, age INT64 NOT NULL>",
-            "STRUCT<name VARCHAR, age INT NOT NULL>",
+            "OBJECT(name VARCHAR, age INT NOT NULL)",
             "(name VARCHAR, age INT NOT NULL)",
-            "STRUCT<name STRING, age INT NOT NULL>",
+            "(name VARCHAR, age INT NOT NULL)",
+            "STRUCT<name: STRING, age: INT NOT NULL>",
             "STRUCT<name VARCHAR, age INT NOT NULL>",
         ),
         (
             line!(),
             Struct(Some(vec![
-                (
+                StructField::new(
                     Ident::plain("last_completion_time"),
                     Timestamp {
                         precision: None,
@@ -772,7 +974,7 @@ fn expected_type_rendering_for(backend: Backend) -> Vec<(u32, SqlType, &'static 
                     },
                     true,
                 ),
-                (
+                StructField::new(
                     Ident::plain("error_time"),
                     Timestamp {
                         precision: None,
@@ -780,54 +982,58 @@ fn expected_type_rendering_for(backend: Backend) -> Vec<(u32, SqlType, &'static 
                     },
                     true,
                 ),
-                (
+                StructField::new(
                     Ident::plain("error"),
                     Struct(Some(vec![
-                        (Ident::plain("reason"), Varchar(None), true),
-                        (Ident::plain("location"), Varchar(None), true),
-                        (Ident::plain("message"), Varchar(None), true),
+                        StructField::new(Ident::plain("reason"), SqlType::varchar(None), true),
+                        StructField::new(Ident::plain("location"), SqlType::varchar(None), true),
+                        StructField::new(Ident::plain("message"), SqlType::varchar(None), true),
                     ])),
                     true,
                 ),
             ])),
             "STRUCT<last_completion_time TIMESTAMP, error_time TIMESTAMP, error STRUCT<reason STRING, location STRING, message STRING>>",
-            "STRUCT<last_completion_time TIMESTAMP_NTZ, error_time TIMESTAMP_NTZ, error STRUCT<reason VARCHAR, location VARCHAR, message VARCHAR>>",
+            "OBJECT(last_completion_time TIMESTAMP_NTZ, error_time TIMESTAMP_NTZ, error OBJECT(reason VARCHAR, location VARCHAR, message VARCHAR))",
             "(last_completion_time TIMESTAMP, error_time TIMESTAMP, error (reason VARCHAR, location VARCHAR, message VARCHAR))",
-            "STRUCT<last_completion_time TIMESTAMP_NTZ, error_time TIMESTAMP_NTZ, error STRUCT<reason STRING, location STRING, message STRING>>",
+            "(last_completion_time TIMESTAMP, error_time TIMESTAMP, error (reason VARCHAR, location VARCHAR, message VARCHAR))",
+            "STRUCT<last_completion_time: TIMESTAMP_NTZ, error_time: TIMESTAMP_NTZ, error: STRUCT<reason: STRING, location: STRING, message: STRING>>",
             "STRUCT<last_completion_time TIMESTAMP WITHOUT TIME ZONE, error_time TIMESTAMP WITHOUT TIME ZONE, error STRUCT<reason VARCHAR, location VARCHAR, message VARCHAR>>",
         ),
         (
             line!(),
             Array(Some(Box::new(Struct(Some(vec![
-                (Ident::plain("date"), Date, true),
-                (Ident::plain("value"), Varchar(None), true),
+                StructField::new(Ident::plain("date"), Date, true),
+                StructField::new(Ident::plain("value"), SqlType::varchar(None), true),
             ]))))),
             "ARRAY<STRUCT<date DATE, value STRING>>",
-            "ARRAY<STRUCT<date DATE, value VARCHAR>>",
+            "ARRAY(OBJECT(date DATE, value VARCHAR))",
             "(date DATE, value VARCHAR)[]",
-            "ARRAY<STRUCT<date DATE, value STRING>>",
+            "(date DATE, value VARCHAR)[]",
+            "ARRAY<STRUCT<date: DATE, value: STRING>>",
             "ARRAY<STRUCT<date DATE, value VARCHAR>>",
         ),
         (
             line!(),
-            Struct(Some(vec![(
+            Struct(Some(vec![StructField::new(
                 Ident::plain("elements"),
                 Array(Some(Box::new(Struct(Some(vec![
-                    (Ident::plain("date"), Date, true),
-                    (Ident::plain("value"), Varchar(None), true),
+                    StructField::new(Ident::plain("date"), Date, true),
+                    StructField::new(Ident::plain("value"), SqlType::varchar(None), true),
                 ]))))),
                 true,
             )])),
             "STRUCT<elements ARRAY<STRUCT<date DATE, value STRING>>>",
-            "STRUCT<elements ARRAY<STRUCT<date DATE, value VARCHAR>>>",
+            "OBJECT(elements ARRAY(OBJECT(date DATE, value VARCHAR)))",
             "(elements (date DATE, value VARCHAR)[])",
-            "STRUCT<elements ARRAY<STRUCT<date DATE, value STRING>>>",
+            "(elements (date DATE, value VARCHAR)[])",
+            "STRUCT<elements: ARRAY<STRUCT<date: DATE, value: STRING>>>",
             "STRUCT<elements ARRAY<STRUCT<date DATE, value VARCHAR>>>",
         ),
         (
             line!(),
-            Map(Some((Box::new(Varchar(None)), Box::new(Integer)))),
+            Map(Some((Box::new(SqlType::varchar(None)), Box::new(Integer)))),
             "MAP<STRING, INT64>",
+            "MAP<VARCHAR, INT>",
             "MAP<VARCHAR, INT>",
             "MAP<VARCHAR, INT>",
             "MAP<STRING, INT>",
@@ -839,13 +1045,24 @@ fn expected_type_rendering_for(backend: Backend) -> Vec<(u32, SqlType, &'static 
             "VARIANT",
             "VARIANT",
             "VARIANT",
+            "SUPER", // https://docs.aws.amazon.com/redshift/latest/dg/r_SUPER_type.html
             "VARIANT",
             "VARIANT",
         ),
-        (line!(), Void, "VOID", "VOID", "VOID", "VOID", "VOID"),
+        (
+            line!(),
+            Void,
+            "VOID",
+            "VOID",
+            "VOID",
+            "VOID",
+            "VOID",
+            "VOID",
+        ),
         (
             line!(),
             Other("ANY OTHER TYPE".to_string()),
+            "ANY OTHER TYPE",
             "ANY OTHER TYPE",
             "ANY OTHER TYPE",
             "ANY OTHER TYPE",
@@ -855,12 +1072,14 @@ fn expected_type_rendering_for(backend: Backend) -> Vec<(u32, SqlType, &'static 
     ];
     let zipped = sqltype_bg_generic_snow_table
         .into_iter()
-        .map(|(line, t, bq, snow, pq, dbx, generic)| {
+        .map(|(line, t, bq, snow, pq, rs, dbx, generic)| {
             let s = match backend {
                 BigQuery => bq,
                 Snowflake => snow,
-                Postgres | Redshift | RedshiftODBC | Salesforce => pq,
+                Postgres | Salesforce => pq,
+                Redshift | RedshiftODBC => rs,
                 Databricks | DatabricksODBC => dbx,
+                DuckDB => todo!("DuckDB tests not implemented yet"),
                 Generic { .. } => generic,
             };
             (line, t, s)
@@ -883,8 +1102,8 @@ fn test_roundtrip_struct_with_quoted_field() {
     // the quote style carried on the SqlType depends on the backend
     let expected_ty = |backend| {
         Struct(Some(vec![
-            (Ident::plain("name"), Varchar(None), true),
-            (
+            StructField::new(Ident::plain("name"), SqlType::varchar(None), true),
+            StructField::new(
                 Ident::unquoted(canonical_quote(backend), "age"),
                 Integer,
                 true,
@@ -893,7 +1112,7 @@ fn test_roundtrip_struct_with_quoted_field() {
     };
     let table = vec![
         (line!(), BigQuery, r#"STRUCT<name VARCHAR, `age` INT>"#),
-        (line!(), Snowflake, r#"STRUCT<name VARCHAR, "age" INT>"#),
+        (line!(), Snowflake, r#"OBJECT(name VARCHAR, "age" INT)"#),
         (line!(), Postgres, r#"STRUCT<name VARCHAR, "age" INT>"#),
         (line!(), Databricks, r#"STRUCT<name VARCHAR, `age` INT>"#),
     ];
@@ -919,14 +1138,46 @@ fn test_timestamp_on_databricks() {
 /// a specific function call compared to `test_string_roundtrip_for_all_types_on_all_backends`.
 #[test]
 fn test_struct_on_snowflake() {
-    let s = r#"STRUCT<name VARCHAR, "age" INT>"#;
+    let s = r#"OBJECT(name VARCHAR, "age" INT)"#;
     let t = Struct(Some(vec![
-        (Ident::new("name", Snowflake), Varchar(None), true),
-        (
+        StructField::new(Ident::new("name", Snowflake), SqlType::varchar(None), true),
+        StructField::new(
             Ident::unquoted(canonical_quote(Snowflake), "age"),
             Integer,
             true,
         ),
     ]));
     assert_roundtrip(line!(), &t, s, Snowflake);
+}
+
+#[test]
+fn test_struct_on_databricks() {
+    let s = "STRUCT<`name`: STRING, `age`: INT, `active`: BOOLEAN>";
+    let t = Struct(Some(vec![
+        StructField::new(
+            Ident::unquoted(canonical_quote(Databricks), "name"),
+            SqlType::varchar(None),
+            true,
+        ),
+        StructField::new(
+            Ident::unquoted(canonical_quote(Databricks), "age"),
+            Integer,
+            true,
+        ),
+        StructField::new(
+            Ident::unquoted(canonical_quote(Databricks), "active"),
+            Boolean,
+            true,
+        ),
+    ]));
+    assert_roundtrip(line!(), &t, s, Databricks);
+
+    let dt = t.pick_best_arrow_type(Databricks);
+    assert!(matches!(dt, DataType::Struct(_)));
+    if let DataType::Struct(fields) = dt {
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0].name(), "name");
+        assert_eq!(fields[1].name(), "age");
+        assert_eq!(fields[2].name(), "active");
+    }
 }

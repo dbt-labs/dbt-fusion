@@ -2,12 +2,11 @@ use std::sync::Arc;
 use std::{collections::BTreeMap, path::PathBuf};
 
 pub use dbt_common::io_args::IoArgs;
-use dbt_common::io_args::{EvalArgs, Phases};
+use dbt_common::io_args::{EvalArgs, FsCommand, Phases};
 use dbt_schemas::state::DbtState;
 
 #[derive(Clone, Default)]
 pub struct LoadArgs {
-    pub command: String,
     pub io: IoArgs,
     // The profile directory to load the profiles from
     pub profiles_dir: Option<PathBuf>,
@@ -37,6 +36,12 @@ pub struct LoadArgs {
     pub lock: bool,
     // Whether to load only profiles
     pub debug_profile: bool,
+    /// Whether to check package version requirements
+    pub version_check: bool,
+    /// Inline SQL to compile (from --inline flag)
+    pub inline_sql: Option<String>,
+    /// Enables persisting compare packages in private builds
+    pub enable_persist_compare_package: bool,
     /// This is for incremental.
     /// The [DbtState] of the previouis compile.
     /// Setting this will cause the 'load' phase to skip a lot of work
@@ -47,7 +52,6 @@ pub struct LoadArgs {
 impl LoadArgs {
     pub fn from_eval_args(arg: &EvalArgs) -> Self {
         Self {
-            command: arg.command.clone(),
             io: arg.io.clone(),
             profile: arg.profile.clone(),
             profiles_dir: arg.profiles_dir.clone(),
@@ -63,7 +67,16 @@ impl LoadArgs {
             threads: arg.num_threads,
             install_deps: arg.phase == Phases::Deps,
             debug_profile: arg.phase == Phases::Debug,
+            version_check: arg.version_check,
+            inline_sql: None, // Will be set separately when needed
+            enable_persist_compare_package: arg.command == FsCommand::Extension("compare"),
             prev_dbt_state: None,
         }
+    }
+
+    /// Set the inline SQL for compilation
+    pub fn with_inline_sql(mut self, inline_sql: Option<String>) -> Self {
+        self.inline_sql = inline_sql;
+        self
     }
 }

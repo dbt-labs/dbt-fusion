@@ -14,12 +14,17 @@ use super::omissible_utils::handle_omissible_override;
 use crate::default_to;
 use crate::schemas::common::DocsConfig;
 use crate::schemas::common::{Access, DbtQuoting};
+// Import comparison helpers from common
+use super::common::{
+    access_eq, docs_eq, grants_eq, meta_eq, omissible_option_eq, same_warehouse_config,
+};
 use crate::schemas::project::configs::common::WarehouseSpecificNodeConfig;
 use crate::schemas::project::configs::common::{
     default_meta_and_tags, default_quoting, default_to_grants,
 };
 use crate::schemas::project::dbt_project::DefaultTo;
-use crate::schemas::project::dbt_project::IterChildren;
+use crate::schemas::project::dbt_project::TypedRecursiveConfig;
+use crate::schemas::properties::{FunctionKind, Volatility};
 use crate::schemas::serde::StringOrArrayOfStrings;
 use crate::schemas::serde::{bool_or_string_bool, default_type};
 
@@ -51,11 +56,15 @@ pub struct ProjectFunctionConfig {
     #[serde(rename = "+quoting")]
     pub quoting: Option<DbtQuoting>,
     #[serde(rename = "+schema")]
-    pub schema: Option<String>,
+    pub schema: Omissible<Option<String>>,
     #[serde(rename = "+static_analysis")]
     pub static_analysis: Option<StaticAnalysisKind>,
     #[serde(rename = "+tags")]
     pub tags: Option<StringOrArrayOfStrings>,
+    #[serde(rename = "+type")]
+    pub function_kind: Option<FunctionKind>,
+    #[serde(rename = "+volatility")]
+    pub volatility: Option<Volatility>,
 
     // Additional properties for directory structure
     pub __additional_properties__: BTreeMap<String, ShouldBe<ProjectFunctionConfig>>,
@@ -76,9 +85,11 @@ impl Default for ProjectFunctionConfig {
             meta: None,
             on_configuration_change: None,
             quoting: None,
-            schema: None,
+            schema: Omissible::Omitted,
             static_analysis: None,
             tags: None,
+            function_kind: None,
+            volatility: None,
             __additional_properties__: BTreeMap::new(),
         }
     }
@@ -102,6 +113,8 @@ impl DefaultTo<ProjectFunctionConfig> for ProjectFunctionConfig {
             schema,
             static_analysis,
             tags,
+            function_kind,
+            volatility,
             __additional_properties__: _,
         } = self;
 
@@ -110,6 +123,7 @@ impl DefaultTo<ProjectFunctionConfig> for ProjectFunctionConfig {
         default_meta_and_tags(meta, &parent.meta, tags, &parent.tags);
         default_to_grants(grants, &parent.grants);
         handle_omissible_override(database, &parent.database);
+        handle_omissible_override(schema, &parent.schema);
 
         default_to!(
             parent,
@@ -122,14 +136,19 @@ impl DefaultTo<ProjectFunctionConfig> for ProjectFunctionConfig {
                 group,
                 language,
                 on_configuration_change,
-                schema,
                 static_analysis,
+                function_kind,
+                volatility,
             ]
         );
     }
 }
 
-impl IterChildren<ProjectFunctionConfig> for ProjectFunctionConfig {
+impl TypedRecursiveConfig for ProjectFunctionConfig {
+    fn type_name() -> &'static str {
+        "function"
+    }
+
     fn iter_children(&self) -> Iter<'_, String, ShouldBe<Self>> {
         self.__additional_properties__.iter()
     }
@@ -144,7 +163,7 @@ pub struct FunctionConfig {
     pub enabled: Option<bool>,
     pub alias: Option<String>,
     pub database: Omissible<Option<String>>,
-    pub schema: Option<String>,
+    pub schema: Omissible<Option<String>>,
     pub tags: Option<StringOrArrayOfStrings>,
     // need default to ensure None if field is not set
     #[serde(default, deserialize_with = "default_type")]
@@ -156,12 +175,31 @@ pub struct FunctionConfig {
     pub language: Option<String>,
     pub on_configuration_change: Option<String>,
     pub static_analysis: Option<StaticAnalysisKind>,
+    #[serde(rename = "type")]
+    pub function_kind: Option<FunctionKind>,
+    pub volatility: Option<Volatility>,
 
     // Warehouse-specific configurations
     pub __warehouse_specific_config__: WarehouseSpecificNodeConfig,
 }
 
 impl DefaultTo<FunctionConfig> for FunctionConfig {
+    fn get_enabled(&self) -> Option<bool> {
+        self.enabled
+    }
+
+    fn database(&self) -> Option<String> {
+        self.database.clone().into_inner().unwrap_or(None)
+    }
+
+    fn schema(&self) -> Option<String> {
+        self.schema.clone().into_inner().unwrap_or(None)
+    }
+
+    fn alias(&self) -> Option<String> {
+        self.alias.clone()
+    }
+
     fn default_to(&mut self, parent: &FunctionConfig) {
         let FunctionConfig {
             access,
@@ -178,14 +216,17 @@ impl DefaultTo<FunctionConfig> for FunctionConfig {
             language,
             on_configuration_change,
             static_analysis,
+            function_kind,
+            volatility,
             __warehouse_specific_config__: warehouse_config,
         } = self;
 
         // Handle warehouse config
         warehouse_config.default_to(&parent.__warehouse_specific_config__);
 
-        // Handle omissible database field separately
+        // Handle omissible database and schema fields separately
         handle_omissible_override(database, &parent.database);
+        handle_omissible_override(schema, &parent.schema);
 
         default_to!(
             parent,
@@ -193,7 +234,6 @@ impl DefaultTo<FunctionConfig> for FunctionConfig {
                 access,
                 enabled,
                 alias,
-                schema,
                 tags,
                 meta,
                 group,
@@ -203,7 +243,56 @@ impl DefaultTo<FunctionConfig> for FunctionConfig {
                 language,
                 on_configuration_change,
                 static_analysis,
+                function_kind,
+                volatility,
             ]
         );
+    }
+}
+
+impl From<ProjectFunctionConfig> for FunctionConfig {
+    fn from(config: ProjectFunctionConfig) -> Self {
+        Self {
+            access: config.access,
+            enabled: config.enabled,
+            alias: config.alias,
+            database: config.database,
+            schema: config.schema,
+            tags: config.tags,
+            meta: config.meta,
+            group: config.group,
+            docs: config.docs,
+            grants: config.grants,
+            quoting: config.quoting,
+            language: config.language,
+            on_configuration_change: config.on_configuration_change,
+            static_analysis: config.static_analysis,
+            function_kind: config.function_kind,
+            volatility: config.volatility,
+            __warehouse_specific_config__: WarehouseSpecificNodeConfig::default(),
+        }
+    }
+}
+
+impl FunctionConfig {
+    /// Custom comparison that treats Omitted and Present(None) as equivalent for schema/database fields
+    pub fn same_config(&self, other: &FunctionConfig) -> bool {
+        // Compare all fields individually
+        self.enabled == other.enabled
+            && self.alias == other.alias
+            && omissible_option_eq(&self.schema, &other.schema)      // Custom comparison for Omissible
+            && self.tags == other.tags
+            && meta_eq(&self.meta, &other.meta)                      // Custom comparison for meta
+            && self.group == other.group
+            && docs_eq(&self.docs, &other.docs)                      // Custom comparison for docs
+            && grants_eq(&self.grants, &other.grants)                // Custom comparison for grants
+            && self.quoting == other.quoting
+            && self.language == other.language
+            && self.on_configuration_change == other.on_configuration_change
+            && self.static_analysis == other.static_analysis
+            && self.function_kind == other.function_kind
+            && self.volatility == other.volatility
+            && access_eq(&self.access, &other.access)                // Custom comparison for access
+            && same_warehouse_config(&self.__warehouse_specific_config__, &other.__warehouse_specific_config__)
     }
 }

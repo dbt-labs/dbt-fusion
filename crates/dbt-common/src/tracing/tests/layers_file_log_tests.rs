@@ -1,8 +1,9 @@
 use crate::{
     io_args::EvalArgs,
     tracing::{
-        create_invocation_attributes,
+        emit::{create_root_info_span, emit_info_event},
         init::create_tracing_subcriber_with_layer,
+        invocation::create_invocation_attributes,
         layers::{
             data_layer::TelemetryDataLayer,
             file_log_layer::build_file_log_layer_with_background_writer,
@@ -40,11 +41,10 @@ fn file_log_layer_creates_invocation_and_log_stub() {
 
     let mut eval_args = EvalArgs::default();
     eval_args.io.invocation_id = invocation_id;
-    let temp_path_string = temp_file_path.to_string_lossy().to_string();
 
     tracing::subscriber::with_default(subscriber, || {
         let invocation_span =
-            create_root_info_span!(create_invocation_attributes("dbt-test", &eval_args).into());
+            create_root_info_span(create_invocation_attributes("dbt-test", &eval_args));
 
         invocation_span.in_scope(|| {
             let log_message = LogMessage {
@@ -52,13 +52,10 @@ fn file_log_layer_creates_invocation_and_log_stub() {
                 dbt_core_event_code: None,
                 original_severity_number: SeverityNumber::Info as i32,
                 original_severity_text: "INFO".to_string(),
-                unique_id: None,
-                file: Some(temp_path_string.clone()),
-                line: None,
-                phase: None,
+                ..Default::default()
             };
 
-            emit_tracing_event!(log_message.into(), "file log layer stub log");
+            emit_info_event(log_message, Some("file log layer stub log"));
         });
     });
 

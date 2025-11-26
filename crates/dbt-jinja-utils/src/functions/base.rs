@@ -6,11 +6,17 @@ use std::{
     sync::Arc,
 };
 
-use dbt_agate::{AgateTable, print_table};
-use dbt_common::{ErrorCode, fs_err, io_args::IoArgs, show_warning};
+use dbt_agate::AgateTable;
+use dbt_common::{
+    ErrorCode,
+    io_args::IoArgs,
+    tracing::emit::{emit_debug_event, emit_info_event, emit_warn_log_message},
+};
 use dbt_schemas::schemas::{InternalDbtNode, Nodes};
+use dbt_telemetry::UserLogMessage;
 use minijinja::{
     arg_utils::ArgsIter,
+    constants::TARGET_PACKAGE_NAME,
     value::{ValueMap, mutable_map::MutableMap},
 };
 
@@ -309,15 +315,22 @@ pub fn fromjson(_state: &State, args: &[Value]) -> Result<Value, Error> {
     let default = iter.next_kwarg::<Option<Value>>("default")?;
     iter.finish()?;
 
+    // Try strict JSON first
     match serde_json::from_str::<serde_json::Value>(string) {
         Ok(value) => Ok(Value::from_serialize(value)),
-        Err(err) => match default {
-            Some(default_value) => Ok(default_value),
-            None => Err(Error::new(
-                ErrorKind::InvalidOperation,
-                format!("Failed to parse JSON: {err}"),
-            )),
-        },
+        Err(json_err) => {
+            // Fall back to YAML to support unquoted scalars or simple mappings
+            match dbt_serde_yaml::from_str::<dbt_serde_yaml::Value>(string) {
+                Ok(yaml_value) => Ok(Value::from_serialize(yaml_value)),
+                Err(_) => match default {
+                    Some(default_value) => Ok(default_value),
+                    None => Err(Error::new(
+                        ErrorKind::InvalidOperation,
+                        format!("Failed to parse JSON: {json_err}"),
+                    )),
+                },
+            }
+        }
     }
 }
 
@@ -843,8 +856,8 @@ pub fn thread_id_fn() -> impl Fn() -> Result<Value, Error> {
 /// ```jinja
 /// {{ print("Hello world!") }}
 /// ```
-pub fn print_fn() -> impl Fn(&[Value], Kwargs) -> Result<Value, Error> {
-    move |args: &[Value], _kwargs: Kwargs| -> Result<Value, Error> {
+pub fn print_fn() -> impl Fn(&State<'_, '_>, &[Value], Kwargs) -> Result<Value, Error> {
+    move |state: &State<'_, '_>, args: &[Value], _kwargs: Kwargs| -> Result<Value, Error> {
         if args.is_empty() {
             return Err(Error::new(
                 ErrorKind::InvalidOperation,
@@ -858,7 +871,12 @@ pub fn print_fn() -> impl Fn(&[Value], Kwargs) -> Result<Value, Error> {
             ));
         }
 
-        log::info!("{}", args[0]);
+        // TODO: fusion print is different from dbt print due to this is printing Debug
+        // for example print('string')
+        // fusion: 'string' // things are always wrapped in single quotes
+        // dbt: string
+        // changed to log::info!("{}", args[0]); if we have to make them consistent
+        log::info!("{:?}", args[0]);
         Ok(Value::from(""))
     }
 }
@@ -867,20 +885,50 @@ pub fn print_fn() -> impl Fn(&[Value], Kwargs) -> Result<Value, Error> {
 ///
 /// Args:
 ///     msg: Message to print
+///     info: If true, log at info level. If False emit at debug level.
 ///
 /// Example:
 /// ```jinja
-/// {{ log("Hello world!") }}
+/// {{ log("Hello world!", info=true) }}
 /// ```
-pub fn log_fn() -> impl Fn(&[Value], Kwargs) -> Result<Value, Error> {
-    move |args: &[Value], kwargs: Kwargs| -> Result<Value, Error> {
+pub fn log_fn() -> impl Fn(&State<'_, '_>, &[Value], Kwargs) -> Result<Value, Error> {
+    move |state: &State<'_, '_>, args: &[Value], kwargs: Kwargs| -> Result<Value, Error> {
         let mut args = ArgParser::new(args, Some(kwargs));
-        let msg = args.get::<Value>("msg")?;
+        let msg = args.get::<Value>("msg")?.to_string();
         let info = args.get::<Value>("info").ok();
-        // todo: print should go to log, or not?
+
+        // Get metadata for the event
+        let current_package_name = state
+            .lookup(TARGET_PACKAGE_NAME)
+            .and_then(|v| v.as_str().map(|s| s.to_string()));
+        let line = state.current_span().start_line;
+        let column = state.current_span().start_col;
+        let cur_file_path = state.current_path().to_str().map(str::to_string);
+
         if info.is_some() && info.unwrap().is_true() {
-            log::info!("{msg}");
+            // Emit UserLogMessage event for log
+            emit_info_event(
+                UserLogMessage::log_info(
+                    current_package_name,
+                    Some(line),
+                    Some(column),
+                    cur_file_path,
+                ),
+                Some(&msg),
+            );
+        } else {
+            // Emit UserLogMessage event for debug log
+            emit_debug_event(
+                UserLogMessage::log_debug(
+                    current_package_name,
+                    Some(line),
+                    Some(column),
+                    cur_file_path,
+                ),
+                Some(&msg),
+            );
         }
+
         Ok(Value::from(""))
     }
 }
@@ -967,10 +1015,13 @@ impl Object for Exceptions {
             "warn" => {
                 let mut args = ArgParser::new(args, None);
                 let warn_string = args.get::<String>("").unwrap_or_else(|_| "".to_string());
-                show_warning!(
-                    self.io_args,
-                    fs_err!(ErrorCode::Generic, "{}", warn_string.as_str(),)
+
+                emit_warn_log_message(
+                    ErrorCode::Generic,
+                    warn_string,
+                    self.io_args.status_reporter.as_ref(),
                 );
+
                 Ok(Value::UNDEFINED)
             }
             // (msg, node=None)
@@ -1050,10 +1101,13 @@ impl Object for Exceptions {
                 let sql_columns = args.get::<Value>("sql_columns").unwrap_or(Value::UNDEFINED);
                 let column_diff_table: &Arc<AgateTable> =
                     get_contract_mismatches(yaml_columns, sql_columns)?;
-                //  print_table(table, max_rows, max_columns, max_column_width)
-                let column_diff_string = print_table(column_diff_table.as_ref(), 50, 50, 50)?;
-                let message = format!(
-                    "This model has an enforced contract that failed.\n Please ensure the name, data_type, and number of columns in your contract match the columns in your model's definition.\n\n {column_diff_string}"
+                let column_diff_display = column_diff_table
+                    .display()
+                    .with_max_rows(50)
+                    .with_max_columns(50)
+                    .with_max_column_width(50);
+                let message = format_args!(
+                    "This model has an enforced contract that failed.\n Please ensure the name, data_type, and number of columns in your contract match the columns in your model's definition.\n\n {column_diff_display}"
                 );
                 if let Some((node_id, file_path)) = node_metadata_from_state(state) {
                     Err(Error::new(
@@ -1147,10 +1201,13 @@ impl Object for Exceptions {
                 let warning = format!(
                     "Data type of snapshot table timestamp columns ({snapshot_time_data_type}) doesn't match derived column 'updated_at' ({updated_at_data_type}). Please update snapshot config 'updated_at'."
                 );
-                show_warning!(
-                    self.io_args,
-                    fs_err!(ErrorCode::Generic, "{}", warning.as_str())
+
+                emit_warn_log_message(
+                    ErrorCode::Generic,
+                    warning,
+                    self.io_args.status_reporter.as_ref(),
                 );
+
                 Ok(Value::UNDEFINED)
             }
             _ => Err(Error::new(
@@ -1171,20 +1228,24 @@ pub fn build_flat_graph(nodes: &Nodes) -> MutableMap {
         .map(|(unique_id, model)| {
             (
                 unique_id.clone(),
-                Value::from_serialize((Arc::as_ref(model) as &dyn InternalDbtNode).serialize()),
+                Value::from_serialize(
+                    (Arc::as_ref(model) as &dyn InternalDbtNode).serialize_for_jinja(),
+                ),
             )
         })
         .chain(nodes.snapshots.iter().map(|(unique_id, snapshot)| {
             (
                 unique_id.clone(),
-                Value::from_serialize((Arc::as_ref(snapshot) as &dyn InternalDbtNode).serialize()),
+                Value::from_serialize(
+                    (Arc::as_ref(snapshot) as &dyn InternalDbtNode).serialize_for_jinja(),
+                ),
             )
         }))
         .chain(nodes.tests.iter().map(|(unique_id, test)| {
             // For tests, update original_file_path to use patch_path if it exists
             // we also do this this when we write the test to the manifest
             // (indicates test was defined in a YAML file)
-            let mut serialized = (Arc::as_ref(test) as &dyn InternalDbtNode).serialize();
+            let mut serialized = (Arc::as_ref(test) as &dyn InternalDbtNode).serialize_for_jinja();
             if let YmlValue::Mapping(ref mut map, _) = serialized
                 && let Some(patch_path) = &test.__common_attr__.patch_path
             {
@@ -1198,7 +1259,9 @@ pub fn build_flat_graph(nodes: &Nodes) -> MutableMap {
         .chain(nodes.seeds.iter().map(|(unique_id, seed)| {
             (
                 unique_id.clone(),
-                Value::from_serialize((Arc::as_ref(seed) as &dyn InternalDbtNode).serialize()),
+                Value::from_serialize(
+                    (Arc::as_ref(seed) as &dyn InternalDbtNode).serialize_for_jinja(),
+                ),
             )
         }))
         .collect();
@@ -1210,7 +1273,9 @@ pub fn build_flat_graph(nodes: &Nodes) -> MutableMap {
         .map(|(unique_id, source)| {
             (
                 unique_id.clone(),
-                Value::from_serialize((Arc::as_ref(source) as &dyn InternalDbtNode).serialize()),
+                Value::from_serialize(
+                    (Arc::as_ref(source) as &dyn InternalDbtNode).serialize_for_jinja(),
+                ),
             )
         })
         .collect();
@@ -1219,9 +1284,19 @@ pub fn build_flat_graph(nodes: &Nodes) -> MutableMap {
         Value::from("sources"),
         Value::from_serialize(sources_insert),
     );
+    let exposures_insert: BTreeMap<String, Value> = nodes
+        .exposures
+        .iter()
+        .map(|(unique_id, exposure)| {
+            (
+                unique_id.clone(),
+                Value::from_serialize((Arc::as_ref(exposure) as &dyn InternalDbtNode).serialize()),
+            )
+        })
+        .collect();
     graph.insert(
         Value::from("exposures"),
-        Value::from_serialize(BTreeMap::<String, Value>::new()),
+        Value::from_serialize(exposures_insert),
     );
     graph.insert(
         Value::from("groups"),
@@ -1379,5 +1454,18 @@ mod tests {
         let tmpl = env.template_from_str(template_source).unwrap();
         let output = tmpl.render(Value::UNDEFINED, &[]).unwrap();
         assert_eq!(output.trim(), "a: 1\nb: 2");
+    }
+
+    #[test]
+    fn test_fromjson_parses_plain_string_via_yaml_fallback() {
+        let mut env = Environment::new();
+        env.add_func_func("fromjson", fromjson);
+
+        // Should parse as a string via YAML fallback when JSON parsing fails
+        let tmpl = env
+            .template_from_str("{{ fromjson('i_am_string') }}")
+            .unwrap();
+        let output = tmpl.render(Value::UNDEFINED, &[]).unwrap();
+        assert_eq!(output.trim(), "i_am_string");
     }
 }

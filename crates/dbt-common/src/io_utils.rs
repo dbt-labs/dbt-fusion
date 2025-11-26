@@ -1,6 +1,9 @@
+use crate::io_args::{EvalArgs, Phases, StaticAnalysisOffReason};
 use crate::stdfs::File;
+use crate::tracing::metrics::get_exit_code_from_error_counter;
 use crate::{ErrorCode, FsError, FsResult, err, fs_err, stdfs::canonicalize};
-use dbt_telemetry::{ExecutionPhase, NodeOutcome, NodeSkipReason};
+use dbt_serde_yaml::Span;
+use dbt_telemetry::{ExecutionPhase, NodeOutcome};
 use pathdiff::diff_paths;
 use std::{
     any::Any,
@@ -21,8 +24,8 @@ pub trait StatusReporter: Any + Send + Sync {
         file_path: PathBuf,
         execution_phase: ExecutionPhase,
         node_outcome: NodeOutcome,
-        node_skip_reason: Option<NodeSkipReason>,
-        node_skip_reason_upstream: Option<(String, String, bool)>,
+        upstream_target: Option<(String, String, bool)>,
+        static_analysis_off_reason: (Option<StaticAnalysisOffReason>, Span),
     );
     /// Called to show progress in the UI
     fn show_progress(&self, action: &str, target: &str, description: Option<&str>);
@@ -171,4 +174,17 @@ pub fn and_n_others(n: usize, items: &[impl ToString]) -> String {
             .collect::<Vec<_>>()
             .join(", ")
     }
+}
+
+pub fn checkpoint_maybe_exit(arg: &EvalArgs, phase: Phases) -> Option<i32> {
+    if arg.skip_checkpoints {
+        return None;
+    }
+
+    let exit_code = get_exit_code_from_error_counter();
+
+    if arg.phase <= phase || exit_code > 0 {
+        return Some(exit_code);
+    }
+    None
 }

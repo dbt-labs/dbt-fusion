@@ -5,12 +5,14 @@ use crate::{
 };
 
 use prost::Name;
-pub use proto_rust::v1::public::events::fusion::invocation::{Invocation, InvocationEvalArgs};
+pub use proto_rust::v1::public::events::fusion::invocation::{
+    Invocation, InvocationEvalArgs, InvocationMetrics,
+};
 pub use proto_rust::v1::public::events::fusion::process::Process;
 
 impl ProtoTelemetryEvent for Invocation {
     const RECORD_CATEGORY: TelemetryEventRecType = TelemetryEventRecType::Span;
-    const OUTPUT_FLAGS: TelemetryOutputFlags = TelemetryOutputFlags::EXPORT_ALL;
+    const OUTPUT_FLAGS: TelemetryOutputFlags = TelemetryOutputFlags::ALL;
 
     fn event_display_name(&self) -> String {
         format!(

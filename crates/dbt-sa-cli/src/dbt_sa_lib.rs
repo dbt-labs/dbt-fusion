@@ -1,21 +1,25 @@
 use crate::dbt_sa_clap::{Cli, Commands, ProjectTemplate};
 use dbt_common::cancellation::CancellationToken;
 use dbt_common::create_root_info_span;
-use dbt_common::tracing::create_invocation_attributes;
+use dbt_common::io_utils::checkpoint_maybe_exit;
+use dbt_common::tracing::emit::{emit_error_log_from_fs_error, emit_info_log_message};
+use dbt_common::tracing::invocation::create_invocation_attributes;
+use dbt_common::tracing::metrics::get_exit_code_from_error_counter;
 use dbt_init::init;
 use dbt_jinja_utils::invocation_args::InvocationArgs;
+use dbt_jinja_utils::listener::DefaultJinjaTypeCheckEventListenerFactory;
 use dbt_loader::clean::execute_clean_command;
 use dbt_schemas::man::execute_man_command;
 
-use dbt_common::io_args::EvalArgs;
+use dbt_common::io_args::{EvalArgs, EvalArgsBuilder};
 use dbt_common::{
-    ErrorCode, FsResult, checkpoint_maybe_exit,
+    ErrorCode, FsResult,
     constants::{DBT_MANIFEST_JSON, INSTALLING, VALIDATING},
     fs_err, fsinfo,
     io_args::{Phases, SystemArgs},
     logging::init_logger,
     pretty_string::GREEN,
-    show_error, show_progress, show_progress_exit, show_result_with_default_title, stdfs,
+    show_progress, show_result_with_default_title, stdfs,
     tracing::span_info::record_span_status,
 };
 
@@ -27,7 +31,7 @@ use git_version::git_version;
 use dbt_schemas::schemas::manifest::build_manifest;
 use tracing::Instrument;
 
-use std::{sync::Arc, time::SystemTime};
+use std::sync::Arc;
 
 use dbt_loader::{args::LoadArgs, load};
 use dbt_parser::{args::ResolveArgs, resolver::resolve};
@@ -48,8 +52,7 @@ pub async fn execute_fs(
     init_logger((&eval_arg.io).into()).expect("Failed to initialize logger");
 
     // Create the Invocation span as a new root
-    let invocation_span =
-        create_root_info_span!(create_invocation_attributes("dbt-sa", &eval_arg).into());
+    let invocation_span = create_root_info_span(create_invocation_attributes("dbt-sa", &eval_arg));
 
     let result = do_execute_fs(&eval_arg, cli, token)
         .instrument(invocation_span.clone())
@@ -67,13 +70,12 @@ pub async fn execute_fs(
 
 #[allow(clippy::cognitive_complexity)]
 async fn do_execute_fs(eval_arg: &EvalArgs, cli: Cli, token: CancellationToken) -> FsResult<i32> {
-    let start = SystemTime::now();
-
     if let Commands::Man(_) = &cli.command {
         return match execute_man_command(eval_arg).await {
             Ok(code) => Ok(code),
             Err(e) => {
-                show_error!(&eval_arg.io, e);
+                emit_error_log_from_fs_error(&e, eval_arg.io.status_reporter.as_ref());
+
                 Ok(1)
             }
         };
@@ -114,25 +116,26 @@ async fn do_execute_fs(eval_arg: &EvalArgs, cli: Cli, token: CancellationToken) 
                     return Ok(0);
                 }
 
-                log::info!(
-                    "{} profile inputs, adapters, and connection",
+                emit_info_log_message(format!(
+                    "{} profile inputs, adapters, and connection\n", // Add empty line for spacing
                     GREEN.apply_to(VALIDATING)
-                );
-                log::info!(""); // Add empty line for spacing
+                ));
             }
             Err(e) => {
-                show_error!(&eval_arg.io, e);
+                emit_error_log_from_fs_error(&e, eval_arg.io.status_reporter.as_ref());
+
                 return Ok(1);
             }
         }
     }
 
     // Handle project specific commands
-    match execute_setup_and_all_phases(eval_arg, cli, &start, &token).await {
+    match execute_setup_and_all_phases(eval_arg, cli, &token).await {
         Ok(code) => Ok(code),
         Err(e) => {
-            show_error!(&eval_arg.io, e);
-            show_progress_exit!(eval_arg, start)
+            emit_error_log_from_fs_error(&e, eval_arg.io.status_reporter.as_ref());
+
+            Ok(1)
         }
     }
 }
@@ -141,7 +144,6 @@ async fn do_execute_fs(eval_arg: &EvalArgs, cli: Cli, token: CancellationToken) 
 async fn execute_setup_and_all_phases(
     eval_arg: &EvalArgs,
     cli: Cli,
-    start: &SystemTime,
     token: &CancellationToken,
 ) -> FsResult<i32> {
     // Header ..
@@ -179,8 +181,9 @@ async fn execute_setup_and_all_phases(
         match execute_clean_command(eval_arg, &clean_args.files, token).await {
             Ok(code) => Ok(code),
             Err(e) => {
-                show_error!(&eval_arg.io, e);
-                show_progress_exit!(eval_arg, start)
+                emit_error_log_from_fs_error(&e, eval_arg.io.status_reporter.as_ref());
+
+                Ok(1)
             }
         }
     } else {
@@ -188,8 +191,9 @@ async fn execute_setup_and_all_phases(
         match execute_all_phases(eval_arg, &cli, token).await {
             Ok(code) => Ok(code),
             Err(e) => {
-                show_error!(&eval_arg.io, e);
-                show_progress_exit!(eval_arg, start)
+                emit_error_log_from_fs_error(&e, eval_arg.io.status_reporter.as_ref());
+
+                Ok(1)
             }
         }
     }
@@ -201,21 +205,28 @@ async fn execute_all_phases(
     _cli: &Cli,
     token: &CancellationToken,
 ) -> FsResult<i32> {
-    let start = SystemTime::now();
-
     // Loads all .yml files + collects all included files
     let load_args = LoadArgs::from_eval_args(arg);
     let invocation_args = InvocationArgs::from_eval_args(arg);
-    let (dbt_state, num_threads, _dbt_cloud) = load(&load_args, &invocation_args, token).await?;
+    let (dbt_state, _dbt_cloud_config) = load(&load_args, &invocation_args, token).await?;
 
-    let arg = arg
-        .with_target(dbt_state.dbt_profile.target.to_string())
-        .with_threads(num_threads);
+    let arg = EvalArgsBuilder::from_eval_args(arg)
+        .with_additional(
+            dbt_state.dbt_profile.target.to_string(),
+            dbt_state.dbt_profile.threads,
+            dbt_state.dbt_profile.db_config.adapter_type_if_supported(),
+        )
+        .build();
+
     show_result_with_default_title!(&arg.io, ShowOptions::InputFiles, &dbt_state.to_string());
 
     // This also exits the init command b/c init `to_eval_args` sets the phase to debug
-    checkpoint_maybe_exit!(Phases::Debug, &arg, start);
-    checkpoint_maybe_exit!(Phases::Deps, &arg, start);
+    if let Some(exit_code) = checkpoint_maybe_exit(&arg, Phases::Debug) {
+        return Ok(exit_code);
+    }
+    if let Some(exit_code) = checkpoint_maybe_exit(&arg, Phases::Deps) {
+        return Ok(exit_code);
+    }
 
     // Parses (dbt parses) all .sql files with execute == false
     let resolve_args = ResolveArgs::try_from_eval_args(&arg)?;
@@ -223,13 +234,11 @@ async fn execute_all_phases(
     let (resolved_state, _jinja_env) = resolve(
         &resolve_args,
         &invocation_args,
-        dbt_state,
+        Arc::new(dbt_state),
         Macros::default(),
         Nodes::default(),
-        Some(Arc::new(
-            dbt_jinja_utils::listener::DefaultRenderingEventListenerFactory::default(),
-        )),
         token,
+        Arc::new(DefaultJinjaTypeCheckEventListenerFactory::default()), // TODO: use option<>
     )
     .await?;
 
@@ -247,5 +256,5 @@ async fn execute_all_phases(
         to_string_pretty(&dbt_manifest)?
     );
 
-    show_progress_exit!(&arg, start)
+    Ok(get_exit_code_from_error_counter())
 }

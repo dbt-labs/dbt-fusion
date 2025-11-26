@@ -1,28 +1,21 @@
 {% materialization incremental, adapter='databricks', supported_languages=['sql', 'python'] -%}
   {{ log("MATERIALIZING INCREMENTAL") }}
-  {# -- todo: use adapter.build_catalog_relation here once we have support for it -- #}
 
-  {#-- Validate early so we don't run SQL if the file_format + strategy combo is invalid --#}
-  {%- set raw_file_format = config.get('file_format', default='delta') -%}
-  {%- set raw_strategy = config.get('incremental_strategy') or 'merge' -%}
+  {%- set catalog_relation = adapter.build_catalog_relation(config.model) -%}
+
+  {#-- Core discrepancy: this line has been removed but it is a nice pre-database validation step;
+    -- todo(versusfacit) make this a model-level config check or catalog_relation check #}
+  {%- set _ = dbt_databricks_validate_get_file_format(catalog_relation.file_format) -%}
+
+  {%- set existing_relation = load_relation_with_metadata(this) %}
+  {%- set target_relation = this.incorporate(type='table') -%}
+  {%- set incremental_strategy = get_incremental_strategy(catalog_relation.file_format) -%}
   {%- set grant_config = config.get('grants') -%}
-  {%- set tblproperties = config.get('tblproperties') -%}
-  {%- set tags = config.get('databricks_tags') -%}
-
-  {%- set file_format = dbt_databricks_validate_get_file_format(raw_file_format) -%}
-  {%- set incremental_strategy = dbt_databricks_validate_get_incremental_strategy(raw_strategy, file_format) -%}
-
-  {#-- Set vars --#}
-
   {%- set full_refresh = should_full_refresh() %}
-  {%- set incremental_predicates = config.get('predicates', default=none) or config.get('incremental_predicates', default=none) -%}
-  {%- set unique_key = config.get('unique_key', none) -%}
   {%- set partition_by = config.get('partition_by', none) -%}
   {%- set language = model['language'] -%}
   {%- set on_schema_change = incremental_validate_on_schema_change(config.get('on_schema_change'), default='ignore') -%}
-  {%- set target_relation = this.incorporate(type='table') -%}
-  {%- set existing_relation = load_relation_with_metadata(this) %}
-  {%- set is_delta = (file_format == 'delta' and existing_relation.is_delta) %}
+  {%- set is_delta = (catalog_relation.file_format == 'delta' and existing_relation.is_delta) -%}
 
   {% if adapter.behavior.use_materialization_v2 %}
     {{ log("USING V2 MATERIALIZATION") }}
@@ -91,7 +84,12 @@
     {{ run_post_hooks() }}
 
   {% else %}
+    {%- set tblproperties = config.get('tblproperties') -%}
+    {%- set tags = config.get('databricks_tags') -%}
     {% set temp_relation = make_temp_relation(target_relation) %}
+    {%- set incremental_predicates = config.get('predicates', default=none) or config.get('incremental_predicates', default=none) -%}
+    {%- set unique_key = config.get('unique_key', none) -%}
+
     {#-- Run pre-hooks --#}
     {{ run_hooks(pre_hooks) }}
     {#-- Incremental run logic --#}
@@ -102,6 +100,10 @@
       {%- endcall -%}
       {% do persist_constraints(target_relation, model) %}
       {% do apply_tags(target_relation, tags) %}
+      {% set column_tags = adapter.get_column_tags_from_model(config.model) %}
+      {% if column_tags and column_tags.tags %}
+        {% do apply_column_tags(target_relation, column_tags) %}
+      {% endif %}
       {%- if language == 'python' -%}
         {%- do apply_tblproperties(target_relation, tblproperties) %}
       {%- endif -%}
@@ -120,6 +122,10 @@
         {% do persist_constraints(target_relation, model) %}
       {% endif %}
       {% do apply_tags(target_relation, tags) %}
+      {% set column_tags = adapter.get_column_tags_from_model(config.model) %}
+      {% if column_tags and column_tags.tags %}
+        {% do apply_column_tags(target_relation, column_tags) %}
+      {% endif %}
       {% do persist_docs(target_relation, model, for_relation=language=='python') %}
     {%- else -%}
       {#-- Set Overwrite Mode to DYNAMIC for subsequent incremental operations --#}
@@ -160,10 +166,14 @@
       {%- endif -%}
       {% if _configuration_changes is not none %}
         {% set tags = _configuration_changes.changes.get("tags", None) %}
+        {% set column_tags = _configuration_changes.changes.get("column_tags", None) %}
         {% set tblproperties = _configuration_changes.changes.get("tblproperties", None) %}
         {% set liquid_clustering = _configuration_changes.changes.get("liquid_clustering") %}
         {% if tags is not none %}
           {% do apply_tags(target_relation, tags.set_tags) %}
+        {%- endif -%}
+        {% if column_tags is not none %}
+          {% do apply_column_tags(target_relation, column_tags) %}
         {%- endif -%}
         {% if tblproperties is not none %}
           {% do apply_tblproperties(target_relation, tblproperties.tblproperties) %}
@@ -190,7 +200,7 @@
   {%- if incremental_strategy == 'insert_overwrite' and not full_refresh -%}
     {{ set_overwrite_mode('STATIC') }}
   {%- endif -%}
-  
+
   {{ return({'relations': [target_relation]}) }}
 
 {%- endmaterialization %}

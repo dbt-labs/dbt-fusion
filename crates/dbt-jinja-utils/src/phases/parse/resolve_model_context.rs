@@ -13,13 +13,15 @@ use std::{
 
 use chrono::TimeZone;
 use chrono_tz::{Europe::London, Tz};
+use dbt_adapter::{
+    cast_util::THIS_RELATION_KEY, load_store::ResultStore, relation_object::create_relation,
+};
 use dbt_common::{
     adapter::AdapterType,
     io_args::{IoArgs, StaticAnalysisKind},
-    serde_utils::convert_yml_to_map,
+    serde_utils::convert_yml_to_value_map,
 };
 use dbt_frontend_common::error::CodeLocation;
-use dbt_fusion_adapter::{load_store::ResultStore, relation_object::create_relation};
 use dbt_schemas::schemas::{
     DbtModelAttr, InternalDbtNode, IntrospectionKind,
     common::{Access, DbtMaterialization, ResolvedQuoting},
@@ -41,7 +43,8 @@ use minijinja::{
     listener::RenderingEventListener,
     machinery::Span,
     value::{
-        Object, ObjectRepr, Value as MinijinjaValue, ValueKind, function_object::FunctionObject,
+        Enumerator, Object, ObjectRepr, Value as MinijinjaValue, ValueKind,
+        function_object::FunctionObject,
     },
 };
 use minijinja_contrib::modules::{py_datetime::datetime::PyDateTime, pytz::PytzTimezone};
@@ -82,20 +85,25 @@ pub fn build_resolve_model_context<T: DefaultTo<T> + 'static>(
 ) -> BTreeMap<String, MinijinjaValue> {
     // Create a relation for 'this' using config values
     let mut context = BTreeMap::new();
-    let this_relation = create_relation(
-        adapter_type,
-        database.to_string(),
-        schema.to_string(),
-        Some(model_name.to_string()),
-        None,
-        package_quoting
-            .try_into()
-            .expect("Failed to convert quoting to resolved quoting"),
-    )
-    .unwrap()
-    .as_value();
+    let sql_resources_clone = sql_resources.clone();
+    let this_relation = ResolveThisFunction {
+        relation: create_relation(
+            adapter_type,
+            database.to_string(),
+            schema.to_string(),
+            Some(model_name.to_string()),
+            None,
+            package_quoting
+                .try_into()
+                .expect("Failed to convert quoting to resolved quoting"),
+        )
+        .unwrap()
+        .as_value(),
+        sql_resources: sql_resources_clone,
+    };
 
-    context.insert("this".to_owned(), this_relation);
+    let this_value = MinijinjaValue::from_object(this_relation);
+    context.insert("this".to_owned(), this_value);
 
     // Create a BTreeMap for builtins
     let mut builtins = BTreeMap::new();
@@ -230,14 +238,14 @@ pub fn build_resolve_model_context<T: DefaultTo<T> + 'static>(
             alias: model_name.to_string(),
             relation_name: None,
             materialized: DbtMaterialization::View,
-            static_analysis: StaticAnalysisKind::On,
+            static_analysis: StaticAnalysisKind::On.into(),
             static_analysis_off_reason: None,
             enabled: true,
             extended_model: false,
             persist_docs: None,
             quoting: ResolvedQuoting::trues(),
             quoting_ignore_case: false,
-            columns: BTreeMap::new(),
+            columns: vec![],
             depends_on: NodeDependsOn {
                 macros: vec![],
                 nodes: vec![],
@@ -262,15 +270,17 @@ pub fn build_resolve_model_context<T: DefaultTo<T> + 'static>(
             freshness: None,
             contract: None,
             event_time: None,
+            catalog_name: None,
+            table_format: None,
         },
         __adapter_attr__: AdapterAttr::default(),
         __other__: BTreeMap::new(),
         deprecated_config: ModelConfig::default(),
     };
 
-    let mut model_map = convert_yml_to_map(model.serialize());
+    let mut model_map = convert_yml_to_value_map(model.serialize());
     model_map.insert(
-        "batch".to_string(),
+        "batch".to_owned(),
         MinijinjaValue::from_object(init_batch_context()),
     );
 
@@ -633,13 +643,13 @@ impl<T: DefaultTo<T>> Object for ParseConfig<T> {
     /// Implement the call method on the config object
     fn call(
         self: &Arc<Self>,
-        _state: &State<'_, '_>,
+        state: &State<'_, '_>,
         args: &[MinijinjaValue],
         _listeners: &[Rc<dyn RenderingEventListener>],
     ) -> Result<MinijinjaValue, MinijinjaError> {
         let mut args = ArgParser::new(args, None);
         // If there is a positional argument, it must be a map
-        let kwargs = if args.positional_len() == 1 {
+        let mut kwargs = if args.positional_len() == 1 {
             let positional_val: MinijinjaValue = args.next_positional::<MinijinjaValue>()?;
             if positional_val.kind() != ValueKind::Map {
                 return Err(MinijinjaError::new(
@@ -668,9 +678,39 @@ impl<T: DefaultTo<T>> Object for ParseConfig<T> {
             args.drain_kwargs()
         };
 
-        let mut result = BTreeMap::new();
-        for key in kwargs.keys() {
-            let value: &MinijinjaValue = kwargs.get(key).unwrap();
+        let enabled = if !kwargs.contains_key("enabled") {
+            kwargs.insert("enabled".to_string(), MinijinjaValue::from(self.enabled));
+            self.enabled
+        } else {
+            kwargs.get("enabled").unwrap().is_true()
+        };
+        // TODO: propgate span info for individual args
+        let span = {
+            let Span {
+                start_line,
+                start_col,
+                start_offset,
+                end_line,
+                end_col,
+                end_offset,
+            } = state.current_span();
+            dbt_serde_yaml::Span {
+                start: dbt_serde_yaml::Marker::new(
+                    start_offset as usize,
+                    start_line as usize,
+                    start_col as usize,
+                ),
+                end: dbt_serde_yaml::Marker::new(
+                    end_offset as usize,
+                    end_line as usize,
+                    end_col as usize,
+                ),
+                filename: self.error_path.as_ref().map(|p| Arc::new(p.to_path_buf())),
+            }
+        };
+
+        let mut mapping = dbt_serde_yaml::Mapping::with_capacity(kwargs.len());
+        for (key, value) in kwargs.into_iter() {
             if value.is_undefined() {
                 return Err(minijinja::Error::new(
                     minijinja::ErrorKind::InvalidOperation,
@@ -678,31 +718,25 @@ impl<T: DefaultTo<T>> Object for ParseConfig<T> {
                 ));
             }
 
-            let value = if let Some(dyn_obj) = value.as_object() {
-                if let Some(pydatetime) = dyn_obj.downcast::<PyDateTime>() {
-                    MinijinjaValue::from_serialize(pydatetime.chrono_dt())
-                } else {
-                    value.clone()
-                }
+            let value = if let Some(dyn_obj) = value.as_object()
+                && let Some(pydatetime) = dyn_obj.downcast::<PyDateTime>()
+            {
+                dbt_serde_yaml::to_value(pydatetime.chrono_dt())
             } else {
-                value.clone()
-            };
+                dbt_serde_yaml::to_value(value)
+            }
+            .map_err(|e| {
+                MinijinjaError::new(
+                    MinijinjaErrorKind::InvalidOperation,
+                    format!("Failed to serialize config into yaml: {e}"),
+                )
+            })?
+            .with_span(span.clone());
 
-            result.insert(key.to_string(), value);
+            mapping.insert(dbt_serde_yaml::Value::String(key, span.clone()), value);
         }
 
-        // Get or insert enabled
-        let enabled = result
-            .remove("enabled")
-            .unwrap_or_else(|| MinijinjaValue::from(self.enabled));
-        result.insert("enabled".to_string(), enabled.clone());
-
-        let yaml_value = dbt_serde_yaml::to_value(result).map_err(|e| {
-            MinijinjaError::new(
-                MinijinjaErrorKind::InvalidOperation,
-                format!("Failed to serialize config into yaml: {e}"),
-            )
-        })?;
+        let yaml_value = dbt_serde_yaml::Value::Mapping(mapping, span);
         let config: T = into_typed_with_error(
             &self.io_args,
             yaml_value,
@@ -720,7 +754,7 @@ impl<T: DefaultTo<T>> Object for ParseConfig<T> {
             .lock()
             .unwrap()
             .push(SqlResource::Config(Box::new(config)));
-        if !enabled.is_true() {
+        if !enabled {
             return Err(MinijinjaError::new(
                 MinijinjaErrorKind::DisabledModel,
                 "Model is disabled".to_string(),
@@ -761,6 +795,57 @@ impl<T: DefaultTo<T>> Object for ParseConfig<T> {
                 format!("Unknown method on parse: {name}"),
             )),
         }
+    }
+}
+
+#[derive(Debug)]
+struct ResolveThisFunction<T: DefaultTo<T> + 'static> {
+    relation: MinijinjaValue,
+    sql_resources: Arc<Mutex<Vec<SqlResource<T>>>>,
+}
+
+impl<T: DefaultTo<T>> Object for ResolveThisFunction<T> {
+    fn call_method(
+        self: &Arc<Self>,
+        state: &State<'_, '_>,
+        name: &str,
+        args: &[MinijinjaValue],
+        listeners: &[Rc<dyn RenderingEventListener>],
+    ) -> Result<MinijinjaValue, MinijinjaError> {
+        self.relation
+            .as_object()
+            .expect("Failed to convert relation to object")
+            .call_method(state, name, args, listeners)
+    }
+
+    fn get_value(self: &Arc<Self>, key: &MinijinjaValue) -> Option<MinijinjaValue> {
+        // This is a special case for the this relation macro to be able to downcast this to a RelationObject
+        if key.as_str() == Some(THIS_RELATION_KEY) {
+            return Some(self.relation.clone());
+        }
+        // TODO: This can be more fine-grained (i.e. if the user only asks for database etc.)
+        if key.as_str()? == "database" || key.as_str()? == "schema" {
+            self.sql_resources.lock().unwrap().push(SqlResource::This);
+        }
+        self.relation
+            .as_object()
+            .expect("Failed to convert relation to object")
+            .get_value(key)
+    }
+
+    fn enumerate(self: &Arc<Self>) -> Enumerator {
+        self.relation
+            .as_object()
+            .expect("Failed to convert relation to object")
+            .enumerate()
+    }
+
+    fn render(self: &Arc<Self>, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.sql_resources.lock().unwrap().push(SqlResource::This);
+        self.relation
+            .as_object()
+            .expect("Failed to convert relation to object")
+            .render(f)
     }
 }
 

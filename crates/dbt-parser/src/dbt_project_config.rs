@@ -8,14 +8,19 @@ use std::{
 };
 
 use dbt_common::{
-    ErrorCode, FsResult, fs_err, io_args::IoArgs, show_error, show_package_error, show_strict_error,
+    FsResult, adapter::AdapterType, io_args::IoArgs, tracing::emit::emit_strict_parse_error,
 };
-use dbt_schemas::schemas::project::{
-    AnalysesConfig, DataTestConfig, DefaultTo, ExposureConfig, IterChildren, MetricConfig,
-    ModelConfig, SavedQueryConfig, SeedConfig, SemanticModelConfig, SnapshotConfig, SourceConfig,
-    UnitTestConfig,
+use dbt_schemas::schemas::{
+    common::DbtQuoting, project::DbtProject, relations::default_dbt_quoting_for,
 };
-use dbt_schemas::schemas::{common::DbtQuoting, project::DbtProject};
+use dbt_schemas::schemas::{
+    project::{
+        AnalysesConfig, DataTestConfig, DefaultTo, ExposureConfig, FunctionConfig, MetricConfig,
+        ModelConfig, SavedQueryConfig, SeedConfig, SemanticModelConfig, SnapshotConfig,
+        SourceConfig, TypedRecursiveConfig, UnitTestConfig,
+    },
+    serde::yaml_to_fs_error,
+};
 use dbt_serde_yaml::ShouldBe;
 
 /// Used to deserialize the top-level `dbt_project.yml` configuration
@@ -46,7 +51,7 @@ pub struct DbtProjectConfig<T: DefaultTo<T>> {
 
 impl<T: DefaultTo<T>> DbtProjectConfig<T> {
     /// Create a new [GlobalProjectConfig] from a default configuration and the root dbt_project.yml [DbtProjectConfigs]
-    pub fn try_new<S: Into<T> + IterChildren<S> + Clone>(
+    pub fn try_new<S: Into<T> + TypedRecursiveConfig>(
         io: &IoArgs,
         dbt_config: &T,
         configs: &S,
@@ -102,7 +107,7 @@ impl<T: DefaultTo<T>> DbtProjectConfig<T> {
 }
 
 /// Recursively build the [DbtProjectConfig] from a parent and child configuration
-pub fn recur_build_dbt_project_config<T: DefaultTo<T>, S: Into<T> + IterChildren<S> + Clone>(
+pub fn recur_build_dbt_project_config<T: DefaultTo<T>, S: Into<T> + TypedRecursiveConfig>(
     io: &IoArgs,
     parent_config: &T,
     child: &S,
@@ -122,27 +127,26 @@ pub fn recur_build_dbt_project_config<T: DefaultTo<T>, S: Into<T> + IterChildren
         };
         let child_config_variant = match maybe_child_config_variant {
             ShouldBe::AndIs(config) => config,
-            ShouldBe::ButIsnt { raw, .. } => {
-                let trimmed_key = key.trim();
-                let suggestion = if !trimmed_key.starts_with("+") {
-                    format!(" Try '+{trimmed_key}' instead.")
-                } else {
-                    "".to_string()
-                };
-                let err = fs_err!(
-                    code => ErrorCode::UnusedConfigKey,
-                    loc => raw.as_ref().map(|r| r.span()).unwrap_or_default(),
-                    "Ignored unexpected key '{trimmed_key}'.{suggestion} YAML path: '{key_path}'."
-                );
-                if let Some(package_name) = dependency_package_name
-                    && !io.show_all_deprecations
-                {
-                    // If we are parsing a dependency package, we use a special macros
-                    // that ensures at most one error is shown per package.
-                    show_package_error!(io, package_name);
-                } else {
-                    show_strict_error!(io, err, dependency_package_name);
+            ShouldBe::ButIsnt(..) => {
+                if let Some(err) = maybe_child_config_variant.take_err() {
+                    let filename = if let Some(raw) = maybe_child_config_variant.as_ref_raw()
+                        && let Some(filename) = raw.span().get_filename()
+                    {
+                        Some(filename)
+                    } else {
+                        None
+                    };
+                    let fs_err = yaml_to_fs_error(err, filename).with_context(format!(
+                        "Invalid {} definition `{}`: {}",
+                        S::type_name(),
+                        key_path,
+                        maybe_child_config_variant
+                            .as_err_msg()
+                            .expect("Error message always present on ShouldBe::ButIsnt variant")
+                    ));
+                    emit_strict_parse_error(&fs_err, dependency_package_name, io);
                 }
+                // Otherwise, the error has already been processed, so we skip this child
                 continue;
             }
         };
@@ -190,6 +194,8 @@ pub struct RootProjectConfigs {
     pub saved_queries: DbtProjectConfig<SavedQueryConfig>,
     /// Analysis configs
     pub analyses: DbtProjectConfig<AnalysesConfig>,
+    /// Function configs
+    pub functions: DbtProjectConfig<FunctionConfig>,
 }
 
 /// Build the [RootProjectConfigs] from a [DbtProject]
@@ -197,6 +203,7 @@ pub fn build_root_project_configs(
     io_args: &IoArgs,
     root_project: &DbtProject,
     root_project_quoting: DbtQuoting,
+    adapter_type: AdapterType,
 ) -> FsResult<RootProjectConfigs> {
     let maybe_root_project_config =
         match (root_project.tests.clone(), root_project.data_tests.clone()) {
@@ -207,6 +214,9 @@ pub fn build_root_project_configs(
             (None, Some(data_tests)) => Some(data_tests),
             (None, None) => None,
         };
+
+    let source_default_quoting = default_dbt_quoting_for(adapter_type);
+
     Ok(RootProjectConfigs {
         models: init_project_config(
             io_args,
@@ -223,7 +233,7 @@ pub fn build_root_project_configs(
             &root_project.sources,
             SourceConfig {
                 enabled: Some(true),
-                quoting: Some(root_project_quoting),
+                quoting: Some(source_default_quoting),
                 ..Default::default()
             },
             None,
@@ -312,11 +322,21 @@ pub fn build_root_project_configs(
             },
             None,
         )?,
+        functions: init_project_config(
+            io_args,
+            &root_project.functions,
+            FunctionConfig {
+                enabled: Some(true),
+                quoting: Some(root_project_quoting),
+                ..Default::default()
+            },
+            None,
+        )?,
     })
 }
 
 /// generate the project config that will be inherited throughout the project
-pub fn init_project_config<T: DefaultTo<T>, S: Into<T> + IterChildren<S> + Clone>(
+pub fn init_project_config<T: DefaultTo<T>, S: TypedRecursiveConfig + Into<T>>(
     io_args: &IoArgs,
     dbt_project_configs: &Option<S>,
     default_config: T,

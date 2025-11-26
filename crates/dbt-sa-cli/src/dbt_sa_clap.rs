@@ -15,8 +15,8 @@ use std::{
 use strum::{Display, IntoEnumIterator};
 
 use dbt_common::io_args::{
-    ClapResourceType, DisplayFormat, EvalArgs, IoArgs, JsonSchemaTypes, Phases, ShowOptions,
-    SystemArgs, check_selector, check_var,
+    ClapResourceType, DisplayFormat, EvalArgs, FsCommand, IoArgs, JsonSchemaTypes, Phases,
+    ShowOptions, SystemArgs, check_selector, check_var,
 };
 use dbt_common::row_limit::RowLimit;
 
@@ -26,7 +26,7 @@ use clap::{ValueEnum, arg};
 use dbt_common::node_selector::{IndirectSelection, parse_model_specifiers};
 
 const DEFAULT_LIMIT: &str = "10";
-static DEFAULT_FORMAT: LazyLock<String> = LazyLock::new(|| DisplayFormat::Table.to_string());
+const DEFAULT_FORMAT: DisplayFormat = DisplayFormat::Table;
 
 // defined in pretty string, but copied here to avoid cycle...
 static BOLD: LazyLock<Style> = LazyLock::new(|| Style::new().bold());
@@ -391,16 +391,16 @@ impl Cli {
         self.common_args().target_path
     }
 
-    pub fn get_command_str(&self) -> &str {
+    pub fn as_command(&self) -> FsCommand {
         // generate the command string
         match &self.command {
-            Commands::Init(..) => "init",
-            Commands::Deps(..) => "deps",
-            Commands::Parse(..) => "parse",
-            Commands::List(..) => "list",
-            Commands::Ls(..) => "ls",
-            Commands::Clean(..) => "clean",
-            Commands::Man(..) => "man",
+            Commands::Init(..) => FsCommand::Init,
+            Commands::Deps(..) => FsCommand::Deps,
+            Commands::Parse(..) => FsCommand::Parse,
+            Commands::List(..) => FsCommand::List,
+            Commands::Ls(..) => FsCommand::List,
+            Commands::Clean(..) => FsCommand::Clean,
+            Commands::Man(..) => FsCommand::Man,
         }
     }
 }
@@ -443,11 +443,7 @@ impl ListArgs {
             eval_args.exclude_resource_types = vec![exclude_resource_type];
         }
         eval_args.limit = self.limit.into();
-        if let Some(output) = &self.output {
-            eval_args.format = output.to_string();
-        } else {
-            eval_args.format = DEFAULT_FORMAT.clone();
-        }
+        eval_args.format = self.output.unwrap_or(DEFAULT_FORMAT);
         eval_args
     }
 }
@@ -455,7 +451,7 @@ impl ListArgs {
 impl ManArgs {
     pub fn to_eval_args(&self, arg: SystemArgs, in_dir: &Path, out_dir: &Path) -> EvalArgs {
         let eval_args = self.common_args.to_eval_args(arg, in_dir, out_dir);
-        eval_args.with_schema(self.schema.clone())
+        eval_args.set_schema(self.schema.clone())
     }
 }
 impl InitArgs {
@@ -468,16 +464,16 @@ impl InitArgs {
             arg.io.show.iter().cloned().collect()
         };
         EvalArgs {
-            command: arg.command.clone(),
+            command: arg.command,
             from_main: arg.from_main,
             io: IoArgs {
                 in_dir: in_dir.to_path_buf(),
                 out_dir: out_dir.to_path_buf(),
                 show,
-                command: arg.command.clone(),
+                is_compile: arg.command == FsCommand::Compile,
                 debug: arg.io.debug,
                 invocation_id: arg.io.invocation_id,
-                send_anonymous_usage_stats: self.common_args.send_anonymous_usage_stats,
+                send_anonymous_usage_stats: self.common_args.get_send_anonymous_usage_stats(),
                 status_reporter: arg.io.status_reporter.clone(),
                 log_format: self.common_args.log_format,
                 log_level: self.common_args.log_level,
@@ -491,7 +487,11 @@ impl InitArgs {
                 build_cache_mode: arg.io.build_cache_mode,
                 build_cache_url: arg.io.build_cache_url,
                 build_cache_cas_url: arg.io.build_cache_cas_url,
+                beta_use_query_cache: arg.io.beta_use_query_cache,
+                host: arg.io.host,
+                port: arg.io.port,
             },
+            send_anonymous_usage_stats: self.common_args.get_send_anonymous_usage_stats(),
             ..Default::default()
         }
     }
@@ -554,15 +554,15 @@ impl CommonArgs {
         }
 
         EvalArgs {
-            command: arg.command.clone(),
+            command: arg.command,
             io: IoArgs {
                 show,
-                command: arg.command.clone(),
+                is_compile: arg.command == FsCommand::Compile,
                 debug: self.debug,
                 invocation_id: arg.io.invocation_id,
                 in_dir: in_dir.to_path_buf(),
                 out_dir: out_dir.to_path_buf(),
-                send_anonymous_usage_stats: arg.io.send_anonymous_usage_stats,
+                send_anonymous_usage_stats: self.get_send_anonymous_usage_stats(),
                 status_reporter: arg.io.status_reporter.clone(),
                 log_format: self.log_format,
                 log_level: self.log_level,
@@ -576,6 +576,9 @@ impl CommonArgs {
                 build_cache_mode: arg.io.build_cache_mode,
                 build_cache_url: arg.io.build_cache_url,
                 build_cache_cas_url: arg.io.build_cache_cas_url,
+                beta_use_query_cache: arg.io.beta_use_query_cache,
+                host: arg.io.host,
+                port: arg.io.port,
             },
             profiles_dir: self.profiles_dir.clone(),
             packages_install_path: self.packages_install_path.clone(),
@@ -583,7 +586,7 @@ impl CommonArgs {
             target: self.target.clone(),
             vars: self.vars.clone().unwrap_or_default(),
             phase: Phases::All,
-            format: DEFAULT_FORMAT.clone(),
+            format: DEFAULT_FORMAT,
             limit: Some(10),
             debug: self.debug,
             num_threads: if self.single_threaded {
@@ -622,6 +625,7 @@ impl CommonArgs {
                 self.write_json
             },
             target_path: self.target_path.clone(),
+            send_anonymous_usage_stats: self.get_send_anonymous_usage_stats(),
             ..Default::default()
         }
     }
@@ -636,14 +640,14 @@ impl CommonArgs {
 }
 
 pub fn from_main(cli: &Cli) -> SystemArgs {
-    let command = cli.get_command_str().to_string();
+    let command = cli.as_command();
 
     SystemArgs {
-        command: command.clone(),
+        command,
         io: IoArgs {
             invocation_id: uuid::Uuid::new_v4(),
             show: cli.common_args().show.iter().cloned().collect(),
-            command,
+            is_compile: command == FsCommand::Compile,
             debug: cli.common_args().debug,
             in_dir: PathBuf::new(),
             out_dir: PathBuf::new(),
@@ -669,6 +673,9 @@ pub fn from_main(cli: &Cli) -> SystemArgs {
             build_cache_mode: None,
             build_cache_url: None,
             build_cache_cas_url: None,
+            beta_use_query_cache: false,
+            host: "localhost".to_string(),
+            port: 8000,
         },
         from_main: true,
 
@@ -678,14 +685,14 @@ pub fn from_main(cli: &Cli) -> SystemArgs {
 }
 
 pub fn from_lib(cli: &Cli) -> SystemArgs {
-    let command = cli.get_command_str().to_string();
+    let command = cli.as_command();
 
     SystemArgs {
-        command: command.clone(),
+        command,
         io: IoArgs {
             invocation_id: uuid::Uuid::new_v4(),
             show: cli.common_args().show.iter().cloned().collect(),
-            command,
+            is_compile: command == FsCommand::Compile,
             debug: cli.common_args().debug,
             in_dir: PathBuf::new(),
             out_dir: PathBuf::new(),
@@ -703,6 +710,9 @@ pub fn from_lib(cli: &Cli) -> SystemArgs {
             build_cache_mode: None,
             build_cache_url: None,
             build_cache_cas_url: None,
+            beta_use_query_cache: false,
+            host: "localhost".to_string(),
+            port: 8000,
         },
         from_main: false,
         target: cli.common_args().target,

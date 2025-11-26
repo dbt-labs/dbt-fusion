@@ -6,6 +6,7 @@ use crate::dbt_cloud_client::{CloudProject, DbtCloudClient, DbtCloudYml};
 use crate::yaml_utils::{has_top_level_key_parsed_file, remove_top_level_key_from_str};
 use dbt_common::adapter::AdapterType;
 use dbt_common::pretty_string::GREEN;
+use dbt_common::tracing::emit::{emit_info_log_message, emit_warn_log_message};
 use dbt_common::{ErrorCode, FsResult, fs_err, io_args::IoArgs};
 use dbt_jinja_utils::phases::load::init::initialize_load_profile_jinja_environment;
 use dbt_jinja_utils::serde::{into_typed_with_jinja, value_from_file};
@@ -30,7 +31,7 @@ pub type Profiles = HashMap<String, ProfileTarget>;
 
 /// Load profile using the standard dbt-loader infrastructure
 fn load_profile_with_loader(
-    profiles_dir: Option<&str>,
+    profiles_dir: Option<&Path>,
     profile_name: &str,
     target: Option<&str>,
 ) -> FsResult<DbConfig> {
@@ -38,12 +39,10 @@ fn load_profile_with_loader(
 
     let io_args = IoArgs {
         in_dir: current_dir,
-        command: "init".to_string(),
         ..Default::default()
     };
 
     let load_args = LoadArgs {
-        command: "init".to_string(),
         io: io_args,
         profiles_dir: profiles_dir.map(PathBuf::from),
         profile: Some(profile_name.to_string()),
@@ -136,18 +135,18 @@ impl ProjectStore {
         format!("https://{}", self.config.context.active_host)
     }
 
-    pub fn try_load_profile(&self, profiles_dir: &str, profile_name: &str) -> Option<DbConfig> {
+    pub fn try_load_profile(&self, profiles_dir: &Path, profile_name: &str) -> Option<DbConfig> {
         load_profile_with_loader(Some(profiles_dir), profile_name, None).ok()
     }
 }
 
 pub struct ProfileSetup {
-    pub profiles_dir: String,
+    pub profiles_dir: PathBuf,
     pub project_store: Option<ProjectStore>,
 }
 
 impl ProfileSetup {
-    pub fn new(profiles_dir: String) -> Self {
+    pub fn new(profiles_dir: PathBuf) -> Self {
         let project_store = ProjectStore::from_dbt_cloud_yml().unwrap_or(None);
         Self {
             profiles_dir,
@@ -294,11 +293,11 @@ impl ProfileSetup {
                     target_file.with_extension("bkp")
                 };
                 fs::write(&backup_file, &existing)?;
-                log::info!(
+                emit_info_log_message(format!(
                     "{} Backup created at {}",
                     GREEN.apply_to("Info"),
                     backup_file.display()
-                );
+                ));
             }
         }
 
@@ -326,11 +325,11 @@ impl ProfileSetup {
 
         fs::write(&target_file, existing)?;
 
-        log::info!(
+        emit_info_log_message(format!(
             "{} Profile written to {}",
             GREEN.apply_to("Success"),
             target_file.display()
-        );
+        ));
         Ok(())
     }
 
@@ -339,11 +338,10 @@ impl ProfileSetup {
         let all_projects = project_store.get_all_projects();
 
         if let Some(active) = active_project {
-            log::info!(
+            emit_info_log_message(format!(
                 "Found active project: {} (ID: {})",
-                active.project_name,
-                active.project_id
-            );
+                active.project_name, active.project_id
+            ));
 
             let use_active = Confirm::new()
                 .with_prompt(format!(
@@ -394,14 +392,21 @@ impl ProfileSetup {
         {
             Ok(db_config) => Ok(db_config),
             Err(e) => {
-                log::warn!("Failed to fetch cloud config: {e}");
+                emit_warn_log_message(
+                    ErrorCode::IoError,
+                    format!("Failed to fetch cloud config: {e}"),
+                    None,
+                );
                 Ok(None)
             }
         }
     }
 
     pub async fn setup_profile(&self, profile_name: &str) -> FsResult<()> {
-        log::info!("{} Setting up your profile...", GREEN.apply_to("Info"));
+        emit_info_log_message(format!(
+            "{} Setting up your profile...",
+            GREEN.apply_to("Info")
+        ));
 
         // Load the profile once at the beginning and cache the result
         let existing_config = if let Some(store) = &self.project_store {
@@ -413,7 +418,9 @@ impl ProfileSetup {
         let profile_exists = existing_config.is_some();
 
         let profile_action = if profile_exists {
-            log::info!("Profile '{profile_name}' already exists. You can choose how to proceed.");
+            emit_info_log_message(format!(
+                "Profile '{profile_name}' already exists. You can choose how to proceed."
+            ));
 
             use dialoguer::Select;
             let options = vec![
@@ -434,13 +441,22 @@ impl ProfileSetup {
 
         match profile_action {
             0 => {
-                log::info!("{} Editing existing profile...", GREEN.apply_to("Info"));
+                emit_info_log_message(format!(
+                    "{} Editing existing profile...",
+                    GREEN.apply_to("Info")
+                ));
             }
             1 => {
-                log::info!("{} Creating new profile...", GREEN.apply_to("Info"));
+                emit_info_log_message(format!(
+                    "{} Creating new profile...",
+                    GREEN.apply_to("Info")
+                ));
             }
             2 => {
-                log::info!("{} Profile setup cancelled.", GREEN.apply_to("Info"));
+                emit_info_log_message(format!(
+                    "{} Profile setup cancelled.",
+                    GREEN.apply_to("Info")
+                ));
                 return Ok(());
             }
             _ => unreachable!(),
@@ -453,22 +469,24 @@ impl ProfileSetup {
 
         let cloud_config = if profile_action == 1 {
             if let Some(project_store) = &self.project_store {
-                log::info!("Found dbt_cloud.yml configuration");
+                emit_info_log_message("Found dbt_cloud.yml configuration");
                 let project_id = Self::handle_cloud_project_selection(project_store).await?;
 
                 match Self::fetch_cloud_config(project_store, &project_id, adapter).await? {
                     Some(config) => Some(config),
                     None => {
-                        log::info!("No cloud config found for this adapter/project");
+                        emit_info_log_message("No cloud config found for this adapter/project");
                         None
                     }
                 }
             } else {
-                log::info!("No dbt_cloud.yml found - proceeding without cloud pre-population");
+                emit_info_log_message(
+                    "No dbt_cloud.yml found - proceeding without cloud pre-population",
+                );
                 None
             }
         } else {
-            log::info!("Editing existing profile - skipping cloud config fetch");
+            emit_info_log_message("Editing existing profile - skipping cloud config fetch");
             None
         };
 
@@ -484,11 +502,11 @@ impl ProfileSetup {
             existing_config.as_ref()
         } else {
             if let Some(existing_config) = existing_config.as_ref() {
-                log::info!(
+                emit_info_log_message(format!(
                     "Adapter type changed from '{}' to '{}' - starting with fresh configuration",
                     existing_config.adapter_type(),
                     adapter
-                );
+                ));
             }
             None
         };

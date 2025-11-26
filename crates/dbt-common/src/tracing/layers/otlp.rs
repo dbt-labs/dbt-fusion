@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use super::super::{
     data_provider::DataProvider,
     layer::{ConsumerLayer, TelemetryConsumer},
@@ -7,7 +9,10 @@ use crate::constants::DBT_FUSION;
 
 use dbt_error::{ErrorCode, FsResult};
 
-use dbt_telemetry::serialize::otlp::{export_log, export_span};
+use dbt_telemetry::{
+    LogMessage,
+    serialize::otlp::{export_log, export_span},
+};
 use dbt_telemetry::{LogRecordInfo, SpanEndInfo, SpanStartInfo, TelemetryOutputFlags};
 
 use opentelemetry::{KeyValue, global, logs::LoggerProvider, trace::TracerProvider};
@@ -154,13 +159,13 @@ impl TelemetryShutdown for SdkLoggerProvider {
 }
 
 impl TelemetryConsumer for OTLPExporterLayer {
-    fn is_span_enabled(&self, span: &SpanStartInfo, _meta: &tracing::Metadata) -> bool {
+    fn is_span_enabled(&self, span: &SpanStartInfo) -> bool {
         span.attributes
             .output_flags()
             .contains(TelemetryOutputFlags::EXPORT_OTLP)
     }
 
-    fn is_log_enabled(&self, log_record: &LogRecordInfo, _meta: &tracing::Metadata) -> bool {
+    fn is_log_enabled(&self, log_record: &LogRecordInfo) -> bool {
         log_record
             .attributes
             .output_flags()
@@ -168,11 +173,24 @@ impl TelemetryConsumer for OTLPExporterLayer {
     }
 
     // We record spans to OTLP only when they are closed, so we don't need to do anything on new span
-    fn on_span_end(&self, span: &SpanEndInfo, _: &DataProvider<'_>) {
+    fn on_span_end(&self, span: &SpanEndInfo, _: &mut DataProvider<'_>) {
         export_span(&self.tracer, span);
     }
 
-    fn on_log_record(&self, record: &LogRecordInfo, _: &DataProvider<'_>) {
+    fn on_log_record(&self, record: &LogRecordInfo, _: &mut DataProvider<'_>) {
+        // Unfortunately, we do not currently enforce log body to not contain ANSI codes,
+        // so we need to make sure to strip them
+        if record.attributes.is::<LogMessage>()
+            && let Cow::Owned(stripped) = console::strip_ansi_codes(record.body.as_str())
+        {
+            let stripped_record = LogRecordInfo {
+                body: stripped,
+                ..record.clone()
+            };
+            export_log(&self.logger, &stripped_record);
+            return;
+        }
+
         export_log(&self.logger, record);
     }
 }

@@ -2,7 +2,9 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use dbt_common::FsResult;
 use dbt_serde_yaml::{JsonSchema, UntaggedEnumDeserialize};
-use serde::{Deserialize, Serialize, Serializer};
+use serde::de::{MapAccess, Visitor};
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_with::skip_serializing_none;
 use strum::Display;
 
@@ -42,6 +44,7 @@ pub struct DbtColumn {
     pub meta: BTreeMap<String, YmlValue>,
     pub tags: Vec<String>,
     pub policy_tags: Option<Vec<String>>,
+    pub databricks_tags: Option<BTreeMap<String, YmlValue>>,
     pub quote: Option<bool>,
     #[serde(default, rename = "config")]
     pub deprecated_config: ColumnConfig,
@@ -56,6 +59,48 @@ where
 
 pub type DbtColumnRef = Arc<DbtColumn>;
 
+/// Serialize and deserialize as a map to maintain Jinja behavior
+pub fn serialize_dbt_columns<S>(columns: &Vec<DbtColumnRef>, s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let mut map = s.serialize_map(Some(columns.len()))?;
+    for col in columns {
+        map.serialize_entry(&col.name.clone(), col)?;
+    }
+    map.end()
+}
+
+pub fn deserialize_dbt_columns<'de, D>(deserializer: D) -> Result<Vec<DbtColumnRef>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct DbtColumnVisitor;
+
+    impl<'de> Visitor<'de> for DbtColumnVisitor {
+        type Value = Vec<DbtColumnRef>;
+
+        fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+        where
+            M: MapAccess<'de>,
+        {
+            let mut columns = Vec::new();
+            while let Some((_key, value)) =
+                map.next_entry::<serde::de::IgnoredAny, DbtColumnRef>()?
+            {
+                columns.push(value)
+            }
+            Ok(columns)
+        }
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "a map of column names to columns")
+        }
+    }
+
+    deserializer.deserialize_map(DbtColumnVisitor)
+}
+
 #[skip_serializing_none]
 #[derive(Default, Deserialize, Serialize, Debug, Clone, JsonSchema)]
 pub struct ColumnProperties {
@@ -67,6 +112,8 @@ pub struct ColumnProperties {
     pub data_tests: Option<Vec<DataTests>>,
     pub granularity: Option<Granularity>,
     pub policy_tags: Option<Vec<String>>,
+    pub databricks_tags: Option<BTreeMap<String, YmlValue>>,
+    pub tags: Option<Vec<String>>,
     pub quote: Option<bool>,
     pub config: Option<ColumnConfig>,
 
@@ -97,6 +144,7 @@ pub struct ColumnConfig {
     #[serde(default)]
     pub tags: Option<StringOrArrayOfStrings>,
     pub meta: Option<BTreeMap<String, YmlValue>>,
+    pub databricks_tags: Option<BTreeMap<String, YmlValue>>,
 }
 
 /// Represents column inheritance rules for a model version
@@ -177,15 +225,15 @@ pub fn process_columns(
     columns: Option<&Vec<ColumnProperties>>,
     meta: Option<BTreeMap<String, YmlValue>>,
     tags: Option<Vec<String>>,
-) -> FsResult<BTreeMap<String, DbtColumnRef>> {
+) -> FsResult<Vec<DbtColumnRef>> {
     Ok(columns
         .map(|cols| {
             cols.iter()
                 .map(|cp| {
-                    let (cp_meta, cp_tags) = cp
+                    let (cp_meta, cp_tags, cp_databricks_tags) = cp
                         .config
                         .clone()
-                        .map(|c| (c.meta, c.tags))
+                        .map(|c| (c.meta, c.tags, c.databricks_tags))
                         .unwrap_or_default();
 
                     Ok(Arc::new(DbtColumn {
@@ -194,11 +242,14 @@ pub fn process_columns(
                         description: cp.description.clone(),
                         constraints: cp.constraints.clone().unwrap_or_default(),
                         meta: cp_meta.or_else(|| meta.clone()).unwrap_or_default(),
-                        tags: cp_tags
-                            .map(|t| t.into())
+                        tags: cp
+                            .tags
+                            .clone()
+                            .or_else(|| cp_tags.map(|t| t.into()))
                             .or_else(|| tags.clone())
                             .unwrap_or_default(),
                         policy_tags: cp.policy_tags.clone(),
+                        databricks_tags: cp.databricks_tags.clone().or(cp_databricks_tags),
                         quote: cp.quote,
                         deprecated_config: cp.config.clone().unwrap_or_default(),
                     }))
@@ -206,11 +257,6 @@ pub fn process_columns(
                 .collect::<Result<Vec<DbtColumnRef>, Box<dyn std::error::Error>>>()
         })
         .transpose()?
-        .map(|cols| {
-            cols.into_iter()
-                .map(|c| (c.name.clone(), c))
-                .collect::<BTreeMap<_, _>>()
-        })
         .unwrap_or_default())
 }
 

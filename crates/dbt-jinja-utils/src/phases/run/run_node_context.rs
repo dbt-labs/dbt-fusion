@@ -13,13 +13,13 @@ use dbt_common::ErrorCode;
 use dbt_common::adapter::AdapterType;
 use dbt_common::constants::DBT_COMPILED_DIR_NAME;
 use dbt_common::constants::DBT_RUN_DIR_NAME;
-use dbt_common::fs_err;
 use dbt_common::io_args::IoArgs;
-use dbt_common::serde_utils::convert_yml_to_map;
-use dbt_common::show_warning;
+use dbt_common::serde_utils::convert_yml_to_value_map;
+
+use dbt_adapter::load_store::ResultStore;
+use dbt_adapter::relation_object::create_relation;
 use dbt_common::tokiofs;
-use dbt_fusion_adapter::load_store::ResultStore;
-use dbt_fusion_adapter::relation_object::create_relation;
+use dbt_common::tracing::emit::emit_warn_log_message;
 use dbt_schemas::schemas::CommonAttributes;
 use dbt_schemas::schemas::NodeBaseAttributes;
 use dbt_schemas::schemas::telemetry::NodeType;
@@ -87,10 +87,12 @@ async fn extend_with_model_context<S: Serialize>(
             YmlValue::Sequence(arr, _) => arr.iter().filter_map(parse_hook_item).collect(),
             YmlValue::Null(_) => vec![],
             _ => {
-                show_warning!(
-                    io_args,
-                    fs_err!(ErrorCode::Generic, "Unknown pre-hook type: {:?}", pre_hook)
+                emit_warn_log_message(
+                    ErrorCode::Generic,
+                    format!("Unknown pre-hook type: {:?}", pre_hook),
+                    io_args.status_reporter.as_ref(),
                 );
+
                 vec![]
             }
         };
@@ -109,14 +111,12 @@ async fn extend_with_model_context<S: Serialize>(
             YmlValue::Sequence(arr, _) => arr.iter().filter_map(parse_hook_item).collect(),
             YmlValue::Null(_) => vec![],
             _ => {
-                show_warning!(
-                    io_args,
-                    fs_err!(
-                        ErrorCode::Generic,
-                        "Unknown post-hook type: {:?}",
-                        post_hook
-                    )
+                emit_warn_log_message(
+                    ErrorCode::Generic,
+                    format!("Unknown post-hook type: {:?}", post_hook),
+                    io_args.status_reporter.as_ref(),
                 );
+
                 vec![]
             }
         };
@@ -128,12 +128,12 @@ async fn extend_with_model_context<S: Serialize>(
         base_context.insert("post_hooks".to_owned(), post_hooks_vals);
     }
 
-    let mut config_map = convert_yml_to_map(config_yml);
+    let mut config_map = convert_yml_to_value_map(config_yml);
     if let Some(sql_header) = sql_header {
         config_map.insert("sql_header".to_string(), sql_header);
     }
 
-    let mut model_map = convert_yml_to_map(model);
+    let mut model_map = convert_yml_to_value_map(model);
 
     // We are reading the raw_sql here for snapshots and models
     let raw_sql_path = match resource_type {
@@ -145,13 +145,10 @@ async fn extend_with_model_context<S: Serialize>(
         if let Ok(raw_sql) = tokiofs::read_to_string(&raw_sql_path).await {
             model_map.insert("raw_sql".to_owned(), MinijinjaValue::from(raw_sql));
         } else {
-            show_warning!(
-                io_args,
-                fs_err!(
-                    ErrorCode::Generic,
-                    "Failed to read raw_sql: {}",
-                    raw_sql_path.display()
-                )
+            emit_warn_log_message(
+                ErrorCode::Generic,
+                format!("Failed to read raw_sql: {}", raw_sql_path.display()),
+                io_args.status_reporter.as_ref(),
             );
         };
     }
@@ -192,6 +189,12 @@ pub fn extend_base_context_stateful_fn(
     base_context.insert(
         "store_raw_result".to_owned(),
         MinijinjaValue::from_function(result_store.store_raw_result()),
+    );
+
+    // Add submit_python_job context function using a separate helper
+    base_context.insert(
+        "submit_python_job".to_owned(),
+        MinijinjaValue::from_function(submit_python_job_context_fn()),
     );
 
     let mut packages = packages;
@@ -245,7 +248,7 @@ pub async fn build_run_node_context<S: Serialize>(
         "write".to_owned(),
         MinijinjaValue::from_object(WriteConfig {
             model_name,
-            resource_type: resource_type.as_ref().to_string(),
+            resource_type: resource_type.as_static_ref().to_string(),
             project_root: io_args.in_dir.clone(),
             target_path: io_args.out_dir.clone(),
         }),
@@ -448,5 +451,46 @@ fn write_file(
             ErrorKind::InvalidOperation,
             format!("Failed to write to {}: {}", full_path.display(), e),
         )),
+    }
+}
+
+/// Returns the function used for the submit_python_job context.
+fn submit_python_job_context_fn()
+-> impl Fn(&State, &[MinijinjaValue]) -> Result<MinijinjaValue, Error> + Copy {
+    |state: &State, args: &[MinijinjaValue]| {
+        // Parse arguments: submit_python_job(parsed_model, compiled_code)
+        if args.len() != 2 {
+            return Err(Error::new(
+                ErrorKind::InvalidOperation,
+                format!("submit_python_job expects 2 arguments, got {}", args.len()),
+            ));
+        }
+        let parsed_model = &args[0];
+        let compiled_code = args[1].as_str().ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidOperation,
+                "compiled_code must be a string",
+            )
+        })?;
+
+        // Note(Ani):
+        // dbt-core validates:
+        //   - macro_stack.depth == 2
+        //   - call_stack[1] == "macro.dbt.statement"
+        //   - "materialization" in call_stack[0]
+        //
+        // In fusion, we shouldn't need to do this because this funciton is only registered in the run node context
+        // so if a user tries to use it outside of a statement.sql macro, in a materialization macro, it will fail earlier due to an unrecongized function call.
+
+        // Get adapter from context and call submit_python_job
+        let adapter = state
+            .lookup("adapter")
+            .ok_or_else(|| Error::new(ErrorKind::UndefinedError, "adapter not found in context"))?;
+        adapter.call_method(
+            state,
+            "submit_python_job",
+            &[parsed_model.clone(), MinijinjaValue::from(compiled_code)],
+            &[],
+        )
     }
 }

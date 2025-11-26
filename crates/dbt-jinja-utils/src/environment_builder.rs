@@ -1,9 +1,6 @@
-use crate::{
-    functions::register_base_functions, jinja_environment::JinjaEnv,
-    listener::RenderingEventListenerFactory,
-};
+use crate::{functions::register_base_functions, jinja_environment::JinjaEnv};
+use dbt_adapter::BaseAdapter;
 use dbt_common::{ErrorCode, FsError, FsResult, fs_err, io_args::IoArgs, unexpected_fs_err};
-use dbt_fusion_adapter::BaseAdapter;
 use minijinja::{
     AdapterDispatchFunction, Argument, DynTypeObject, Environment, Error as MinijinjaError,
     ErrorKind as MinijinjaErrorKind, UndefinedFunctionType, UserDefinedFunctionType, Value,
@@ -18,8 +15,8 @@ use minijinja::{
     value::{ValueKind, ValueMap},
 };
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::{collections::BTreeMap, path::PathBuf};
-use std::{path::Path, sync::Arc};
 
 type PackageName = String;
 
@@ -101,11 +98,7 @@ impl JinjaEnvBuilder {
     }
 
     /// Register macros with the environment.
-    pub fn try_with_macros(
-        mut self,
-        macros: MacroUnitsWrapper,
-        listener_factory: Option<Arc<dyn RenderingEventListenerFactory>>,
-    ) -> FsResult<Self> {
+    pub fn try_with_macros(mut self, macros: MacroUnitsWrapper) -> FsResult<Self> {
         let adapter = self.adapter.as_ref().ok_or_else(|| {
             unexpected_fs_err!("try_with_macros requires adapter configuration to be set")
         })?;
@@ -117,11 +110,10 @@ impl JinjaEnvBuilder {
             .ok_or_else(|| unexpected_fs_err!("try_with_macros requires root package to be set"))?;
 
         // Get internal packages for this adapter
-        let internal_packages = get_internal_packages(adapter.adapter_type().as_ref());
-
+        #[allow(unused_mut)]
+        let mut internal_packages = get_internal_packages(adapter.adapter_type().as_ref());
         // Initialize all registries
         let mut macro_namespace_registry = ValueMap::new(); // package_name → [macro_names]
-        let mut macro_namespace_registry_for_builtins = Vec::new(); // package_name → DynTypeObject
         let mut macro_template_registry = ValueMap::new(); // template_name → macro_info
 
         let mut non_internal_packages: ValueMap = ValueMap::new(); // package_name → [macro_names]
@@ -141,10 +133,15 @@ impl JinjaEnvBuilder {
                         .collect::<Vec<_>>(),
                 ),
             );
-            macro_namespace_registry_for_builtins.push(package_name.clone());
         }
+        self.env.add_global(
+            MACRO_NAMESPACE_REGISTRY,
+            Value::from_object(macro_namespace_registry),
+        );
+
+        let macro_namespace_registry = self.env.get_macro_namespace_registry();
         // Load jinja typecheck builtins
-        let builtins = load_builtins(macro_namespace_registry_for_builtins)
+        let builtins = load_builtins(macro_namespace_registry.clone())
             .map_err(|e| unexpected_fs_err!("Failed to load jinja typecheck builtins: {}", e))?;
         for (package_name, macro_units) in macros.macros {
             // Internal packages (dbt, dbt_postgres, etc.)
@@ -167,10 +164,6 @@ impl JinjaEnvBuilder {
                     macro_unit.info.span.start_col as usize,
                     macro_unit.info.span.start_offset as usize,
                 );
-                let listeners = listener_factory
-                    .as_ref()
-                    .map(|factory| factory.create_listeners(Path::new(&filename), &offset))
-                    .unwrap_or_default();
                 let macro_name = macro_unit.info.name.clone();
                 let template_name = format!("{package_name}.{macro_name}");
 
@@ -182,11 +175,6 @@ impl JinjaEnvBuilder {
                         Some(filename.clone()),
                     )
                     .map_err(|e| FsError::from_jinja_err(e, "Failed to add template"))?;
-                for listener in listeners {
-                    if let Some(factory) = listener_factory.as_ref() {
-                        factory.destroy_listener(Path::new(&filename), listener)
-                    };
-                }
 
                 let funcsign = match macro_unit.info.funcsign.clone() {
                     Some(funcsign) => {
@@ -236,7 +224,8 @@ impl JinjaEnvBuilder {
                             args,
                             returns,
                             &macro_unit.info.path,
-                            &macro_unit.info.span,
+                            &macro_unit.info.name_span,
+                            &macro_unit.info.unique_id,
                         )))
                     }
                     None => DynTypeObject::new(Arc::new(UndefinedFunctionType::new(
@@ -248,6 +237,7 @@ impl JinjaEnvBuilder {
                         ),
                         &macro_unit.info.path,
                         &macro_unit.info.span,
+                        &macro_unit.info.unique_id,
                     ))),
                 };
                 function_registry.insert(template_name.clone(), funcsign.clone());
@@ -289,10 +279,6 @@ impl JinjaEnvBuilder {
             .or_insert_with(|| Value::from_serialize(Vec::<String>::new()));
 
         // Add all registries to environment
-        self.env.add_global(
-            MACRO_NAMESPACE_REGISTRY,
-            Value::from_object(macro_namespace_registry),
-        );
         self.env.add_global(
             MACRO_TEMPLATE_REGISTRY,
             Value::from_object(macro_template_registry),
@@ -489,10 +475,10 @@ impl Default for JinjaEnvBuilder {
 mod tests {
     use std::{collections::BTreeSet, path::PathBuf, sync::Mutex};
 
+    use dbt_adapter::ParseAdapter;
+    use dbt_adapter::sql_types::NaiveTypeOpsImpl;
     use dbt_common::adapter::AdapterType;
     use dbt_common::cancellation::never_cancels;
-    use dbt_fusion_adapter::ParseAdapter;
-    use dbt_fusion_adapter::sql_types::NaiveTypeOpsImpl;
     use dbt_schemas::schemas::relations::DEFAULT_DBT_QUOTING;
     use minijinja::{
         constants::MACRO_DISPATCH_ORDER, context, dispatch_object::THREAD_LOCAL_DEPENDENCIES,
@@ -518,6 +504,8 @@ mod tests {
                 },
                 funcsign: None,
                 args: vec![],
+                unique_id: "test".to_string(),
+                name_span: Span::default(),
             },
             sql: sql.to_string(),
         }
@@ -615,7 +603,7 @@ all okay!");
         let builder: JinjaEnvBuilder = JinjaEnvBuilder::new()
             .with_adapter(Arc::new(adapter) as Arc<dyn BaseAdapter>)
             .with_root_package("test_package".to_string())
-            .try_with_macros(macro_units, None)
+            .try_with_macros(macro_units)
             .expect("Failed to register macros");
         let env = builder.build();
         // one exists in test_package, dbt_postgres, and dbt
@@ -703,7 +691,7 @@ all okay!");
         let builder: JinjaEnvBuilder = JinjaEnvBuilder::new()
             .with_adapter(Arc::new(adapter) as Arc<dyn BaseAdapter>)
             .with_root_package("test_package".to_string())
-            .try_with_macros(macro_units, None)
+            .try_with_macros(macro_units)
             .expect("Failed to register macros");
         let env = builder.build();
 
@@ -783,6 +771,8 @@ all okay!");
                             },
                             funcsign: None,
                             args: vec![],
+                            unique_id: "test".to_string(),
+                            name_span: Span::default(),
                         },
                         sql: "{% macro some_macro() %}hello{% endmacro %}".to_string(),
                     },
@@ -793,12 +783,14 @@ all okay!");
                             span: Span::default(),
                             funcsign: None,
                             args: vec![],
+                            unique_id: "test".to_string(),
+                            name_span: Span::default(),
                         },
                         sql: "{% macro macro_b() %}{%- set small_macro_name = some_macro -%} {{ small_macro_name() }}{% endmacro %}".to_string(),
                     },
                 ],
             )]),
-        ), None)
+        ))
             .unwrap()
             .build();
         // Test assigning macro to variable and using it
@@ -886,7 +878,7 @@ all okay!");
         let builder: JinjaEnvBuilder = JinjaEnvBuilder::new()
             .with_adapter(Arc::new(adapter) as Arc<dyn BaseAdapter>)
             .with_root_package("empty_root".to_string())
-            .try_with_macros(macro_units, None)
+            .try_with_macros(macro_units)
             .expect("Failed to register macros");
 
         let env = builder.build();

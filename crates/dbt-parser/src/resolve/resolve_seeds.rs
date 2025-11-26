@@ -5,13 +5,14 @@ use crate::utils::{
     update_node_relation_components,
 };
 use dbt_common::adapter::AdapterType;
-use dbt_common::{ErrorCode, FsResult, fs_err, show_error, stdfs};
+use dbt_common::tracing::emit::emit_error_log_from_fs_error;
+use dbt_common::{ErrorCode, FsResult, fs_err, stdfs};
 use dbt_frontend_common::Dialect;
 use dbt_jinja_utils::jinja_environment::JinjaEnv;
 use dbt_jinja_utils::node_resolver::NodeResolver;
 use dbt_jinja_utils::serde::into_typed_with_jinja;
 use dbt_jinja_utils::utils::dependency_package_name_from_ctx;
-use dbt_schemas::dbt_utils::validate_delimeter;
+use dbt_schemas::dbt_utils::validate_delimiter;
 use dbt_schemas::schemas::common::{DbtChecksum, DbtMaterialization, DbtQuoting, NodeDependsOn};
 use dbt_schemas::schemas::dbt_column::process_columns;
 use dbt_schemas::schemas::project::DefaultTo;
@@ -23,6 +24,7 @@ use dbt_schemas::state::{ModelStatus, NodeResolverTracker};
 use minijinja::value::Value as MinijinjaValue;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use super::resolve_properties::MinimalPropertiesEntry;
@@ -50,6 +52,23 @@ pub fn resolve_seeds(
     let io_args = &arg.io;
     let dependency_package_name = dependency_package_name_from_ctx(jinja_env, base_ctx);
 
+    let mut seed_root_dirs: Vec<String> = package
+        .dbt_project
+        .seed_paths
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|path| {
+            Path::new(&path)
+                .components()
+                .next()
+                .map(|comp| comp.as_os_str().to_string_lossy().to_string())
+        })
+        .collect();
+    if seed_root_dirs.is_empty() {
+        seed_root_dirs.push("seeds".to_string());
+    }
+
     let local_project_config = init_project_config(
         io_args,
         &package.dbt_project.seeds,
@@ -71,16 +90,36 @@ pub fn resolve_seeds(
             continue;
         }
 
-        let seed_name = if path_extension == "parquet" {
-            path.parent()
-                .unwrap()
-                .file_stem()
-                .unwrap()
-                .to_str()
-                .unwrap()
+        let seed_name_owned = if path_extension == "parquet" {
+            let components: Vec<String> = path
+                .iter()
+                .map(|part| part.to_string_lossy().to_string())
+                .collect();
+            if components.len() >= 2 {
+                let parent_component = &components[components.len() - 2];
+                let parent_is_seed_root =
+                    seed_root_dirs.iter().any(|root| root == parent_component);
+                if parent_is_seed_root && components.len() == 2 {
+                    path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| parent_component.clone())
+                } else {
+                    parent_component.clone()
+                }
+            } else {
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| path.to_string_lossy().to_string())
+            }
         } else {
-            path.file_stem().unwrap().to_str().unwrap()
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| path.to_string_lossy().to_string())
         };
+        let seed_name = seed_name_owned.as_str();
         let unique_id = format!("seed.{package_name}.{seed_name}");
 
         let fqn = get_node_fqn(
@@ -130,15 +169,16 @@ pub fn resolve_seeds(
                 .map(|(k, v)| {
                     Ok((
                         Dialect::Snowflake
-                            .parse_identifier(k)
+                            .parse_identifier(k.as_str())
                             .map_err(|e| {
                                 fs_err!(
-                                    ErrorCode::InvalidColumnReference,
-                                    "Invalid identifier: {}",
-                                    e
+                                    code => ErrorCode::InvalidColumnReference,
+                                    loc => k.span().clone(),
+                                    "Invalid identifier: {e}",
                                 )
                             })?
-                            .to_value(),
+                            .to_value()
+                            .into(),
                         v.to_owned(),
                     ))
                 })
@@ -161,7 +201,7 @@ pub fn resolve_seeds(
             properties_config.tags.clone().map(|tags| tags.into()),
         )?;
 
-        validate_delimeter(&properties_config.delimiter)?;
+        validate_delimiter(&properties_config.delimiter)?;
 
         // Calculate original file path first so we can use it for the checksum
         // if necessary for large seeds
@@ -248,7 +288,8 @@ pub fn resolve_seeds(
         match node_resolver.insert_ref(&dbt_seed, adapter_type, status, false) {
             Ok(_) => (),
             Err(e) => {
-                show_error!(&io_args, e.with_location(path.clone()));
+                let err_with_loc = e.with_location(path.clone());
+                emit_error_log_from_fs_error(&err_with_loc, io_args.status_reporter.as_ref());
             }
         }
 

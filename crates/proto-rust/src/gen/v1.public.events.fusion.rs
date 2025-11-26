@@ -455,7 +455,8 @@ impl ::prost::Name for Onboarding {
         "/v1.public.events.fusion.Onboarding".into()
     }
 }
-#[derive(::serde::Serialize)]
+#[derive(::serde::Serialize, ::serde::Deserialize)]
+#[cfg_attr(any(test, feature = "test-utils"), derive(::fake::Dummy))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum OnboardingScreen {
@@ -474,6 +475,9 @@ pub enum OnboardingScreen {
     Compile = 12,
     CompileFail = 13,
     Success = 14,
+    AgenticAutofix = 15,
+    TryAgenticAutofix = 16,
+    DownloadAgentsMd = 17,
 }
 impl OnboardingScreen {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -497,6 +501,9 @@ impl OnboardingScreen {
             Self::Compile => "COMPILE",
             Self::CompileFail => "COMPILE_FAIL",
             Self::Success => "SUCCESS",
+            Self::AgenticAutofix => "AGENTIC_AUTOFIX",
+            Self::TryAgenticAutofix => "TRY_AGENTIC_AUTOFIX",
+            Self::DownloadAgentsMd => "DOWNLOAD_AGENTS_MD",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -517,6 +524,9 @@ impl OnboardingScreen {
             "COMPILE" => Some(Self::Compile),
             "COMPILE_FAIL" => Some(Self::CompileFail),
             "SUCCESS" => Some(Self::Success),
+            "AGENTIC_AUTOFIX" => Some(Self::AgenticAutofix),
+            "TRY_AGENTIC_AUTOFIX" => Some(Self::TryAgenticAutofix),
+            "DOWNLOAD_AGENTS_MD" => Some(Self::DownloadAgentsMd),
             _ => None,
         }
     }

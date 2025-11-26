@@ -15,6 +15,7 @@ use crate::vm::context::Context;
 use crate::vm::fuel::FuelTracker;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 /// When macros are used, the state carries an `id` counter.  Whenever a state is
@@ -58,6 +59,10 @@ pub struct State<'template, 'env> {
     pub(crate) closure_tracker: std::sync::Arc<crate::vm::closure_object::ClosureTracker>,
     #[cfg(feature = "fuel")]
     pub(crate) fuel_tracker: Option<std::sync::Arc<FuelTracker>>,
+
+    // current program counter, updated by the vm eval loop, is only used for
+    // error reporting in filters/functions:
+    pub(crate) pc: usize,
 }
 
 impl fmt::Debug for State<'_, '_> {
@@ -97,6 +102,8 @@ impl<'template, 'env> State<'template, 'env> {
             closure_tracker: Default::default(),
             #[cfg(feature = "fuel")]
             fuel_tracker: env.fuel().map(FuelTracker::new),
+
+            pc: 0,
         }
     }
 
@@ -109,6 +116,19 @@ impl<'template, 'env> State<'template, 'env> {
             &self.ctx.current_path.clone(),
             &span.with_offset(&self.ctx.current_span),
         )
+    }
+
+    /// Returns a [Span] corresponding to the current instruction.
+    pub fn current_span(&self) -> Span {
+        self.instructions.get_span(self.pc).map_or_else(
+            || self.ctx.current_span,
+            |s| s.with_offset(&self.ctx.current_span),
+        )
+    }
+
+    /// Returns the current path of the template being rendered.
+    pub fn current_path(&self) -> &PathBuf {
+        &self.ctx.current_path
     }
 
     /// Creates an empty state for an environment.
@@ -137,12 +157,12 @@ impl<'template, 'env> State<'template, 'env> {
     }
 
     /// Returns the relation name for current node from the state.
-    pub fn relation_name_from_state(&self) -> Option<String> {
+    pub fn database_schema_alias_from_state(&self) -> Option<(String, String, String)> {
         let model = self.lookup("model")?;
-        if let Some(relation_name) = model.get_attr_fast("relation_name") {
-            return relation_name.as_str().map(|s| s.to_string());
-        }
-        None
+        let database = model.get_attr_fast("database")?.as_str()?.to_string();
+        let schema = model.get_attr_fast("schema")?.as_str()?.to_string();
+        let alias = model.get_attr_fast("alias")?.as_str()?.to_string();
+        Some((database, schema, alias))
     }
 
     /// Returns the base context of the state and add file_stack to it.

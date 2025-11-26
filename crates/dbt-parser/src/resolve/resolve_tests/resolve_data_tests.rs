@@ -4,10 +4,10 @@ use crate::dbt_project_config::init_project_config;
 use crate::renderer::RenderCtx;
 use crate::renderer::RenderCtxInner;
 use crate::renderer::SqlFileRenderResult;
+use crate::renderer::collect_adapter_identifiers_detect_unsafe;
 use crate::renderer::render_unresolved_sql_files;
 use crate::resolve::resolve_properties::MinimalPropertiesEntry;
 use crate::utils::RelationComponents;
-use crate::utils::convert_macro_names_to_unique_ids;
 use crate::utils::generate_relation_components;
 use crate::utils::get_node_fqn;
 use crate::utils::get_original_file_contents;
@@ -25,8 +25,13 @@ use dbt_common::io_args::StaticAnalysisOffReason;
 use dbt_common::io_utils::try_read_yml_to_str;
 use dbt_common::stdfs;
 use dbt_jinja_utils::jinja_environment::JinjaEnv;
+use dbt_jinja_utils::listener::DefaultJinjaTypeCheckEventListenerFactory;
+use dbt_jinja_utils::listener::JinjaTypeCheckingEventListenerFactory;
+use dbt_jinja_utils::node_resolver::NodeResolver;
 use dbt_jinja_utils::utils::dependency_package_name_from_ctx;
 use dbt_schemas::schemas::DbtTestAttr;
+use dbt_schemas::schemas::InternalDbtNodeAttributes;
+use dbt_schemas::schemas::IntrospectionKind;
 use dbt_schemas::schemas::common::DbtChecksum;
 use dbt_schemas::schemas::common::DbtContract;
 use dbt_schemas::schemas::common::DbtMaterialization;
@@ -47,6 +52,7 @@ use dbt_schemas::state::DbtRuntimeConfig;
 use dbt_schemas::state::GenericTestAsset;
 use dbt_schemas::state::ModelStatus;
 use dbt_schemas::state::{DbtAsset, DbtPackage};
+use dbt_serde_yaml::Spanned;
 use dbt_serde_yaml::Value as YmlValue;
 use md5;
 use minijinja::Value;
@@ -85,6 +91,26 @@ fn test_metadata_from_asset(asset: &GenericTestAsset) -> Option<TestMetadata> {
     None
 }
 
+pub fn build_data_test_raw_code(
+    test_metadata: Option<TestMetadata>,
+    alias: String,
+) -> Option<String> {
+    if let Some(test_metadata) = test_metadata {
+        let config_str = format!("config(alias=\"{alias}\")");
+
+        let mut test_macro_name = format!("test_{}", test_metadata.name);
+        if let Some(namespace) = test_metadata.namespace {
+            test_macro_name = format!("{}.{}", namespace, test_macro_name);
+        }
+
+        return Some(format!(
+            "{{{{ {test_macro_name}(**_dbt_generic_test_kwargs) }}}}{{{{ {config_str} }}}}"
+        ));
+    }
+
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn resolve_data_tests(
     arg: &ResolveArgs,
@@ -100,9 +126,14 @@ pub async fn resolve_data_tests(
     base_ctx: &BTreeMap<String, minijinja::Value>,
     runtime_config: Arc<DbtRuntimeConfig>,
     collected_generic_tests: &[GenericTestAsset],
+    node_resolver: &NodeResolver,
+    jinja_env: Arc<JinjaEnv>,
     token: &CancellationToken,
 ) -> FsResult<(HashMap<String, Arc<DbtTest>>, HashMap<String, Arc<DbtTest>>)> {
+    let jinja_type_checking_event_listener_factory =
+        Arc::new(DefaultJinjaTypeCheckEventListenerFactory::default());
     let mut nodes: HashMap<String, Arc<DbtTest>> = HashMap::new();
+    let mut nodes_with_execute: HashMap<String, DbtTest> = HashMap::new();
     let mut disabled_tests: HashMap<String, Arc<DbtTest>> = HashMap::new();
     let package_name = package.dbt_project.name.as_str();
 
@@ -165,13 +196,15 @@ pub async fn resolve_data_tests(
         runtime_config: runtime_config.clone(),
     };
 
-    let mut test_sql_resources_map = render_unresolved_sql_files::<
-        DataTestConfig,
-        DataTestProperties,
-    >(
-        &render_ctx, &test_assets_to_render, test_properties, token
-    )
-    .await?;
+    let mut test_sql_resources_map =
+        render_unresolved_sql_files::<DataTestConfig, DataTestProperties>(
+            &render_ctx,
+            &test_assets_to_render,
+            test_properties,
+            token,
+            jinja_type_checking_event_listener_factory.clone(),
+        )
+        .await?;
     // make deterministic
     test_sql_resources_map.sort_by(|a, b| {
         a.asset
@@ -188,12 +221,18 @@ pub async fn resolve_data_tests(
         limit: None,
         ..Default::default()
     };
+
+    let all_depends_on = jinja_type_checking_event_listener_factory
+        .all_depends_on
+        .read()
+        .unwrap()
+        .clone();
+
     for SqlFileRenderResult {
         asset: dbt_asset,
         sql_file_info,
         rendered_sql,
         macro_spans: _macro_spans,
-        macro_calls,
         properties: maybe_properties,
         status,
         patch_path,
@@ -261,18 +300,36 @@ pub async fn resolve_data_tests(
 
         let static_analysis = test_config
             .static_analysis
-            .unwrap_or(StaticAnalysisKind::On);
+            .clone()
+            .unwrap_or_else(|| StaticAnalysisKind::On.into());
 
-        let original_file_path =
+        let macro_depends_on = all_depends_on
+            .get(&format!("{package_name}.{test_name}"))
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+
+        // NOTE: This says get_original_file_path but for tests this is the path to the generated sql file
+        let generated_file_path =
             get_original_file_path(&dbt_asset.base_path, &arg.io.in_dir, &dbt_asset.path);
-        let is_singular_data_test = original_file_path.ends_with(".sql");
 
-        let mut raw_code: Option<String> = None;
-        let mut language: Option<String> = None;
-        if is_singular_data_test {
-            raw_code = get_original_file_contents(&arg.io.in_dir, &original_file_path);
-            language = Some("sql".to_string());
-        }
+        let defined_at = test_path_to_test_asset
+            .get(&dbt_asset.path)
+            .map(|test_asset| test_asset.defined_at.clone());
+
+        let patch_path = test_path_to_test_asset
+            .get(&dbt_asset.path)
+            .map(|test_asset| test_asset.original_file_path.clone())
+            .or_else(|| patch_path.clone());
+
+        let is_singular_data_test = defined_at.is_none();
+
+        let manifest_original_file_path = if is_singular_data_test {
+            generated_file_path.clone()
+        } else {
+            patch_path.clone().unwrap()
+        };
 
         // Populate TestMetadata only for generic data tests (not singular .sql tests)
         // This ensures external tooling (e.g., project-evaluator) correctly classifies tests
@@ -285,19 +342,16 @@ pub async fn resolve_data_tests(
         };
 
         let mut dbt_test = DbtTest {
-            defined_at: test_path_to_test_asset
-                .get(&dbt_asset.path)
-                .map(|test_asset| test_asset.defined_at.clone()),
+            defined_at,
+            manifest_original_file_path: manifest_original_file_path.clone(),
             __common_attr__: CommonAttributes {
                 name: test_name.to_owned(),
                 package_name: package_name.to_owned(),
                 path: dbt_asset.path.to_owned(),
                 name_span: dbt_common::Span::default(),
-                original_file_path,
-                patch_path: test_path_to_test_asset
-                    .get(&dbt_asset.path)
-                    .map(|test_asset| test_asset.original_file_path.clone())
-                    .or_else(|| patch_path.clone()),
+                // original_file_path is a misnomer for tests, it's the path to the generated sql file
+                original_file_path: generated_file_path,
+                patch_path,
                 unique_id: unique_id.clone(),
                 fqn,
                 description: properties.description.clone(),
@@ -305,10 +359,10 @@ pub async fn resolve_data_tests(
                 // TODO: hydrate for generic + singular tests
                 // Examples in Mantle:
                 // - Generic test: "{{ test_not_null(**_dbt_generic_test_kwargs) }}"
-                // - Generic test with dbt_utils.expression_is_true:"{{ dbt_utils.test_expression_is_true(**_dbt_generic_test_kwargs) }}{{ config(alias=\"dbt_utils_expression_is_true_c_177c20685a18a9071d4a71719e3d9565\") }}"
+                // - Generic test with dbt_utils.expression_is_true: "{{ dbt_utils.test_expression_is_true(**_dbt_generic_test_kwargs) }}{{ config(alias=\"dbt_utils_expression_is_true_c_177c20685a18a9071d4a71719e3d9565\") }}"
                 // - Singular test: "SELECT 1\nFROM {{ ref('customers') }}\nLIMIT 0"
-                raw_code,
-                language,
+                raw_code: Some("will_be_updated_below".to_string()),
+                language: Some("sql".to_string()),
                 tags: test_config
                     .tags
                     .clone()
@@ -321,8 +375,9 @@ pub async fn resolve_data_tests(
                 schema: schema.to_owned(),
                 alias: "will_be_updated_below".to_owned(),
                 relation_name: None,
-                static_analysis_off_reason: matches!(static_analysis, StaticAnalysisKind::Off)
-                    .then(|| StaticAnalysisOffReason::ConfiguredOff),
+                static_analysis_off_reason: (static_analysis.clone().into_inner()
+                    == StaticAnalysisKind::Off)
+                    .then_some(StaticAnalysisOffReason::ConfiguredOff),
                 static_analysis,
                 quoting: test_config
                     .quoting
@@ -338,9 +393,9 @@ pub async fn resolve_data_tests(
                 enabled: test_config.enabled.unwrap_or(true),
                 extended_model: false,
                 persist_docs: None,
-                columns: BTreeMap::new(),
+                columns: vec![],
                 depends_on: NodeDependsOn {
-                    macros: convert_macro_names_to_unique_ids(macro_calls),
+                    macros: macro_depends_on,
                     nodes: vec![],
                     nodes_with_ref_location: vec![],
                 },
@@ -386,8 +441,9 @@ pub async fn resolve_data_tests(
                             test_asset.resource_name
                         )
                     }),
-                test_metadata: inferred_test_metadata,
+                test_metadata: inferred_test_metadata.clone(),
                 file_key_name: None,
+                introspection: IntrospectionKind::None,
             },
             deprecated_config: *test_config.clone(),
             __other__: BTreeMap::new(),
@@ -411,9 +467,19 @@ pub async fn resolve_data_tests(
             adapter_type,
         )?;
 
+        dbt_test.__common_attr__.raw_code = if is_singular_data_test {
+            get_original_file_contents(&arg.io.in_dir, &manifest_original_file_path)
+        } else {
+            build_data_test_raw_code(inferred_test_metadata, dbt_test.__base_attr__.alias.clone())
+        };
+
         match status {
             ModelStatus::Enabled => {
-                nodes.insert(unique_id, Arc::new(dbt_test));
+                if sql_file_info.execute {
+                    nodes_with_execute.insert(unique_id.to_owned(), dbt_test);
+                } else {
+                    nodes.insert(unique_id, Arc::new(dbt_test));
+                }
             }
             ModelStatus::Disabled => {
                 disabled_tests.insert(unique_id, Arc::new(dbt_test));
@@ -421,6 +487,28 @@ pub async fn resolve_data_tests(
             ModelStatus::ParsingFailed => {}
         }
     }
+
+    // Second pass to capture all identifiers with the appropriate context
+    // `models_with_execute` should never have overlapping Arc pointers with `models` and `disabled_models`
+    // otherwise make_mut will clone the inner model, and the modifications inside this function call will be lost
+    let tests_rest = collect_adapter_identifiers_detect_unsafe(
+        arg,
+        nodes_with_execute,
+        node_resolver,
+        jinja_env,
+        adapter_type,
+        package.dbt_project.name.as_str(),
+        &root_project.name,
+        runtime_config,
+        token,
+    )
+    .await?;
+
+    nodes.extend(
+        tests_rest
+            .into_iter()
+            .map(|(k, _)| (k.__common_attr__.unique_id.clone(), Arc::new(k))),
+    );
 
     Ok((nodes, disabled_tests))
 }

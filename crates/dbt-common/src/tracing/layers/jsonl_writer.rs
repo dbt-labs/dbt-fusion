@@ -1,5 +1,7 @@
+use std::borrow::Cow;
+
 use dbt_telemetry::{
-    LogRecordInfo, SpanEndInfo, SpanStartInfo, TelemetryOutputFlags, TelemetryRecordRef,
+    LogMessage, LogRecordInfo, SpanEndInfo, SpanStartInfo, TelemetryOutputFlags, TelemetryRecordRef,
 };
 use tracing::level_filters::LevelFilter;
 
@@ -51,43 +53,52 @@ impl TelemetryJsonlWriterLayer {
 }
 
 impl TelemetryConsumer for TelemetryJsonlWriterLayer {
-    fn is_span_enabled(&self, span: &SpanStartInfo, _meta: &tracing::Metadata) -> bool {
+    fn is_span_enabled(&self, span: &SpanStartInfo) -> bool {
         span.attributes
             .output_flags()
             .contains(TelemetryOutputFlags::EXPORT_JSONL)
     }
 
-    fn is_log_enabled(&self, log_record: &LogRecordInfo, _meta: &tracing::Metadata) -> bool {
+    fn is_log_enabled(&self, log_record: &LogRecordInfo) -> bool {
         log_record
             .attributes
             .output_flags()
             .contains(TelemetryOutputFlags::EXPORT_JSONL)
     }
 
-    fn on_span_start(&self, span: &SpanStartInfo, _: &DataProvider<'_>) {
+    fn on_span_start(&self, span: &SpanStartInfo, _: &mut DataProvider<'_>) {
         if let Ok(json) = serde_json::to_string(&TelemetryRecordRef::SpanStart(span)) {
-            // Currently we silently ignore write errors. We expect writers to be
-            // smart enough to avoid trying to write after fatal errors and report
-            // them during shutdown.
-            let _ = self.writer.writeln(json.as_str());
+            self.writer.writeln(json.as_str());
         }
     }
 
-    fn on_span_end(&self, span: &SpanEndInfo, _: &DataProvider<'_>) {
+    fn on_span_end(&self, span: &SpanEndInfo, _: &mut DataProvider<'_>) {
         if let Ok(json) = serde_json::to_string(&TelemetryRecordRef::SpanEnd(span)) {
-            // Currently we silently ignore write errors. We expect writers to be
-            // smart enough to avoid trying to write after fatal errors and report
-            // them during shutdown.
-            let _ = self.writer.writeln(json.as_str());
+            self.writer.writeln(json.as_str());
         }
     }
 
-    fn on_log_record(&self, record: &LogRecordInfo, _: &DataProvider<'_>) {
+    fn on_log_record(&self, record: &LogRecordInfo, _: &mut DataProvider<'_>) {
+        // Unfortunately, we do not currently enforce log body to not contain ANSI codes,
+        // so we need to make sure to strip them
+        if record.attributes.is::<LogMessage>()
+            && let Cow::Owned(stripped) = console::strip_ansi_codes(record.body.as_str())
+        {
+            let stripped_record = LogRecordInfo {
+                body: stripped,
+                ..record.clone()
+            };
+
+            if let Ok(json) =
+                serde_json::to_string(&TelemetryRecordRef::LogRecord(&stripped_record))
+            {
+                self.writer.writeln(json.as_str());
+            }
+            return;
+        }
+
         if let Ok(json) = serde_json::to_string(&TelemetryRecordRef::LogRecord(record)) {
-            // Currently we silently ignore write errors. We expect writers to be
-            // smart enough to avoid trying to write after fatal errors and report
-            // them during shutdown.
-            let _ = self.writer.writeln(json.as_str());
+            self.writer.writeln(json.as_str());
         }
     }
 }

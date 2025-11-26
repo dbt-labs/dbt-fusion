@@ -76,9 +76,9 @@ use std::{
 
 use dbt_common::{
     CodeLocation, ErrorCode, FsError, FsResult, fs_err, io_args::IoArgs,
-    io_utils::try_read_yml_to_str, show_error, show_package_error, show_strict_error,
-    show_warning_soon_to_be_error,
+    io_utils::try_read_yml_to_str, tracing::emit::emit_strict_parse_error,
 };
+use dbt_schemas::schemas::serde::yaml_to_fs_error;
 use dbt_serde_yaml::Value;
 use minijinja::listener::RenderingEventListener;
 use regex::Regex;
@@ -133,15 +133,7 @@ where
 
     if show_errors_or_warnings {
         for error in errors {
-            if let Some(package_name) = dependency_package_name
-                && !io_args.show_all_deprecations
-            {
-                // If we are parsing a dependency package, we use a special macros
-                // that ensures at most one error is shown per package.
-                show_package_error!(io_args, package_name);
-            } else {
-                show_strict_error!(io_args, error, dependency_package_name);
-            }
+            emit_strict_parse_error(&error, dependency_package_name, io_args);
         }
     }
 
@@ -176,15 +168,7 @@ where
         for error in errors {
             let context = error_context(&error);
             let error = error.with_context(context);
-            if let Some(package_name) = dependency_package_name
-                && !io_args.show_all_deprecations
-            {
-                // If we are parsing a dependency package, we use a special macros
-                // that ensures at most one error is shown per package.
-                show_package_error!(io_args, package_name);
-            } else {
-                show_strict_error!(io_args, error, dependency_package_name);
-            }
+            emit_strict_parse_error(&error, dependency_package_name, io_args);
         }
     }
 
@@ -208,15 +192,7 @@ where
         for error in errors {
             let error =
                 error.with_location(CodeLocation::from(error_path.clone().unwrap_or_default()));
-            if let Some(package_name) = dependency_package_name
-                && !io_args.show_all_deprecations
-            {
-                // If we are parsing a dependency package, we use a special macros
-                // that ensures at most one error is shown per package.
-                show_package_error!(io_args, package_name);
-            } else {
-                show_strict_error!(io_args, error, dependency_package_name);
-            }
+            emit_strict_parse_error(&error, dependency_package_name, io_args);
         }
     }
 
@@ -251,15 +227,7 @@ where
 
     if show_errors_or_warnings {
         for error in errors {
-            if let Some(package_name) = dependency_package_name
-                && !io_args.show_all_deprecations
-            {
-                // If we are parsing a dependency package, we use a special macros
-                // that ensures at most one error is shown per package.
-                show_package_error!(io_args, package_name);
-            } else {
-                show_strict_error!(io_args, error, dependency_package_name);
-            }
+            emit_strict_parse_error(&error, dependency_package_name, io_args);
         }
     }
 
@@ -316,6 +284,11 @@ fn trim_beginning_whitespace_for_first_line_with_content(input: &str) -> String 
     input.to_string()
 }
 
+/// Strips the UTF-8 BOM from the beginning of the input string.
+fn strip_utf8_bom(input: &str) -> &str {
+    input.strip_prefix('\u{feff}').unwrap_or(input)
+}
+
 /// Internal function that deserializes a YAML string into a `Value`.
 /// The error_display_path should be an absolute, canonicalized path.
 ///
@@ -330,8 +303,9 @@ fn value_from_str(
 ) -> FsResult<Value> {
     let _f = dbt_serde_yaml::with_filename(error_display_path.map(PathBuf::from));
 
-    // replace tabs with spaces
+    // strip utf8 bom and replace tabs with spaces
     // trim beginning whitespace for the first line with content
+    let input = strip_utf8_bom(input);
     let input = replace_tabs_with_spaces(input);
     let input = trim_beginning_whitespace_for_first_line_with_content(&input);
     let mut value = Value::from_str(&input, |path, key, existing_key| {
@@ -339,7 +313,7 @@ fn value_from_str(
         let path = strip_dunder_fields_from_path(&path.to_string());
         let duplicate_key_error = fs_err!(
             code => ErrorCode::DuplicateConfigKey,
-            loc => key.span(),
+            loc => key.span().clone(),
             "Duplicate key `{}`. This key overwrites a previous definition of the same key \
                 at line {} column {}. YAML path: `{}`.",
             key_repr.trim(),
@@ -349,15 +323,7 @@ fn value_from_str(
         );
 
         if show_errors_or_warnings {
-            if let Some(package_name) = dependency_package_name
-                && !io_args.show_all_deprecations
-            {
-                // If we are parsing a dependency package, we use a special macros
-                // that ensures at most one error is shown per package.
-                show_package_error!(io_args, package_name);
-            } else {
-                show_strict_error!(io_args, duplicate_key_error, dependency_package_name);
-            }
+            emit_strict_parse_error(&duplicate_key_error, dependency_package_name, io_args);
         }
         // last key wins:
         dbt_serde_yaml::mapping::DuplicateKey::Overwrite
@@ -406,7 +372,7 @@ where
         let path = strip_dunder_fields_from_path(&path.to_string());
         warnings.push(*fs_err!(
             code => ErrorCode::UnusedConfigKey,
-            loc => key.span(),
+            loc => key.span().clone(),
             "Ignored unexpected key `{:?}`. YAML path: `{}`.", key_repr.trim(), path
         ))
     };
@@ -487,32 +453,11 @@ pub fn check_single_expression_without_whitepsace_control(input: &str) -> bool {
         && { RE_SIMPLE_EXPR.is_match(input) }
 }
 
-/// Converts a `dbt_serde_yaml::Error` into a `FsError`, attaching the error location
-pub fn yaml_to_fs_error(err: dbt_serde_yaml::Error, filename: Option<&Path>) -> Box<FsError> {
-    let msg = err.display_no_mark().to_string();
-    let location = err
-        .span()
-        .map_or_else(CodeLocation::default, CodeLocation::from);
-    let location = if let Some(filename) = filename {
-        location.with_file(filename)
-    } else {
-        location
-    };
-
-    if let Some(err) = err.into_external()
-        && let Ok(err) = err.downcast::<FsError>()
-    {
-        // These are errors raised from our own callbacks:
-        return err;
-    }
-    FsError::new(ErrorCode::SerializationError, format!("YAML error: {msg}"))
-        .with_location(location)
-        .into()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dbt_common::io_args::IoArgs;
+    use dbt_serde_yaml::Value;
 
     #[test]
     fn test_check_single_expression_without_whitepsace_control() {
@@ -522,5 +467,23 @@ mod tests {
         assert!(!check_single_expression_without_whitepsace_control(
             "{{- config(enabled=true) -}}"
         ));
+    }
+
+    #[test]
+    fn test_value_from_str_strips_utf8_bom_and_parses_ok() {
+        // \u{feff} is the UTF-8 BOM. BOM at start should be ignored and parsing should succeed.
+        let io = IoArgs::default();
+        let input = "\u{feff}version: 2\nmodels:\n  - name: dim_bom_test\n";
+        let res = value_from_str(&io, input, None, false, None);
+        assert!(
+            res.is_ok(),
+            "Expected BOM-prefixed YAML to parse successfully, got: {:?}",
+            res.err()
+        );
+        let val: Value = res.unwrap();
+        match val {
+            Value::Mapping(_, _) => {} // minimal structural check
+            other => panic!("Expected top-level mapping, got: {:?}", other),
+        }
     }
 }

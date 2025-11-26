@@ -1,20 +1,13 @@
 //! Render tests for the dbt-parser crate
-
-#[cfg(test)]
-mod test_macro_dependency_integration;
-
-#[cfg(test)]
-mod test_namespaced_macro_tracking;
-
 #[cfg(test)]
 #[allow(clippy::module_inception)]
 mod tests {
+    use dbt_adapter::sql_types::NaiveTypeOpsImpl;
+    use dbt_adapter::{BaseAdapter, ParseAdapter};
     use dbt_common::adapter::AdapterType;
     use dbt_common::cancellation::never_cancels;
     use dbt_common::{FsResult, io_args::IoArgs};
     use dbt_frontend_common::error::CodeLocation;
-    use dbt_fusion_adapter::sql_types::NaiveTypeOpsImpl;
-    use dbt_fusion_adapter::{BaseAdapter, ParseAdapter};
     use dbt_jinja_utils::invocation_args::InvocationArgs;
     use dbt_jinja_utils::jinja_environment::JinjaEnv;
     use dbt_jinja_utils::listener::DefaultRenderingEventListenerFactory;
@@ -23,6 +16,7 @@ mod tests {
     use dbt_jinja_utils::phases::parse::sql_resource::SqlResource;
     use dbt_jinja_utils::utils::render_sql;
     use dbt_schemas::schemas::profiles::PostgresDbConfig;
+    use dbt_schemas::schemas::project::ProjectModelConfig;
     use dbt_schemas::schemas::project::{DefaultTo, ModelConfig};
     use dbt_schemas::schemas::relations::DEFAULT_DBT_QUOTING;
     use dbt_schemas::schemas::serde::StringOrInteger;
@@ -39,6 +33,7 @@ mod tests {
     use chrono_tz::Tz;
     use std::collections::BTreeSet;
     use std::path::Path;
+    use std::rc::Rc;
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
     use std::{collections::BTreeMap, path::PathBuf};
@@ -110,7 +105,6 @@ mod tests {
             &invocation_args,
             BTreeSet::from(["common".to_string()]),
             IoArgs::default(),
-            None,
             never_cancels(),
             None,
         )
@@ -119,6 +113,53 @@ mod tests {
         let sql_resources = Arc::new(Mutex::new(Vec::new()));
 
         (env, sql_resources, init_config)
+    }
+
+    #[test]
+    fn test_meta_field_defers_jinja_expansion() {
+        // Build a minimal ProjectModelConfig YAML with +meta containing a Jinja expression,
+        // and a regular field (+description) that should be eagerly rendered.
+        let yaml = r#"
+        +meta:
+          demo: "{{ 1 + 2 }}"
+        +description: "prefix {{ 1 + 2 }}"
+        "#;
+
+        // Parse YAML to Value first, then render with into_typed_with_jinja
+        let val: dbt_serde_yaml::Value = dbt_serde_yaml::from_str(yaml).unwrap();
+
+        // Reuse the existing test env setup for a valid Jinja environment
+        let (env, _sql_resources, _init_cfg) = setup_test_env();
+
+        // Empty context and listeners for rendering
+        let ctx: BTreeMap<String, Value> = BTreeMap::new();
+        let listeners: Vec<Rc<dyn minijinja::listener::RenderingEventListener>> = Vec::new();
+
+        // Perform typed deserialization with Jinja rendering enabled
+        let cfg: ProjectModelConfig = dbt_jinja_utils::serde::into_typed_with_jinja(
+            &IoArgs::default(),
+            val,
+            false,
+            &env,
+            &ctx,
+            &listeners,
+            None,
+            true,
+        )
+        .unwrap();
+
+        // Assert: +meta is Verbatim -> inner string should NOT be rendered
+        let meta_opt = (*cfg.meta).as_ref();
+        assert!(meta_opt.is_some(), "+meta should be present");
+        let meta = meta_opt.unwrap();
+        let demo_val = meta.get("demo").expect("demo key in +meta");
+        match demo_val {
+            dbt_serde_yaml::Value::String(s, _) => assert_eq!(s, "{{ 1 + 2 }}"),
+            other => panic!("expected string in +meta.demo, got {other:?}"),
+        }
+
+        // Assert: +description is a normal string -> should be rendered to "3"
+        assert_eq!(cfg.description.as_deref(), Some("prefix 3"));
     }
 
     #[tokio::test]
@@ -545,7 +586,15 @@ mod tests {
                     end_offset: 94
                 },
                 None,
-                vec![]
+                vec![],
+                Span {
+                    start_line: 2,
+                    start_col: 22,
+                    start_offset: 22,
+                    end_line: 2,
+                    end_col: 30,
+                    end_offset: 30
+                }
             )]
         );
         Ok(())
@@ -573,6 +622,14 @@ mod tests {
                     end_line: 6,
                     end_col: 26,
                     end_offset: 186
+                },
+                Span {
+                    start_line: 2,
+                    start_col: 21,
+                    start_offset: 21,
+                    end_line: 2,
+                    end_col: 35,
+                    end_offset: 35
                 }
             )]
         );
@@ -611,7 +668,15 @@ mod tests {
                         end_offset: 84
                     },
                     None,
-                    vec![]
+                    vec![],
+                    Span {
+                        start_line: 2,
+                        start_col: 22,
+                        start_offset: 22,
+                        end_line: 2,
+                        end_col: 27,
+                        end_offset: 27
+                    }
                 ),
                 SqlResource::Test(
                     "test_second".to_string(),
@@ -622,6 +687,14 @@ mod tests {
                         end_line: 8,
                         end_col: 26,
                         end_offset: 190
+                    },
+                    Span {
+                        start_line: 6,
+                        start_col: 21,
+                        start_offset: 106,
+                        end_line: 6,
+                        end_col: 27,
+                        end_offset: 112
                     }
                 ),
                 SqlResource::Macro(
@@ -635,7 +708,15 @@ mod tests {
                         end_offset: 275
                     },
                     None,
-                    vec![]
+                    vec![],
+                    Span {
+                        start_line: 10,
+                        start_col: 22,
+                        start_offset: 213,
+                        end_line: 10,
+                        end_col: 27,
+                        end_offset: 218
+                    }
                 ),
             ]
         );
@@ -667,7 +748,15 @@ mod tests {
                         end_offset: 155
                     },
                     None,
-                    vec![]
+                    vec![],
+                    Span {
+                        start_line: 2,
+                        start_col: 22,
+                        start_offset: 22,
+                        end_line: 2,
+                        end_col: 27,
+                        end_offset: 27
+                    }
                 ),
                 SqlResource::Macro(
                     "inner".to_string(),
@@ -680,7 +769,15 @@ mod tests {
                         end_offset: 128
                     },
                     None,
-                    vec![]
+                    vec![],
+                    Span {
+                        start_line: 3,
+                        start_col: 26,
+                        start_offset: 58,
+                        end_line: 3,
+                        end_col: 31,
+                        end_offset: 63
+                    }
                 ),
             ]
         );
@@ -725,6 +822,14 @@ mod tests {
                     end_col: 37,
                     start_offset: 13,
                     end_offset: 86
+                },
+                Span {
+                    start_line: 2,
+                    start_col: 32,
+                    start_offset: 32,
+                    end_line: 2,
+                    end_col: 36,
+                    end_offset: 36
                 }
             )]
         );
@@ -749,6 +854,14 @@ mod tests {
                     end_col: 33,
                     start_offset: 9,
                     end_offset: 128
+                },
+                Span {
+                    start_line: 2,
+                    start_col: 28,
+                    start_offset: 28,
+                    end_line: 2,
+                    end_col: 32,
+                    end_offset: 32
                 }
             )]
         );

@@ -1,10 +1,11 @@
 use dbt_common::io_args::IoArgs;
+use dbt_common::tracing::emit::emit_warn_log_message;
 use dbt_common::{
     ErrorCode, FsResult,
     constants::{DBT_PACKAGES_LOCK_FILE, DBT_PROJECT_YML},
     err, fs_err,
     io_utils::try_read_yml_to_str,
-    show_warning, stdfs,
+    stdfs,
 };
 use dbt_jinja_utils::serde::from_yaml_raw;
 use dbt_schemas::schemas::project::DbtProjectNameOnly;
@@ -68,21 +69,19 @@ fn try_load_from_deprecated_dbt_packages_lock(
             packages: deprecated_packages,
             sha1_hash,
         }) => {
-            show_warning!(
-                io,
-                fs_err!(
-                    ErrorCode::FmtError,
-                    "Found package-lock.yml file with out of date formatting, ignoring..."
-                )
+            emit_warn_log_message(
+                ErrorCode::FmtError,
+                "Old format package-lock.yml file found. Please provide package definitions.",
+                io.status_reporter.as_ref(),
             );
+
             if !dbt_packages_dir.exists() {
-                show_warning!(
-                    io,
-                    fs_err!(
-                        ErrorCode::FmtError,
-                        "Attempted to infer package name from package-lock.yml, but no packages directory found, skipping...",
-                    )
+                emit_warn_log_message(
+                    ErrorCode::FmtError,
+                    "Attempted to infer package name from package-lock.yml, but no packages directory found, skipping...",
+                    io.status_reporter.as_ref(),
                 );
+
                 return Ok(None);
             }
 
@@ -96,15 +95,16 @@ fn try_load_from_deprecated_dbt_packages_lock(
                     )
                 })?,
                 Err(e) => {
-                    show_warning!(
-                        io,
-                        fs_err!(
-                            ErrorCode::IoError,
+                    emit_warn_log_message(
+                        ErrorCode::IoError,
+                        format!(
                             "Failed to read packages directory at {}: {}",
                             dbt_packages_dir.display(),
                             e
-                        )
+                        ),
+                        io.status_reporter.as_ref(),
                     );
+
                     return Ok(None);
                 }
             };
@@ -131,15 +131,16 @@ fn try_load_from_deprecated_dbt_packages_lock(
                                 version,
                             }));
                         } else {
-                            show_warning!(
-                                io,
-                                fs_err!(
-                                    ErrorCode::FmtError,
+                            emit_warn_log_message(
+                                ErrorCode::FmtError,
+                                format!(
                                     "Attempted to infer package name from package-lock.yml, but package {} not found in '{}', skipping...",
                                     package,
                                     dbt_packages_dir.display()
-                                )
+                                ),
+                                io.status_reporter.as_ref(),
                             );
+
                             return Ok(None);
                         }
                     }
@@ -162,15 +163,16 @@ fn try_load_from_deprecated_dbt_packages_lock(
                                 __unrendered__: unrendered,
                             }));
                         } else {
-                            show_warning!(
-                                io,
-                                fs_err!(
-                                    ErrorCode::FmtError,
+                            emit_warn_log_message(
+                                ErrorCode::FmtError,
+                                format!(
                                     "Attempted to infer package name from package-lock.yml, but package {} not found in '{}', skipping...",
                                     git,
                                     dbt_packages_dir.display()
-                                )
+                                ),
+                                io.status_reporter.as_ref(),
                             );
+
                             return Ok(None);
                         }
                     }
@@ -233,4 +235,44 @@ fn try_load_from_deprecated_dbt_packages_lock(
             )
         }
     }
+}
+
+/// Load package-lock.yml without validating against packages.yml
+/// Used when packages.yml doesn't exist but we want to install from the lock file
+/// This matches dbt-core behavior where the lock file can be used independently
+pub fn load_dbt_packages_lock_without_validation(
+    io: &IoArgs,
+    dbt_packages_dir: &Path,
+) -> FsResult<Option<DbtPackagesLock>> {
+    let packages_lock_path = io.in_dir.join(DBT_PACKAGES_LOCK_FILE);
+    if !packages_lock_path.exists() {
+        return Ok(None);
+    }
+
+    let yml_str = try_read_yml_to_str(&packages_lock_path)?;
+    let rendered_yml: DbtPackagesLock =
+        match from_yaml_raw(io, &yml_str, Some(&packages_lock_path), true, None) {
+            Ok(rendered_yml) => rendered_yml,
+            Err(e) => {
+                if e.to_string()
+                    .contains("not match any variant of untagged enum DbtPackageLock")
+                {
+                    // Try loading deprecated format
+                    // For deprecated format without packages.yml, we try to infer package names
+                    // from the installed packages directory
+                    return try_load_from_deprecated_dbt_packages_lock(
+                        io,
+                        dbt_packages_dir,
+                        &yml_str,
+                    );
+                }
+                return err!(
+                    ErrorCode::IoError,
+                    "Failed to parse package-lock.yml file: {}",
+                    e
+                );
+            }
+        };
+
+    Ok(Some(rendered_yml))
 }

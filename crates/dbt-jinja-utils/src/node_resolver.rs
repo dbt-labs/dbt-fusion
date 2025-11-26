@@ -4,12 +4,16 @@ use std::{
     iter::Iterator,
 };
 
-use dbt_common::{
-    CodeLocation, ErrorCode, FsResult, adapter::AdapterType, err, fs_err, io_args::IoArgs,
-    show_error, unexpected_err,
-};
-use dbt_fusion_adapter::relation_object::{
+use dbt_adapter::relation_object::{
     RelationObject, create_relation_from_node, create_relation_internal,
+};
+use dbt_common::{
+    CodeLocation, ErrorCode, FsResult,
+    adapter::AdapterType,
+    err, fs_err,
+    io_args::IoArgs,
+    tracing::emit::{emit_error_log_from_fs_error, emit_warn_log_from_fs_error},
+    unexpected_err,
 };
 use dbt_schemas::dbt_types::RelationType;
 use dbt_schemas::{
@@ -192,6 +196,10 @@ impl NodeResolver {
 }
 
 impl NodeResolverTracker for NodeResolver {
+    fn deep_clone(&self) -> Box<dyn NodeResolverTracker> {
+        Box::new(self.clone())
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -715,6 +723,7 @@ pub fn resolve_dependencies(
     io: &IoArgs,
     nodes: &mut Nodes,
     disabled_nodes: &mut Nodes,
+    operations: &mut dbt_schemas::state::Operations,
     node_resolver: &NodeResolver,
 ) -> HashSet<String> {
     let mut tests_to_disable = Vec::new();
@@ -755,15 +764,13 @@ pub fn resolve_dependencies(
                 Ok((dependency_id, _, _, _)) => {
                     // Check for self-reference
                     if dependency_id == node_unique_id {
-                        show_error!(
-                            io,
-                            fs_err!(
-                                ErrorCode::CyclicDependency,
-                                "Model '{}' cannot reference itself",
-                                name
-                            )
-                            .with_location(location)
-                        );
+                        let err_with_loc = fs_err!(
+                            ErrorCode::CyclicDependency,
+                            "Model '{}' cannot reference itself",
+                            name
+                        )
+                        .with_location(location);
+                        emit_error_log_from_fs_error(&err_with_loc, io.status_reporter.as_ref());
                     } else {
                         node_base.depends_on.nodes.push(dependency_id.clone());
                         node_base
@@ -773,13 +780,22 @@ pub fn resolve_dependencies(
                     }
                 }
                 Err(e) => {
-                    // Check if this is a disabled dependency error
-                    if is_test && e.code == ErrorCode::DisabledDependency {
-                        has_disabled_dependency = true;
+                    // For tests, warn on missing or disabled dependencies instead of erroring
+                    if is_test
+                        && (e.code == ErrorCode::DisabledDependency
+                            || e.code == ErrorCode::InvalidConfig)
+                    {
+                        // Only set has_disabled_dependency for disabled deps (not missing deps)
+                        if e.code == ErrorCode::DisabledDependency {
+                            has_disabled_dependency = true;
+                        }
+                        let err_with_loc = e.with_location(location);
+                        emit_warn_log_from_fs_error(&err_with_loc, io.status_reporter.as_ref());
                     } else {
                         // Track this node as having an error (unresolved ref/source)
                         nodes_with_errors.insert(node_unique_id.clone());
-                        show_error!(io, e.with_location(location));
+                        let err_with_loc = e.with_location(location);
+                        emit_error_log_from_fs_error(&err_with_loc, io.status_reporter.as_ref());
                     }
                 }
             };
@@ -806,13 +822,22 @@ pub fn resolve_dependencies(
                         .push((dependency_id, location));
                 }
                 Err(e) => {
-                    // Check if this is a disabled dependency error
-                    if is_test && e.code == ErrorCode::DisabledDependency {
-                        has_disabled_dependency = true;
+                    // For tests, warn on missing or disabled dependencies instead of erroring
+                    if is_test
+                        && (e.code == ErrorCode::DisabledDependency
+                            || e.code == ErrorCode::InvalidConfig)
+                    {
+                        // Only set has_disabled_dependency for disabled deps (not missing deps)
+                        if e.code == ErrorCode::DisabledDependency {
+                            has_disabled_dependency = true;
+                        }
+                        let err_with_loc = e.with_location(location);
+                        emit_warn_log_from_fs_error(&err_with_loc, io.status_reporter.as_ref());
                     } else {
                         // Track this node as having an error (unresolved ref/source)
                         nodes_with_errors.insert(node_unique_id.clone());
-                        show_error!(io, e.with_location(location));
+                        let err_with_loc = e.with_location(location);
+                        emit_error_log_from_fs_error(&err_with_loc, io.status_reporter.as_ref());
                     }
                 }
             };
@@ -847,7 +872,8 @@ pub fn resolve_dependencies(
                     } else {
                         // Track this node as having an error (unresolved function)
                         nodes_with_errors.insert(node_unique_id.clone());
-                        show_error!(io, e.with_location(location));
+                        let err_with_loc = e.with_location(location);
+                        emit_error_log_from_fs_error(&err_with_loc, io.status_reporter.as_ref());
                     }
                 }
             };
@@ -864,6 +890,93 @@ pub fn resolve_dependencies(
             disabled_nodes.tests.insert(test_id.clone(), node);
         }
     }
+
+    // Process operations (on_run_start and on_run_end)
+    [&mut operations.on_run_start, &mut operations.on_run_end]
+        .iter_mut()
+        .for_each(|ops| {
+            ops.iter_mut().for_each(|operation_spanned| {
+                let mut operation = (**operation_spanned).clone();
+                let operation_package = operation.__common_attr__.package_name.clone();
+                let operation_unique_id = operation.__common_attr__.unique_id.clone();
+
+                // Process refs
+                operation.__base_attr__.refs.iter().for_each(|dbt_ref| {
+                    let location = dbt_ref
+                        .location
+                        .as_ref()
+                        .map_or_else(CodeLocation::default, |loc| {
+                            loc.clone().with_file(&operation.__common_attr__.path)
+                        });
+
+                    match node_resolver.lookup_ref(
+                        &dbt_ref.package,
+                        &dbt_ref.name,
+                        &dbt_ref.version.as_ref().map(|v| v.to_string()),
+                        &Some(operation_package.clone()),
+                    ) {
+                        Ok((dependency_id, _, _, _)) => {
+                            operation
+                                .__base_attr__
+                                .depends_on
+                                .nodes
+                                .push(dependency_id.clone());
+                            operation
+                                .__base_attr__
+                                .depends_on
+                                .nodes_with_ref_location
+                                .push((dependency_id, location));
+                        }
+                        Err(e) => {
+                            nodes_with_errors.insert(operation_unique_id.clone());
+                            let err_with_loc = e.with_location(location);
+                            emit_error_log_from_fs_error(
+                                &err_with_loc,
+                                io.status_reporter.as_ref(),
+                            );
+                        }
+                    }
+                });
+
+                // Process sources
+                operation
+                    .__base_attr__
+                    .sources
+                    .iter()
+                    .filter(|source_wrapper| source_wrapper.source.len() == 2)
+                    .for_each(|source_wrapper| {
+                        let source_name = &source_wrapper.source[0];
+                        let table_name = &source_wrapper.source[1];
+                        let location = source_wrapper
+                            .location
+                            .as_ref()
+                            .map_or_else(CodeLocation::default, |loc| {
+                                loc.clone().with_file(&operation.__common_attr__.path)
+                            });
+
+                        match node_resolver.lookup_source(
+                            &operation_package,
+                            source_name,
+                            table_name,
+                        ) {
+                            Ok((dependency_id, _, _)) => {
+                                operation.__base_attr__.depends_on.nodes.push(dependency_id);
+                            }
+                            Err(e) => {
+                                nodes_with_errors.insert(operation_unique_id.clone());
+                                let err_with_loc = e.with_location(location);
+                                emit_error_log_from_fs_error(
+                                    &err_with_loc,
+                                    io.status_reporter.as_ref(),
+                                );
+                            }
+                        }
+                    });
+
+                // Replace with updated operation
+                *operation_spanned = operation_spanned.clone().map(|_| operation);
+            });
+        });
 
     // Return the set of nodes that had resolution errors
     nodes_with_errors

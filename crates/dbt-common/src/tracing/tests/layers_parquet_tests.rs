@@ -1,12 +1,17 @@
-use crate::tracing::layers::{
-    data_layer::TelemetryDataLayer, parquet_writer::build_parquet_writer_layer,
-};
 use crate::tracing::{
-    event_info::store_event_attributes, init::create_tracing_subcriber_with_layer, span_info,
+    emit::{create_info_span_with_parent, emit_info_event},
+    event_info::store_event_attributes,
+    init::create_tracing_subcriber_with_layer,
+    layers::{
+        data_layer::{TelemetryDataLayer, get_span_start_info_from_span},
+        parquet_writer::build_parquet_writer_layer,
+    },
+    span_info,
+    tests::mocks::{MockDynLogEvent, MockDynSpanEvent},
 };
 use dbt_telemetry::{
-    CallTrace, LogMessage, LogRecordInfo, PackageUpdate, RecordCodeLocation, SeverityNumber,
-    SpanEndInfo, SpanStartInfo, TelemetryAttributes, TelemetryEventTypeRegistry, TelemetryRecord,
+    CallTrace, LogMessage, LogRecordInfo, RecordCodeLocation, SeverityNumber, SpanEndInfo,
+    TelemetryAttributes, TelemetryEventTypeRegistry, TelemetryOutputFlags, TelemetryRecord,
     serialize::arrow::deserialize_from_arrow,
 };
 use std::{collections::BTreeMap, fs, panic::Location, time::SystemTime};
@@ -43,6 +48,7 @@ fn test_tracing_parquet_filtering() {
         dbt_core_event_code: Some("test_code".to_string()),
         original_severity_number: SeverityNumber::Warn as i32,
         original_severity_text: "WARN".to_string(),
+        package_name: None,
         unique_id: None,
         phase: None,
         file: None,
@@ -80,25 +86,30 @@ fn test_tracing_parquet_filtering() {
         let _sp = dev_span.enter();
 
         span_info::with_span(&dev_span, |span_ref| {
-            let span_ext = span_ref.extensions();
-            expected_span_id = span_ext.get::<SpanStartInfo>().unwrap().span_id;
+            expected_span_id = get_span_start_info_from_span(&span_ref).unwrap().span_id;
         });
 
         // Emit a log with Log attributes (should be included) & save the location (almost, one line off)
         test_log_location = Location::caller();
-        emit_tracing_event!(test_log_attrs.clone(), "Valid log message");
+        emit_info_event(test_log_attrs.clone(), Some("Valid log message"));
 
-        // Emit package update event, should be filtered out as it is marked as
-        // non-exportable via parquet
-        create_info_span!(
-            parent: &dev_span,
-            PackageUpdate {
-                version: "1.0.0".to_string(),
-                package: "test_package".to_string(),
-                exe_path: None,
-            }
-            .into()
-        );
+        // Emit mock span without EXPORT_PARQUET flag (should be filtered out)
+        let mock_span_attrs: TelemetryAttributes = MockDynSpanEvent {
+            name: "filtered_span".to_string(),
+            flags: TelemetryOutputFlags::EXPORT_JSONL_AND_OTLP,
+            ..Default::default()
+        }
+        .into();
+        create_info_span_with_parent(dev_span.id(), mock_span_attrs);
+
+        // Emit mock log without EXPORT_PARQUET flag (should be filtered out)
+        let mock_log_attrs: TelemetryAttributes = MockDynLogEvent {
+            code: 999,
+            flags: TelemetryOutputFlags::EXPORT_JSONL_AND_OTLP,
+            ..Default::default()
+        }
+        .into();
+        emit_info_event(mock_log_attrs, Some("This log should be filtered out"));
     });
 
     // Shutdown telemetry to ensure all data is flushed to the file
@@ -124,10 +135,14 @@ fn test_tracing_parquet_filtering() {
         all_records.extend(records);
     }
 
-    // Verify filtering worked correctly - should have 2 records (1 SpanEnd with Process attrs, 1 LogRecord with Log attrs)
-    assert_eq!(all_records.len(), 2, "Expected 2 records after filtering");
+    // Verify filtering worked correctly - should have 3 records (1 SpanStart, 1 SpanEnd with Process attrs, 1 LogRecord with Log attrs)
+    assert_eq!(all_records.len(), 3, "Expected 3 records after filtering");
 
     // Verify we have the correct records
+    let span_start_record = all_records
+        .iter()
+        .find(|r| matches!(r, TelemetryRecord::SpanStart(_)))
+        .expect("Expected a SpanStart record");
     let span_end_record = all_records
         .iter()
         .find(|r| matches!(r, TelemetryRecord::SpanEnd(_)))
@@ -136,6 +151,24 @@ fn test_tracing_parquet_filtering() {
         .iter()
         .find(|r| matches!(r, TelemetryRecord::LogRecord(_)))
         .expect("Expected a LogRecord");
+
+    // Verify the SpanStart record is the valid one
+    if let TelemetryRecord::SpanStart(span_start_info) = span_start_record {
+        assert_eq!(span_start_info.trace_id, trace_id);
+        assert_eq!(span_start_info.span_id, expected_span_id);
+        assert!(
+            span_start_info
+                .span_name
+                .starts_with("Dev trace: dev_test (")
+        );
+        assert!(span_start_info.parent_span_id.is_none());
+        assert!(span_start_info.links.is_none());
+        assert_eq!(span_start_info.severity_number, SeverityNumber::Trace);
+        assert_eq!(span_start_info.severity_text, "TRACE");
+        assert!(span_start_info.start_time_unix_nano > before_start);
+    } else {
+        panic!("Expected a SpanStart record");
+    }
 
     // Verify the SpanEnd record is the valid one
     if let TelemetryRecord::SpanEnd(SpanEndInfo {

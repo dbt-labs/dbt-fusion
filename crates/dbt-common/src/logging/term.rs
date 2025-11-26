@@ -4,6 +4,7 @@ use std::ops::Sub;
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::time::Duration;
 use std::time::Instant;
@@ -20,6 +21,29 @@ use unicode_segmentation::UnicodeSegmentation as _;
 use crate::logging::events::StatEvent;
 use crate::logging::events::TermEvent;
 use crate::pretty_string::{DIM, GREEN, RED, YELLOW};
+
+/// Type alias for the hook function that suspends progress bars.
+type SuspendHook = Box<dyn Fn(&mut dyn FnMut()) + Send + Sync>;
+
+/// Global hook for suspending progress bars during log emission.
+/// This allows new tracing-based layers to suspend the indicatif progress bars
+/// managed by FancyLogger. This will go away once we migrate fully to tracing.
+static PROGRESS_BAR_SUSPEND_HOOK: OnceLock<SuspendHook> = OnceLock::new();
+
+/// Register a callback that will be invoked to suspend progress bars during log emission.
+pub fn register_progress_bar_suspend_hook(hook: impl Fn(&mut dyn FnMut()) + Send + Sync + 'static) {
+    let _ = PROGRESS_BAR_SUSPEND_HOOK.set(Box::new(hook));
+}
+
+/// Suspend progress bars while executing the provided closure.
+/// If no hook is registered, the closure is executed immediately.
+pub fn with_suspended_progress_bars<F: FnMut()>(mut f: F) {
+    if let Some(hook) = PROGRESS_BAR_SUSPEND_HOOK.get() {
+        hook(&mut f);
+    } else {
+        f()
+    }
+}
 
 const SLOW_CONTEXT_THRESHOLD: Duration = Duration::from_secs(300);
 
@@ -94,14 +118,23 @@ impl FancyLogger {
     pub fn new(child_loggers: Vec<Box<dyn log::Log>>) -> Self {
         let shutdown = Arc::new((Mutex::new(false), Condvar::new()));
 
-        FancyLogger {
+        let logger = FancyLogger {
             controller: MultiProgress::new(),
             spinners: Arc::new(DashMap::new()),
             bars: Arc::new(DashMap::new()),
             children: child_loggers,
             shutdown,
             ticker: None,
-        }
+        };
+
+        // Register progress bar suspension hook for tracing layers
+        let controller = logger.controller.clone();
+
+        register_progress_bar_suspend_hook(move |f| {
+            controller.suspend(f);
+        });
+
+        logger
     }
 
     /// Starts the ticker thread that will periodically tick all active spinners
@@ -492,7 +525,7 @@ impl ContextualProgressBar {
 
     fn format_counters(&self, writer: &'_ mut dyn fmt::Write) {
         let Ok(counters) = self.counters.read() else {
-            // debug!("Poisoned 'counters' read lock in console");
+            // emit_trace_log_message(|| "Poisoned 'counters' read lock in console".to_string());
             let _ = writer.write_str("<N/A>");
             return;
         };
@@ -556,7 +589,7 @@ impl ContextualProgressBar {
                 match writer.write_str(shortmsg.as_str()) {
                     Ok(_) => (),
                     Err(_) => {
-                        // debug!("Failed to write context message");
+                        // emit_trace_log_message(|| "Failed to write context message".to_string());
                     }
                 }
                 // items.iter().take(5).for_each(|item| {
@@ -565,7 +598,7 @@ impl ContextualProgressBar {
                 // });
             }
             Err(_) => {
-                // debug!("Poisoned 'context_slots' read lock in console");
+                // emit_trace_log_message(|| "Poisoned 'context_slots' read lock in console".to_string());
                 let _ = writer.write_str("<N/A>");
             }
         }
@@ -621,7 +654,7 @@ impl ContextualProgressBar {
                 slots.push(ContextItem::new(item.to_string()));
             }
             Err(_) => {
-                // debug!("Poisoned 'context_slots' write lock in console");
+                // emit_trace_log_message(|| "Poisoned 'context_slots' write lock in console".to_string());
             }
         }
     }
@@ -634,7 +667,7 @@ impl ContextualProgressBar {
                 }
             }
             Err(_) => {
-                // debug!("Poisoned 'context_slots' write lock in console");
+                // emit_trace_log_message(|| "Poisoned 'context_slots' write lock in console".to_string());
             }
         }
     }

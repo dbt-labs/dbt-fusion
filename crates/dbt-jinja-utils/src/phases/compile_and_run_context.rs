@@ -6,9 +6,9 @@ use std::sync::{Arc, OnceLock};
 
 use crate::functions::build_flat_graph;
 use crate::jinja_environment::JinjaEnv;
+use dbt_adapter::BaseAdapter;
+use dbt_adapter::load_store::ResultStore;
 use dbt_common::once_cell_vars::DISPATCH_CONFIG;
-use dbt_fusion_adapter::BaseAdapter;
-use dbt_fusion_adapter::load_store::ResultStore;
 use dbt_schemas::schemas::Nodes;
 use dbt_schemas::state::{DbtRuntimeConfig, NodeResolverTracker};
 use minijinja::arg_utils::{ArgParser, ArgsIter};
@@ -105,6 +105,22 @@ pub fn build_compile_and_run_base_context(
         "builtins".to_string(),
         MinijinjaValue::from_object(builtins),
     );
+
+    // Populate dbt_metadata_envs from OS env vars with prefix DBT_ENV_CUSTOM_ENV_
+    // Mirrors dbt-core behavior so packages can safely iterate .items()
+    {
+        let mut meta_envs: BTreeMap<String, MinijinjaValue> = BTreeMap::new();
+        const PREFIX: &str = "DBT_ENV_CUSTOM_ENV_";
+        for (k, v) in std::env::vars() {
+            if let Some(suffix) = k.strip_prefix(PREFIX) {
+                meta_envs.insert(suffix.to_string(), MinijinjaValue::from(v));
+            }
+        }
+        ctx.insert(
+            "dbt_metadata_envs".to_string(),
+            MinijinjaValue::from_object(meta_envs),
+        );
+    }
 
     let mut packages: BTreeSet<String> = runtime_config.dependencies.keys().cloned().collect();
     packages.insert(package_name.to_string());
@@ -754,5 +770,58 @@ impl Object for LazyFlatGraph {
         Self: Sized + 'static,
     {
         self.get_graph().as_object().unwrap().render(f)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dbt_schemas::state::DummyNodeResolverTracker;
+    use dbt_test_utils::TestEnvGuard;
+    use std::env;
+
+    #[test]
+    fn test_dbt_metadata_envs_populated_from_env() {
+        // Isolate env to avoid interference across tests
+        let _guard = TestEnvGuard::new(&[], &["DBT_ENV_CUSTOM_ENV_"]);
+
+        // Arrange: set a custom env var following dbt-core convention
+        const ENV_KEY: &str = "DBT_ENV_CUSTOM_ENV_FOO";
+        // Ensure clean state
+        unsafe {
+            #[allow(clippy::disallowed_methods)]
+            env::remove_var(ENV_KEY);
+            #[allow(clippy::disallowed_methods)]
+            env::set_var(ENV_KEY, "bar");
+        }
+
+        let node_resolver = Arc::new(DummyNodeResolverTracker);
+        let nodes = Nodes::default();
+        let runtime_config = Arc::new(DbtRuntimeConfig::default());
+
+        // Act
+        let ctx =
+            build_compile_and_run_base_context(node_resolver, "test_pkg", &nodes, runtime_config);
+
+        // Cleanup env to avoid side effects
+        unsafe {
+            #[allow(clippy::disallowed_methods)]
+            env::remove_var(ENV_KEY);
+        }
+
+        // Assert
+        let meta = ctx
+            .get("dbt_metadata_envs")
+            .expect("dbt_metadata_envs should be set");
+        let map = meta
+            .as_object()
+            .and_then(|o| o.downcast_ref::<BTreeMap<String, MinijinjaValue>>())
+            .expect("dbt_metadata_envs should be a map");
+
+        assert_eq!(
+            map.get("FOO").and_then(|v| v.as_str()),
+            Some("bar"),
+            "Expected dbt_metadata_envs['FOO']='bar'"
+        );
     }
 }

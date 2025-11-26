@@ -1,7 +1,5 @@
 use dbt_frontend_common::Dialect;
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use strum_macros::{Display, EnumString};
 
 use arrow::array::Array;
 use arrow::datatypes::DataType;
@@ -17,6 +15,7 @@ use term_size;
 
 use crate::FsResult;
 use crate::fs_err;
+use crate::io_args::DisplayFormat;
 
 pub fn make_table_name<T: AsRef<str>>(catalog: T, schema: T, table: T) -> String {
     [catalog.as_ref(), schema.as_ref(), table.as_ref()].join(".")
@@ -33,41 +32,6 @@ pub fn make_column_names(schema: &Schema) -> Vec<String> {
 const BORDER_PADDING_SIZE: usize = 3;
 const BORDER_SIZE: usize = 1;
 pub const ELLIPSIS: &str = "..";
-
-/// Display rows in different formats
-// Note there are two DisplayFormat enums, one in this file and one in clap_cli.rs
-// Both have the same values and can be translated by the DisplayFormat::from() function
-#[derive(
-    Debug,
-    Copy,
-    Clone,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Default,
-    Display,
-    Serialize,
-    Deserialize,
-    EnumString,
-)]
-#[serde(rename_all = "lowercase")]
-#[strum(serialize_all = "lowercase")]
-pub enum DisplayFormat {
-    #[default]
-    Table,
-    Csv,
-    Tsv,
-    Json,
-    NdJson,
-    Yml,
-    /// Output nodes as selector strings (e.g. "source:pkg.source_name.table_name")
-    Selector,
-    /// Output nodes as search names (node.search_name)
-    Name,
-    /// Output nodes as file paths (node.original_file_path)
-    Path,
-}
 
 // originally defined in print_data_format.rs
 macro_rules! batches_to_json {
@@ -112,7 +76,7 @@ pub fn pretty_data_table(
     subtitle: &str,
     column_names: &[String],
     record_batches: &[RecordBatch],
-    display_format: &DisplayFormat,
+    display_format: DisplayFormat,
     limit: Option<usize>,
     show_footer: bool,
     actual_rows: Option<usize>,
@@ -183,7 +147,9 @@ pub fn pretty_data_table(
             let converted_batches = stringify_types_for_show(record_batches);
 
             // print title and subtitle
-            out.push_str(&format!("{}\n", &title));
+            if !title.is_empty() {
+                out.push_str(&format!("{title}\n"));
+            }
             if !subtitle.is_empty() {
                 out.push_str(&format!("{subtitle}\n"));
             }
@@ -425,7 +391,7 @@ fn create_table(column_names: &[String]) -> (Table, usize, Vec<usize>, bool) {
 pub fn pretty_schema_table(
     title: &str,
     subtitle: &str,
-    display_format: &DisplayFormat,
+    display_format: DisplayFormat,
     table_schema: &Schema,
     _dialect: Dialect,
     limit: Option<usize>,
@@ -496,7 +462,7 @@ pub fn pretty_vec_table(
     subtitle: &str,
     column_names: &[String],
     rows: &[Vec<String>],
-    display_format: &DisplayFormat,
+    display_format: DisplayFormat,
     limit: Option<usize>,
     show_footer: bool,
     show_index: bool,
@@ -525,7 +491,7 @@ pub fn pretty_vec_table(
     for (col_idx, column_name) in column_names.iter().enumerate() {
         let column_data: Vec<&str> = rows
             .iter()
-            .map(|row| row.get(col_idx).map_or("", |s| s.as_str()))
+            .map(|row| row.get(col_idx).map_or_else(|| "", |s| s.as_str()))
             .collect();
 
         columns.push(Arc::new(StringArray::from(column_data)));

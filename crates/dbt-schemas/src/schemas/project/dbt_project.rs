@@ -40,6 +40,10 @@ use super::ProjectUnitTestConfig;
 pub struct ProjectDbtCloudConfig {
     #[serde(rename = "project-id")]
     pub project_id: Option<StringOrInteger>,
+    #[serde(rename = "defer-env-id")]
+    pub defer_env_id: Option<StringOrInteger>,
+
+    // unsure if any of these other keys are actually used or expected
     pub account_id: Option<StringOrInteger>,
     #[serde(rename = "account-host")]
     pub account_host: Option<String>,
@@ -47,8 +51,6 @@ pub struct ProjectDbtCloudConfig {
     pub job_id: Option<StringOrInteger>,
     #[serde(rename = "run-id")]
     pub run_id: Option<StringOrInteger>,
-    #[serde(rename = "defer-env-id")]
-    pub defer_env_id: Option<StringOrInteger>,
     pub api_key: Option<StringOrInteger>,
     pub application: Option<StringOrInteger>,
     pub environment: Option<StringOrInteger>,
@@ -279,8 +281,13 @@ macro_rules! default_to {
     };
 }
 
-pub trait IterChildren<T> {
-    fn iter_children(&self) -> Iter<'_, String, ShouldBe<T>>;
+/// Yaml configs that can contain nested child configs of the same type.
+pub trait TypedRecursiveConfig: Clone {
+    /// Returns the type name of the config, e.g., "model", "source", etc.
+    fn type_name() -> &'static str;
+
+    /// Returns an iterator over the child configs.
+    fn iter_children(&self) -> Iter<'_, String, ShouldBe<Self>>;
 }
 
 #[cfg(test)]

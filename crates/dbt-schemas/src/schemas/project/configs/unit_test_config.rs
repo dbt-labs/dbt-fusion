@@ -1,5 +1,5 @@
 use dbt_common::io_args::StaticAnalysisKind;
-use dbt_serde_yaml::{JsonSchema, ShouldBe};
+use dbt_serde_yaml::{JsonSchema, ShouldBe, Spanned};
 use serde::{Deserialize, Serialize};
 // Type aliases for clarity
 type YmlValue = dbt_serde_yaml::Value;
@@ -14,7 +14,7 @@ use crate::{
             BigqueryClusterConfig, GrantAccessToTarget, PartitionConfig, postgres::PostgresIndex,
         },
         project::{
-            DefaultTo, IterChildren,
+            DefaultTo, TypedRecursiveConfig,
             configs::common::{WarehouseSpecificNodeConfig, default_meta_and_tags},
         },
         serde::{
@@ -23,7 +23,7 @@ use crate::{
     },
 };
 
-#[skip_serializing_none]
+// NOTE: No #[skip_serializing_none] - we handle None serialization in serialize_with_mode
 #[derive(Deserialize, Serialize, Debug, Clone, JsonSchema)]
 pub struct ProjectUnitTestConfig {
     #[serde(default, rename = "+enabled", deserialize_with = "bool_or_string_bool")]
@@ -33,7 +33,7 @@ pub struct ProjectUnitTestConfig {
     #[serde(rename = "+tags")]
     pub tags: Option<StringOrArrayOfStrings>,
     #[serde(rename = "+static_analysis")]
-    pub static_analysis: Option<StaticAnalysisKind>,
+    pub static_analysis: Option<Spanned<StaticAnalysisKind>>,
 
     // Snowflake specific fields
     #[serde(rename = "+adapter_properties")]
@@ -130,14 +130,14 @@ pub struct ProjectUnitTestConfig {
         deserialize_with = "f64_or_string_f64"
     )]
     pub refresh_interval_minutes: Option<f64>,
-    #[serde(rename = "+description")]
-    pub description: Option<String>,
     #[serde(rename = "+max_staleness")]
     pub max_staleness: Option<String>,
 
     // Databricks specific fields
     #[serde(rename = "+file_format")]
     pub file_format: Option<String>,
+    #[serde(rename = "+catalog_name")]
+    pub catalog_name: Option<String>,
     #[serde(rename = "+location_root")]
     pub location_root: Option<String>,
     #[serde(rename = "+tblproperties")]
@@ -240,7 +240,11 @@ pub struct ProjectUnitTestConfig {
     pub __additional_properties__: BTreeMap<String, ShouldBe<ProjectUnitTestConfig>>,
 }
 
-impl IterChildren<ProjectUnitTestConfig> for ProjectUnitTestConfig {
+impl TypedRecursiveConfig for ProjectUnitTestConfig {
+    fn type_name() -> &'static str {
+        "unit_test"
+    }
+
     fn iter_children(&self) -> Iter<'_, String, ShouldBe<Self>> {
         self.__additional_properties__.iter()
     }
@@ -251,10 +255,9 @@ impl IterChildren<ProjectUnitTestConfig> for ProjectUnitTestConfig {
 pub struct UnitTestConfig {
     #[serde(default, deserialize_with = "bool_or_string_bool")]
     pub enabled: Option<bool>,
-    pub static_analysis: Option<StaticAnalysisKind>,
+    pub static_analysis: Option<Spanned<StaticAnalysisKind>>,
     pub meta: Option<BTreeMap<String, YmlValue>>,
     pub tags: Option<StringOrArrayOfStrings>,
-    pub description: Option<String>,
     // Adapter specific configs
     pub __warehouse_specific_config__: WarehouseSpecificNodeConfig,
 }
@@ -266,8 +269,8 @@ impl From<ProjectUnitTestConfig> for UnitTestConfig {
             static_analysis: config.static_analysis,
             meta: config.meta,
             tags: config.tags,
-            description: config.description,
             __warehouse_specific_config__: WarehouseSpecificNodeConfig {
+                description: None, // Only for Bigquery Models
                 adapter_properties: config.adapter_properties,
                 external_volume: config.external_volume,
                 base_location_root: config.base_location_root,
@@ -297,9 +300,15 @@ impl From<ProjectUnitTestConfig> for UnitTestConfig {
                 partitions: config.partitions,
                 enable_refresh: config.enable_refresh,
                 refresh_interval_minutes: config.refresh_interval_minutes,
+                resource_tags: None,
                 max_staleness: config.max_staleness,
+                jar_file_uri: None,
+                timeout: None,
+                batch_id: None,
+                dataproc_cluster_name: None,
 
                 file_format: config.file_format,
+                catalog_name: config.catalog_name,
                 location_root: config.location_root,
                 tblproperties: config.tblproperties,
                 include_full_name_in_path: config.include_full_name_in_path,
@@ -349,7 +358,6 @@ impl From<UnitTestConfig> for ProjectUnitTestConfig {
             static_analysis: config.static_analysis,
             meta: config.meta,
             tags: config.tags,
-            description: config.description,
             // Snowflake fields
             adapter_properties: config.__warehouse_specific_config__.adapter_properties,
             external_volume: config.__warehouse_specific_config__.external_volume,
@@ -389,6 +397,7 @@ impl From<UnitTestConfig> for ProjectUnitTestConfig {
             max_staleness: config.__warehouse_specific_config__.max_staleness,
             // Databricks fields
             file_format: config.__warehouse_specific_config__.file_format,
+            catalog_name: config.__warehouse_specific_config__.catalog_name,
             location_root: config.__warehouse_specific_config__.location_root,
             tblproperties: config.__warehouse_specific_config__.tblproperties,
             include_full_name_in_path: config
@@ -447,7 +456,6 @@ impl DefaultTo<UnitTestConfig> for UnitTestConfig {
             static_analysis,
             meta,
             tags,
-            description,
             __warehouse_specific_config__: warehouse_specific_config,
         } = self;
 
@@ -461,6 +469,6 @@ impl DefaultTo<UnitTestConfig> for UnitTestConfig {
         #[allow(unused, clippy::let_unit_value)]
         let tags = ();
 
-        default_to!(parent, [enabled, static_analysis, description]);
+        default_to!(parent, [enabled, static_analysis]);
     }
 }

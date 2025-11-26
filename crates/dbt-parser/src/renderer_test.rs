@@ -4,9 +4,10 @@ mod tests {
     use crate::dbt_project_config::DbtProjectConfig;
     use crate::renderer::{RenderCtx, RenderCtxInner, render_unresolved_sql_files};
     use dbt_common::adapter::AdapterType;
-    use dbt_common::io_args::IoArgs;
+    use dbt_common::io_args::{FsCommand, IoArgs};
     use dbt_common::serde_utils::Omissible;
     use dbt_jinja_utils::jinja_environment::JinjaEnv;
+    use dbt_jinja_utils::listener::DefaultJinjaTypeCheckEventListenerFactory;
     use dbt_schemas::filter::RunFilter;
     use dbt_schemas::schemas::common::DbtQuoting;
     use dbt_schemas::schemas::project::ModelConfig;
@@ -70,7 +71,7 @@ mod tests {
                 ..Default::default()
             },
             num_threads: Some(1), // Will test both sequential (1) and parallel (>1)
-            command: "test".to_string(),
+            command: FsCommand::Test,
             vars: BTreeMap::new(),
             from_main: false,
             selector: None,
@@ -79,7 +80,6 @@ mod tests {
             exclude: None,
             replay: None,
             sample_config: RunFilter::default(),
-            inline_sql: None,
             sample_renaming: BTreeMap::new(),
         };
 
@@ -125,6 +125,7 @@ mod tests {
             &[test_asset],
             &mut node_properties,
             &token,
+            Arc::new(DefaultJinjaTypeCheckEventListenerFactory::default()),
         )
         .await
         .unwrap();
@@ -157,6 +158,7 @@ mod tests {
             &many_assets,
             &mut node_properties,
             &token,
+            Arc::new(DefaultJinjaTypeCheckEventListenerFactory::default()),
         )
         .await
         .unwrap();

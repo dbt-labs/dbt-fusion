@@ -128,7 +128,7 @@ impl BigqueryAuth {
                 ))
             })?;
         // Replace escaped newlines with a single newline
-        keyfile_json.private_key = keyfile_json.private_key.replace("\\\\n", "\\n");
+        keyfile_json.private_key = keyfile_json.private_key.replace("\\n", "\n");
 
         // Turn it into a JSON string again so we can pass it to the ADBC driver
         let keyfile_json_string: String = serde_json::to_value(keyfile_json)
@@ -215,6 +215,10 @@ impl Auth for BigqueryAuth {
 
         if let Some(project_id) = Self::project_id(config)? {
             builder.with_named_option(bigquery::PROJECT_ID, project_id)?;
+        }
+
+        if let Some(quota_project) = config.get_string("quota_project") {
+            builder.with_named_option(bigquery::AUTH_QUOTA_PROJECT, quota_project)?;
         }
 
         let dataset_id = Self::dataset_id(config)?;

@@ -1,9 +1,8 @@
 use dbt_common::io_args::StaticAnalysisKind;
-use dbt_serde_yaml::{JsonSchema, ShouldBe};
+use dbt_serde_yaml::{JsonSchema, ShouldBe, Spanned};
 use serde::{Deserialize, Serialize};
 // Type aliases for clarity
 type YmlValue = dbt_serde_yaml::Value;
-use serde_with::skip_serializing_none;
 use std::collections::BTreeMap;
 use std::collections::btree_map::Iter;
 
@@ -17,12 +16,12 @@ use crate::schemas::manifest::{BigqueryClusterConfig, PartitionConfig};
 use crate::schemas::project::configs::common::{
     WarehouseSpecificNodeConfig, default_meta_and_tags, default_quoting,
 };
-use crate::schemas::project::{DefaultTo, IterChildren};
+use crate::schemas::project::{DefaultTo, TypedRecursiveConfig};
 use crate::schemas::serde::{
     StringOrArrayOfStrings, bool_or_string_bool, f64_or_string_f64, u64_or_string_u64,
 };
 
-#[skip_serializing_none]
+// NOTE: No #[skip_serializing_none] - we handle None serialization in serialize_with_mode
 #[derive(Deserialize, Serialize, Debug, Clone, JsonSchema)]
 pub struct ProjectDataTestConfig {
     #[serde(rename = "+alias")]
@@ -35,13 +34,19 @@ pub struct ProjectDataTestConfig {
     pub error_if: Option<String>,
     #[serde(rename = "+fail_calc")]
     pub fail_calc: Option<String>,
+    #[serde(
+        default,
+        rename = "+full_refresh",
+        deserialize_with = "bool_or_string_bool"
+    )]
+    pub full_refresh: Option<bool>,
     #[serde(rename = "+group")]
     pub group: Option<String>,
     #[serde(rename = "+limit")]
     pub limit: Option<i32>,
     #[serde(rename = "+meta")]
     pub meta: Option<BTreeMap<String, YmlValue>>,
-    #[serde(rename = "+schema")]
+    #[serde(rename = "+schema", alias = "+dataset")]
     pub schema: Option<String>,
     #[serde(rename = "+severity")]
     pub severity: Option<Severity>,
@@ -62,7 +67,7 @@ pub struct ProjectDataTestConfig {
     #[serde(rename = "+quoting")]
     pub quoting: Option<DbtQuoting>,
     #[serde(rename = "+static_analysis")]
-    pub static_analysis: Option<StaticAnalysisKind>,
+    pub static_analysis: Option<Spanned<StaticAnalysisKind>>,
 
     // Snowflake specific fields
     #[serde(rename = "+adapter_properties")]
@@ -159,14 +164,14 @@ pub struct ProjectDataTestConfig {
         deserialize_with = "f64_or_string_f64"
     )]
     pub refresh_interval_minutes: Option<f64>,
-    #[serde(rename = "+description")]
-    pub description: Option<String>,
     #[serde(rename = "+max_staleness")]
     pub max_staleness: Option<String>,
 
     // Databricks specific fields
     #[serde(rename = "+file_format")]
     pub file_format: Option<String>,
+    #[serde(rename = "+catalog_name")]
+    pub catalog_name: Option<String>,
     #[serde(rename = "+location_root")]
     pub location_root: Option<String>,
     #[serde(rename = "+tblproperties")]
@@ -269,13 +274,17 @@ pub struct ProjectDataTestConfig {
     pub __additional_properties__: BTreeMap<String, ShouldBe<ProjectDataTestConfig>>,
 }
 
-impl IterChildren<ProjectDataTestConfig> for ProjectDataTestConfig {
+impl TypedRecursiveConfig for ProjectDataTestConfig {
+    fn type_name() -> &'static str {
+        "data_test"
+    }
+
     fn iter_children(&self) -> Iter<'_, String, ShouldBe<Self>> {
         self.__additional_properties__.iter()
     }
 }
 
-#[skip_serializing_none]
+// NOTE: No #[skip_serializing_none] - we handle None serialization in serialize_with_mode
 #[derive(Deserialize, Serialize, Debug, Clone, Default, JsonSchema)]
 pub struct DataTestConfig {
     pub alias: Option<String>,
@@ -287,6 +296,8 @@ pub struct DataTestConfig {
     pub enabled: Option<bool>,
     pub error_if: Option<String>,
     pub fail_calc: Option<String>,
+    #[serde(default, deserialize_with = "bool_or_string_bool")]
+    pub full_refresh: Option<bool>,
     pub group: Option<String>,
     pub limit: Option<i32>,
     pub meta: Option<BTreeMap<String, YmlValue>>,
@@ -297,10 +308,9 @@ pub struct DataTestConfig {
     pub tags: Option<StringOrArrayOfStrings>,
     pub warn_if: Option<String>,
     pub quoting: Option<DbtQuoting>,
-    pub static_analysis: Option<StaticAnalysisKind>,
+    pub static_analysis: Option<Spanned<StaticAnalysisKind>>,
     #[serde(rename = "where")]
     pub where_: Option<String>,
-    pub description: Option<String>,
     pub materialized: Option<DbtMaterialization>,
     // Adapter specific configs
     pub __warehouse_specific_config__: WarehouseSpecificNodeConfig,
@@ -314,6 +324,7 @@ impl From<ProjectDataTestConfig> for DataTestConfig {
             enabled: config.enabled,
             error_if: config.error_if,
             fail_calc: config.fail_calc,
+            full_refresh: config.full_refresh,
             group: config.group,
             limit: config.limit,
             meta: config.meta,
@@ -326,10 +337,10 @@ impl From<ProjectDataTestConfig> for DataTestConfig {
             quoting: config.quoting,
             where_: config.where_,
             static_analysis: config.static_analysis,
-            description: config.description,
             materialized: Some(DbtMaterialization::Test),
             // Initialize adapter specific configs with values from flattened fields
             __warehouse_specific_config__: WarehouseSpecificNodeConfig {
+                description: None, // Not applicable for data tests
                 adapter_properties: config.adapter_properties,
                 external_volume: config.external_volume,
                 base_location_root: config.base_location_root,
@@ -359,9 +370,15 @@ impl From<ProjectDataTestConfig> for DataTestConfig {
                 partitions: config.partitions,
                 enable_refresh: config.enable_refresh,
                 refresh_interval_minutes: config.refresh_interval_minutes,
+                resource_tags: None,
                 max_staleness: config.max_staleness,
+                jar_file_uri: None,
+                timeout: None,
+                batch_id: None,
+                dataproc_cluster_name: None,
 
                 file_format: config.file_format,
+                catalog_name: config.catalog_name,
                 location_root: config.location_root,
                 tblproperties: config.tblproperties,
                 include_full_name_in_path: config.include_full_name_in_path,
@@ -413,6 +430,7 @@ impl From<DataTestConfig> for ProjectDataTestConfig {
             enabled: config.enabled,
             error_if: config.error_if,
             fail_calc: config.fail_calc,
+            full_refresh: config.full_refresh,
             group: config.group,
             limit: config.limit,
             meta: config.meta,
@@ -425,7 +443,6 @@ impl From<DataTestConfig> for ProjectDataTestConfig {
             quoting: config.quoting,
             where_: config.where_,
             static_analysis: config.static_analysis,
-            description: config.description,
             partition_by: config.__warehouse_specific_config__.partition_by,
             // Snowflake fields
             adapter_properties: config.__warehouse_specific_config__.adapter_properties,
@@ -465,6 +482,7 @@ impl From<DataTestConfig> for ProjectDataTestConfig {
             max_staleness: config.__warehouse_specific_config__.max_staleness,
             // Databricks fields
             file_format: config.__warehouse_specific_config__.file_format,
+            catalog_name: config.__warehouse_specific_config__.catalog_name,
             location_root: config.__warehouse_specific_config__.location_root,
             tblproperties: config.__warehouse_specific_config__.tblproperties,
             include_full_name_in_path: config
@@ -525,6 +543,7 @@ impl DefaultTo<DataTestConfig> for DataTestConfig {
             enabled,
             error_if,
             fail_calc,
+            full_refresh,
             group,
             limit,
             meta,
@@ -537,7 +556,6 @@ impl DefaultTo<DataTestConfig> for DataTestConfig {
             quoting,
             where_,
             static_analysis,
-            description,
             materialized,
             // Adapter specific configs
             __warehouse_specific_config__: warehouse_specific_config,
@@ -566,13 +584,13 @@ impl DefaultTo<DataTestConfig> for DataTestConfig {
                 error_if,
                 warn_if,
                 fail_calc,
+                full_refresh,
                 alias,
                 database,
                 schema,
                 group,
                 where_,
                 static_analysis,
-                description,
                 materialized,
             ]
         );

@@ -106,17 +106,21 @@ pub struct ArrowAttributes<'a> {
     pub node_error_type: Option<NodeErrorType>,
     pub node_cancel_reason: Option<NodeCancelReason>,
     pub node_skip_reason: Option<NodeSkipReason>,
+    pub sao_enabled: Option<bool>,
     // CallTrace/Unknown fields
     pub dev_name: Option<Cow<'a, str>>,
-    // Code location fields
+    // Fusion source code location fields (debug only)
     pub file: Option<Cow<'a, str>>,
     pub line: Option<u32>,
     // Log fields
     pub code: Option<u32>,
     pub original_severity_number: Option<i32>,
     pub original_severity_text: Option<Cow<'a, str>>,
-    // Artifact paths
+    pub package_name: Option<Cow<'a, str>>,
+    // Artifact or node paths & location
     pub relative_path: Option<Cow<'a, str>>,
+    pub code_line: Option<u32>,
+    pub code_column: Option<u32>,
     pub artifact_type: Option<ArtifactType>,
     // Query fields
     pub query_id: Option<Cow<'a, str>>,
@@ -124,7 +128,13 @@ pub struct ArrowAttributes<'a> {
     pub adapter_type: Option<Cow<'a, str>>,
     pub query_error_vendor_code: Option<i32>,
     /// Associated content hash (e.g. can be CAS hash for artifacts stored in CAS).
+    /// or node checksum.
     pub content_hash: Option<Cow<'a, str>>,
+    // Formatted output fields (e.g. `list` command)
+    pub output_format: Option<Cow<'a, str>>,
+    pub content: Option<Cow<'a, str>>,
+    // Node processing duration
+    pub duration_ms: Option<u64>,
 }
 
 #[inline]
@@ -413,17 +423,21 @@ fn create_arrow_schema() -> (Vec<FieldRef>, Vec<FieldRef>) {
         dict_utf8_field("node_error_type", true),
         dict_utf8_field("node_cancel_reason", true),
         dict_utf8_field("node_skip_reason", true),
+        Field::new("sao_enabled", DataType::Boolean, true),
         // CallTrace/Unknown fields
         dict_utf8_field("dev_name", true),
-        // Code location fields
+        // Fusion origin code location fields (debug only)
         dict_utf8_field("file", true),
         Field::new("line", DataType::UInt32, true),
         // Log fields
         Field::new("code", DataType::UInt32, true),
         Field::new("original_severity_number", DataType::Int32, true),
         dict_utf8_field("original_severity_text", true),
-        // Artifact paths
+        dict_utf8_field("package_name", true),
+        // Artifact or node paths & location
         large_utf8_field("relative_path", true),
+        Field::new("code_line", DataType::UInt32, true),
+        Field::new("code_column", DataType::UInt32, true),
         dict_utf8_field("artifact_type", true),
         // Query fields
         large_utf8_field("query_id", true),
@@ -432,6 +446,11 @@ fn create_arrow_schema() -> (Vec<FieldRef>, Vec<FieldRef>) {
         Field::new("query_error_vendor_code", DataType::Int32, true),
         // Content hash (e.g. CAS hash for artifacts stored in CAS)
         large_utf8_field("content_hash", true),
+        // List command output fields
+        dict_utf8_field("output_format", true),
+        large_utf8_field("content", true),
+        // Node processing duration
+        Field::new("duration_ms", DataType::UInt64, true),
     ]);
 
     // Top-level fields for ArrowTelemetryRecord
@@ -1017,28 +1036,27 @@ mod tests {
         hasher.finish()
     }
 
-    fn create_fake_attributes(seed: &str, event_type: &'static str) -> TelemetryAttributes {
-        let faker = TelemetryEventTypeRegistry::public()
-            .get_faker(event_type)
-            .unwrap_or_else(|| panic!("No faker defined for event type \"{event_type}\""));
-
-        TelemetryAttributes::new(faker(seed))
-    }
-
     fn create_all_fake_attributes(seed: &str) -> Vec<TelemetryAttributes> {
         let mut attributes = Vec::new();
         for event_type in TelemetryEventTypeRegistry::public().iter() {
-            let attrs = create_fake_attributes(seed, event_type);
+            let faker = TelemetryEventTypeRegistry::public()
+                .get_faker(event_type)
+                .unwrap_or_else(|| panic!("No faker defined for event type \"{event_type}\""));
 
-            // Skip variants that are known to not be serialized
-            if !attrs
-                .output_flags()
-                .contains(TelemetryOutputFlags::EXPORT_PARQUET)
-            {
-                continue;
+            // Faker returns a vector of attribute variants
+            for attr_boxed in faker(seed) {
+                let attrs = TelemetryAttributes::new(attr_boxed);
+
+                // Skip variants that are known to not be serialized
+                if !attrs
+                    .output_flags()
+                    .contains(TelemetryOutputFlags::EXPORT_PARQUET)
+                {
+                    continue;
+                }
+
+                attributes.push(attrs);
             }
-
-            attributes.push(attrs);
         }
         attributes
     }
@@ -1304,7 +1322,7 @@ mod tests {
             .fields()
             .iter()
             .enumerate()
-            .filter(|&(idx, _)| (idx != column_index))
+            .filter(|&(idx, _)| idx != column_index)
             .map(|(_, field)| Arc::new(field.as_ref().clone()))
             .collect();
 
@@ -1312,7 +1330,7 @@ mod tests {
             .columns()
             .iter()
             .enumerate()
-            .filter(|&(idx, _)| (idx != column_index))
+            .filter(|&(idx, _)| idx != column_index)
             .map(|(_, column)| column.clone())
             .collect();
 

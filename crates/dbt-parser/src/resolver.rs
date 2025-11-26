@@ -4,11 +4,14 @@ use dbt_common::FsError;
 use dbt_common::adapter::AdapterType;
 use dbt_common::cancellation::CancellationToken;
 use dbt_common::constants::{DBT_GENERIC_TESTS_DIR_NAME, RESOLVING};
+use dbt_common::io_args::FsCommand;
 use dbt_common::once_cell_vars::DISPATCH_CONFIG;
+use dbt_common::stdfs;
+use dbt_common::tracing::emit::{emit_error_log_from_fs_error, emit_warn_log_from_fs_error};
 use dbt_common::tracing::event_info::store_event_attributes;
-use dbt_common::{ErrorCode, FsResult, err, fs_err, show_error, with_progress};
-use dbt_common::{show_warning, stdfs};
+use dbt_common::{ErrorCode, FsResult, err, fs_err, with_progress};
 use dbt_jinja_utils::invocation_args::InvocationArgs;
+use dbt_jinja_utils::listener::JinjaTypeCheckingEventListenerFactory;
 use dbt_jinja_utils::node_resolver::{NodeResolver, resolve_dependencies};
 use dbt_jinja_utils::phases::parse::build_resolve_context;
 use dbt_jinja_utils::phases::parse::init::initialize_parse_jinja_environment;
@@ -21,8 +24,9 @@ use dbt_schemas::schemas::properties::{MetricsProperties, ModelProperties};
 use dbt_schemas::schemas::{InternalDbtNode, Nodes};
 
 use dbt_jinja_utils::jinja_environment::JinjaEnv;
-use dbt_schemas::state::{DbtAsset, DbtPackage, GenericTestAsset, Macros, RenderResults};
+use dbt_schemas::state::{DbtPackage, GenericTestAsset, Macros, RenderResults};
 use dbt_schemas::state::{DbtRuntimeConfig, Operations};
+use tracing::Instrument as _;
 
 use crate::args::ResolveArgs;
 use crate::dbt_project_config::{RootProjectConfigs, build_root_project_configs};
@@ -30,13 +34,11 @@ use crate::resolve::resolve_groups::resolve_groups;
 use crate::resolve::resolve_operations::resolve_operations;
 use crate::resolve::resolve_query_comment::resolve_query_comment;
 use crate::utils::{self, clear_package_diagnostics};
+use dbt_schemas::schemas::common::DbtQuoting;
 use dbt_schemas::schemas::telemetry::{ExecutionPhase, NodeType, PhaseExecuted};
-use dbt_schemas::state::DbtState;
-use dbt_schemas::state::ResolverState;
+use dbt_schemas::state::{DbtState, ResolverState};
 use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::fs as tokiofs;
 
 use crate::resolve::resolve_analyses::resolve_analyses;
 use crate::resolve::resolve_exposures::resolve_exposures;
@@ -70,27 +72,19 @@ use dbt_serde_yaml::Value as YmlValue;
 #[tracing::instrument(
     skip_all,
     fields(
-        _e = ?store_event_attributes(PhaseExecuted::start_general(ExecutionPhase::Parse).into()),
+        _e = ?store_event_attributes(PhaseExecuted::start_general(ExecutionPhase::Parse)),
     )
 )]
 pub async fn resolve(
     arg: &ResolveArgs,
     invocation_args: &InvocationArgs,
-    mut dbt_state: DbtState,
+    dbt_state: Arc<DbtState>,
     macros: Macros,
     nodes: Nodes,
-    listener_factory: Option<Arc<dyn dbt_jinja_utils::listener::RenderingEventListenerFactory>>,
     token: &CancellationToken,
+    jinja_type_checking_event_listener_factory: Arc<dyn JinjaTypeCheckingEventListenerFactory>,
 ) -> FsResult<(ResolverState, Arc<JinjaEnv>)> {
     let _pb = with_progress!(arg.io, spinner => RESOLVING);
-
-    // Handle inline SQL if provided
-    if let Some(inline_sql) = &arg.inline_sql {
-        // We need to make dbt_state mutable for this one operation
-        let _ = prepare_inline_sql(inline_sql, &arg.io.out_dir, &mut dbt_state).await?;
-    }
-
-    let dbt_state = Arc::new(dbt_state);
 
     // Get the root project name
     let root_project_name = dbt_state.root_project_name();
@@ -108,17 +102,6 @@ pub async fn resolve(
         macros.macros.extend(resolved_macros);
         let docs_macros = resolve_docs_macros(&arg.io, &package.docs_files)?;
         macros.docs_macros.extend(docs_macros);
-    }
-
-    let mut operations = Operations::default();
-    for package in &dbt_state.packages {
-        let (on_run_start, on_run_end) = resolve_operations(
-            &package.dbt_project,
-            &package.package_root_path,
-            &arg.io.in_dir,
-        );
-        operations.on_run_start.extend(on_run_start);
-        operations.on_run_end.extend(on_run_end);
     }
 
     let adapter_type = dbt_state
@@ -156,7 +139,6 @@ pub async fn resolve(
             .map(|p| p.dbt_project.name.clone())
             .collect(),
         arg.io.clone(),
-        listener_factory,
         token.clone(),
         dbt_state.catalogs.clone(),
     )?);
@@ -171,8 +153,12 @@ pub async fn resolve(
 
     // let mut nodes = Nodes::default();
     let mut disabled_nodes = Nodes::default();
-    let root_project_configs =
-        build_root_project_configs(&arg.io, dbt_state.root_project(), root_project_quoting)?;
+    let root_project_configs = build_root_project_configs(
+        &arg.io,
+        dbt_state.root_project(),
+        root_project_quoting,
+        adapter_type,
+    )?;
     let root_project_configs = Arc::new(root_project_configs);
     // Process packages in topological order
 
@@ -183,7 +169,7 @@ pub async fn resolve(
         None,
         arg.sample_config.clone(),
         arg.sample_renaming.clone(),
-        arg.command == "compile" || arg.command == "test",
+        arg.command == FsCommand::Compile || arg.command == FsCommand::Test,
     )?;
     let mut collector = RenderResults {
         rendering_results: BTreeMap::new(),
@@ -212,6 +198,7 @@ pub async fn resolve(
             &mut node_resolver,
             &mut all_runtime_configs,
             token,
+            jinja_type_checking_event_listener_factory.clone(),
         )
         .await?;
         nodes.extend(resolved_nodes);
@@ -239,6 +226,7 @@ pub async fn resolve(
             &mut node_resolver,
             &mut all_runtime_configs,
             token,
+            jinja_type_checking_event_listener_factory.clone(),
         )
         .await?;
         nodes.extend(resolved_nodes);
@@ -254,7 +242,7 @@ pub async fn resolve(
     match nodes.warn_on_microbatch() {
         Ok(_) => {}
         Err(e) => {
-            show_warning!(arg.io, e);
+            emit_warn_log_from_fs_error(e.as_ref(), arg.io.status_reporter.as_ref());
         }
     }
 
@@ -268,10 +256,44 @@ pub async fn resolve(
         .get(dbt_state.root_project_name())
         .unwrap();
 
+    // Resolve operations (on_run_start and on_run_end) with rendering and dependency extraction
+    let mut operations = Operations::default();
+    for package in &dbt_state.packages {
+        // Get the package-specific runtime config so operations can access package vars
+        let package_runtime_config = all_runtime_configs
+            .get(&package.dbt_project.name)
+            .unwrap_or(root_runtime_config);
+
+        let (on_run_start, on_run_end) = resolve_operations(
+            &package.dbt_project,
+            &package.package_root_path,
+            &arg.io.in_dir,
+            &jinja_env,
+            &arg.io,
+            adapter_type,
+            &dbt_state.dbt_profile.database,
+            &dbt_state.dbt_profile.schema,
+            DbtQuoting {
+                database: root_project_quoting.database,
+                schema: root_project_quoting.schema,
+                identifier: root_project_quoting.identifier,
+                snowflake_ignore_case: None,
+            },
+            package_runtime_config.clone(),
+        )?;
+        operations.on_run_start.extend(on_run_start);
+        operations.on_run_end.extend(on_run_end);
+    }
+
     // take refs and sources, resolve them to a unique_id and put in depends_on
     // This returns a set of node IDs that had resolution errors (unresolved refs/sources)
-    let nodes_with_resolution_errors =
-        resolve_dependencies(&arg.io, &mut nodes, &mut disabled_nodes, &node_resolver);
+    let nodes_with_resolution_errors = resolve_dependencies(
+        &arg.io,
+        &mut nodes,
+        &mut disabled_nodes,
+        &mut operations,
+        &node_resolver,
+    );
 
     // Check access
     check_access(arg, &nodes, &all_runtime_configs);
@@ -375,7 +397,7 @@ fn check_node_access<F>(
                     target_unique_id,
                     target_node.__model_attr__.group.as_deref().unwrap_or(""),
                 );
-                show_error!(arg.io, err);
+                emit_error_log_from_fs_error(&err, arg.io.status_reporter.as_ref());
             } else if target_node.__model_attr__.access == Access::Protected && diffent_packages {
                 let err = fs_err!(
                     code => ErrorCode::AccessDenied,
@@ -385,7 +407,7 @@ fn check_node_access<F>(
                     target_unique_id,
                     target_node.common().package_name,
                 );
-                show_error!(arg.io, err);
+                emit_error_log_from_fs_error(&err, arg.io.status_reporter.as_ref());
             }
         }
     }
@@ -405,6 +427,7 @@ pub async fn resolve_inner(
     node_resolver: &mut NodeResolver,
     runtime_config: Arc<DbtRuntimeConfig>,
     token: &CancellationToken,
+    jinja_type_checking_event_listener_factory: Arc<dyn JinjaTypeCheckingEventListenerFactory>,
 ) -> FsResult<(Nodes, Nodes, RenderResults, NodeResolver, bool)> {
     let mut nodes = Nodes::default();
     let mut disabled_nodes = Nodes::default();
@@ -441,6 +464,8 @@ pub async fn resolve_inner(
     let dependency_package_name = dependency_package_name_from_ctx(&jinja_env, &base_ctx);
     let mut typed_models_properties: BTreeMap<String, ModelProperties> = BTreeMap::new();
 
+    let semantic_layer_spec_is_legacy = min_properties.semantic_layer_spec_is_legacy;
+
     for (model_name, minimal_model_props) in &min_properties.models {
         // Extract metrics to be parsed separately because they are not supposed to be rendered with Jinja
         let mut maybe_model_metrics_yml: Option<YmlValue> = None;
@@ -462,17 +487,19 @@ pub async fn resolve_inner(
             false,
         )?;
 
-        // The caveat to parsing model.metrics separately is that any yaml errors will be reported with root path
-        // as `models.[$].metrics` meaning if there's an unexpected key such as `models.[$].metrics.[$].non_existent_key`
-        // it will report unexpected key at `.[$].non_existent_key`, when it should be `.metrics.[$].non_existent_key`
-        //
-        // This will be inconsistent with unexpected keys in `models.[$]` where for example an unexpected
-        // key in `models.[$].derived_semantics.made_up_key` will report unexpected key at
-        // `derived_semantics.[$].non_existent_key`
-        if let Some(model_metrics_yml) = maybe_model_metrics_yml {
-            let typed_model_metrics_props: Option<Vec<MetricsProperties>> =
-                into_typed_with_error(&arg.io, model_metrics_yml, true, None, None)?;
-            typed_model_props.metrics = typed_model_metrics_props;
+        if !semantic_layer_spec_is_legacy {
+            // The caveat to parsing model.metrics separately is that any yaml errors will be reported with root path
+            // as `models.[$].metrics` meaning if there's an unexpected key such as `models.[$].metrics.[$].non_existent_key`
+            // it will report unexpected key at `.[$].non_existent_key`, when it should be `.metrics.[$].non_existent_key`
+            //
+            // This will be inconsistent with unexpected keys in `models.[$]` where for example an unexpected
+            // key in `models.[$].derived_semantics.made_up_key` will report unexpected key at
+            // `derived_semantics.[$].non_existent_key`
+            if let Some(model_metrics_yml) = maybe_model_metrics_yml {
+                let typed_model_metrics_props: Option<Vec<MetricsProperties>> =
+                    into_typed_with_error(&arg.io, model_metrics_yml, true, None, None)?;
+                typed_model_props.metrics = typed_model_metrics_props;
+            }
         }
 
         typed_models_properties.insert(model_name.clone(), typed_model_props);
@@ -482,7 +509,6 @@ pub async fn resolve_inner(
     let (sources, disabled_sources) = resolve_sources(
         arg,
         package,
-        package_quoting,
         root_package_name,
         root_project_configs,
         min_properties.source_tables,
@@ -557,6 +583,7 @@ pub async fn resolve_inner(
         &mut collected_generic_tests,
         node_resolver,
         token,
+        jinja_type_checking_event_listener_factory.clone(),
     )
     .await?;
     nodes.models.extend(models);
@@ -618,8 +645,6 @@ pub async fn resolve_inner(
     .await?;
     nodes.exposures.extend(exposures);
     disabled_nodes.exposures.extend(disabled_exposures);
-
-    let semantic_layer_spec_is_legacy = min_properties.semantic_layer_spec_is_legacy;
 
     if !semantic_layer_spec_is_legacy {
         let (semantic_models, disabled_semantic_models) = resolve_semantic_models(
@@ -685,6 +710,8 @@ pub async fn resolve_inner(
         &base_ctx,
         runtime_config.clone(),
         &collected_generic_tests,
+        node_resolver,
+        jinja_env.clone(),
         token,
     )
     .await?;
@@ -790,6 +817,7 @@ async fn resolve_package(
     node_resolver: NodeResolver,
     all_runtime_configs: BTreeMap<String, Arc<DbtRuntimeConfig>>,
     token: &CancellationToken,
+    jinja_type_checking_event_listener_factory: Arc<dyn JinjaTypeCheckingEventListenerFactory>,
 ) -> FsResult<(
     String,
     Arc<DbtRuntimeConfig>,
@@ -842,6 +870,7 @@ async fn resolve_package(
         &mut node_resolver.clone(),
         runtime_config.clone(),
         token,
+        jinja_type_checking_event_listener_factory.clone(),
     )
     .await?;
 
@@ -871,6 +900,7 @@ async fn resolve_packages_sequentially(
     node_resolver: &mut NodeResolver,
     all_runtime_configs: &mut BTreeMap<String, Arc<DbtRuntimeConfig>>,
     token: &CancellationToken,
+    jinja_type_checking_event_listener_factory: Arc<dyn JinjaTypeCheckingEventListenerFactory>,
 ) -> FsResult<(Nodes, Nodes, RenderResults, bool)> {
     let mut nodes = Nodes::default();
     let mut disabled_nodes = Nodes::default();
@@ -894,6 +924,7 @@ async fn resolve_packages_sequentially(
                 node_resolver.clone(),
                 all_runtime_configs.clone(),
                 token,
+                jinja_type_checking_event_listener_factory.clone(),
             )
             .await?;
 
@@ -944,6 +975,7 @@ async fn resolve_packages_parallel(
     node_resolver: &mut NodeResolver,
     all_runtime_configs: &mut BTreeMap<String, Arc<DbtRuntimeConfig>>,
     token: &CancellationToken,
+    jinja_type_checking_event_listener_factory: Arc<dyn JinjaTypeCheckingEventListenerFactory>,
 ) -> FsResult<(Nodes, Nodes, RenderResults, bool)> {
     let mut nodes = Nodes::default();
     let mut disabled_nodes = Nodes::default();
@@ -966,23 +998,29 @@ async fn resolve_packages_parallel(
             let all_runtime_configs = all_runtime_configs.clone(); // read-only for this wave
             let dbt_state = dbt_state.clone();
             let token = token.clone();
-            handles.push(tokio::spawn(async move {
-                resolve_package(
-                    package_name,
-                    arg,
-                    dbt_state,
-                    root_project_name,
-                    root_project_configs,
-                    adapter_type,
-                    macros,
-                    jinja_env,
-                    node_resolver,
-                    all_runtime_configs,
-                    &token,
-                )
-                .await
-                .map_err(|e| *e)
-            }));
+            let jinja_type_checking_event_listener_factory =
+                jinja_type_checking_event_listener_factory.clone();
+            handles.push(tokio::spawn(
+                async move {
+                    resolve_package(
+                        package_name,
+                        arg,
+                        dbt_state,
+                        root_project_name,
+                        root_project_configs,
+                        adapter_type,
+                        macros,
+                        jinja_env,
+                        node_resolver,
+                        all_runtime_configs,
+                        &token,
+                        jinja_type_checking_event_listener_factory,
+                    )
+                    .await
+                    .map_err(|e| *e)
+                }
+                .in_current_span(),
+            ));
         }
 
         // Wait for all packages in this wave to finish, then merge results and update configs
@@ -1022,53 +1060,4 @@ async fn resolve_packages_parallel(
         collector,
         semantic_layer_spec_is_legacy,
     ))
-}
-
-/// Prepares inline SQL for processing by writing it to a file and adding it to the DbtState.
-///
-/// This function:
-/// 1. Writes the inline SQL to target/inline_<uuid>.sql
-/// 2. Creates a DbtAsset for the file
-/// 3. Adds it to the root package's model_sql_files
-/// 4. Returns the generated model name for later reference
-///
-/// # Arguments
-/// * `inline_sql` - The SQL string provided via --inline flag
-/// * `out_dir` - The target directory where inline SQL will be written
-/// * `dbt_state` - The mutable DbtState to update with the inline asset
-async fn prepare_inline_sql(
-    inline_sql: &str,
-    out_dir: &Path,
-    dbt_state: &mut DbtState,
-) -> FsResult<String> {
-    // Generate unique model name using shortened UUID (first 8 chars)
-    let unique_id = uuid::Uuid::new_v4();
-    let short_id = &unique_id.to_string()[..8];
-    let model_name = format!("inline_{short_id}");
-    let filename = format!("{model_name}.sql");
-
-    // Write inline SQL to target directory
-    let inline_path = out_dir.join(&filename);
-    tokiofs::create_dir_all(out_dir).await?;
-    tokiofs::write(&inline_path, inline_sql).await?;
-
-    // Create DbtAsset for the inline SQL
-    let inline_asset = DbtAsset {
-        base_path: out_dir.to_path_buf(),
-        path: PathBuf::from(filename),
-        package_name: dbt_state.root_project_name().to_string(),
-    };
-
-    // Set inline_file in root package and add to model_sql_files
-    let root_project_name = dbt_state.root_project_name().to_string();
-    if let Some(root_package) = dbt_state
-        .packages
-        .iter_mut()
-        .find(|p| p.dbt_project.name == root_project_name)
-    {
-        root_package.inline_file = Some(inline_asset.clone());
-        root_package.model_sql_files.push(inline_asset);
-    }
-
-    Ok(model_name)
 }

@@ -3,7 +3,8 @@ use crate::dbt_project_config::strip_resource_paths_from_ref_path;
 use crate::resolve::resolve_properties::MinimalPropertiesEntry;
 use dbt_common::adapter::AdapterType;
 use dbt_common::io_args::IoArgs;
-use dbt_common::{ErrorCode, FsError, FsResult, fs_err, show_error, stdfs};
+use dbt_common::tracing::emit::emit_error_log_from_fs_error;
+use dbt_common::{ErrorCode, FsError, FsResult, fs_err, stdfs};
 use dbt_jinja_utils::jinja_environment::JinjaEnv;
 use dbt_jinja_utils::phases::parse::sql_resource::SqlResource;
 use dbt_jinja_utils::utils::{generate_component_name, generate_relation_name};
@@ -19,7 +20,7 @@ use minijinja::compiler::parser::Parser;
 use minijinja::machinery::{Span, WhitespaceConfig};
 use minijinja::syntax::SyntaxConfig;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -190,11 +191,11 @@ pub fn register_duplicate_resource(
 /// Trigger duplicate errors
 pub fn trigger_duplicate_errors(io: &IoArgs, duplicate_errors: &mut Vec<FsError>) -> FsResult<()> {
     if !duplicate_errors.is_empty() {
-        while let Some(err_msg) = duplicate_errors.pop() {
+        while let Some(err) = duplicate_errors.pop() {
             if duplicate_errors.is_empty() {
-                return Err(Box::new(err_msg));
+                return Err(Box::new(err));
             } else {
-                show_error!(io, Box::new(err_msg));
+                emit_error_log_from_fs_error(&err, io.status_reporter.as_ref());
             }
         }
     }
@@ -453,10 +454,15 @@ fn extract_sql_resources_from_ast<T: DefaultTo<T>>(
                         span,
                         func_sign,
                         args,
+                        macro_node.name_span,
                     ));
                 }
                 MacroKind::Test => {
-                    sql_resources.push(SqlResource::Test(macro_name.to_string(), span));
+                    sql_resources.push(SqlResource::Test(
+                        macro_name.to_string(),
+                        span,
+                        macro_node.name_span,
+                    ));
                 }
                 MacroKind::Doc => {
                     if let Some(Stmt::EmitRaw(emit_raw)) = macro_node.body.first() {
@@ -464,7 +470,11 @@ fn extract_sql_resources_from_ast<T: DefaultTo<T>>(
                     }
                 }
                 MacroKind::Snapshot => {
-                    sql_resources.push(SqlResource::Snapshot(macro_name.to_string(), span));
+                    sql_resources.push(SqlResource::Snapshot(
+                        macro_name.to_string(),
+                        span,
+                        macro_node.name_span,
+                    ));
                 }
                 MacroKind::Materialization => {
                     let adapter_type = meta.get("adapter").expect("adapter is required");
@@ -472,6 +482,7 @@ fn extract_sql_resources_from_ast<T: DefaultTo<T>>(
                         macro_name.to_string(),
                         adapter_type.as_str().unwrap().to_string(),
                         span,
+                        macro_node.name_span,
                     ));
                 }
             }
@@ -504,25 +515,6 @@ fn extract_sql_resources_from_ast<T: DefaultTo<T>>(
         }
         _ => {}
     }
-}
-
-/// Convert macro names to unique IDs
-/// For now, we'll use a simple heuristic to determine the package name
-/// In the future, this should be improved to look up macros in the macro registry
-pub fn convert_macro_names_to_unique_ids(macro_calls: &HashSet<String>) -> Vec<String> {
-    macro_calls
-        .iter()
-        .filter_map(|name| {
-            // Check if the macro name already contains a package prefix
-            if name.contains('.') {
-                // It's already in the format package.macro_name
-                Some(format!("macro.{name}"))
-            } else {
-                // If name doesn't contain '.', assume it's a function in context, don't collect
-                None
-            }
-        })
-        .collect()
 }
 
 /// Clear the diagnostics for a package

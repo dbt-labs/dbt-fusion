@@ -3,7 +3,7 @@
 use dbt_common::FsResult;
 use dbt_common::io_args::IoArgs;
 use dbt_common::{
-    io_args::EvalArgs,
+    io_args::{EvalArgs, FsCommand},
     node_selector::{IndirectSelection, SelectExpression},
 };
 use dbt_schemas::filter::RunFilter;
@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 #[derive(Clone, Default, Debug)]
 pub struct ResolveArgs {
     /// The command to run
-    pub command: String,
+    pub command: FsCommand,
     /// All io args
     pub io: IoArgs,
     /// Vars to pass to the jinja environment
@@ -34,8 +34,6 @@ pub struct ResolveArgs {
     pub replay: Option<dbt_common::io_args::ReplayMode>,
     /// Sample config
     pub sample_config: RunFilter,
-    /// Inline SQL to compile (from --inline flag)
-    pub inline_sql: Option<String>,
     /// For remapping unique_is to (database, schema, table) when sampling is enabled
     pub sample_renaming: BTreeMap<String, (String, String, String)>,
 }
@@ -44,7 +42,7 @@ impl ResolveArgs {
     /// Produce [ResolveArgs] from a set of [EvalArgs]
     pub fn try_from_eval_args(arg: &EvalArgs) -> FsResult<Self> {
         Ok(ResolveArgs {
-            command: arg.command.clone(),
+            command: arg.command,
             io: arg.io.clone(),
             vars: arg.vars.clone(),
             from_main: arg.from_main,
@@ -55,14 +53,7 @@ impl ResolveArgs {
             indirect_selection: arg.indirect_selection,
             replay: arg.replay.clone(),
             sample_config: RunFilter::try_from(arg.empty, arg.sample.clone())?,
-            inline_sql: None, // Will be set separately when needed
             sample_renaming: arg.sample_renaming.clone(),
         })
-    }
-
-    /// Set the inline SQL for compilation
-    pub fn with_inline_sql(mut self, inline_sql: Option<String>) -> Self {
-        self.inline_sql = inline_sql;
-        self
     }
 }

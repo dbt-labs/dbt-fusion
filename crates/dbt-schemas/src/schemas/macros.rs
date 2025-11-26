@@ -28,6 +28,8 @@ pub struct DbtMacro {
     pub funcsign: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<ArgSpec>,
+    #[serde(skip_serializing)]
+    pub macro_name_span: Option<Span>,
     pub __other__: BTreeMap<String, Value>,
 }
 
@@ -61,6 +63,8 @@ pub fn build_macro_units(nodes: &BTreeMap<String, DbtMacro>) -> BTreeMap<String,
                     span: inner_macro.span.expect("span is required"),
                     funcsign: inner_macro.funcsign.clone(),
                     args: inner_macro.args.clone(),
+                    unique_id: inner_macro.unique_id.clone(),
+                    name_span: inner_macro.macro_name_span.expect("name_span is required"),
                 },
                 sql: inner_macro.macro_sql.clone(),
             });

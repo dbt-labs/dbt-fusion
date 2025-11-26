@@ -3,6 +3,7 @@ use crate::dbt_project_config::{RootProjectConfigs, init_project_config};
 use crate::utils::{get_node_fqn, get_original_file_path, get_unique_id};
 
 use dbt_common::FsResult;
+use dbt_common::io_args::{StaticAnalysisKind, StaticAnalysisOffReason};
 use dbt_jinja_utils::jinja_environment::JinjaEnv;
 use dbt_jinja_utils::utils::dependency_package_name_from_ctx;
 use dbt_schemas::schemas::common::{DbtChecksum, Dimension, DimensionTypeParams, NodeDependsOn};
@@ -19,7 +20,9 @@ use dbt_schemas::schemas::properties::ModelProperties;
 use dbt_schemas::schemas::properties::metrics_properties::{AggregationType, PercentileType};
 use dbt_schemas::schemas::ref_and_source::DbtRef;
 use dbt_schemas::schemas::semantic_layer::semantic_manifest::SemanticLayerElementConfig;
-use dbt_schemas::schemas::{CommonAttributes, DbtModel, InternalDbtNodeAttributes};
+use dbt_schemas::schemas::{
+    CommonAttributes, DbtModel, InternalDbtNodeAttributes, NodeBaseAttributes,
+};
 use dbt_schemas::state::DbtPackage;
 use minijinja::value::Value as MinijinjaValue;
 use std::collections::{BTreeMap, HashMap};
@@ -76,7 +79,6 @@ pub async fn resolve_semantic_models(
         return Ok((semantic_models, disabled_semantic_models));
     }
 
-    // TODO: what is the difference between 'package_name' and 'dependency_package_name'?
     let dependency_package_name = dependency_package_name_from_ctx(env, base_ctx);
     let _local_model_project_config = init_project_config(
         &args.io,
@@ -91,7 +93,7 @@ pub async fn resolve_semantic_models(
         &args.io,
         &package.dbt_project.semantic_models,
         SemanticModelConfig {
-            enabled: Some(false),
+            enabled: Some(true),
             ..Default::default()
         },
         dependency_package_name,
@@ -233,16 +235,19 @@ pub async fn resolve_semantic_models(
                     .unwrap_or_default(),
                 meta: semantic_model_config.meta.clone().unwrap_or_default(),
             },
-            __semantic_model_attr__: DbtSemanticModelAttr {
-                unrendered_config: BTreeMap::new(), // TODO: do we need to hydrate?
-                depends_on: NodeDependsOn {
-                    nodes: vec![model_unique_id.clone()],
-                    macros: vec![],
-                    nodes_with_ref_location: vec![],
-                },
-                group: semantic_model_config.group.clone(),
-                created_at: chrono::Utc::now().timestamp() as f64,
-                metadata: None, // deprioritized feature. always null for now.
+            __base_attr__: NodeBaseAttributes {
+                database: "".to_string(),
+                schema: "".to_string(),
+                alias: "".to_string(),
+                relation_name: None,
+                quoting: Default::default(),
+                materialized: Default::default(),
+                static_analysis: StaticAnalysisKind::Off.into(),
+                static_analysis_off_reason: Some(StaticAnalysisOffReason::UnableToFetchSchema),
+                enabled: true,
+                extended_model: false,
+                persist_docs: None,
+                columns: Default::default(),
                 refs: vec![DbtRef {
                     // only name is hydrated for parity with Mantle
                     name: model_name.clone(),
@@ -250,7 +255,22 @@ pub async fn resolve_semantic_models(
                     version: None,
                     location: None,
                 }],
-                label: None, // no semantic model level label (could maybe inherit from model?)
+                sources: vec![],
+                functions: vec![],
+                metrics: vec![],
+                depends_on: NodeDependsOn {
+                    nodes: vec![model_unique_id.clone()],
+                    macros: vec![],
+                    nodes_with_ref_location: vec![],
+                },
+                quoting_ignore_case: false,
+            },
+            __semantic_model_attr__: DbtSemanticModelAttr {
+                unrendered_config: BTreeMap::new(), // TODO: do we need to hydrate?
+                group: semantic_model_config.group.clone(),
+                created_at: chrono::Utc::now().timestamp() as f64,
+                metadata: None, // deprioritized feature. always null for now.
+                label: None,    // no semantic model level label (could maybe inherit from model?)
                 model: format!("ref('{model_name}')"),
                 node_relation: Some(node_relation),
                 defaults: Some(SemanticModelDefaults {
@@ -302,7 +322,7 @@ pub fn model_props_to_semantic_entities(model_props: ModelProperties) -> Vec<Sem
                 name: column_entity_config.name.unwrap_or_default(),
                 entity_type: column_entity_config.type_,
                 description: column_entity_config.description,
-                expr: None, // only applicable for derived_semantics
+                expr: Some(column.name.clone()),
                 label: column_entity_config.label,
                 config: column_entity_config.config,
                 // fields below are always null (for now)
@@ -375,7 +395,7 @@ pub fn model_props_to_dimensions(model_props: ModelProperties) -> Vec<Dimension>
                 column_name: Some(column.name.clone()),
                 dimension_type: column_dimension_config.type_.clone(),
                 description: column_dimension_config.description,
-                expr: None, // only applicable for derived_semantics
+                expr: Some(column.name.clone()),
                 label: column_dimension_config.label,
                 is_partition: column_dimension_config.is_partition.unwrap_or(false),
                 type_params,

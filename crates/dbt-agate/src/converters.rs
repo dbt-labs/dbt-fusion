@@ -3,16 +3,19 @@
 //!
 
 use arrow::array::{AsArray as _, PrimitiveArray};
-use arrow::buffer::{BooleanBuffer, NullBuffer, ScalarBuffer};
+use arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow::compute::{CastOptions, cast_with_options};
 use arrow::datatypes::*;
 use arrow::util::display::FormatOptions;
-use arrow_array::{Array, ArrowPrimitiveType, BooleanArray, GenericByteArray, OffsetSizeTrait};
+use arrow_array::{
+    Array, ArrowPrimitiveType, BooleanArray, GenericByteArray, GenericListArray, MapArray,
+    OffsetSizeTrait,
+};
 use arrow_buffer::i256;
 use arrow_schema::ArrowError;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use chrono_tz::Tz;
-use minijinja::Value;
+use minijinja::{Value, value::ValueMap};
 use minijinja_contrib::modules::py_datetime::date::PyDate;
 use minijinja_contrib::modules::py_datetime::datetime::PyDateTime;
 use minijinja_contrib::modules::py_datetime::time::PyTime;
@@ -129,6 +132,18 @@ impl<T: DecimalType> DecimalArrayConverter<T> {
 
 trait ConvertibleToI128 {
     fn to_i128(self) -> Option<i128>;
+}
+
+impl ConvertibleToI128 for i32 {
+    fn to_i128(self) -> Option<i128> {
+        Some(self as i128)
+    }
+}
+
+impl ConvertibleToI128 for i64 {
+    fn to_i128(self) -> Option<i128> {
+        Some(self as i128)
+    }
 }
 
 impl ConvertibleToI128 for i128 {
@@ -468,6 +483,108 @@ type BinaryArrayConverter = GenericBinaryArrayConverter<i32>;
 // type LargeBinaryArrayConverter = GenericBinaryArrayConverter<i64>;
 // }}}
 
+// List {{{
+struct GenericListArrayConverter<O: OffsetSizeTrait> {
+    offsets: OffsetBuffer<O>,
+    child: Box<dyn ArrayConverter>,
+    nulls: Option<NullBuffer>,
+}
+
+impl<O: OffsetSizeTrait> GenericListArrayConverter<O> {
+    pub fn new(list_array: &GenericListArray<O>) -> Result<Self, ArrowError> {
+        let child_array = list_array.values();
+        let child = make_array_converter(child_array.as_ref())?;
+        Ok(Self {
+            offsets: list_array.offsets().clone(),
+            child,
+            nulls: list_array.nulls().cloned(),
+        })
+    }
+
+    #[inline(always)]
+    pub fn is_valid(&self, idx: usize) -> bool {
+        self.nulls.as_ref().is_none_or(|nulls| nulls.is_valid(idx))
+    }
+
+    #[inline(always)]
+    fn range_for(&self, idx: usize) -> std::ops::Range<usize> {
+        let start = self.offsets[idx].as_usize();
+        let end = self.offsets[idx + 1].as_usize();
+        start..end
+    }
+}
+
+impl<O: OffsetSizeTrait> ArrayConverter for GenericListArrayConverter<O> {
+    fn to_value(&self, idx: usize) -> Value {
+        if self.is_valid(idx) {
+            let range = self.range_for(idx);
+            let mut elems = Vec::with_capacity(range.len());
+
+            for child_idx in range {
+                elems.push(self.child.to_value(child_idx));
+            }
+            Value::from(elems)
+        } else {
+            Value::from(())
+        }
+    }
+}
+
+type ListArrayConverter = GenericListArrayConverter<i32>;
+type LargeListArrayConverter = GenericListArrayConverter<i64>;
+// }}}
+
+// Map {{{
+struct MapConverter {
+    keys: Box<dyn ArrayConverter>,
+    values: Box<dyn ArrayConverter>,
+    offsets: OffsetBuffer<i32>,
+    nulls: Option<NullBuffer>,
+}
+
+impl MapConverter {
+    pub fn new(array: &MapArray) -> Result<Self, ArrowError> {
+        let keys = make_array_converter(array.keys().as_ref())?;
+        let values = make_array_converter(array.values().as_ref())?;
+        Ok(Self {
+            keys,
+            values,
+            offsets: array.offsets().clone(),
+            nulls: array.nulls().cloned(),
+        })
+    }
+
+    #[inline(always)]
+    pub fn is_valid(&self, idx: usize) -> bool {
+        self.nulls.as_ref().is_none_or(|nulls| nulls.is_valid(idx))
+    }
+
+    #[inline(always)]
+    fn range_for(&self, idx: usize) -> std::ops::Range<usize> {
+        let start = self.offsets[idx].as_usize();
+        let end = self.offsets[idx + 1].as_usize();
+        start..end
+    }
+}
+
+impl ArrayConverter for MapConverter {
+    fn to_value(&self, idx: usize) -> Value {
+        if self.is_valid(idx) {
+            let npairs = self.range_for(idx);
+            let mut elems = ValueMap::with_capacity(npairs.len());
+
+            for idx in npairs {
+                elems.insert(self.keys.to_value(idx), self.values.to_value(idx));
+            }
+            Value::from(elems)
+        } else {
+            Value::from(())
+        }
+    }
+}
+
+// }}}
+
 pub fn make_array_converter(array: &dyn Array) -> Result<Box<dyn ArrayConverter>, ArrowError> {
     let converter: Box<dyn ArrayConverter> = match array.data_type() {
         DataType::Boolean => Box::new(BooleanArrayConverter::new(array.as_boolean())),
@@ -500,6 +617,12 @@ pub fn make_array_converter(array: &dyn Array) -> Result<Box<dyn ArrayConverter>
         )),
         DataType::Float64 => Box::new(PrimitiveArrayConverter::<Float64Type>::new(
             array.as_primitive::<Float64Type>(),
+        )),
+        DataType::Decimal32(_, _) => Box::new(DecimalArrayConverter::<Decimal32Type>::new(
+            array.as_primitive::<Decimal32Type>(),
+        )),
+        DataType::Decimal64(_, _) => Box::new(DecimalArrayConverter::<Decimal64Type>::new(
+            array.as_primitive::<Decimal64Type>(),
         )),
         DataType::Decimal128(_, _) => Box::new(DecimalArrayConverter::<Decimal128Type>::new(
             array.as_primitive::<Decimal128Type>(),
@@ -559,6 +682,11 @@ pub fn make_array_converter(array: &dyn Array) -> Result<Box<dyn ArrayConverter>
                 maybe_tz.clone(),
             ))
         }
+        DataType::List(_field) => Box::new(ListArrayConverter::new(array.as_list::<i32>())?),
+        DataType::LargeList(_field) => {
+            Box::new(LargeListArrayConverter::new(array.as_list::<i64>())?)
+        }
+        DataType::Map(_field, _is_sorted) => Box::new(MapConverter::new(array.as_map())?),
         _ => {
             // FALLBACK: Turn every Arrow value into a [minijinja::Value] string.
             let format_options = FormatOptions::new().with_null("None");
@@ -579,10 +707,13 @@ mod tests {
     use arrow::compute::kernels::cast_utils::Parser as _;
     use arrow_array::{
         ArrayRef, Date32Array, Date64Array, Decimal128Array, Decimal256Array, Float64Array,
-        Int32Array, Int64Array, StringArray, Time32MillisecondArray, Time32SecondArray,
-        Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
-        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt64Array,
+        Int32Array, Int64Array, LargeListArray, ListArray, StringArray, Time32MillisecondArray,
+        Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray, UInt64Array,
+        builder::{Int32Builder, ListBuilder, MapBuilder, StringBuilder},
     };
+
     use arrow_buffer::Buffer;
     use arrow_data::ArrayData;
     use arrow_data::decimal::MAX_DECIMAL128_FOR_EACH_PRECISION;
@@ -940,5 +1071,113 @@ mod tests {
     #[test]
     fn test_timestamp_nanos_values() {
         assert_timestamp_values!(TimestampNanosecondArray, 1_000_000_000);
+    }
+
+    #[test]
+    fn test_list_values() {
+        let data = vec![Some(vec![Some(1), Some(2)]), Some(vec![Some(3)]), None];
+
+        let array: ArrayRef = Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(data));
+
+        let result = arrow_to_values(&array).unwrap();
+
+        assert_eq!(
+            result,
+            vec![
+                Value::from(vec![Value::from(1), Value::from(2)]),
+                Value::from(vec![Value::from(3)]),
+                Value::from(()), // null row
+            ]
+        );
+    }
+
+    #[test]
+    fn test_large_list_values() {
+        let data = vec![Some(vec![Some(1), Some(2)]), Some(vec![Some(3)]), None];
+
+        let array: ArrayRef =
+            Arc::new(LargeListArray::from_iter_primitive::<Int32Type, _, _>(data));
+
+        let result = arrow_to_values(&array).unwrap();
+
+        assert_eq!(
+            result,
+            vec![
+                Value::from(vec![Value::from(1), Value::from(2)]),
+                Value::from(vec![Value::from(3)]),
+                Value::from(()), // null row
+            ]
+        );
+    }
+
+    #[test]
+    fn test_nested_list() {
+        let inner_values_builder = ListBuilder::new(Int32Builder::new());
+        let mut outer_builder = ListBuilder::new(inner_values_builder);
+
+        {
+            let inner_builder = outer_builder.values();
+
+            inner_builder.values().append_value(1);
+            inner_builder.append(true);
+
+            inner_builder.values().append_value(2);
+            inner_builder.append(true);
+
+            outer_builder.append(true);
+        }
+
+        outer_builder.append(false);
+
+        let array: ArrayRef = Arc::new(outer_builder.finish());
+        let result = arrow_to_values(&array).unwrap();
+
+        assert_eq!(
+            result,
+            vec![
+                Value::from(vec![vec![Value::from(1)], vec![Value::from(2)],]),
+                Value::from(()), // null row
+            ]
+        );
+    }
+
+    #[test]
+    fn test_map_column_with_nulls() {
+        let string_builder = StringBuilder::new();
+        let int_builder = Int32Builder::with_capacity(4);
+
+        // {"joe": 1}, {"blogs": 2, "foo": 4}, {}, null]
+        let mut builder = MapBuilder::new(None, string_builder, int_builder);
+
+        builder.keys().append_value("joe");
+        builder.values().append_value(1);
+        builder.append(true).unwrap();
+
+        builder.keys().append_value("blogs");
+        builder.values().append_value(2);
+        builder.keys().append_value("foo");
+        builder.values().append_value(4);
+        builder.append(true).unwrap();
+        builder.append(true).unwrap();
+        builder.append(false).unwrap();
+
+        let array = builder.finish();
+        let result = arrow_to_values(&array).unwrap();
+        let mut m1 = ValueMap::new();
+        m1.insert(Value::from("joe"), Value::from(1));
+
+        let mut m2 = ValueMap::new();
+        m2.insert(Value::from("blogs"), Value::from(2));
+        m2.insert(Value::from("foo"), Value::from(4));
+
+        assert_eq!(
+            result,
+            vec![
+                Value::from(m1),
+                Value::from(m2),
+                Value::from(ValueMap::new()), // empty dict
+                Value::from(())               // None
+            ]
+        );
     }
 }

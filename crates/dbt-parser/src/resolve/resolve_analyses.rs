@@ -4,8 +4,10 @@ use std::{collections::BTreeMap, sync::Arc};
 use dbt_common::adapter::AdapterType;
 use dbt_common::cancellation::CancellationToken;
 use dbt_common::io_args::StaticAnalysisKind;
-use dbt_common::{ErrorCode, FsResult, error::AbstractLocation, fs_err, show_warning};
+use dbt_common::tracing::emit::emit_warn_log_from_fs_error;
+use dbt_common::{ErrorCode, FsResult, error::AbstractLocation, fs_err};
 use dbt_jinja_utils::jinja_environment::JinjaEnv;
+use dbt_jinja_utils::listener::DefaultJinjaTypeCheckEventListenerFactory;
 use dbt_jinja_utils::utils::dependency_package_name_from_ctx;
 use dbt_schemas::schemas::common::{DbtMaterialization, DbtQuoting, ResolvedQuoting};
 use dbt_schemas::schemas::dbt_column::process_columns;
@@ -30,9 +32,7 @@ use crate::utils::{RelationComponents, update_node_relation_components};
 use crate::{
     args::ResolveArgs,
     renderer::{SqlFileRenderResult, render_unresolved_sql_files},
-    utils::{
-        convert_macro_names_to_unique_ids, get_node_fqn, get_original_file_path, get_unique_id,
-    },
+    utils::{get_node_fqn, get_original_file_path, get_unique_id},
 };
 
 /// Resolve analysis resources for a package into models and rendered SQL, updating refs/sources.
@@ -58,6 +58,8 @@ pub async fn resolve_analyses(
 )> {
     let mut analyses: HashMap<String, Arc<DbtAnalysis>> = HashMap::new();
     let mut rendering_results: HashMap<String, (String, MacroSpans)> = HashMap::new();
+    let jinja_type_checking_event_listener_factory =
+        Arc::new(DefaultJinjaTypeCheckEventListenerFactory::default());
 
     let local_project_config = if package.dbt_project.name == root_project.name {
         root_project_configs.analyses.clone()
@@ -67,7 +69,7 @@ pub async fn resolve_analyses(
             &package.dbt_project.analyses,
             AnalysesConfig {
                 enabled: Some(true),
-                static_analysis: Some(StaticAnalysisKind::Off),
+                static_analysis: Some(StaticAnalysisKind::Off.into()),
                 ..Default::default()
             },
             dependency_package_name_from_ctx(&env, base_ctx),
@@ -103,6 +105,7 @@ pub async fn resolve_analyses(
             &package.analysis_files,
             analysis_properties,
             token,
+            jinja_type_checking_event_listener_factory.clone(),
         )
         .await?;
     // make deterministic
@@ -114,12 +117,17 @@ pub async fn resolve_analyses(
             .then(a.asset.path.cmp(&b.asset.path))
     });
 
+    let all_depends_on = jinja_type_checking_event_listener_factory
+        .all_depends_on
+        .read()
+        .unwrap()
+        .clone();
+
     for SqlFileRenderResult {
         asset: dbt_asset,
         sql_file_info,
         rendered_sql,
         macro_spans,
-        macro_calls,
         properties: maybe_properties,
         status,
         patch_path,
@@ -171,6 +179,12 @@ pub async fn resolve_analyses(
         )?;
 
         let is_enabled = matches!(status, ModelStatus::Enabled);
+        let macro_depends_on = all_depends_on
+            .get(&format!("{package_name}.{analysis_name}"))
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
 
         let mut dbt_analysis = DbtAnalysis {
             __common_attr__: CommonAttributes {
@@ -206,11 +220,12 @@ pub async fn resolve_analyses(
                 quoting_ignore_case: false,
                 static_analysis: analysis_config
                     .static_analysis
-                    .unwrap_or(StaticAnalysisKind::Unsafe),
+                    .clone()
+                    .unwrap_or_else(|| StaticAnalysisKind::Unsafe.into()),
                 static_analysis_off_reason: None,
                 columns,
                 depends_on: NodeDependsOn {
-                    macros: convert_macro_names_to_unique_ids(&macro_calls),
+                    macros: macro_depends_on,
                     nodes: vec![],
                     nodes_with_ref_location: vec![],
                 },
@@ -284,7 +299,7 @@ pub async fn resolve_analyses(
                 "Unused schema.yml entry for analysis '{}'",
                 analysis_name,
             );
-            show_warning!(&arg.io, err);
+            emit_warn_log_from_fs_error(&err, arg.io.status_reporter.as_ref());
         }
     }
 

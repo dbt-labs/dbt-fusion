@@ -184,6 +184,7 @@ impl DbConfig {
                 "compute_region",
                 "dataproc_cluster_name",
                 "gcs_bucket",
+                "submission_method",
                 "dataproc_batch",
             ],
             DbConfig::Redshift(_) => &[
@@ -463,6 +464,19 @@ pub struct RedshiftDbConfig {
     pub region: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub threads: Option<StringOrInteger>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[merge(strategy = merge_strategies_extend::overwrite_always)]
+    pub token_endpoint: Option<HashMap<String, YmlValue>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idc_region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idp_listen_port: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idc_client_display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idp_response_timeout: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, JsonSchema, Merge)]
@@ -486,6 +500,8 @@ pub struct SnowflakeDbConfig {
     pub connect_retries: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connect_timeout: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_timeout: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reuse_connections: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -590,6 +606,8 @@ pub struct BigqueryDbConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub priority: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota_project: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub maximum_bytes_billed: Option<i64>,
@@ -627,6 +645,8 @@ pub struct BigqueryDbConfig {
     pub dataproc_region: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gcs_bucket: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub submission_method: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub job_creation_timeout_seconds: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -805,6 +825,7 @@ pub struct SnowflakeTargetEnv {
     pub insecure_mode: bool,  // Default: false
     pub connect_retries: i64, // Default: 1
     pub connect_timeout: Option<i64>,
+    pub request_timeout: Option<i64>,
     pub retry_on_database_errors: bool, // Default: false
     pub retry_all: bool,                // Default: false
     pub reuse_connections: Option<bool>,
@@ -833,6 +854,7 @@ pub struct BigqueryTargetEnv {
     pub maximum_bytes_billed: Option<i64>,
     pub method: Option<String>,
     pub priority: Option<String>,
+    pub quota_project: Option<String>,
     pub retries: Option<i64>,
     pub target_name: Option<String>,
     pub timeout_seconds: Option<i64>,
@@ -858,9 +880,17 @@ pub struct DatabricksTargetEnv {
 }
 
 #[derive(Serialize, JsonSchema)]
+pub struct RedshiftTokenEndpoint {
+    pub r#type: String,
+    pub request_url: String,
+    pub idp_auth_credentials: Option<String>,
+    pub request_data: String,
+}
+
+#[derive(Serialize, JsonSchema)]
 pub struct RedshiftTargetEnv {
     pub host: String,
-    pub user: String,
+    pub user: Option<String>,
     pub port: StringOrInteger,
     pub method: Option<String>,
     pub cluster_id: Option<String>,
@@ -881,6 +911,12 @@ pub struct RedshiftTargetEnv {
     pub is_serverless: Option<bool>,
     pub serverless_work_group: Option<String>,
     pub serverless_acct_id: Option<String>,
+    pub token_endpoint: Option<HashMap<String, YmlValue>>,
+    pub idc_region: Option<String>,
+    pub issuer_url: Option<String>,
+    pub idp_listen_port: Option<i64>,
+    pub idc_client_display_name: Option<String>,
+    pub idp_response_timeout: Option<i64>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -917,6 +953,7 @@ impl TryFrom<DbConfig> for TargetContext {
                     protocol: config.protocol,
                     connect_retries: config.connect_retries.unwrap_or(1),
                     connect_timeout: config.connect_timeout,
+                    request_timeout: config.request_timeout,
                     retry_on_database_errors: config.retry_on_database_errors.unwrap_or(false),
                     retry_all: config.retry_all.unwrap_or(false),
                     reuse_connections: config.reuse_connections,
@@ -1025,6 +1062,7 @@ impl TryFrom<DbConfig> for TargetContext {
                     maximum_bytes_billed: config.maximum_bytes_billed,
                     method: config.method.clone(),
                     priority: config.priority.clone(),
+                    quota_project: config.quota_project.clone(),
                     retries: config.retries,
                     target_name: config.target_name.clone(),
                     timeout_seconds: config.timeout_seconds,
@@ -1055,7 +1093,7 @@ impl TryFrom<DbConfig> for TargetContext {
                     .ok_or_else(|| missing("dbname or database"))?;
                 Ok(TargetContext::Redshift(RedshiftTargetEnv {
                     host: config.host.ok_or_else(|| missing("host"))?,
-                    user: config.user.ok_or_else(|| missing("user"))?,
+                    user: config.user,
                     port: config.port.ok_or_else(|| missing("port"))?,
                     method: config.method,
                     cluster_id: config.cluster_id,
@@ -1081,6 +1119,12 @@ impl TryFrom<DbConfig> for TargetContext {
                     is_serverless: None,
                     serverless_work_group: None,
                     serverless_acct_id: None,
+                    token_endpoint: config.token_endpoint,
+                    idc_region: config.idc_region,
+                    idc_client_display_name: config.idc_client_display_name,
+                    issuer_url: config.issuer_url,
+                    idp_listen_port: config.idp_listen_port,
+                    idp_response_timeout: config.idp_response_timeout,
                 }))
             }
 

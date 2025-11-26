@@ -45,6 +45,8 @@ pub enum Backend {
     Redshift,
     /// Salesforce driver implementation (ADBC).
     Salesforce,
+    /// DuckDB driver implementation (ADBC).
+    DuckDB,
     /// Databricks driver implementation (ODBC).
     DatabricksODBC,
     /// Redshift driver implementation (ODBC).
@@ -73,6 +75,7 @@ impl Display for Backend {
             Backend::Postgres => write!(f, "PostgreSQL"),
             Backend::Databricks => write!(f, "Databricks"),
             Backend::Redshift => write!(f, "Redshift"),
+            Backend::DuckDB => write!(f, "DuckDB"),
             Backend::DatabricksODBC => write!(f, "Databricks"),
             Backend::RedshiftODBC => write!(f, "Redshift"),
             Backend::Salesforce => write!(f, "Salesforce"),
@@ -90,6 +93,7 @@ impl Backend {
             Backend::Databricks => Some("adbc_driver_databricks"),
             Backend::Salesforce => Some("adbc_driver_salesforce"),
             Backend::Redshift => Some("adbc_driver_redshift"),
+            Backend::DuckDB => Some("duckdb"),
             Backend::DatabricksODBC | Backend::RedshiftODBC => None, // these use ODBC
             Backend::Generic { library_name, .. } => Some(library_name),
         }
@@ -98,6 +102,7 @@ impl Backend {
     pub fn adbc_driver_entrypoint(&self) -> Option<&'static [u8]> {
         match self {
             Backend::Snowflake => Some(b"SnowflakeDriverInit"),
+            Backend::DuckDB => Some(b"duckdb_adbc_init"),
             Backend::Generic {
                 library_name: _,
                 entrypoint,
@@ -114,6 +119,7 @@ impl Backend {
             | Backend::Databricks
             | Backend::Redshift
             | Backend::Salesforce
+            | Backend::DuckDB
             | Backend::Generic { .. } => FFIProtocol::Adbc,
             Backend::DatabricksODBC | Backend::RedshiftODBC => FFIProtocol::Odbc,
         }
@@ -312,6 +318,7 @@ impl AdbcDriver {
             | Backend::Postgres
             | Backend::Databricks
             | Backend::Redshift
+            | Backend::DuckDB
             | Backend::Salesforce => {
                 debug_assert!(backend.ffi_protocol() == FFIProtocol::Adbc);
                 debug_assert!(install::is_installable_driver(backend));
@@ -501,6 +508,8 @@ mod tests {
         try_load_with_builder(Backend::BigQuery, AdbcVersion::V100)?;
         try_load_with_builder(Backend::Postgres, AdbcVersion::V100)?;
         try_load_with_builder(Backend::Databricks, AdbcVersion::V100)?;
+        try_load_with_builder(Backend::DuckDB, AdbcVersion::V100)?;
+        try_load_with_builder(Backend::Salesforce, AdbcVersion::V100)?;
         Ok(())
     }
 
@@ -511,6 +520,8 @@ mod tests {
         try_load_with_builder(Backend::BigQuery, AdbcVersion::V110)?;
         try_load_with_builder(Backend::Postgres, AdbcVersion::V110)?;
         try_load_with_builder(Backend::Databricks, AdbcVersion::V110)?;
+        try_load_with_builder(Backend::DuckDB, AdbcVersion::V110)?;
+        try_load_with_builder(Backend::Salesforce, AdbcVersion::V110)?;
         Ok(())
     }
 
@@ -522,6 +533,8 @@ mod tests {
             Backend::BigQuery,
             Backend::Postgres,
             Backend::Databricks,
+            Backend::DuckDB,
+            Backend::Salesforce,
         ]
         .iter()
         .copied()

@@ -1,9 +1,8 @@
 use dbt_common::io_args::StaticAnalysisKind;
-use dbt_serde_yaml::{JsonSchema, ShouldBe};
+use dbt_serde_yaml::{JsonSchema, ShouldBe, Spanned};
 use serde::{Deserialize, Serialize};
 // Type aliases for clarity
 type YmlValue = dbt_serde_yaml::Value;
-use serde_with::skip_serializing_none;
 use std::collections::BTreeMap;
 use std::collections::btree_map::Iter;
 
@@ -14,12 +13,12 @@ use crate::schemas::manifest::postgres::PostgresIndex;
 use crate::schemas::manifest::{BigqueryClusterConfig, PartitionConfig};
 use crate::schemas::project::configs::common::WarehouseSpecificNodeConfig;
 use crate::schemas::project::configs::common::{default_meta_and_tags, default_quoting};
-use crate::schemas::project::{DefaultTo, IterChildren};
+use crate::schemas::project::{DefaultTo, TypedRecursiveConfig};
 use crate::schemas::serde::{
     StringOrArrayOfStrings, bool_or_string_bool, f64_or_string_f64, u64_or_string_u64,
 };
 
-#[skip_serializing_none]
+// NOTE: No #[skip_serializing_none] - we handle None serialization in serialize_with_mode
 #[derive(Deserialize, Serialize, Debug, Clone, JsonSchema)]
 pub struct ProjectSourceConfig {
     #[serde(default, rename = "+enabled", deserialize_with = "bool_or_string_bool")]
@@ -39,7 +38,7 @@ pub struct ProjectSourceConfig {
     #[serde(rename = "+loaded_at_field")]
     pub loaded_at_field: Option<String>,
     #[serde(rename = "+static_analysis")]
-    pub static_analysis: Option<StaticAnalysisKind>,
+    pub static_analysis: Option<Spanned<StaticAnalysisKind>>,
 
     // Snowflake specific fields
     #[serde(rename = "+adapter_properties")]
@@ -136,14 +135,13 @@ pub struct ProjectSourceConfig {
         deserialize_with = "f64_or_string_f64"
     )]
     pub refresh_interval_minutes: Option<f64>,
-    #[serde(rename = "+description")]
-    pub description: Option<String>,
     #[serde(rename = "+max_staleness")]
     pub max_staleness: Option<String>,
-
     // Databricks specific fields
     #[serde(rename = "+file_format")]
     pub file_format: Option<String>,
+    #[serde(rename = "+catalog_name")]
+    pub catalog_name: Option<String>,
     #[serde(rename = "+location_root")]
     pub location_root: Option<String>,
     #[serde(rename = "+tblproperties")]
@@ -247,13 +245,17 @@ pub struct ProjectSourceConfig {
     pub __additional_properties__: BTreeMap<String, ShouldBe<ProjectSourceConfig>>,
 }
 
-impl IterChildren<ProjectSourceConfig> for ProjectSourceConfig {
+impl TypedRecursiveConfig for ProjectSourceConfig {
+    fn type_name() -> &'static str {
+        "source"
+    }
+
     fn iter_children(&self) -> Iter<'_, String, ShouldBe<Self>> {
         self.__additional_properties__.iter()
     }
 }
 
-#[skip_serializing_none]
+// NOTE: No #[skip_serializing_none] - we handle None serialization in serialize_with_mode
 #[derive(Deserialize, Serialize, Debug, Clone, Default, PartialEq, JsonSchema)]
 pub struct SourceConfig {
     #[serde(default, deserialize_with = "bool_or_string_bool")]
@@ -265,8 +267,7 @@ pub struct SourceConfig {
     pub quoting: Option<DbtQuoting>,
     pub loaded_at_field: Option<String>,
     pub loaded_at_query: Option<String>,
-    pub static_analysis: Option<StaticAnalysisKind>,
-    pub description: Option<String>,
+    pub static_analysis: Option<Spanned<StaticAnalysisKind>>,
     // Adapter specific configs
     pub __warehouse_specific_config__: WarehouseSpecificNodeConfig,
 }
@@ -283,8 +284,8 @@ impl From<ProjectSourceConfig> for SourceConfig {
             loaded_at_field: config.loaded_at_field,
             loaded_at_query: config.loaded_at_query,
             static_analysis: config.static_analysis,
-            description: config.description,
             __warehouse_specific_config__: WarehouseSpecificNodeConfig {
+                description: None, // Only for Bigquery Models
                 adapter_properties: config.adapter_properties,
                 external_volume: config.external_volume,
                 base_location_root: config.base_location_root,
@@ -314,9 +315,15 @@ impl From<ProjectSourceConfig> for SourceConfig {
                 partitions: config.partitions,
                 enable_refresh: config.enable_refresh,
                 refresh_interval_minutes: config.refresh_interval_minutes,
+                resource_tags: None,
                 max_staleness: config.max_staleness,
+                jar_file_uri: None,
+                timeout: None,
+                batch_id: None,
+                dataproc_cluster_name: None,
 
                 file_format: config.file_format,
+                catalog_name: config.catalog_name,
                 location_root: config.location_root,
                 tblproperties: config.tblproperties,
                 include_full_name_in_path: config.include_full_name_in_path,
@@ -372,7 +379,6 @@ impl From<SourceConfig> for ProjectSourceConfig {
             loaded_at_field: config.loaded_at_field,
             loaded_at_query: config.loaded_at_query,
             static_analysis: config.static_analysis,
-            description: config.description,
             // Snowflake fields
             adapter_properties: config.__warehouse_specific_config__.adapter_properties,
             external_volume: config.__warehouse_specific_config__.external_volume,
@@ -412,6 +418,7 @@ impl From<SourceConfig> for ProjectSourceConfig {
             max_staleness: config.__warehouse_specific_config__.max_staleness,
             // Databricks fields
             file_format: config.__warehouse_specific_config__.file_format,
+            catalog_name: config.__warehouse_specific_config__.catalog_name,
             location_root: config.__warehouse_specific_config__.location_root,
             tblproperties: config.__warehouse_specific_config__.tblproperties,
             include_full_name_in_path: config
@@ -476,7 +483,6 @@ impl DefaultTo<SourceConfig> for SourceConfig {
             loaded_at_field,
             loaded_at_query,
             static_analysis,
-            description,
             __warehouse_specific_config__: warehouse_specific_config,
         } = self;
 
@@ -501,7 +507,6 @@ impl DefaultTo<SourceConfig> for SourceConfig {
                 loaded_at_field,
                 loaded_at_query,
                 static_analysis,
-                description
             ]
         );
     }

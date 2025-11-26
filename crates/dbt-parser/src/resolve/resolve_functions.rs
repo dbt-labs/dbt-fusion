@@ -4,7 +4,9 @@ use std::{collections::BTreeMap, sync::Arc};
 use dbt_common::adapter::AdapterType;
 use dbt_common::cancellation::CancellationToken;
 use dbt_common::io_args::StaticAnalysisKind;
-use dbt_common::{FsResult, error::AbstractLocation, show_error};
+use dbt_common::tracing::emit::emit_error_log_from_fs_error;
+use dbt_common::{FsResult, error::AbstractLocation};
+use dbt_jinja_utils::listener::DefaultJinjaTypeCheckEventListenerFactory;
 use dbt_jinja_utils::utils::dependency_package_name_from_ctx;
 use dbt_jinja_utils::{jinja_environment::JinjaEnv, node_resolver::NodeResolver};
 use dbt_schemas::schemas::DbtFunctionAttr;
@@ -28,9 +30,7 @@ use crate::utils::{RelationComponents, update_node_relation_components};
 use crate::{
     args::ResolveArgs,
     renderer::{SqlFileRenderResult, render_unresolved_sql_files},
-    utils::{
-        convert_macro_names_to_unique_ids, get_node_fqn, get_original_file_path, get_unique_id,
-    },
+    utils::{get_node_fqn, get_original_file_path, get_unique_id},
 };
 
 use super::resolve_properties::MinimalPropertiesEntry;
@@ -60,12 +60,12 @@ pub async fn resolve_functions(
     let mut rendering_results: HashMap<String, (String, MacroSpans)> = HashMap::new();
 
     let local_project_config = if package.dbt_project.name == root_project.name {
-        root_project_configs.models.clone()
+        root_project_configs.functions.clone()
     } else {
         init_project_config(
             &arg.io,
-            &package.dbt_project.models,
-            dbt_schemas::schemas::project::ModelConfig {
+            &package.dbt_project.functions,
+            FunctionConfig {
                 enabled: Some(true),
                 quoting: Some(package_quoting),
                 ..Default::default()
@@ -78,7 +78,7 @@ pub async fn resolve_functions(
         inner: Arc::new(RenderCtxInner {
             args: arg.clone(),
             root_project_name: root_project.name.clone(),
-            root_project_config: root_project_configs.models.clone(),
+            root_project_config: root_project_configs.functions.clone(),
             package_quoting,
             base_ctx: base_ctx.clone(),
             package_name: package_name.to_string(),
@@ -97,16 +97,15 @@ pub async fn resolve_functions(
         runtime_config: runtime_config.clone(),
     };
 
-    let mut function_sql_resources_map = render_unresolved_sql_files::<
-        dbt_schemas::schemas::project::ModelConfig,
-        FunctionProperties,
-    >(
-        &render_ctx,
-        &package.function_sql_files,
-        function_properties,
-        token,
-    )
-    .await?;
+    let mut function_sql_resources_map =
+        render_unresolved_sql_files::<FunctionConfig, FunctionProperties>(
+            &render_ctx,
+            &package.function_sql_files,
+            function_properties,
+            token,
+            Arc::new(DefaultJinjaTypeCheckEventListenerFactory::default()),
+        )
+        .await?;
     // make deterministic
     function_sql_resources_map.sort_by(|a, b| {
         a.asset
@@ -121,7 +120,6 @@ pub async fn resolve_functions(
         sql_file_info,
         rendered_sql,
         macro_spans,
-        macro_calls,
         properties: maybe_properties,
         status,
         patch_path,
@@ -153,7 +151,7 @@ pub async fn resolve_functions(
         };
 
         let depends_on = NodeDependsOn {
-            macros: convert_macro_names_to_unique_ids(&macro_calls),
+            macros: vec![],
             nodes: vec![],
             nodes_with_ref_location: vec![],
         };
@@ -171,7 +169,9 @@ pub async fn resolve_functions(
                 patch_path,
                 fqn,
                 description: properties.description,
-                raw_code: Some(rendered_sql.clone()),
+                // NOTE: raw_code has to be this value for consistency with models
+                // The actual rendered SQL is stored in rendering_results
+                raw_code: Some("--placeholder--".to_string()),
                 checksum: sql_file_info.checksum,
                 language: properties.language.clone(),
                 tags: model_config
@@ -187,7 +187,7 @@ pub async fn resolve_functions(
                 alias: "".to_owned(),           // will be updated below
                 relation_name: None,            // will be updated below
                 materialized: dbt_schemas::schemas::common::DbtMaterialization::Function,
-                static_analysis: StaticAnalysisKind::On,
+                static_analysis: StaticAnalysisKind::On.into(),
                 static_analysis_off_reason: None,
                 quoting: package_quoting
                     .try_into()
@@ -196,7 +196,7 @@ pub async fn resolve_functions(
                 enabled: model_config.enabled.unwrap_or(true),
                 extended_model: false,
                 persist_docs: None,
-                columns: BTreeMap::new(),
+                columns: vec![],
                 depends_on,
                 refs: sql_file_info
                     .refs
@@ -242,13 +242,13 @@ pub async fn resolve_functions(
                     .and_then(|c| c.on_configuration_change.clone()),
                 returns: properties.returns.clone(),
                 arguments: properties.arguments.clone(),
-                function_kind: properties.function_kind.clone().unwrap_or_default(),
             },
             deprecated_config: FunctionConfig {
                 enabled: model_config.enabled,
                 group: model_config.group.clone(),
                 tags: model_config.tags.clone(),
                 meta: model_config.meta.clone(),
+                function_kind: model_config.function_kind.clone(),
                 ..Default::default()
             },
             __other__: BTreeMap::new(),
@@ -275,7 +275,8 @@ pub async fn resolve_functions(
         match node_resolver.insert_function(&function, adapter_type, status) {
             Ok(_) => (),
             Err(e) => {
-                show_error!(&arg.io, e.with_location(dbt_asset.path.clone()));
+                let err_with_loc = e.with_location(dbt_asset.path.clone());
+                emit_error_log_from_fs_error(&err_with_loc, arg.io.status_reporter.as_ref());
             }
         }
 

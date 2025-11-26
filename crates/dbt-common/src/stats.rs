@@ -1,11 +1,5 @@
 use chrono::{DateTime, Local};
-use dbt_telemetry::{
-    NodeCacheReason, NodeErrorType, NodeEvaluated, NodeOutcome, NodeSkipReason, NodeType,
-    TestEvaluationDetail, TestOutcome,
-};
-use proto_rust::impls::node::update_dbt_core_event_code_for_node_evaluation_end;
-use proto_rust::v1::public::events::fusion::node::NodeCacheDetail;
-use proto_rust::v1::public::events::fusion::node::node_evaluated::NodeOutcomeDetail;
+use dbt_telemetry::NodeOutcome;
 use std::fmt;
 use std::time::{Duration, SystemTime};
 use strum_macros::EnumString;
@@ -22,7 +16,7 @@ pub enum NodeStatus {
     TestPassed,
     SkippedUpstreamFailed,
     ReusedNoChanges(String),
-    ReusedStillFresh(String),
+    ReusedStillFresh(String, u64, u64),
     ReusedStillFreshNoChanges(String),
     NoOp,
 }
@@ -31,7 +25,7 @@ impl NodeStatus {
     pub fn get_message(&self) -> Option<String> {
         match self {
             NodeStatus::ReusedNoChanges(message) => Some(message.clone()),
-            NodeStatus::ReusedStillFresh(message) => Some(message.clone()),
+            NodeStatus::ReusedStillFresh(message, _, _) => Some(message.clone()),
             NodeStatus::ReusedStillFreshNoChanges(message) => Some(message.clone()),
             _ => None,
         }
@@ -46,82 +40,11 @@ impl From<NodeStatus> for NodeOutcome {
             NodeStatus::Errored => NodeOutcome::Error,
             NodeStatus::SkippedUpstreamFailed => NodeOutcome::Skipped,
             NodeStatus::ReusedNoChanges(_) => NodeOutcome::Skipped,
-            NodeStatus::ReusedStillFresh(_) => NodeOutcome::Skipped,
+            NodeStatus::ReusedStillFresh(_, _, _) => NodeOutcome::Skipped,
             NodeStatus::ReusedStillFreshNoChanges(_) => NodeOutcome::Skipped,
             NodeStatus::NoOp => NodeOutcome::Skipped,
         }
     }
-}
-
-/// TODO: this is a temporary reverse mapping from legacy status to new outcome model.
-/// We should revert to using outcome directly in the task result and calculate status
-/// from that - since outcome is more expressive, and current implementation is lossy.
-pub fn update_node_outcome_from_legacy_status(event: &mut NodeEvaluated, status: NodeStatus) {
-    match status {
-        NodeStatus::Succeeded => {
-            event.set_node_outcome(NodeOutcome::Success);
-        }
-        NodeStatus::TestPassed => {
-            event.set_node_outcome(NodeOutcome::Success);
-
-            event.node_outcome_detail = Some(NodeOutcomeDetail::NodeTestDetail(
-                TestEvaluationDetail::new(TestOutcome::Passed, 0), // Todo - we need rows
-            ));
-        }
-        NodeStatus::TestWarned => {
-            event.set_node_outcome(NodeOutcome::Success);
-
-            event.node_outcome_detail = Some(NodeOutcomeDetail::NodeTestDetail(
-                TestEvaluationDetail::new(TestOutcome::Warned, 0), // Todo - we need rows
-            ));
-        }
-        NodeStatus::Errored => {
-            if event.node_type() == NodeType::Test || event.node_type() == NodeType::UnitTest {
-                event.set_node_outcome(NodeOutcome::Success);
-
-                event.node_outcome_detail = Some(NodeOutcomeDetail::NodeTestDetail(
-                    TestEvaluationDetail::new(TestOutcome::Failed, 0), // Todo - we need rows
-                ));
-            } else {
-                event.set_node_outcome(NodeOutcome::Error);
-                event.set_node_error_type(NodeErrorType::User); // TODO: probably not necessary
-            };
-        }
-        NodeStatus::SkippedUpstreamFailed => {
-            event.set_node_outcome(NodeOutcome::Skipped);
-            event.set_node_skip_reason(NodeSkipReason::Upstream);
-        }
-        NodeStatus::ReusedNoChanges(_) => {
-            event.set_node_outcome(NodeOutcome::Skipped);
-            event.set_node_skip_reason(NodeSkipReason::Cached);
-
-            event.node_outcome_detail = Some(NodeOutcomeDetail::NodeCacheDetail(
-                NodeCacheDetail::new(NodeCacheReason::NoChanges),
-            ));
-        }
-        NodeStatus::ReusedStillFresh(_) => {
-            event.set_node_outcome(NodeOutcome::Skipped);
-            event.set_node_skip_reason(NodeSkipReason::Cached);
-
-            event.node_outcome_detail = Some(NodeOutcomeDetail::NodeCacheDetail(
-                NodeCacheDetail::new(NodeCacheReason::StillFresh),
-            ));
-        }
-        NodeStatus::ReusedStillFreshNoChanges(_) => {
-            event.set_node_outcome(NodeOutcome::Skipped);
-            event.set_node_skip_reason(NodeSkipReason::Cached);
-
-            event.node_outcome_detail = Some(NodeOutcomeDetail::NodeCacheDetail(
-                NodeCacheDetail::new(NodeCacheReason::UpdateCriteriaNotMet),
-            ));
-        }
-        NodeStatus::NoOp => {
-            event.set_node_outcome(NodeOutcome::Skipped);
-            event.set_node_skip_reason(NodeSkipReason::NoOp);
-        }
-    };
-
-    update_dbt_core_event_code_for_node_evaluation_end(event);
 }
 
 impl fmt::Display for NodeStatus {
@@ -131,7 +54,7 @@ impl fmt::Display for NodeStatus {
             NodeStatus::Errored => "error",
             NodeStatus::SkippedUpstreamFailed => "skipped",
             NodeStatus::ReusedNoChanges(_)
-            | NodeStatus::ReusedStillFresh(_)
+            | NodeStatus::ReusedStillFresh(_, _, _)
             | NodeStatus::ReusedStillFreshNoChanges(_) => "reused",
             NodeStatus::NoOp => "noop",
         };
@@ -147,6 +70,7 @@ pub struct Stat {
     pub end_time: SystemTime,
     pub status: NodeStatus,
     pub thread_id: String,
+    pub message: Option<String>,
 }
 
 impl Stat {
@@ -155,6 +79,7 @@ impl Stat {
         start_time: SystemTime,
         num_rows: Option<usize>,
         status: NodeStatus,
+        message: Option<String>,
     ) -> Self {
         let end_time = SystemTime::now();
         Stat {
@@ -169,6 +94,7 @@ impl Stat {
                     .trim_start_matches("ThreadId(")
                     .trim_end_matches(")")
             ),
+            message,
         }
     }
 
@@ -197,22 +123,34 @@ impl Stat {
     }
     pub fn result_status_string(&self) -> String {
         match self.status {
-            NodeStatus::Succeeded | NodeStatus::TestWarned | NodeStatus::TestPassed => {
-                if self.unique_id.starts_with("test.") || self.unique_id.starts_with("unit_test.") {
-                    match self.num_rows {
-                        Some(0) => "pass".to_string(),
-                        Some(_) => "fail".to_string(),
-                        // Using "success" as fallback, though tests should have pass/fail
-                        None => "success".to_string(),
-                    }
-                } else {
-                    "success".to_string()
+            NodeStatus::Succeeded
+                if self.unique_id.starts_with("test.")
+                    || self.unique_id.starts_with("unit_test.") =>
+            {
+                match self.num_rows {
+                    Some(0) => "pass".to_string(),
+                    Some(_) => "fail".to_string(),
+                    // Using "pass" as fallback, though tests should have pass/fail
+                    None => "pass".to_string(),
                 }
             }
+            NodeStatus::Errored
+                if self.unique_id.starts_with("test.")
+                    || self.unique_id.starts_with("unit_test.") =>
+            {
+                match self.num_rows {
+                    Some(0) => "error".to_string(),
+                    Some(_) => "fail".to_string(),
+                    None => "error".to_string(),
+                }
+            }
+            NodeStatus::Succeeded => "success".to_string(),
+            NodeStatus::TestWarned => "warn".to_string(),
+            NodeStatus::TestPassed => "pass".to_string(),
             NodeStatus::Errored => "error".to_string(),
             NodeStatus::SkippedUpstreamFailed => "skipped".to_string(),
             NodeStatus::ReusedNoChanges(_) => "reused".to_string(),
-            NodeStatus::ReusedStillFresh(_) => "reused".to_string(),
+            NodeStatus::ReusedStillFresh(_, _, _) => "reused".to_string(),
             NodeStatus::ReusedStillFreshNoChanges(_) => "reused".to_string(),
             NodeStatus::NoOp => "skipped".to_string(),
         }

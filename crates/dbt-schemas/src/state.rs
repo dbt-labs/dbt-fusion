@@ -26,7 +26,8 @@ use crate::schemas::{
 use blake3::Hasher;
 use chrono::{DateTime, Local, Utc};
 use dbt_common::{
-    ErrorCode, FsResult, adapter::AdapterType, fs_err, serde_utils::convert_yml_to_map,
+    ErrorCode, FsResult, adapter::AdapterType, fs_err, io_args::FsCommand,
+    serde_utils::convert_yml_to_map,
 };
 use minijinja::{MacroSpans, Value as MinijinjaValue, value::Object};
 use serde::Deserialize;
@@ -266,6 +267,7 @@ impl fmt::Display for DbtState {
 }
 
 pub trait NodeResolverTracker: fmt::Debug + Send + Sync {
+    fn deep_clone(&self) -> Box<dyn NodeResolverTracker>;
     fn as_any(&self) -> &dyn Any;
     fn insert_ref(
         &mut self,
@@ -316,10 +318,14 @@ pub trait NodeResolverTracker: fmt::Debug + Send + Sync {
 }
 
 // test only
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DummyNodeResolverTracker;
 
 impl NodeResolverTracker for DummyNodeResolverTracker {
+    fn deep_clone(&self) -> Box<dyn NodeResolverTracker> {
+        Box::new(self.clone())
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -545,12 +551,16 @@ pub enum NodeExecutionState {
     Run,
 }
 impl NodeExecutionState {
-    /// Converts a command string to a NodeExecutionState
-    pub fn from_cmd(cmd: &str) -> Self {
+    /// Converts a command to a NodeExecutionState
+    pub fn from_cmd(cmd: FsCommand) -> Self {
         match cmd {
-            "parse" => NodeExecutionState::Parsed,
-            "compile" => NodeExecutionState::Compiled,
-            "run" | "build" | "test" | "snapshot" | "seed" => NodeExecutionState::Run,
+            FsCommand::Parse => NodeExecutionState::Parsed,
+            FsCommand::Compile => NodeExecutionState::Compiled,
+            FsCommand::Run
+            | FsCommand::Build
+            | FsCommand::Test
+            | FsCommand::Snapshot
+            | FsCommand::Seed => NodeExecutionState::Run,
             _ => NodeExecutionState::NotProcessed,
         }
     }
@@ -794,13 +804,14 @@ impl DbtRuntimeConfig {
             args: InvocationArgs::default(),
         };
 
+        // TODO(anna): Look into whether this should also be Index map
         let mut runtime_config = Self {
-            runtime_config: convert_yml_to_map(
+            runtime_config: BTreeMap::from_iter(convert_yml_to_map(
                 dbt_serde_yaml::to_value(&runtime_config_inner).unwrap(),
-            ),
+            )),
             dependencies: BTreeMap::new(),
-            vars: minijinja::Value::from_object(VarProvider::new(convert_yml_to_map(
-                dbt_serde_yaml::to_value(&runtime_config_inner.vars).unwrap(),
+            vars: minijinja::Value::from_object(VarProvider::new(BTreeMap::from_iter(
+                convert_yml_to_map(dbt_serde_yaml::to_value(&runtime_config_inner.vars).unwrap()),
             ))),
             inner: runtime_config_inner,
         };

@@ -1,11 +1,12 @@
 use super::super::{
-    convert::tracing_level_to_severity,
-    data_provider::{DataProvider, DataProviderMut},
+    constants::{PROCESS_SPAN_NAME, ROOT_SPAN_NAME},
+    data_provider::DataProvider,
+    emit::get_file_and_line,
     event_info::{get_log_message, take_event_attributes},
-    filter::FilterMask,
     init::process_span,
     layer::{ConsumerLayer, MiddlewareLayer},
-    metrics::MetricCounters,
+    metrics::init_metrics_storage_on_root_span,
+    shared::Recordable,
     span_info::get_span_debug_extra_attrs,
 };
 use rand::RngCore;
@@ -20,10 +21,92 @@ use tracing_subscriber::{
 };
 
 use dbt_telemetry::{
-    CallTrace, Invocation, LogMessage, LogRecordInfo, RecordCodeLocation, SpanEndInfo,
-    SpanStartInfo, SpanStatus, TelemetryAttributes, TelemetryContext, TelemetryEventRecType,
-    Unknown,
+    CallTrace, Invocation, LogMessage, LogRecordInfo, RecordCodeLocation, SeverityNumber,
+    SpanEndInfo, SpanLinkInfo, SpanStartInfo, SpanStatus, TelemetryAttributes, TelemetryContext,
+    TelemetryEventRecType, Unknown,
 };
+
+/// A bitmask used to represent which consumers are not interested in a given
+/// telemetry span. Consumers are indexed by their position in the consumer list
+/// of a TelemetryDataLayer.
+///
+/// Keep private to this module to avoid potential modification by consumers
+/// or middleware layers via data provider access.
+#[derive(Debug, Default, Clone, Copy)]
+struct FilterMask(u64);
+
+impl FilterMask {
+    /// Returns an empty filter mask (meaning no consumers are disabled)
+    pub(super) fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Returns a full filter mask (meaning all consumers are disabled)
+    pub(super) fn disabled() -> Self {
+        Self(u64::MAX)
+    }
+
+    /// Returns true if this is a filter mask that disables all consumers
+    pub(super) fn is_disabled(&self) -> bool {
+        self.0 == u64::MAX
+    }
+
+    pub(super) fn set_filtered(&mut self, index: usize) {
+        // Shift would panic in debug if index >= 64, but we add a nice message via debug_assert
+        debug_assert!(
+            index < 64,
+            "Exceeding mask length. Index must be less than 64"
+        );
+        self.0 |= 1 << index;
+    }
+
+    pub(super) fn is_filtered(&self, index: usize) -> bool {
+        // Shift would panic in debug if index >= 64, but we add a nice message via debug_assert
+        debug_assert!(
+            index < 64,
+            "Exceeding mask length. Index must be less than 64"
+        );
+        self.0 & (1 << index) != 0
+    }
+}
+
+// Private newtypes to protect internal data layer state from being accessed
+// by middleware or consumer layers. These types are stored in span extensions
+// and are only accessible by the data layer itself.
+
+/// Read-only wrapper for SpanStartInfo stored in span extensions.
+///
+/// This struct provides immutable access to SpanStartInfo while preventing
+/// accidental modification by middleware or consumer layers. The wrapper can
+/// only be constructed within the data layer, but can be accessed immutably
+/// from anywhere within the tracing module to enable read-only APIs.
+///
+/// # Safety guarantees
+///
+/// - Construction is restricted to the data layer (private field)
+/// - Deref provides only immutable references to SpanStartInfo
+/// - Cannot be mutated via span extensions (extensions_mut requires
+///   constructing a new value to replace, and our Deref prevents mutable access)
+pub(in crate::tracing) struct DLSpanStartInfo(SpanStartInfo);
+
+impl DLSpanStartInfo {
+    /// Creates a new wrapper for SpanStartInfo.
+    /// Only accessible within the data layer module.
+    fn new(info: SpanStartInfo) -> Self {
+        Self(info)
+    }
+}
+
+impl std::ops::Deref for DLSpanStartInfo {
+    type Target = SpanStartInfo;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// Private wrapper for TelemetryContext stored in span extensions.
+struct DLTelemetryContext(TelemetryContext);
 
 /// A tracing layer that creates structured telemetry data and stores it in span extensions.
 ///
@@ -103,10 +186,22 @@ where
             .unwrap_or_else(uuid::Uuid::now_v7)
     }
 
-    fn get_location(&self, metadata: &tracing::Metadata<'_>) -> RecordCodeLocation {
+    fn get_location(
+        &self,
+        metadata: &tracing::Metadata<'_>,
+        values: Option<Recordable<'_>>,
+    ) -> RecordCodeLocation {
         if self.strip_code_location {
             RecordCodeLocation::default()
         } else {
+            // Try extracting using our custom location
+            if let Some((file, line)) = values.and_then(|values| get_file_and_line(values)) {
+                return RecordCodeLocation {
+                    file: Some(file),
+                    line: Some(line),
+                    ..Default::default()
+                };
+            }
             // Extract code location from metadata
             RecordCodeLocation::from(metadata)
         }
@@ -129,7 +224,7 @@ where
         // such as location, name etc. only in debug builds
 
         // Calculate code location once
-        let location = self.get_location(metadata);
+        let location = self.get_location(metadata, Some(attrs.values().into()));
 
         // Extract attributes in the following priority:
         // - Pre-populated attributes (the "normal" way for all non-trace level spans)
@@ -152,7 +247,7 @@ where
                 file: location
                     .file
                     .as_ref()
-                    .map_or("<unknown>", |v| v)
+                    .map_or_else(|| "<unknown>", |v| v)
                     .to_string(),
                 line: location.line.unwrap_or_default(),
             }
@@ -172,14 +267,14 @@ where
                     .cloned()
                     .unwrap_or_else(FilterMask::empty);
 
-                let parent_ctx = parent_span_ext.get::<TelemetryContext>();
+                let parent_ctx = parent_span_ext.get::<DLTelemetryContext>();
                 parent_span_ext
-                    .get::<SpanStartInfo>()
+                    .get::<DLSpanStartInfo>()
                     .map(|parent_span_record| {
                         (
-                            parent_span_record.trace_id,
-                            Some(parent_span_record.span_id),
-                            parent_ctx.cloned(),
+                            parent_span_record.0.trace_id,
+                            Some(parent_span_record.0.span_id),
+                            parent_ctx.map(|pcx| pcx.0.clone()),
                             parent_span_filter_mask,
                         )
                     })
@@ -217,24 +312,24 @@ where
         let this_ctx = attributes.inner().context().or(parent_ctx);
 
         let start_time = SystemTime::now();
-        let (severity_number, severity_text) = tracing_level_to_severity(metadata.level());
+        let severity_number = metadata.level().into();
 
         let mut record = SpanStartInfo {
             trace_id,
             span_id: global_span_id,
             span_name: attributes.event_display_name(),
             parent_span_id: global_parent_span_id,
-            links: None, // TODO: implement links from `follows_from`
+            links: None, // Links are always empty at creation time
             start_time_unix_nano: start_time,
             severity_number,
-            severity_text: severity_text.to_string(),
+            severity_text: severity_number.as_str().to_string(),
             attributes: attributes.clone(),
         };
 
         // If this is the root span, initialize invocation-level metrics storage.
         // We have to do it early to ensure it is available to middlewares
         if span.parent().is_none() {
-            span.extensions_mut().insert(MetricCounters::new());
+            init_metrics_storage_on_root_span(&span);
         }
 
         // Get root_span for data provider
@@ -243,6 +338,15 @@ where
             .from_root()
             .next()
             .expect("Root span must exist");
+
+        // If tracing is set up correctly, the only time when root span doesn't have our special root
+        // span name marker is when it is the process span created during tracing initialization.
+        debug_assert!(
+            root_span.name() == ROOT_SPAN_NAME || span.name() == PROCESS_SPAN_NAME || cfg!(test),
+            "Expected root span created via `create_root_info_span`. Got: {}.
+            Are you running code not instrumented under an invocation span tree?",
+            root_span.name()
+        );
 
         // For each span we save which consumers have filtered out this span
         let mut span_filter_mask = FilterMask::empty();
@@ -257,19 +361,20 @@ where
                 span_id: global_span_id,
                 span_name: attributes.event_display_name(),
                 parent_span_id: global_parent_span_id,
-                links: None, // TODO: implement links from `follows_from`
+                links: None, // Links are always empty at creation time
                 start_time_unix_nano: start_time,
                 severity_number,
-                severity_text: severity_text.to_string(),
+                severity_text: severity_number.as_str().to_string(),
                 attributes: attributes.clone(),
             };
 
             // This block scope ensures that we don't hold mutable extensions beyond middleware calls.
             // This is important because current span may be the root span itself, and we later take
             // another mutable reference to store the data there.
-            let mut data_provider = DataProviderMut::new(&root_span);
+            let mut data_provider = DataProvider::new(&root_span, &span);
 
             for middleware in &self.middlewares {
+                // Extract links before moving record into middleware
                 match middleware.on_span_start(record, &mut data_provider) {
                     Some(next_record) => {
                         record = next_record;
@@ -293,7 +398,7 @@ where
         // This block also creates scope to limit read-only borrow of span extensions
         // as we need mutable borrow later
         if !span_filter_mask.is_disabled() {
-            let data_provider = DataProvider::new(&root_span);
+            let mut data_provider = DataProvider::new(&root_span, &span);
 
             for (index, consumer) in self.consumers.iter().enumerate() {
                 debug_assert!(
@@ -302,7 +407,7 @@ where
                 );
 
                 // Check if span is enabled for this consumer
-                if !consumer.is_span_enabled(&record, metadata) {
+                if !consumer.is_span_enabled(&record) {
                     // Mark this consumer as filtered out for this span
                     span_filter_mask.set_filtered(index);
                     continue;
@@ -314,7 +419,7 @@ where
                 if !parent_span_filter_mask.is_filtered(index) {
                     // Parent span is not filtered out, we can pass the record as is
                     // No need to search for unfiltered parent
-                    consumer.on_span_start(&record, &data_provider);
+                    consumer.on_span_start(&record, &mut data_provider);
                     continue;
                 }
 
@@ -334,26 +439,73 @@ where
                     ..record.clone()
                 };
 
-                consumer.on_span_start(&modified_record, &data_provider);
+                consumer.on_span_start(&modified_record, &mut data_provider);
             }
         }
 
+        // Get a mutable reference to span extensions to store our data
         let mut ext_mut = span.extensions_mut();
 
+        // First, private data that should only be accessible to data layer itself.
+        // We use private newtype wrappers to avoid accidental modification by middleware
+        // or consumer layers via data provider access.
         // Store the filter mask for this span
         ext_mut.insert(span_filter_mask);
 
-        // Store the record in span extensions
-        ext_mut.insert(record);
-
-        // And store the attributes in the span extensions as well,
-        // we use this to update them post creation and add to closing span record
-        ext_mut.insert(attributes);
+        // Store an immutable start record in span extensions. Used later to build the SpanEnd record
+        ext_mut.insert(DLSpanStartInfo::new(record));
 
         // Store computed context for this span (if any)
         if let Some(ctx) = this_ctx {
-            ext_mut.insert(ctx);
+            ext_mut.insert(DLTelemetryContext(ctx));
         }
+
+        // Finally store "mutable", user modifiable attributes.
+        // This allows both the app code as well as middleware to
+        // modify span attributes post-creation before they are finalized at span end.
+        ext_mut.insert(attributes);
+    }
+
+    fn on_follows_from(&self, span: &span::Id, follows: &span::Id, ctx: Context<'_, S>) {
+        // Get the span that declares it follows another span
+        let Some(current_span) = ctx.span(span) else {
+            return;
+        };
+
+        // Get the span that is being followed
+        let Some(followed_span) = ctx.span(follows) else {
+            // The followed span might not be tracked (e.g., it was filtered out or never created)
+            return;
+        };
+
+        // Extract trace_id and span_id from the followed span
+        let (followed_trace_id, followed_span_id) = {
+            let followed_ext = followed_span.extensions();
+            let Some(DLSpanStartInfo(followed_start_info)) = followed_ext.get::<DLSpanStartInfo>()
+            else {
+                // The followed span doesn't have start info (shouldn't happen in normal operation)
+                return;
+            };
+            (followed_start_info.trace_id, followed_start_info.span_id)
+        };
+
+        // Create a SpanLinkInfo for this follows_from relationship
+        let link = SpanLinkInfo {
+            trace_id: followed_trace_id,
+            span_id: followed_span_id,
+            attributes: std::collections::BTreeMap::new(),
+        };
+
+        // Update the current span's DLSpanStartInfo to include this link
+        let mut current_ext = current_span.extensions_mut();
+        if let Some(DLSpanStartInfo(start_info)) = current_ext.get_mut::<DLSpanStartInfo>() {
+            // Initialize links vector if it doesn't exist, then append the new link
+            match &mut start_info.links {
+                Some(links) => links.push(link),
+                None => start_info.links = Some(vec![link]),
+            }
+        }
+        // If there's no DLSpanStartInfo, the span wasn't properly initialized, so we skip
     }
 
     fn on_close(&self, id: span::Id, ctx: Context<'_, S>) {
@@ -372,47 +524,51 @@ where
                 trace_id,
                 span_id,
                 parent_span_id,
+                links,
                 start_time_unix_nano,
                 severity_number,
                 severity_text,
                 start_attributes,
-            ) = if let Some(SpanStartInfo {
+            ) = if let Some(DLSpanStartInfo(SpanStartInfo {
                 trace_id,
                 span_id,
                 parent_span_id,
+                links,
                 start_time_unix_nano,
                 severity_number,
                 severity_text,
                 attributes,
                 ..
-            }) = span_ext.get::<SpanStartInfo>()
+            })) = span_ext.get::<DLSpanStartInfo>()
             {
                 (
                     *trace_id,
                     *span_id,
                     *parent_span_id,
+                    links.clone(),
                     *start_time_unix_nano,
                     *severity_number,
                     severity_text.clone(),
                     attributes.clone(),
                 )
             } else {
-                let (severity_number, severity_text) = tracing_level_to_severity(metadata.level());
-                let location = self.get_location(metadata);
+                let severity_number: SeverityNumber = metadata.level().into();
+                let location = self.get_location(metadata, None);
 
                 (
                     self.fallback_trace_id,
                     self.next_span_id(),
                     None,
+                    None, // No links in fallback case
                     SystemTime::now(),
                     severity_number,
-                    severity_text.to_string(),
+                    severity_number.as_str().to_string(),
                     Unknown {
                         name: metadata.name().to_string(),
                         file: location
                             .file
                             .as_ref()
-                            .map_or("<unknown>", |v| v)
+                            .map_or_else(|| "<unknown>", |v| v)
                             .to_string(),
                         line: location.line.unwrap_or_default(),
                     }
@@ -420,15 +576,19 @@ where
                 ) // Fallback. Should not happen
             };
 
-            let status = span_ext.get::<SpanStatus>().cloned();
-
             // Pull the current span context (if any) to inject into closing attributes
-            let current_ctx = span_ext.get::<TelemetryContext>().cloned();
+            let current_ctx = span_ext.get::<DLTelemetryContext>().map(|c| c.0.clone());
 
             let mut attributes = span_ext.get::<TelemetryAttributes>().cloned().unwrap_or({
                 // If no attributes were recorded, use the start attributes
                 start_attributes
             });
+
+            // Pull record status from span extensions (if any) or try to infer from attributes
+            let status = span_ext
+                .get::<SpanStatus>()
+                .cloned()
+                .or_else(|| attributes.get_span_status());
 
             // check that attributes are of expected record type
             debug_assert_eq!(attributes.record_category(), TelemetryEventRecType::Span);
@@ -450,7 +610,7 @@ where
                 span_id,
                 span_name: attributes.event_display_name(),
                 parent_span_id,
-                links: None, // TODO: implement links from `follows_from`
+                links,
                 start_time_unix_nano,
                 end_time_unix_nano: SystemTime::now(),
                 severity_number,
@@ -474,9 +634,18 @@ where
             .next()
             .expect("Root span must exist");
 
-        if !self.middlewares.is_empty() {
-            let mut data_provider = DataProviderMut::new(&root_span);
+        // If tracing is set up correctly, the only time when root span doesn't have our special root
+        // span name marker is when it is the process span created during tracing initialization.
+        debug_assert!(
+            root_span.name() == ROOT_SPAN_NAME || span.name() == PROCESS_SPAN_NAME || cfg!(test),
+            "Expected root span created via `create_root_info_span`. Got: {}.
+            Are you running code not instrumented under an invocation span tree?",
+            root_span.name()
+        );
 
+        let mut data_provider = DataProvider::new(&root_span, &span);
+
+        if !self.middlewares.is_empty() {
             for middleware in &self.middlewares {
                 match middleware.on_span_end(record, &mut data_provider) {
                     Some(next_record) => {
@@ -491,8 +660,6 @@ where
         }
 
         // Notify consumers if the span was not filtered out by middleware
-
-        let data_provider = DataProvider::new(&root_span);
         let curr_parent = span.parent();
         let parent_span_filter_mask = curr_parent
             .as_ref()
@@ -512,7 +679,7 @@ where
 
             let Some(curr_parent) = curr_parent.as_ref() else {
                 // No parent span, so no filtering to do. Call consumer and continue
-                consumer.on_span_end(&record, &data_provider);
+                consumer.on_span_end(&record, &mut data_provider);
                 continue;
             };
 
@@ -522,7 +689,7 @@ where
             if !parent_span_filter_mask.is_filtered(index) {
                 // Parent span is not filtered out, we can pass the record as is
                 // No need to search for unfiltered parent
-                consumer.on_span_end(&record, &data_provider);
+                consumer.on_span_end(&record, &mut data_provider);
                 continue;
             }
 
@@ -537,7 +704,7 @@ where
                 ..record.clone()
             };
 
-            consumer.on_span_end(&modified_record, &data_provider);
+            consumer.on_span_end(&modified_record, &mut data_provider);
         }
     }
 
@@ -555,15 +722,15 @@ where
                         .cloned()
                         .unwrap_or_else(FilterMask::empty);
 
-                    let parent_ctx = parent_span_ext.get::<TelemetryContext>();
+                    let parent_ctx = parent_span_ext.get::<DLTelemetryContext>();
                     parent_span_ext
-                        .get::<SpanStartInfo>()
+                        .get::<DLSpanStartInfo>()
                         .map(|parent_span_start_info| {
                             (
-                                parent_span_start_info.trace_id,
-                                Some(parent_span_start_info.span_id),
-                                Some(parent_span_start_info.span_name.clone()),
-                                parent_ctx.cloned(),
+                                parent_span_start_info.0.trace_id,
+                                Some(parent_span_start_info.0.span_id),
+                                Some(parent_span_start_info.0.span_name.clone()),
+                                parent_ctx.map(|pcx| pcx.0.clone()),
                                 parent_span_filter_mask,
                             )
                         })
@@ -579,10 +746,10 @@ where
         let metadata = event.metadata();
 
         // Calculate code location
-        let location = self.get_location(metadata);
+        let location = self.get_location(metadata, Some(event.into()));
 
         // TODO: calculate modified severity based on user config when such feature is implemented
-        let (severity_number, severity_text) = tracing_level_to_severity(metadata.level());
+        let severity_number: SeverityNumber = metadata.level().into();
 
         // Extract message from event
         let message = get_log_message(event);
@@ -598,7 +765,8 @@ where
                 code: None,
                 dbt_core_event_code: None,
                 original_severity_number: severity_number as i32,
-                original_severity_text: severity_text.to_string(),
+                original_severity_text: severity_number.as_str().to_string(),
+                package_name: None,
                 unique_id: None,
                 phase: None,
                 file: location.file,
@@ -624,7 +792,7 @@ where
             span_name,
             event_id: self.next_event_id(),
             severity_number,
-            severity_text: severity_text.to_string(),
+            severity_text: severity_number.as_str().to_string(),
             body: message,
             attributes,
         };
@@ -633,12 +801,34 @@ where
             .as_ref()
             .map(|ps| ps.scope().from_root().next().expect("Root span must exist"));
 
-        if !self.middlewares.is_empty() {
-            let mut data_provider = root_span
-                .as_ref()
-                .map(|root_span| DataProviderMut::new(root_span))
-                .unwrap_or_else(DataProviderMut::none);
+        // Unlike spans, where we expect that they are set-up corerctly and rooted under our special root span,
+        // there are multiple valid use-cases for events being logged outside of any span context:
+        // 1. Third-party libraries may log events on worker threads
+        // 2. Worker threads that emit traces not tied to the main invocation (e.g. vortex client)
+        // 3. Apps using this infrastructure that do not have a concept of invocation
+        // 4. Errors during initialization before invocation span is created
+        //
+        // In order to accommodate these use-cases, we allow events as long as at least process
+        // span is present as a fallback. The lack of process span would indicate that a worker
+        // thread is logging events after tracing has been shutdown, which is likely a bug and
+        // will cause unexpected behavior in consumers.
+        //
+        // The main downside of a lax check here, is that middlewares that rely on data_provider
+        // scoped to invocation context will instead get a process-level data provider, which will
+        // lead to incorrect behavior. E.g. error metric counts and related exit code calculation will
+        // ignore such events. These scenarios should be covered by tests to avoid regressions.
+        debug_assert!(
+            root_span.is_some() || cfg!(test),
+            "Event logged outside of span context. Expected root span created via `create_root_info_span`
+            or a process span. Are you logging events after tracing has been shutdown?",
+        );
 
+        let mut data_provider = match (root_span.as_ref(), parent_span.as_ref()) {
+            (Some(root_span), Some(parent_span)) => DataProvider::new(root_span, parent_span),
+            _ => DataProvider::none(),
+        };
+
+        if !self.middlewares.is_empty() {
             for middleware in &self.middlewares {
                 match middleware.on_log_record(log_record, &mut data_provider) {
                     Some(next_record) => {
@@ -652,11 +842,6 @@ where
             }
         }
 
-        let data_provider = parent_span
-            .as_ref()
-            .map(|parent_span| DataProvider::new(parent_span))
-            .unwrap_or_else(DataProvider::none);
-
         // Notify consumers if the event was not filtered out by middleware
         for (index, consumer) in self.consumers.iter().enumerate() {
             debug_assert!(
@@ -664,7 +849,7 @@ where
                 "Consumer index must be less than 64. Invariant is preserved by construction."
             );
 
-            if !consumer.is_log_enabled(&log_record, metadata) {
+            if !consumer.is_log_enabled(&log_record) {
                 continue;
             }
 
@@ -674,7 +859,7 @@ where
             if !parent_span_filter_mask.is_filtered(index) {
                 // Parent span is not filtered out, we can pass the record as is
                 // No need to search for unfiltered parent
-                consumer.on_log_record(&log_record, &data_provider);
+                consumer.on_log_record(&log_record, &mut data_provider);
                 continue;
             }
 
@@ -682,7 +867,7 @@ where
             // we have one
             let Some(curr_parent) = parent_span.as_ref() else {
                 // No parent span, so no filtering to do & can't get a real data provider
-                consumer.on_log_record(&log_record, &data_provider);
+                consumer.on_log_record(&log_record, &mut data_provider);
                 continue;
             };
 
@@ -697,7 +882,7 @@ where
                 ..log_record.clone()
             };
 
-            consumer.on_log_record(&modified_record, &data_provider);
+            consumer.on_log_record(&modified_record, &mut data_provider);
         }
     }
 }
@@ -723,8 +908,8 @@ where
             // Check if this parent span was filtered out for this consumer
             if !parent_span_filter_mask.is_filtered(index) {
                 // Found an unfiltered parent span for this consumer. Extract its span ID
-                if let Some(parent_span_record) = parent_ext.get::<SpanStartInfo>() {
-                    return Some(parent_span_record.span_id);
+                if let Some(parent_span_record) = parent_ext.get::<DLSpanStartInfo>() {
+                    return Some(parent_span_record.0.span_id);
                 } else {
                     unreachable!("Parent span must have a SpanStartInfo record in its extensions");
                 }
@@ -737,5 +922,54 @@ where
         };
 
         parent = grand_parent;
+    }
+}
+
+#[cfg(test)]
+pub(in crate::tracing) fn get_span_start_info_from_span(
+    span: &SpanRef<'_, impl Subscriber + for<'lookup> LookupSpan<'lookup>>,
+) -> Option<SpanStartInfo> {
+    let span_ext = span.extensions();
+    span_ext
+        .get::<DLSpanStartInfo>()
+        .map(|start_info| (**start_info).clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FilterMask;
+
+    #[test]
+    fn empty_mask_reports_empty() {
+        let mask = FilterMask::empty();
+
+        for i in 0..64 {
+            assert!(!mask.is_filtered(i));
+        }
+    }
+
+    #[test]
+    fn full_mask_reports_full() {
+        let mask = FilterMask::disabled();
+
+        assert!(mask.is_disabled());
+        for i in 0..64 {
+            assert!(mask.is_filtered(i));
+        }
+    }
+
+    #[test]
+    fn set_filtered_marks_bits() {
+        let mut mask = FilterMask::empty();
+
+        assert!(!mask.is_filtered(1));
+        assert!(!mask.is_filtered(63));
+
+        mask.set_filtered(1);
+        mask.set_filtered(63);
+
+        assert!(mask.is_filtered(1));
+        assert!(mask.is_filtered(63));
+        assert!(!mask.is_filtered(0));
     }
 }

@@ -6,7 +6,7 @@ use crate::schemas::common::ResolvedQuoting;
 use dbt_common::constants::DBT_CTE_PREFIX;
 use dbt_common::{FsResult, current_function_name};
 use dbt_frontend_common::FullyQualifiedName;
-use minijinja::arg_utils::{ArgParser, check_num_args};
+use minijinja::arg_utils::{ArgParser, ArgsIter};
 use minijinja::{Error as MinijinjaError, ErrorKind as MinijinjaErrorKind, State, Value};
 use minijinja::{invalid_argument, invalid_argument_inner, jinja_err};
 use minijinja_contrib::modules::py_datetime::datetime::PyDateTime;
@@ -126,10 +126,15 @@ pub trait BaseRelationProperties {
 
     fn get_identifier(&self) -> FsResult<String>;
 
+    fn get_location(&self) -> FsResult<Option<String>> {
+        Ok(None)
+    }
+
     fn get_fqn(&self) -> FsResult<FullyQualifiedName> {
         let catalog = self.get_database()?;
         let schema = self.get_schema()?;
         let table = self.get_identifier()?;
+        // TODO: should we add location here?
         Ok(FullyQualifiedName::new(catalog, schema, table))
     }
 }
@@ -265,6 +270,28 @@ pub trait BaseRelation: BaseRelationProperties + Any + Send + Sync + fmt::Debug 
             ),
         }
     }
+
+    fn location(&self) -> Value {
+        Value::NONE
+    }
+
+    fn location_as_str(&self) -> Result<Option<String>, MinijinjaError> {
+        Ok(self.location().to_str().map(|s| s.to_string()))
+    }
+
+    fn location_as_resolved_str(&self) -> Result<Option<String>, MinijinjaError> {
+        match self.location().to_str() {
+            Some(val) => {
+                if !self.quote_policy().database {
+                    Ok(Some(self.normalize_component(val.as_ref())))
+                } else {
+                    Ok(Some(val.to_string()))
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Return the relation type if available, defaulting to None.
     fn relation_type(&self) -> Option<RelationType> {
         None
@@ -527,9 +554,41 @@ pub trait BaseRelation: BaseRelationProperties + Any + Send + Sync + fmt::Debug 
         self.include_inner(include_policy)
     }
 
+    fn quote(&self, args: &[Value]) -> Result<Value, MinijinjaError> {
+        let defaults = self.include_policy();
+        let iter = ArgsIter::new(
+            current_function_name!(),
+            &["database", "schema", "identifier"],
+            args,
+        );
+        let database = iter
+            .next_kwarg::<Option<bool>>("database")?
+            .unwrap_or(defaults.database);
+        let schema = iter
+            .next_kwarg::<Option<bool>>("schema")?
+            .unwrap_or(defaults.schema);
+        let identifier = iter
+            .next_kwarg::<Option<bool>>("identifier")?
+            .unwrap_or(defaults.identifier);
+
+        let quote_policy = Policy {
+            database,
+            schema,
+            identifier,
+        };
+        self.quote_inner(quote_policy)
+    }
+
     /// Implement this to support `include`
     /// Replace the `include_policy` field with the input policy, and return that an update relation value
     fn include_inner(&self, _policy: Policy) -> Result<Value, MinijinjaError>;
+
+    fn quote_inner(&self, _policy: Policy) -> Result<Value, MinijinjaError> {
+        Err(MinijinjaError::new(
+            MinijinjaErrorKind::InvalidOperation,
+            "Not implemented",
+        ))
+    }
 
     /// Incorporate
     fn incorporate(&self, args: &[Value]) -> Result<Value, MinijinjaError> {
@@ -604,15 +663,20 @@ pub trait BaseRelation: BaseRelationProperties + Any + Send + Sync + fmt::Debug 
             None => self.relation_type(),
         };
 
-        Ok(self
-            .create_relation(
-                database,
-                schema,
-                identifier,
-                relation_type,
-                self.quote_policy(),
-            )?
-            .as_value())
+        self.create_relation(
+            database,
+            schema,
+            identifier,
+            relation_type,
+            self.quote_policy(),
+        )?
+        .post_incorporate(args)
+    }
+
+    /// Hook for adapter-specific incorporate behavior.
+    /// Default implementation just delegates to create_relation.
+    fn post_incorporate(&self, _args: ArgParser) -> Result<Value, MinijinjaError> {
+        Ok(self.as_value())
     }
 
     /// Create a new relation with the specified components and policies.
@@ -633,16 +697,11 @@ pub trait BaseRelation: BaseRelationProperties + Any + Send + Sync + fmt::Debug 
         quote_policy: Policy,
     ) -> Result<Arc<dyn BaseRelation>, MinijinjaError>;
 
-    /// reference: https://github.com/dbt-labs/dbt-adapters/blob/main/dbt-adapters/src/dbt/adapters/base/relation.py#L183-L184
+    /// reference: https://github.com/dbt-labs/dbt-adapters/blob/0775dd27929337ea529cad868dd1722812b8e0fb/dbt-adapters/src/dbt/adapters/base/relation.py#L234
     fn information_schema(&self, args: &[Value]) -> Result<Value, MinijinjaError> {
-        let mut args = ArgParser::new(args, None);
-        check_num_args(current_function_name!(), &args, 0, 1)?;
-
-        let view_name = args.get::<Value>("view_name")?;
-        let view_name = match view_name.as_str() {
-            Some(view_name) => view_name,
-            None => return invalid_argument!("view_name must exist"),
-        };
+        let iter = ArgsIter::new(current_function_name!(), &["view_name"], args);
+        let view_name = iter.next_kwarg_aliased::<Option<&str>>("view_name", &["identifier"])?;
+        iter.finish()?;
 
         self.information_schema_inner(self.database_as_str().ok(), view_name)
     }
@@ -650,7 +709,7 @@ pub trait BaseRelation: BaseRelationProperties + Any + Send + Sync + fmt::Debug 
     fn information_schema_inner(
         &self,
         database: Option<String>,
-        view_name: &str,
+        view_name: Option<&str>,
     ) -> Result<Value, MinijinjaError>;
 
     /// needs_to_drop
@@ -883,7 +942,7 @@ mod tests {
         fn information_schema_inner(
             &self,
             _database: Option<String>,
-            _view_name: &str,
+            _view_name: Option<&str>,
         ) -> Result<Value, MinijinjaError> {
             unimplemented!("InformationSchema")
         }

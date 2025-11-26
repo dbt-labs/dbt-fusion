@@ -1,6 +1,6 @@
+use crate::schemas::serde::bool_or_string_bool;
 use dbt_serde_yaml::{JsonSchema, ShouldBe};
 use serde::{Deserialize, Serialize};
-use serde_with::skip_serializing_none;
 use std::collections::{BTreeMap, btree_map::Iter};
 
 // Type aliases for clarity
@@ -9,29 +9,37 @@ type YmlValue = dbt_serde_yaml::Value;
 use crate::{
     default_to,
     schemas::{
-        project::{DefaultTo, IterChildren, configs::common::default_meta_and_tags},
+        project::{DefaultTo, TypedRecursiveConfig, configs::common::default_meta_and_tags},
         serde::StringOrArrayOfStrings,
     },
 };
 
-#[skip_serializing_none]
+// NOTE: No #[skip_serializing_none] - we handle None serialization in serialize_with_mode
 #[derive(Deserialize, Serialize, Debug, Clone, JsonSchema)]
 pub struct ProjectSemanticModelConfig {
+    #[serde(default, rename = "+enabled", deserialize_with = "bool_or_string_bool")]
     pub enabled: Option<bool>,
+    #[serde(rename = "+group")]
     pub group: Option<String>,
+    #[serde(rename = "+meta")]
     pub meta: Option<BTreeMap<String, YmlValue>>,
     #[serde(rename = "+tags")]
     pub tags: Option<StringOrArrayOfStrings>,
+
     pub __additional_properties__: BTreeMap<String, ShouldBe<ProjectSemanticModelConfig>>,
 }
 
-impl IterChildren<ProjectSemanticModelConfig> for ProjectSemanticModelConfig {
+impl TypedRecursiveConfig for ProjectSemanticModelConfig {
+    fn type_name() -> &'static str {
+        "semantic_model"
+    }
+
     fn iter_children(&self) -> Iter<'_, String, ShouldBe<Self>> {
         self.__additional_properties__.iter()
     }
 }
 
-#[skip_serializing_none]
+// NOTE: No #[skip_serializing_none] - we handle None serialization in serialize_with_mode
 #[derive(Deserialize, Serialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 pub struct SemanticModelConfig {
     pub enabled: Option<bool>,

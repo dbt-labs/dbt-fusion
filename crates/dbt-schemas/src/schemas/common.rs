@@ -44,6 +44,10 @@ impl FreshnessRules {
         }
         Ok(())
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.count.is_none() && self.period.is_none()
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, JsonSchema, PartialEq, Eq, Default)]
@@ -88,7 +92,10 @@ impl ModelFreshnessRules {
             return Ok(());
         }
         let rule = rule.expect("rule should be Some now");
-        if rule.count.is_none() || rule.period.is_none() {
+        let count_present = rule.count.is_some();
+        let period_present = rule.period.is_some();
+
+        if count_present != period_present {
             return Err(fs_err!(
                 ErrorCode::InvalidArgument,
                 "count and period are required when freshness is provided, count: {:?}, period: {:?}",
@@ -174,6 +181,17 @@ pub enum FreshnessStatus {
     Pass,
     Warn,
     Error,
+}
+
+impl std::fmt::Display for FreshnessStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Pass => "pass",
+            Self::Warn => "warn",
+            Self::Error => "error",
+        };
+        write!(f, "{s}")
+    }
 }
 
 /// Trait for types that can be merged, taking the last non-None value
@@ -915,6 +933,22 @@ impl Hooks {
     }
 }
 
+// Helper function to compare hooks wrapped in Verbatim<Option<Hooks>> where None equals Some(ArrayOfStrings([]))
+pub fn hooks_equal(a: &Verbatim<Option<Hooks>>, b: &Verbatim<Option<Hooks>>) -> bool {
+    match (a.as_ref(), b.as_ref()) {
+        (None, None) => true,
+        (None, Some(b_hooks)) => {
+            // Check if b_hooks is effectively empty
+            matches!(b_hooks, Hooks::ArrayOfStrings(vec) if vec.is_empty())
+        }
+        (Some(a_hooks), None) => {
+            // Check if a_hooks is effectively empty
+            matches!(a_hooks, Hooks::ArrayOfStrings(vec) if vec.is_empty())
+        }
+        (Some(a_hooks), Some(b_hooks)) => a_hooks.hooks_equal(b_hooks),
+    }
+}
+
 #[skip_serializing_none]
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
 pub struct HookConfig {
@@ -1068,6 +1102,15 @@ pub fn _normalize_quote(quoting: bool, dialect: &Dialect, name: &str) -> (String
     }
 }
 
+/// Normalize SQL by removing all whitespace and converting to lowercase.
+/// This ensures consistent checksums regardless of formatting differences.
+pub fn normalize_sql(sql: &str) -> String {
+    sql.chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_lowercase()
+}
+
 /// Merge two meta maps, with the second map's values taking precedence on key conflicts.
 pub fn merge_meta(
     base_meta: Option<BTreeMap<String, YmlValue>>,
@@ -1104,6 +1147,44 @@ pub fn merge_tags(
         (Some(base), None) => Some(base),
         (None, Some(update)) => Some(update),
     }
+}
+
+pub fn conform_normalized_snapshot_raw_code_to_mantle_format(normalized_full: &str) -> String {
+    // Strip snapshot tags to match dbt-mantle behavior
+    // Remove everything before and including {%snapshot name%} or {%-snapshot name-%}
+    let sql_without_opening = normalized_full
+        .find("{%-snapshot")
+        .or_else(|| normalized_full.find("{%snapshot"))
+        .and_then(|start_pos| {
+            // Found the opening tag, now find where it ends
+            let after_tag_start = &normalized_full[start_pos..];
+            after_tag_start
+                .find("-%}")
+                .or_else(|| after_tag_start.find("%}"))
+                .map(|end_offset| {
+                    let tag_end = if after_tag_start[end_offset..].starts_with("-%}") {
+                        end_offset + 3
+                    } else {
+                        end_offset + 2
+                    };
+                    &normalized_full[start_pos + tag_end..]
+                })
+        })
+        .unwrap_or(normalized_full);
+
+    // Strip the closing endsnapshot tag ({%endsnapshot%} or {%-endsnapshot-%})
+    let normalized_sql = sql_without_opening
+        .strip_suffix("-%}")
+        .or_else(|| sql_without_opening.strip_suffix("%}"))
+        .and_then(|s| {
+            // Find the start of the closing tag ({%- or {%)
+            s.rfind("{%-endsnapshot")
+                .or_else(|| s.rfind("{%endsnapshot"))
+                .map(|pos| &s[..pos])
+        })
+        .unwrap_or(sql_without_opening);
+
+    normalized_sql.to_string()
 }
 
 #[cfg(test)]

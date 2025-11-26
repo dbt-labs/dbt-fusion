@@ -16,6 +16,7 @@ workspace = true
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
 dbt-common = { workspace = true }
+dbt-adapter = { workspace = true }
 dbt-deps = { workspace = true }
 dbt-fusion-workspace-hack = { version = "0.1" }
 dbt-jinja-utils = { workspace = true }
@@ -24,7 +25,6 @@ dbt-serde_yaml = { workspace = true }
 dirs = { workspace = true }
 flate2 = { workspace = true }
 ignore = { workspace = true }
-log = { workspace = true }
 minijinja = { workspace = true }
 once_cell = { workspace = true }
 pathdiff = { workspace = true }
@@ -35,6 +35,7 @@ rust-embed = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+uuid = { workspace = true }
 walkdir = { workspace = true }
 
 

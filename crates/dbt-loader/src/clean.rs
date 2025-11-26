@@ -3,15 +3,19 @@ use crate::{
     dbt_project_yml_loader::{collect_protected_paths, load_project_yml},
     load,
 };
-use std::{collections::BTreeMap, path::Path, time::SystemTime};
+use std::{collections::BTreeMap, path::Path};
 
 use dbt_common::{
     ErrorCode, FsResult,
     cancellation::CancellationToken,
     constants::{DBT_PROJECT_YML, REMOVING},
     err, fs_err, fsinfo,
-    io_args::{EvalArgs, IoArgs},
-    show_error, show_progress, show_progress_exit, stdfs,
+    io_args::{EvalArgs, EvalArgsBuilder, IoArgs},
+    show_progress, stdfs,
+    tracing::{
+        emit::{emit_error_log_from_fs_error, emit_trace_log_message},
+        metrics::get_exit_code_from_error_counter,
+    },
 };
 use dbt_jinja_utils::{
     invocation_args::InvocationArgs, phases::load::init::initialize_load_jinja_environment,
@@ -22,14 +26,14 @@ pub async fn execute_clean_command(
     files: &[String],
     token: &CancellationToken,
 ) -> FsResult<i32> {
-    let start = SystemTime::now();
-
     let load_args = LoadArgs::from_eval_args(arg);
     let invocation_args = InvocationArgs::from_eval_args(arg);
-    let (dbt_state, num_threads, _dbt_cloud) = load(&load_args, &invocation_args, token).await?;
+    let (dbt_state, _dbt_cloud_config) = load(&load_args, &invocation_args, token).await?;
     let flags: BTreeMap<String, minijinja::Value> = invocation_args.to_dict();
 
-    let arg = arg.with_threads(num_threads);
+    let arg = EvalArgsBuilder::from_eval_args(arg)
+        .with_threads(dbt_state.dbt_profile.threads)
+        .build();
 
     let env = initialize_load_jinja_environment(
         &dbt_state.dbt_profile.profile,
@@ -89,35 +93,33 @@ pub async fn execute_clean_command(
                 show_progress!(&arg.io, info);
                 stdfs::remove_dir_all(path)
             } else {
-                log::trace!("The target directory does not exist: {}", path.display());
+                emit_trace_log_message(|| {
+                    format!("The target directory does not exist: {}", path.display())
+                });
                 Ok(())
             }
         })?;
     }
 
-    show_progress_exit!(arg, start)
+    Ok(get_exit_code_from_error_counter())
 }
 
 fn unrelated_paths<P: AsRef<Path>, Q: AsRef<Path>>(io: &IoArgs, to: P, from: Q) -> bool {
-    match stdfs::diff_paths(&to, &from) {
-        Ok(diff) => {
+    stdfs::diff_paths(&to, &from)
+        .and_then(|diff| {
             // It is safe to delete a directory if the only way to get to a protected directory is to navigate to the parent.
             if diff.components().next() == Some(std::path::Component::ParentDir) {
                 Ok(true)
             } else {
-                let e = fs_err!(
+                Err(fs_err!(
                     ErrorCode::InvalidPath,
                     "The target directory is protected: {}",
                     from.as_ref().display()
-                );
-                show_error!(io, &e);
-                Err(e)
+                ))
             }
-        }
-        Err(e) => {
-            show_error!(io, &e);
-            Err(e)
-        }
-    }
-    .is_ok()
+        })
+        .inspect_err(|e| {
+            emit_error_log_from_fs_error(e, io.status_reporter.as_ref());
+        })
+        .is_ok()
 }

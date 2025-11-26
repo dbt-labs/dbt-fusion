@@ -1,6 +1,6 @@
 use clap::ValueEnum;
 use dbt_serde_yaml::{JsonSchema, Value};
-use dbt_telemetry::NodeType;
+use dbt_telemetry::{NodeType, ShowDataOutputFormat};
 use pathdiff::diff_paths;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -17,6 +17,18 @@ use strum_macros::Display;
 
 use log::LevelFilter;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum LocalExecutionBackendKind {
+    #[default]
+    /// Run models in the current process
+    Inline,
+    /// Run models in a separate worker process
+    Worker,
+    /// Run models in a service
+    Service,
+}
+
+use crate::adapter::AdapterType;
 use crate::{
     constants::{DBT_GENERIC_TESTS_DIR_NAME, DBT_SNAPSHOTS_DIR_NAME},
     io_utils::StatusReporter,
@@ -26,7 +38,64 @@ use crate::{
         parse_model_specifiers,
     },
     pretty_string::BLUE,
+    tracing::invocation::with_invocation_mut,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FsCommand {
+    /// Special value indicating no command was provided.
+    /// Used in places where a command is optional to avoid using Option<>
+    #[default]
+    Unset,
+    /// Standard dbt commands
+    Build,
+    Clean,
+    Clone,
+    Compile,
+    Debug,
+    Deps,
+    Init,
+    List,
+    Man,
+    Parse,
+    Run,
+    RunOperation,
+    Seed,
+    Show,
+    Snapshot,
+    Source,
+    System,
+    Test,
+    /// All other commands provided by private cli's
+    Extension(&'static str),
+}
+
+impl FsCommand {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            FsCommand::Unset => "",
+            FsCommand::Build => "build",
+            FsCommand::Clean => "clean",
+            FsCommand::Clone => "clone",
+            FsCommand::Compile => "compile",
+            FsCommand::Debug => "debug",
+            FsCommand::Deps => "deps",
+            FsCommand::Init => "init",
+            FsCommand::List => "list",
+            FsCommand::Man => "man",
+            FsCommand::Parse => "parse",
+            FsCommand::Run => "run",
+            FsCommand::RunOperation => "run-operation",
+            FsCommand::Seed => "seed",
+            FsCommand::Show => "show",
+            FsCommand::Snapshot => "snapshot",
+            FsCommand::Source => "freshness",
+            FsCommand::System => "system",
+            FsCommand::Test => "test",
+            FsCommand::Extension(s) => s,
+        }
+    }
+}
 
 // ----------------------------------------------------------------------------------------------
 // IO Args
@@ -34,7 +103,7 @@ use crate::{
 pub struct IoArgs {
     pub invocation_id: uuid::Uuid,
     pub show: HashSet<ShowOptions>,
-    pub command: String,
+    pub is_compile: bool,
     pub in_dir: PathBuf,
     pub out_dir: PathBuf,
     pub log_path: Option<PathBuf>,
@@ -58,6 +127,9 @@ pub struct IoArgs {
     pub build_cache_url: Option<String>,
     pub build_cache_cas_url: Option<String>,
     pub build_cache_mode: Option<BuildCacheMode>,
+    pub beta_use_query_cache: bool,
+    pub host: String,
+    pub port: u16,
 }
 impl IoArgs {
     pub fn is_generated_file(&self, rel_path: &Path) -> bool {
@@ -137,7 +209,7 @@ impl IoArgs {
             // TODO: temporary logic to avoid showing skipped nodes for compile.
             // Should be centralized across all commands, progress message types, and options.
             && (option != ShowOptions::Completed
-                || self.command.as_str() != "compile"
+                || !self.is_compile
                 || self.debug)
     }
 
@@ -159,7 +231,7 @@ impl IoArgs {
 // System Args
 #[derive(Clone, Debug)]
 pub struct SystemArgs {
-    pub command: String,
+    pub command: FsCommand,
     pub io: IoArgs,
     pub from_main: bool,
     pub num_threads: Option<usize>,
@@ -171,7 +243,7 @@ pub struct SystemArgs {
 #[derive(Clone, Default)]
 pub struct EvalArgs {
     // The command to run
-    pub command: String,
+    pub command: FsCommand,
     // io
     pub io: IoArgs,
     // The profile directory to load the profiles from
@@ -192,8 +264,8 @@ pub struct EvalArgs {
     pub vars: BTreeMap<String, Value>,
     // Stop as soon as this stage is reached
     pub phase: Phases,
-    // Display rows in different formats, this is .to_string on DisplayFormat; we use a string here to break dep. cycle
-    pub format: String,
+    // Display rows in different formats
+    pub format: DisplayFormat,
     /// Limiting number of shown rows. None means no limit, run with --limit -1 to remove limit
     pub limit: Option<usize>,
     /// called as bin or as library
@@ -246,7 +318,8 @@ pub struct EvalArgs {
     pub static_analysis: StaticAnalysisKind,
     pub interactive: bool,
     pub check_conformance: bool,
-    pub validate_semantic_manifest: bool,
+    pub skip_semantic_manifest_validation: bool,
+    pub export_saved_queries: bool,
     pub task_cache_url: String,
     pub run_cache_mode: RunCacheMode,
     pub show_scans: bool,
@@ -272,6 +345,9 @@ pub struct EvalArgs {
     pub check_all: bool,
     // todo: temporary, until Sampling is public, maps (source) unique_id to renamed (database, schema, table)
     pub sample_renaming: BTreeMap<String, (String, String, String)>,
+    pub local_execution_backend: LocalExecutionBackendKind,
+    /// Does not apply to interactive checkpoints.
+    pub skip_checkpoints: bool,
 }
 impl fmt::Debug for EvalArgs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -298,62 +374,126 @@ impl fmt::Debug for EvalArgs {
     }
 }
 
-impl EvalArgs {
-    // todo: switch to using a builder pattern that doesn't clone...
-    pub fn with_target(&self, target: String) -> Self {
-        let mut new_args = self.clone();
-        new_args.target = Some(target);
-        new_args
+pub struct EvalArgsBuilder {
+    pub args: EvalArgs,
+}
+
+impl EvalArgsBuilder {
+    pub fn from_eval_args(args: &EvalArgs) -> Self {
+        Self { args: args.clone() }
     }
-    pub fn with_threads(&self, num_threads: Option<usize>) -> Self {
-        let mut new_args = self.clone();
-        new_args.num_threads = num_threads;
-        new_args
-    }
-    pub fn without_show(&self, option: ShowOptions) -> Self {
-        let mut new_args = self.clone();
-        new_args.io.show.remove(&option);
-        new_args
+}
+
+impl EvalArgsBuilder {
+    /// Configure additional arguments
+    pub fn with_additional(
+        self,
+        target: String,
+        threads: Option<usize>,
+        adapter_type: Option<AdapterType>,
+    ) -> Self {
+        self.with_target(target)
+            .with_threads(threads)
+            .disable_static_analysis_if_not_supported(adapter_type)
     }
 
-    // this could accept a SelectExpression incase we want to join more complex selections together.
-    pub fn with_refined_node_selectors(&self, predicate: Option<SelectionCriteria>) -> EvalArgs {
-        let mut res = self.clone();
+    fn with_target(mut self, target: String) -> Self {
+        // Update span info as it is used in telemetry & TUI
+        with_invocation_mut(|invocation| {
+            if let Some(args) = invocation.eval_args.as_mut() {
+                args.target = Some(target.clone());
+            };
+        });
+
+        self.args.target = Some(target);
+        self
+    }
+
+    pub fn with_threads(mut self, num_threads: Option<usize>) -> Self {
+        // Update span info as it is used in telemetry & TUI
+        with_invocation_mut(|invocation| {
+            if let Some(args) = invocation.eval_args.as_mut() {
+                args.num_threads = num_threads.map(|l| l as u64);
+            };
+        });
+
+        self.args.num_threads = num_threads;
+        self
+    }
+
+    /// Disable the static analysis for a specific adapter if the relevant dialect is unsupported.
+    /// Otherwise, it's a noop
+    pub fn disable_static_analysis_if_not_supported(
+        mut self,
+        adapter_type: Option<AdapterType>,
+    ) -> Self {
+        match adapter_type {
+            // include adapters that don't support static analysis here
+            Some(AdapterType::Salesforce) | None => {
+                #[cfg(debug_assertions)]
+                {
+                    println!(
+                        "debug:warning=static analysis for adapter: {:?} is disabled",
+                        adapter_type
+                    );
+                }
+                self.args.static_analysis = StaticAnalysisKind::Off;
+            }
+            _ => {}
+        }
+        self
+    }
+
+    pub fn with_show_scans(mut self, show_scans: bool) -> Self {
+        self.args.show_scans = show_scans;
+        self
+    }
+
+    pub fn with_max_depth(mut self, max_depth: usize) -> Self {
+        self.args.max_depth = max_depth;
+        self
+    }
+
+    pub fn with_use_fqtn(mut self, use_fqtn: bool) -> Self {
+        self.args.use_fqtn = use_fqtn;
+        self
+    }
+
+    pub fn build(self) -> EvalArgs {
+        self.args
+    }
+}
+
+impl EvalArgs {
+    // this could accept a SelectExpression in case we want to join more complex selections together.
+    pub fn set_refined_node_selectors(mut self, predicate: Option<SelectionCriteria>) -> EvalArgs {
         // Convert SelectionCriteria to SelectExpression::Atom first
         let predicate_expr = predicate.map(SelectExpression::Atom);
 
-        res.select = conjoin_expression(self.select.clone(), predicate_expr.clone());
-        if res.exclude.is_some() {
-            res.exclude = conjoin_expression(self.exclude.clone(), predicate_expr);
+        self.select = conjoin_expression(self.select.clone(), predicate_expr.clone());
+        if self.exclude.is_some() {
+            self.exclude = conjoin_expression(self.exclude.clone(), predicate_expr);
         }
-        res
+
+        // Update span info as it is used in telemetry & TUI
+        with_invocation_mut(|invocation| {
+            if let Some(args) = invocation.eval_args.as_mut() {
+                args.select = self.select.iter().map(|s| s.to_string()).collect();
+                args.exclude = self.exclude.iter().map(|s| s.to_string()).collect();
+            };
+        });
+
+        self
     }
 
-    pub fn with_schema(&self, schema: Vec<JsonSchemaTypes>) -> Self {
-        let mut res = self.clone();
-        res.schema = schema;
-        res
+    pub fn set_schema(mut self, schema: Vec<JsonSchemaTypes>) -> Self {
+        self.schema = schema;
+        self
     }
 
-    pub fn with_show_scans(&self, show_scans: bool) -> Self {
-        let mut res = self.clone();
-        res.show_scans = show_scans;
-        res
-    }
-    pub fn with_max_depth(&self, max_depth: usize) -> Self {
-        let mut res = self.clone();
-        res.max_depth = max_depth;
-        res
-    }
-    pub fn with_use_fqtn(&self, use_fqtn: bool) -> Self {
-        let mut res = self.clone();
-        res.use_fqtn = use_fqtn;
-        res
-    }
-    pub fn with_connection(&self, connection: bool) -> Self {
-        let mut res = self.clone();
-        res.connection = connection;
-        res
+    pub fn set_connection(mut self, connection: bool) -> Self {
+        self.connection = connection;
+        self
     }
 }
 
@@ -374,6 +514,10 @@ pub enum ClapResourceType {
     Test,
     UnitTest,
     Analysis,
+    Function,
+    SemanticModel,
+    Metric,
+    SavedQuery,
 }
 
 impl Display for ClapResourceType {
@@ -386,6 +530,10 @@ impl Display for ClapResourceType {
             ClapResourceType::Test => "test",
             ClapResourceType::UnitTest => "unit_test",
             ClapResourceType::Analysis => "analysis",
+            ClapResourceType::Function => "function",
+            ClapResourceType::SemanticModel => "semantic_model",
+            ClapResourceType::Metric => "metric",
+            ClapResourceType::SavedQuery => "saved_query",
         };
         write!(f, "{s}")
     }
@@ -401,6 +549,10 @@ impl From<&ClapResourceType> for NodeType {
             ClapResourceType::Test => NodeType::Test,
             ClapResourceType::UnitTest => NodeType::UnitTest,
             ClapResourceType::Analysis => NodeType::Analysis,
+            ClapResourceType::Function => NodeType::Function,
+            ClapResourceType::SemanticModel => NodeType::SemanticModel,
+            ClapResourceType::Metric => NodeType::Metric,
+            ClapResourceType::SavedQuery => NodeType::SavedQuery,
         }
     }
 }
@@ -484,6 +636,101 @@ pub enum DisplayFormat {
     Name,
     /// Output nodes as file paths (node.original_file_path)
     Path,
+}
+
+impl TryFrom<DisplayFormat> for ShowDataOutputFormat {
+    type Error = ();
+
+    fn try_from(format: DisplayFormat) -> Result<Self, Self::Error> {
+        match format {
+            DisplayFormat::Json => Ok(Self::Json),
+            DisplayFormat::Table => Ok(Self::Text),
+            DisplayFormat::Csv => Ok(Self::Csv),
+            DisplayFormat::Tsv => Ok(Self::Tsv),
+            DisplayFormat::NdJson => Ok(Self::Ndjson),
+            DisplayFormat::Yml => Ok(Self::Yml),
+            _ => Err(()),
+        }
+    }
+}
+
+/// Output format for the list command. This is a subset of DisplayFormat
+/// that only includes formats supported by the list command.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    Hash,
+    Eq,
+    ValueEnum,
+    Default,
+    EnumIter,
+    strum_macros::IntoStaticStr,
+)]
+#[strum(serialize_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
+#[clap(rename_all = "lowercase")]
+pub enum ListOutputFormat {
+    /// Output nodes as JSON objects with customizable keys
+    Json,
+    /// Output nodes as selector strings (e.g. "source:pkg.source_name.table_name")
+    #[default]
+    Selector,
+    /// Output nodes as search names (node.search_name)
+    Name,
+    /// Output nodes as file paths (node.original_file_path)
+    Path,
+}
+
+impl From<ListOutputFormat> for DisplayFormat {
+    fn from(format: ListOutputFormat) -> Self {
+        match format {
+            ListOutputFormat::Json => DisplayFormat::Json,
+            ListOutputFormat::Selector => DisplayFormat::Selector,
+            ListOutputFormat::Name => DisplayFormat::Name,
+            ListOutputFormat::Path => DisplayFormat::Path,
+        }
+    }
+}
+
+impl TryFrom<DisplayFormat> for ListOutputFormat {
+    type Error = ();
+
+    fn try_from(format: DisplayFormat) -> Result<Self, Self::Error> {
+        match format {
+            DisplayFormat::Json => Ok(ListOutputFormat::Json),
+            DisplayFormat::Selector => Ok(ListOutputFormat::Selector),
+            DisplayFormat::Name => Ok(ListOutputFormat::Name),
+            DisplayFormat::Path => Ok(ListOutputFormat::Path),
+            _ => Err(()),
+        }
+    }
+}
+
+impl From<ListOutputFormat> for dbt_telemetry::ListOutputFormat {
+    fn from(format: ListOutputFormat) -> Self {
+        match format {
+            ListOutputFormat::Json => Self::Json,
+            ListOutputFormat::Selector => Self::Selector,
+            ListOutputFormat::Name => Self::Name,
+            ListOutputFormat::Path => Self::Path,
+        }
+    }
+}
+
+impl ListOutputFormat {
+    pub fn supported_formats() -> impl Iterator<Item = &'static str> {
+        use strum::IntoEnumIterator;
+
+        Self::iter().map(|f| f.into())
+    }
+
+    pub fn supported_formats_display() -> String {
+        Self::supported_formats().collect::<Vec<_>>().join(", ")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -654,7 +901,7 @@ impl ShowOptions {
             ShowOptions::Schedule => BLUE.apply_to("Schedule").to_string(),
             ShowOptions::Instructions => BLUE.apply_to("Instruction").to_string(),
             ShowOptions::SourcedSchemas => BLUE.apply_to("Sourced schemas").to_string(),
-            ShowOptions::Nodes => BLUE.apply_to("Selected nodes").to_string(),
+            ShowOptions::Nodes => "Selected nodes".to_string(),
             // remark: we don't use this case, but use compile time and runtime stats
             ShowOptions::Stats => BLUE.apply_to("Statistics").to_string(),
             // remark: these come with own titles..

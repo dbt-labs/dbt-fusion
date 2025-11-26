@@ -61,6 +61,19 @@ impl Ident {
     pub fn display(&self, backend: Backend) -> IdentDisplay<'_> {
         IdentDisplay(self, backend)
     }
+
+    /// Converts the identifier to a string losing any quoting information.
+    ///
+    /// This is bad because quoting governs how an identifier is interpreted
+    /// regarding case-sensitivity and allowed characters, so you should worry
+    /// every time you use this method. [Ident::display] will render the identifier
+    /// with quotes if necessary according to the backend's dialect rules.
+    pub(crate) fn to_string_lossy(&self) -> &String {
+        match self {
+            Ident::Unquoted(_, s) => s,
+            Ident::Plain(s) => s,
+        }
+    }
 }
 
 pub struct IdentDisplay<'a>(&'a Ident, Backend);
@@ -111,7 +124,7 @@ pub const fn quote_char(backend: Backend) -> char {
     match backend {
         BigQuery | Databricks | DatabricksODBC => '`',
         Snowflake => '"',
-        Redshift | RedshiftODBC | Postgres | Salesforce => '"',
+        Redshift | RedshiftODBC | Postgres | Salesforce | DuckDB => '"',
         Generic { .. } => '"',
     }
 }
@@ -121,7 +134,9 @@ pub const fn canonical_quote(backend: Backend) -> QuotingStyle {
     use Backend::*;
     match backend {
         BigQuery | Databricks | DatabricksODBC => QuotingStyle::Backtick,
-        Snowflake | Redshift | RedshiftODBC | Postgres | Salesforce => QuotingStyle::Double,
+        Snowflake | Redshift | RedshiftODBC | Postgres | Salesforce | DuckDB => {
+            QuotingStyle::Double
+        }
         Generic { .. } => QuotingStyle::Double,
     }
 }
@@ -145,6 +160,7 @@ pub fn is_valid_ident_char(c: char, backend: Backend) -> bool {
         | Redshift
         | RedshiftODBC
         | Salesforce
+        | DuckDB
         | Generic { .. } => c.is_alphanumeric() || c == '_',
     }
 }

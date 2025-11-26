@@ -41,12 +41,12 @@ fn infer_from_constraints(model: &DbtModel) -> Option<Vec<String>> {
         }
     }
 
-    if let Some((col_name, _)) = model.__base_attr__.columns.iter().find(|(_, col)| {
+    if let Some(col) = model.__base_attr__.columns.iter().find(|col| {
         col.constraints
             .iter()
             .any(|cc| cc.type_ == ConstraintType::PrimaryKey)
     }) {
-        return Some(vec![col_name.clone()]);
+        return Some(vec![col.name.clone()]);
     }
 
     None
@@ -226,7 +226,7 @@ pub fn infer_and_apply_primary_keys(nodes: &mut Nodes, disabled_nodes: &Nodes) {
 mod tests {
     use super::*;
     use dbt_schemas::schemas::nodes::{DbtTestAttr, TestMetadata};
-    use dbt_schemas::schemas::{CommonAttributes, NodeBaseAttributes};
+    use dbt_schemas::schemas::{CommonAttributes, IntrospectionKind, NodeBaseAttributes};
 
     fn empty_nodes() -> Nodes {
         Nodes::default()
@@ -304,6 +304,7 @@ mod tests {
                     namespace: None,
                 }),
                 file_key_name: None,
+                introspection: IntrospectionKind::None,
             },
             ..Default::default()
         };
@@ -326,6 +327,7 @@ mod tests {
                     namespace: None,
                 }),
                 file_key_name: None,
+                introspection: IntrospectionKind::None,
             },
             ..Default::default()
         };

@@ -20,7 +20,7 @@ use crate::schemas::manifest::GrantAccessToTarget;
 use crate::schemas::manifest::postgres::PostgresIndex;
 use crate::schemas::manifest::{BigqueryClusterConfig, PartitionConfig};
 use crate::schemas::project::DefaultTo;
-use crate::schemas::project::IterChildren;
+use crate::schemas::project::TypedRecursiveConfig;
 use crate::schemas::project::configs::common::WarehouseSpecificNodeConfig;
 use crate::schemas::project::configs::common::default_column_types;
 use crate::schemas::project::configs::common::default_hooks;
@@ -35,7 +35,7 @@ use crate::schemas::serde::{f64_or_string_f64, u64_or_string_u64};
 #[derive(Deserialize, Serialize, Debug, Clone, JsonSchema)]
 pub struct ProjectSeedConfig {
     #[serde(rename = "+column_types")]
-    pub column_types: Option<BTreeMap<String, String>>,
+    pub column_types: Option<BTreeMap<Spanned<String>, String>>,
     #[serde(rename = "+copy_grants")]
     pub copy_grants: Option<bool>,
     #[serde(rename = "+database", alias = "+project", alias = "+data_space")]
@@ -158,12 +158,12 @@ pub struct ProjectSeedConfig {
         deserialize_with = "f64_or_string_f64"
     )]
     pub refresh_interval_minutes: Option<f64>,
-    #[serde(rename = "+description")]
-    pub description: Option<String>,
     #[serde(rename = "+max_staleness")]
     pub max_staleness: Option<String>,
     #[serde(rename = "+file_format")]
     pub file_format: Option<String>,
+    #[serde(rename = "+catalog_name")]
+    pub catalog_name: Option<String>,
     #[serde(rename = "+location_root")]
     pub location_root: Option<String>,
     #[serde(rename = "+tblproperties")]
@@ -262,16 +262,20 @@ pub struct ProjectSeedConfig {
     pub __additional_properties__: BTreeMap<String, ShouldBe<ProjectSeedConfig>>,
 }
 
-impl IterChildren<ProjectSeedConfig> for ProjectSeedConfig {
+impl TypedRecursiveConfig for ProjectSeedConfig {
+    fn type_name() -> &'static str {
+        "seed"
+    }
+
     fn iter_children(&self) -> Iter<'_, String, ShouldBe<Self>> {
         self.__additional_properties__.iter()
     }
 }
 
-#[skip_serializing_none]
+// NOTE: No #[skip_serializing_none] - we handle None serialization in serialize_with_mode
 #[derive(Deserialize, Serialize, Debug, Default, PartialEq, Clone, JsonSchema)]
 pub struct SeedConfig {
-    pub column_types: Option<BTreeMap<String, String>>,
+    pub column_types: Option<BTreeMap<Spanned<String>, String>>,
     #[serde(alias = "project", alias = "data_space")]
     pub database: Option<String>,
     #[serde(alias = "dataset")]
@@ -289,11 +293,12 @@ pub struct SeedConfig {
     pub group: Option<String>,
     pub meta: Option<BTreeMap<String, YmlValue>>,
     pub persist_docs: Option<PersistDocsConfig>,
+    #[serde(alias = "post-hook")]
     pub post_hook: Verbatim<Option<Hooks>>,
+    #[serde(alias = "pre-hook")]
     pub pre_hook: Verbatim<Option<Hooks>>,
     pub tags: Option<StringOrArrayOfStrings>,
     pub quoting: Option<DbtQuoting>,
-    pub description: Option<String>,
     pub materialized: Option<DbtMaterialization>,
     // Adapter specific configs
     pub __warehouse_specific_config__: WarehouseSpecificNodeConfig,
@@ -320,9 +325,9 @@ impl From<ProjectSeedConfig> for SeedConfig {
             pre_hook: config.pre_hook,
             tags: config.tags,
             quoting: config.quoting,
-            description: config.description,
             materialized: Some(DbtMaterialization::Seed),
             __warehouse_specific_config__: WarehouseSpecificNodeConfig {
+                description: None, // Only for BigQuery models
                 adapter_properties: config.adapter_properties,
                 external_volume: config.external_volume,
                 base_location_root: config.base_location_root,
@@ -352,9 +357,14 @@ impl From<ProjectSeedConfig> for SeedConfig {
                 partitions: config.partitions,
                 enable_refresh: config.enable_refresh,
                 refresh_interval_minutes: config.refresh_interval_minutes,
+                resource_tags: None,
                 max_staleness: config.max_staleness,
-
+                jar_file_uri: None,
+                timeout: None,
+                batch_id: None,
+                dataproc_cluster_name: None,
                 file_format: config.file_format,
+                catalog_name: config.catalog_name,
                 location_root: config.location_root,
                 tblproperties: config.tblproperties,
                 include_full_name_in_path: config.include_full_name_in_path,
@@ -419,7 +429,6 @@ impl From<SeedConfig> for ProjectSeedConfig {
             pre_hook: config.pre_hook,
             tags: config.tags,
             quoting: config.quoting,
-            description: config.description,
             // Snowflake fields
             adapter_properties: config.__warehouse_specific_config__.adapter_properties,
             snowflake_warehouse: config.__warehouse_specific_config__.snowflake_warehouse,
@@ -459,6 +468,7 @@ impl From<SeedConfig> for ProjectSeedConfig {
             max_staleness: config.__warehouse_specific_config__.max_staleness,
             // Databricks fields
             file_format: config.__warehouse_specific_config__.file_format,
+            catalog_name: config.__warehouse_specific_config__.catalog_name,
             location_root: config.__warehouse_specific_config__.location_root,
             tblproperties: config.__warehouse_specific_config__.tblproperties,
             include_full_name_in_path: config
@@ -538,7 +548,6 @@ impl DefaultTo<SeedConfig> for SeedConfig {
             full_refresh,
             group,
             persist_docs,
-            description,
             materialized,
             // Adapter specific configs
             __warehouse_specific_config__: warehouse_specific_config,
@@ -576,7 +585,6 @@ impl DefaultTo<SeedConfig> for SeedConfig {
                 full_refresh,
                 group,
                 persist_docs,
-                description,
                 materialized,
             ]
         );

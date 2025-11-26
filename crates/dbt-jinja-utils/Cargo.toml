@@ -18,17 +18,19 @@ doctest = false
 workspace = true
 
 [dependencies]
+dbt-adapter = { workspace = true }
 dbt-agate = { workspace = true }
 dbt-common = { workspace = true }
 dbt-frontend-common = { workspace = true }
-dbt-fusion-adapter = { workspace = true }
 dbt-schemas = { workspace = true }
+dbt-telemetry = { workspace = true }
 
 arrow = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
 dashmap = { workspace = true }
 dbt-serde_yaml = { workspace = true }
+indexmap = { workspace = true, features = ["serde"] }
 itertools = { workspace = true }
 log = { workspace = true }
 md5 = { workspace = true }
@@ -44,4 +46,5 @@ dbt-fusion-workspace-hack = { version = "0.1" }
 
 [dev-dependencies]
 dbt-test-primitives = { workspace = true }
+dbt-test-utils = { workspace = true }
 insta = { version = "1.38.0", features = ["glob", "serde"] }

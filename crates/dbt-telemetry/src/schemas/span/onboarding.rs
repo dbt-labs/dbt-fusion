@@ -9,7 +9,7 @@ pub use proto_rust::v1::public::events::fusion::onboarding::OnboardingScreenShow
 
 impl ProtoTelemetryEvent for OnboardingScreenShown {
     const RECORD_CATEGORY: TelemetryEventRecType = TelemetryEventRecType::Span;
-    const OUTPUT_FLAGS: TelemetryOutputFlags = TelemetryOutputFlags::EXPORT_ALL;
+    const OUTPUT_FLAGS: TelemetryOutputFlags = TelemetryOutputFlags::ALL;
 
     fn event_display_name(&self) -> String {
         format!("Onboarding screen shown: {}", self.screen().as_str_name())
@@ -24,9 +24,9 @@ impl ArrowSerializableTelemetryEvent for OnboardingScreenShown {
     fn to_arrow_record(&self) -> ArrowAttributes<'_> {
         ArrowAttributes {
             json_payload: serde_json::to_string(self)
-                .unwrap_or_else(|_| {
+                .unwrap_or_else(|e| {
                     panic!(
-                        "Failed to serialize event type \"{}\" to JSON",
+                        "Failed to serialize event type \"{}\" to JSON: {e}",
                         Self::full_name()
                     )
                 })

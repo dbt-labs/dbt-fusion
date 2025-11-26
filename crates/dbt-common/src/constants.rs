@@ -9,9 +9,11 @@ pub const DBT_MIN_SUPPORTED_VERSION: &str = "1.8.0";
 // (versusfacit): Load state from catalogs.yml. We only permit a single
 // catalogs.yml. A possible future direction will be to move this to
 // ~/.dbt directory. This depends on read catalog and Xplat decisions.
+pub const DBT_CONFIG_DIR: &str = ".dbt";
 pub const DBT_CATALOGS_YML: &str = "catalogs.yml";
 pub const DBT_PROJECT_YML: &str = "dbt_project.yml";
 pub const DBT_PROFILES_YML: &str = "profiles.yml";
+pub const DBT_CLOUD_YML: &str = "dbt_cloud.yml";
 
 // ----------------------------------------------------------------------------------------------
 // dbt outputs
@@ -35,6 +37,7 @@ pub const DBT_TARGET_DIR_NAME: &str = "target";
 pub const DBT_PACKAGES_DIR_NAME: &str = "dbt_packages";
 pub const DBT_INTERNAL_PACKAGES_DIR_NAME: &str = "dbt_internal_packages";
 pub const DBT_MANIFEST_JSON: &str = "manifest.json";
+pub const DBT_MANIFEST_INFO: &str = "manifest.info";
 pub const DBT_SEMANTIC_MANIFEST_JSON: &str = "semantic_manifest.json";
 pub const DBT_CATALOG_JSON: &str = "catalog.json";
 pub const DBT_COMPILED_DIR_NAME: &str = "compiled";
@@ -66,11 +69,6 @@ pub const ERROR: &str = "error:";
 pub const WARNING: &str = "warning:";
 pub const PANIC: &str = "panic:";
 
-// ----------------------------------------------------------------------------------------------
-// test verdicts
-pub const VERDICT_PASS: &str = "[Pass]";
-pub const VERDICT_FAIL: &str = "[Fail]";
-pub const VERDICT_WARN: &str = "[Warn]";
 // ----------------------------------------------------------------------------------------------
 // actions in order of appearance
 
@@ -112,6 +110,7 @@ pub const SKIPPED: &str = "   Skipped";
 pub const ANALYZED: &str = "  Analyzed";
 pub const RENDERED: &str = "  Rendered";
 pub const FRESHNESS: &str = " Freshness";
+pub const TEST: &str = "      Test";
 
 // debug command
 pub const VALIDATING: &str = "Validating";
@@ -126,10 +125,6 @@ pub const PREVIEWING: &str = "Previewing";
 pub const INLINE_NODE: &str = "sql_operation.inline";
 pub const NOOP: &str = "noop";
 pub const SAMPLING: &str = "  Sampling";
-
-// log targets
-pub const EXECUTING: &str = " ExecutingSql";
-pub const CACHE_LOG: &str = "CacheLogging";
 
 // cas/node read/write
 

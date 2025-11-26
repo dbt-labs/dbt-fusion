@@ -2,6 +2,9 @@ use dbt_cloud_api::{
     apis::{configuration::Configuration, connections_api, users_api, whoami_api},
     models,
 };
+use dbt_common::tracing::emit::{
+    emit_debug_log_message, emit_info_log_message, emit_warn_log_message,
+};
 use dbt_common::{ErrorCode, FsResult, adapter::AdapterType, fs_err};
 use dbt_schemas::schemas::profiles::{
     BigqueryDbConfig, DatabricksDbConfig, DbConfig, PostgresDbConfig, RedshiftDbConfig,
@@ -181,6 +184,7 @@ fn create_merged_db_config(
                 token_uri: None,
                 token: None,
                 keyfile: None,
+                quota_project: None,
                 retries: None,
                 location: None,
                 scopes: None,
@@ -191,6 +195,7 @@ fn create_merged_db_config(
                 dataproc_cluster_name: None,
                 dataproc_region: None,
                 gcs_bucket: None,
+                submission_method: None,
                 job_creation_timeout_seconds: None,
                 job_execution_timeout_seconds: None,
                 job_retries: None,
@@ -301,11 +306,13 @@ fn create_merged_db_config(
                     token: None,
                     keyfile: None,
                     keyfile_json: None,
+                    quota_project: None,
                     compute_region: None,
                     dataproc_batch: None,
                     dataproc_cluster_name: None,
                     dataproc_region: None,
                     gcs_bucket: None,
+                    submission_method: None,
                     job_creation_timeout_seconds: None,
                     job_execution_timeout_seconds: None,
                     job_retries: None,
@@ -354,7 +361,10 @@ fn create_merged_db_config(
                     schema: None,
                     method: None,
                     refresh_token: None,
+                    // TODO(anna): Not sure whether this needs to be set as none. could not find mention in docs
+                    quota_project: None,
                     client_secret: None,
+                    submission_method: None,
                     token: None,
                     keyfile: None,
                     keyfile_json: None,
@@ -387,10 +397,14 @@ fn create_merged_db_config(
             }
             (DbConfig::Databricks(_), models::Config::DatabricksConnection(_)) => {
                 // TODO: Implement Databricks merging when needed
-                log::debug!("Databricks connection merging not yet implemented");
+                emit_debug_log_message("Databricks connection merging not yet implemented");
             }
             _ => {
-                log::warn!("Adapter type mismatch between credential and connection");
+                emit_warn_log_message(
+                    ErrorCode::Generic,
+                    "Adapter type mismatch between credential and connection",
+                    None,
+                );
             }
         }
     }
@@ -476,10 +490,10 @@ impl DbtCloudClient {
         // Check if dbt_cloud.yml exists
         let dbt_cloud_config_path = home_dir.join(".dbt").join("dbt_cloud.yml");
         if !dbt_cloud_config_path.exists() {
-            log::info!(
+            emit_info_log_message(format!(
                 "dbt_cloud.yml not found at {}",
                 dbt_cloud_config_path.display()
-            );
+            ));
             return Ok(None);
         }
 
@@ -498,7 +512,11 @@ impl DbtCloudClient {
             .find(|project| project.project_id == *active_project_id);
 
         if active_project.is_none() {
-            log::warn!("No project found with active project ID: {active_project_id}");
+            emit_warn_log_message(
+                ErrorCode::Generic,
+                format!("No project found with active project ID: {active_project_id}"),
+                None,
+            );
         }
 
         Ok(active_project)
@@ -647,8 +665,12 @@ impl DbtCloudClient {
                 {
                     Ok(response) => Some(response),
                     Err(e) => {
-                        log::warn!(
-                            "Failed to fetch connection details for connection_id {connection_id}: {e}"
+                        emit_warn_log_message(
+                            ErrorCode::IoError,
+                            format!(
+                                "Failed to fetch connection details for connection_id {connection_id}: {e}"
+                            ),
+                            None,
                         );
                         None
                     }
@@ -663,8 +685,10 @@ impl DbtCloudClient {
             match create_merged_db_config(credential, connection_config) {
                 Some(merged_config) => Ok(Some(merged_config)),
                 None => {
-                    log::warn!(
-                        "Unable to create DbConfig from user credential and connection data"
+                    emit_warn_log_message(
+                        ErrorCode::Generic,
+                        "Unable to create DbConfig from user credential and connection data",
+                        None,
                     );
                     Ok(None)
                 }

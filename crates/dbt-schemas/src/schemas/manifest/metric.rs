@@ -6,8 +6,7 @@ use serde::{Deserialize, Serialize};
 type YmlValue = dbt_serde_yaml::Value;
 
 use crate::schemas::{
-    CommonAttributes,
-    common::NodeDependsOn,
+    CommonAttributes, NodeBaseAttributes,
     dbt_column::Granularity,
     manifest::common::{SourceFileMetadata, WhereFilter, WhereFilterIntersection},
     project::MetricConfig,
@@ -19,13 +18,13 @@ use crate::schemas::{
             PeriodAggregationType, StringOrMetricPropertiesMetricInput, WindowChoice,
         },
     },
-    ref_and_source::DbtRef,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct DbtMetric {
     pub __common_attr__: CommonAttributes,
+    pub __base_attr__: NodeBaseAttributes,
     pub __metric_attr__: DbtMetricAttr,
 
     // To be deprecated
@@ -41,11 +40,8 @@ pub struct DbtMetricAttr {
     pub type_params: MetricTypeParams,
     pub filter: Option<WhereFilterIntersection>,
     pub metadata: Option<SourceFileMetadata>,
-    pub time_granularity: Option<String>,
+    pub time_granularity: Option<Granularity>,
     pub unrendered_config: BTreeMap<String, YmlValue>,
-    pub depends_on: NodeDependsOn,
-    pub refs: Vec<DbtRef>,
-    pub sources: Vec<Vec<String>>,
     pub metrics: Vec<MetricInput>,
     pub created_at: f64,
     pub group: Option<String>,
@@ -66,6 +62,8 @@ pub struct MetricTypeParams {
     #[serde(default = "default_join_to_timespine")]
     pub join_to_timespine: Option<bool>,
     pub fill_nulls_with: Option<i32>,
+    #[serde(skip_deserializing)]
+    pub is_private: bool,
     pub metric_aggregation_params: Option<MetricAggregationParameters>,
 }
 
@@ -295,7 +293,7 @@ impl From<MetricPropertiesMetricInput> for MetricInput {
             offset_window: metric_input
                 .offset_window
                 .and_then(|w| MetricTimeWindow::from_string(w).ok()),
-            offset_to_grain: None,
+            offset_to_grain: metric_input.offset_to_grain,
         }
     }
 }
@@ -316,14 +314,10 @@ impl From<MetricsProperties> for MetricTypeParams {
         };
         let expr = props.expr.clone().map(String::from);
 
-        let metric_aliases: Option<Vec<MetricInput>> = props
-            .metric_aliases
+        let input_metrics: Option<Vec<MetricInput>> = props
+            .input_metrics
             .clone()
-            .map(|metric_aliases| metric_aliases.into_iter().map(MetricInput::from).collect());
-        let metrics = props
-            .metrics
-            .clone()
-            .map(|metrics| metrics.into_iter().map(MetricInput::from).collect());
+            .map(|input_metrics| input_metrics.into_iter().map(MetricInput::from).collect());
 
         // we infer conversion type from other fields, since type is optional
         let conversion_type_params: Option<ConversionTypeParams> =
@@ -349,8 +343,9 @@ impl From<MetricsProperties> for MetricTypeParams {
             conversion_type_params,
             expr,
             window,
-            metrics: metrics.or(metric_aliases), // TODO: confirm which ones take precedence
+            metrics: input_metrics,
             input_measures: Some(vec![]),
+            is_private: props.hidden.unwrap_or(false),
             ..Default::default()
         };
 

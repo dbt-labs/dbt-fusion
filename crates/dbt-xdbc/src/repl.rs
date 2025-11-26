@@ -7,7 +7,8 @@ use adbc_core::{
 };
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
-use dbt_common::pretty_table::{DisplayFormat, pretty_data_table};
+use dbt_common::io_args::DisplayFormat;
+use dbt_common::pretty_table::pretty_data_table;
 use dialoguer::{BasicHistory, Input, theme::ColorfulTheme};
 
 use crate::{
@@ -124,9 +125,10 @@ impl ReplState {
             return Ok((0, 0));
         }
 
+        let ctx = QueryCtx::default();
         let conn = self.connection.as_mut();
         let mut stmt = conn.new_statement()?;
-        stmt.set_sql_query(&QueryCtx::new("repl").with_sql(query))?;
+        stmt.set_sql_query(&ctx, query)?;
         let reader = stmt.execute()?;
 
         let num_cols = reader.schema().fields().len();
@@ -351,7 +353,7 @@ pub async fn run_repl(backend_str: &str) -> Result<()> {
                         "",
                         &column_names,
                         slice::from_ref(&batch),
-                        &DisplayFormat::Table,
+                        DisplayFormat::Table,
                         Some(10),
                         true,
                         Some(batch.num_rows()),

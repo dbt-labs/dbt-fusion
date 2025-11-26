@@ -1,19 +1,21 @@
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
+use dbt_adapter::load_catalogs;
 use dbt_common::cancellation::CancellationToken;
 use dbt_common::constants::{
     DBT_CATALOGS_YML, DBT_DEPENDENCIES_YML, DBT_PACKAGES_LOCK_FILE, DBT_PACKAGES_YML,
 };
 use dbt_common::once_cell_vars::DISPATCH_CONFIG;
-use dbt_common::show_warning;
+use dbt_common::tracing::emit::emit_warn_log_from_fs_error;
 use dbt_jinja_utils::invocation_args::InvocationArgs;
 use dbt_jinja_utils::jinja_environment::JinjaEnv;
 use dbt_jinja_utils::phases::load::init::initialize_load_jinja_environment;
 use dbt_jinja_utils::phases::load::init::initialize_load_profile_jinja_environment;
-use dbt_jinja_utils::serde::yaml_to_fs_error;
-use dbt_schemas::schemas::serde::StringOrInteger;
+use dbt_schemas::schemas::serde::{StringOrInteger, yaml_to_fs_error};
 use dbt_schemas::schemas::telemetry::{ExecutionPhase, PhaseExecuted};
+use dbt_schemas::schemas::{DbtCloudConfig, DbtCloudProjectConfig};
 use dbt_schemas::state::DbtProfile;
+use dbt_serde_yaml;
 use fs_deps::get_or_install_packages;
 use pathdiff::diff_paths;
 use serde::Deserialize;
@@ -28,13 +30,14 @@ use std::{fs, io};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
 use dbt_common::constants::{
-    DBT_INTERNAL_PACKAGES_DIR_NAME, DBT_PACKAGES_DIR_NAME, DBT_PROJECT_YML, LOADING,
+    DBT_CLOUD_YML, DBT_CONFIG_DIR, DBT_INTERNAL_PACKAGES_DIR_NAME, DBT_PACKAGES_DIR_NAME,
+    DBT_PROJECT_YML, LOADING,
 };
 use dbt_common::error::LiftableResult;
 use project::DbtProject;
 
 use dbt_common::stdfs::last_modified;
-use dbt_common::{ErrorCode, ectx, err, with_progress};
+use dbt_common::{ErrorCode, ectx, err, tokiofs, with_progress};
 use dbt_common::{FsResult, fs_err};
 use dbt_schemas::schemas::project::{self, DbtProjectSimplified, ProjectDbtCloudConfig};
 use dbt_schemas::state::{DbtAsset, DbtPackage, DbtState, DbtVars, ResourcePathKind};
@@ -42,11 +45,13 @@ use dbt_schemas::state::{DbtAsset, DbtPackage, DbtState, DbtVars, ResourcePathKi
 use crate::args::LoadArgs;
 use crate::dbt_project_yml_loader::load_project_yml;
 use crate::download_publication::download_publication_artifacts;
-use crate::load_catalogs;
 use crate::utils::{collect_file_info, identify_package_dependencies};
 use crate::{
     load_internal_packages, load_packages, load_profiles, load_vars, persist_internal_packages,
 };
+
+// Temporary opt-in switch for unreleased Python model support.
+const PYTHON_MODELS_ENV_VAR: &str = "DBT_ENABLE_BETA_PYTHON_MODELS";
 
 use dbt_jinja_utils::phases::load::secret_renderer::secret_context_env_var;
 use dbt_jinja_utils::serde::{into_typed_with_jinja, value_from_file};
@@ -57,18 +62,23 @@ use dbt_common::tracing::event_info::store_event_attributes;
 #[tracing::instrument(
     skip_all,
     fields(
-        _e = ?store_event_attributes(PhaseExecuted::start_general(ExecutionPhase::LoadProject).into()),
+        _e = ?store_event_attributes(PhaseExecuted::start_general(ExecutionPhase::LoadProject)),
     )
 )]
 pub async fn load(
     arg: &LoadArgs,
     iarg: &InvocationArgs,
     token: &CancellationToken,
-) -> FsResult<(DbtState, Option<usize>, Option<ProjectDbtCloudConfig>)> {
+) -> FsResult<(DbtState, Option<DbtCloudProjectConfig>)> {
     let _pb = with_progress!(arg.io, spinner => LOADING);
 
     let (simplified_dbt_project, mut dbt_profile) =
         load_simplified_project_and_profiles(arg).await?;
+
+    let dbt_cloud_project = match &simplified_dbt_project.dbt_cloud {
+        Some(project_cloud) => load_cloud_project_config(project_cloud),
+        None => None,
+    };
 
     // Check if .gitignore exists and add dbt_internal_packages/ if not present
     let gitignore_path = arg.io.in_dir.join(".gitignore");
@@ -85,16 +95,8 @@ pub async fn load(
     }
 
     // initialize loader into a crate accessible static location
-    let catalogs_yml_path = arg.io.in_dir.join(DBT_CATALOGS_YML);
-    match fs::read_to_string(&catalogs_yml_path) {
-        Ok(text) => load_catalogs(&text, &catalogs_yml_path),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(fs_err!(
-            code => ErrorCode::InvalidConfig,
-            loc  => PathBuf::from(&catalogs_yml_path),
-            "Failed to read '{}': {}", DBT_CATALOGS_YML, e
-        )),
-    }?;
+    let env = initialize_load_profile_jinja_environment();
+    load_catalogs(arg, &env).await?;
 
     let final_threads = if iarg.num_threads.is_none() {
         if let Some(threads) = dbt_profile.db_config.get_threads() {
@@ -142,7 +144,7 @@ pub async fn load(
 
     // If we are running `dbt debug` we don't need to collect dbt_project.yml files
     if arg.debug_profile {
-        return Ok((dbt_state, final_threads, simplified_dbt_project.dbt_cloud));
+        return Ok((dbt_state, dbt_cloud_project));
     }
 
     let flags: BTreeMap<String, minijinja::Value> = iarg.to_dict();
@@ -199,7 +201,7 @@ pub async fn load(
         dbt_state.packages.extend(packages);
         dbt_state.packages[0] = new_root_package;
 
-        return Ok((dbt_state, final_threads, simplified_dbt_project.dbt_cloud));
+        return Ok((dbt_state, dbt_cloud_project));
     }
 
     // Load the packages.yml file, if it exists and install the packages if arg.install_deps is true
@@ -210,7 +212,11 @@ pub async fn load(
         &simplified_dbt_project,
     );
 
-    persist_internal_packages(&internal_packages_install_path, adapter_type, &arg.command)?;
+    persist_internal_packages(
+        &internal_packages_install_path,
+        adapter_type,
+        arg.enable_persist_compare_package,
+    )?;
 
     let (packages_lock, upstream_projects) = get_or_install_packages(
         &arg.io,
@@ -221,19 +227,16 @@ pub async fn load(
         arg.upgrade,
         arg.lock,
         arg.vars.clone(),
+        arg.version_check,
         token,
     )
     .await?;
+
     // get publication artifact for each upstream project
-    download_publication_artifacts(
-        &upstream_projects,
-        &simplified_dbt_project.dbt_cloud,
-        &arg.io,
-    )
-    .await?;
+    download_publication_artifacts(&upstream_projects, &dbt_cloud_project, &arg.io).await?;
     // If we are running `dbt deps` we don't need to collect files
     if arg.install_deps {
-        return Ok((dbt_state, final_threads, simplified_dbt_project.dbt_cloud));
+        return Ok((dbt_state, dbt_cloud_project));
     }
 
     let lookup_map = packages_lock.lookup_map();
@@ -268,7 +271,42 @@ pub async fn load(
         dbt_state.packages.extend(packages);
         dbt_state.vars = collected_vars.into_iter().collect();
     }
-    Ok((dbt_state, final_threads, simplified_dbt_project.dbt_cloud))
+
+    // Handle inline SQL if provided
+    if let Some(inline_sql) = &arg.inline_sql {
+        let _ = prepare_inline_sql(inline_sql, &arg.io.out_dir, &mut dbt_state).await?;
+    }
+
+    Ok((dbt_state, dbt_cloud_project))
+}
+
+pub async fn load_catalogs(arg: &LoadArgs, env: &JinjaEnv) -> FsResult<()> {
+    let ctx: BTreeMap<String, minijinja::Value> = BTreeMap::from([
+        (
+            "env_var".to_owned(),
+            minijinja::Value::from_func_func("env_var", secret_context_env_var),
+        ),
+        (
+            "var".to_owned(),
+            minijinja::Value::from_function(var_fn(arg.vars.clone())),
+        ),
+    ]);
+    let catalogs_yml_path = arg.io.in_dir.join(DBT_CATALOGS_YML);
+    match fs::read_to_string(&catalogs_yml_path) {
+        Ok(raw_text) => {
+            let raw_text_yml: dbt_serde_yaml::Value = dbt_serde_yaml::from_str(&raw_text)
+                .map_err(|e| yaml_to_fs_error(e, Some(&catalogs_yml_path)))?;
+            let text: dbt_serde_yaml::Value =
+                into_typed_with_jinja(&arg.io, raw_text_yml, true, env, &ctx, &[], None, true)?;
+            load_catalogs::load_catalogs(text, &catalogs_yml_path)
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(fs_err!(
+            code => ErrorCode::InvalidConfig,
+            loc  => PathBuf::from(&catalogs_yml_path),
+            "Failed to read '{}': {}", DBT_CATALOGS_YML, e
+        )),
+    }
 }
 
 pub async fn load_simplified_project_and_profiles(
@@ -335,6 +373,41 @@ pub async fn load_simplified_project_and_profiles(
     let dbt_profile = load_profiles(arg, &simplified_dbt_project, &env, &ctx)?;
 
     Ok((simplified_dbt_project, dbt_profile))
+}
+
+pub fn load_cloud_project_config(
+    project_dbt_cloud: &ProjectDbtCloudConfig,
+) -> Option<DbtCloudProjectConfig> {
+    // Get home directory
+    let home_dir = dirs::home_dir()?;
+
+    // Check if dbt_cloud.yml exists
+    let dbt_cloud_config_path = home_dir.join(DBT_CONFIG_DIR).join(DBT_CLOUD_YML);
+    if !dbt_cloud_config_path.exists() {
+        return None;
+    }
+
+    // Read and parse the dbt_cloud.yml file
+    let content = fs::read_to_string(&dbt_cloud_config_path).ok()?;
+    let cloud_config: DbtCloudConfig = dbt_serde_yaml::from_str(&content).ok()?;
+
+    // TODO: unsure if we should exit early if the project_id is not set in dbt_project.yml
+    // or if we should fall back to the active_project in dbt_cloud.yml
+    let project = match &project_dbt_cloud.project_id {
+        Some(project_id) => cloud_config.get_project_by_id(project_id.to_string().as_str()),
+        None => cloud_config.get_project_by_id(&cloud_config.context.active_project),
+    };
+
+    let defer_env_id = project_dbt_cloud
+        .defer_env_id
+        .clone()
+        .map(|env_id| env_id.to_string())
+        .or_else(|| cloud_config.context.defer_env_id.clone());
+
+    Some(DbtCloudProjectConfig {
+        defer_env_id,
+        project: project.cloned(),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -430,27 +503,6 @@ pub async fn load_inner(
         files.sort_by(|a, b| a.0.cmp(&b.0));
     }
 
-    let python_files = find_files_by_kind_and_extension(
-        package_path,
-        &dbt_project.name,
-        &ResourcePathKind::ModelPaths,
-        &["py"],
-        &all_files,
-    );
-
-    if !python_files.is_empty() {
-        for file in python_files {
-            show_warning!(
-                &arg.io,
-                *fs_err!(
-                    code => ErrorCode::UnsupportedFileExtension,
-                    loc => file.path.clone(),
-                    "Python models are not currently supported"
-                )
-            );
-        }
-    }
-
     // todo: we could optimize here, but for now just take everything,...
     let mut dbt_properties = find_files_by_kind_and_extension(
         package_path,
@@ -518,13 +570,35 @@ pub async fn load_inner(
         &["sql"],
         &all_files,
     );
-    let model_sql_files = find_files_by_kind_and_extension(
+    let mut model_sql_files = find_files_by_kind_and_extension(
         package_path,
         &dbt_project.name,
         &ResourcePathKind::ModelPaths,
         &["sql"],
         &all_files,
     );
+    let python_model_files = find_files_by_kind_and_extension(
+        package_path,
+        &dbt_project.name,
+        &ResourcePathKind::ModelPaths,
+        &["py"],
+        &all_files,
+    );
+    if python_models_feature_enabled() {
+        if !python_model_files.is_empty() {
+            model_sql_files.extend(python_model_files);
+            model_sql_files.sort_by(|a, b| a.path.cmp(&b.path));
+        }
+    } else if !python_model_files.is_empty() {
+        for file in python_model_files {
+            let err = fs_err!(
+                code => ErrorCode::UnsupportedFileExtension,
+                loc => file.path.clone(),
+                "Python models are not currently supported"
+            );
+            emit_warn_log_from_fs_error(&err, arg.io.status_reporter.as_ref());
+        }
+    }
     let function_sql_files = find_files_by_kind_and_extension(
         package_path,
         &dbt_project.name,
@@ -664,6 +738,22 @@ fn find_files_by_kind_and_extension(
         .collect::<Vec<_>>();
     paths.sort_by(|a, b| a.path.cmp(&b.path));
     paths
+}
+
+fn python_models_feature_enabled() -> bool {
+    let is_on = std::env::var(PYTHON_MODELS_ENV_VAR)
+        .map(|value| {
+            let trimmed = value.trim();
+            trimmed == "1"
+                || trimmed.eq_ignore_ascii_case("true")
+                || trimmed.eq_ignore_ascii_case("yes")
+                || trimmed.eq_ignore_ascii_case("on")
+        })
+        .unwrap_or(false);
+    if is_on {
+        eprintln!("WARNING: Python models feature is enabled via environment variable");
+    }
+    is_on
 }
 
 /// Loads the .dbtignore file if it exists in the given path
@@ -874,6 +964,55 @@ fn find_session_files(package_path: &Path) -> FsResult<Vec<(PathBuf, SystemTime)
     }
 
     Ok(result)
+}
+
+/// Prepares inline SQL for processing by writing it to a file and adding it to the DbtState.
+///
+/// This function:
+/// 1. Writes the inline SQL to target/inline_<uuid>.sql
+/// 2. Creates a DbtAsset for the file
+/// 3. Adds it to the root package's model_sql_files
+/// 4. Returns the generated model name for later reference
+///
+/// # Arguments
+/// * `inline_sql` - The SQL string provided via --inline flag
+/// * `out_dir` - The target directory where inline SQL will be written
+/// * `dbt_state` - The mutable DbtState to update with the inline asset
+async fn prepare_inline_sql(
+    inline_sql: &str,
+    out_dir: &Path,
+    dbt_state: &mut DbtState,
+) -> FsResult<String> {
+    // Generate unique model name using shortened UUID (first 8 chars)
+    let unique_id = uuid::Uuid::new_v4();
+    let short_id = &unique_id.to_string()[..8];
+    let model_name = format!("inline_{short_id}");
+    let filename = format!("{model_name}.sql");
+
+    // Write inline SQL to target directory
+    let inline_path = out_dir.join(&filename);
+    tokiofs::create_dir_all(out_dir).await?;
+    tokiofs::write(&inline_path, inline_sql).await?;
+
+    // Create DbtAsset for the inline SQL
+    let inline_asset = DbtAsset {
+        base_path: out_dir.to_path_buf(),
+        path: PathBuf::from(filename),
+        package_name: dbt_state.root_project_name().to_string(),
+    };
+
+    // Set inline_file in root package and add to model_sql_files
+    let root_project_name = dbt_state.root_project_name().to_string();
+    if let Some(root_package) = dbt_state
+        .packages
+        .iter_mut()
+        .find(|p| p.dbt_project.name == root_project_name)
+    {
+        root_package.inline_file = Some(inline_asset.clone());
+        root_package.model_sql_files.push(inline_asset);
+    }
+
+    Ok(model_name)
 }
 
 #[cfg(test)]

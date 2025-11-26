@@ -1,6 +1,7 @@
 use dbt_common::io_args::StaticAnalysisKind;
 use dbt_serde_yaml::JsonSchema;
 use dbt_serde_yaml::ShouldBe;
+use dbt_serde_yaml::Spanned;
 use dbt_serde_yaml::Verbatim;
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
@@ -22,7 +23,7 @@ use crate::schemas::manifest::GrantAccessToTarget;
 use crate::schemas::manifest::postgres::PostgresIndex;
 use crate::schemas::manifest::{BigqueryClusterConfig, PartitionConfig};
 use crate::schemas::project::DefaultTo;
-use crate::schemas::project::IterChildren;
+use crate::schemas::project::TypedRecursiveConfig;
 use crate::schemas::project::configs::common::WarehouseSpecificNodeConfig;
 use crate::schemas::project::configs::common::default_hooks;
 use crate::schemas::project::configs::common::default_meta_and_tags;
@@ -32,7 +33,7 @@ use crate::schemas::serde::StringOrArrayOfStrings;
 use crate::schemas::serde::bool_or_string_bool;
 use crate::schemas::serde::{f64_or_string_f64, u64_or_string_u64};
 
-#[skip_serializing_none]
+// NOTE: No #[skip_serializing_none] - we handle None serialization in serialize_with_mode
 #[derive(Deserialize, Serialize, Debug, Clone, JsonSchema)]
 pub struct ProjectSnapshotConfig {
     // Snapshot-specific Configuration
@@ -67,6 +68,12 @@ pub struct ProjectSnapshotConfig {
     // General Configuration
     #[serde(default, rename = "+enabled", deserialize_with = "bool_or_string_bool")]
     pub enabled: Option<bool>,
+    #[serde(
+        default,
+        rename = "+full_refresh",
+        deserialize_with = "bool_or_string_bool"
+    )]
+    pub full_refresh: Option<bool>,
     #[serde(rename = "+tags")]
     pub tags: Option<StringOrArrayOfStrings>,
     #[serde(rename = "+pre-hook")]
@@ -82,7 +89,7 @@ pub struct ProjectSnapshotConfig {
     #[serde(rename = "+quoting")]
     pub quoting: Option<DbtQuoting>,
     #[serde(rename = "+static_analysis")]
-    pub static_analysis: Option<StaticAnalysisKind>,
+    pub static_analysis: Option<Spanned<StaticAnalysisKind>>,
     #[serde(rename = "+meta")]
     pub meta: Option<BTreeMap<String, YmlValue>>,
     #[serde(rename = "+group")]
@@ -93,7 +100,11 @@ pub struct ProjectSnapshotConfig {
         deserialize_with = "bool_or_string_bool"
     )]
     pub quote_columns: Option<bool>,
-    #[serde(rename = "+invalidate_hard_deletes")]
+    #[serde(
+        default,
+        rename = "+invalidate_hard_deletes",
+        deserialize_with = "bool_or_string_bool"
+    )]
     pub invalidate_hard_deletes: Option<bool>,
     #[serde(rename = "+docs")]
     pub docs: Option<DocsConfig>,
@@ -153,8 +164,6 @@ pub struct ProjectSnapshotConfig {
     // Adapter-specific fields (BigQuery)
     #[serde(rename = "+cluster_by")]
     pub cluster_by: Option<BigqueryClusterConfig>,
-    #[serde(rename = "+description")]
-    pub description: Option<String>,
     #[serde(
         default,
         rename = "+enable_refresh",
@@ -224,6 +233,8 @@ pub struct ProjectSnapshotConfig {
     pub databricks_tags: Option<BTreeMap<String, YmlValue>>,
     #[serde(rename = "+file_format")]
     pub file_format: Option<String>,
+    #[serde(rename = "+catalog_name")]
+    pub catalog_name: Option<String>,
     #[serde(
         default,
         rename = "+include_full_name_in_path",
@@ -297,13 +308,17 @@ pub struct ProjectSnapshotConfig {
     pub __additional_properties__: BTreeMap<String, ShouldBe<ProjectSnapshotConfig>>,
 }
 
-impl IterChildren<ProjectSnapshotConfig> for ProjectSnapshotConfig {
+impl TypedRecursiveConfig for ProjectSnapshotConfig {
+    fn type_name() -> &'static str {
+        "snapshot"
+    }
+
     fn iter_children(&self) -> Iter<'_, String, ShouldBe<Self>> {
         self.__additional_properties__.iter()
     }
 }
 
-#[skip_serializing_none]
+// NOTE: No #[skip_serializing_none] - we handle None serialization in serialize_with_mode
 #[derive(Deserialize, Serialize, Debug, Clone, JsonSchema, Default, PartialEq)]
 pub struct SnapshotConfig {
     // Snapshot-specific Configuration
@@ -327,6 +342,8 @@ pub struct SnapshotConfig {
     // General Configuration
     #[serde(default, deserialize_with = "bool_or_string_bool")]
     pub enabled: Option<bool>,
+    #[serde(default, deserialize_with = "bool_or_string_bool")]
+    pub full_refresh: Option<bool>,
     pub tags: Option<StringOrArrayOfStrings>,
     #[serde(alias = "pre-hook")]
     pub pre_hook: Verbatim<Option<Hooks>>,
@@ -336,14 +353,14 @@ pub struct SnapshotConfig {
     pub grants: Option<BTreeMap<String, StringOrArrayOfStrings>>,
     pub event_time: Option<String>,
     pub quoting: Option<DbtQuoting>,
-    pub static_analysis: Option<StaticAnalysisKind>,
+    pub static_analysis: Option<Spanned<StaticAnalysisKind>>,
     pub meta: Option<BTreeMap<String, YmlValue>>,
     pub group: Option<String>,
     #[serde(default, deserialize_with = "bool_or_string_bool")]
     pub quote_columns: Option<bool>,
+    #[serde(default, deserialize_with = "bool_or_string_bool")]
     pub invalidate_hard_deletes: Option<bool>,
     pub docs: Option<DocsConfig>,
-    pub description: Option<String>,
     // Adapter specific configs
     pub __warehouse_specific_config__: WarehouseSpecificNodeConfig,
 }
@@ -351,11 +368,11 @@ pub struct SnapshotConfig {
 #[skip_serializing_none]
 #[derive(Deserialize, Serialize, Debug, Clone, JsonSchema, PartialEq, Eq, Default)]
 pub struct SnapshotMetaColumnNames {
-    dbt_scd_id: Option<String>,
-    dbt_updated_at: Option<String>,
-    dbt_valid_from: Option<String>,
-    dbt_valid_to: Option<String>,
-    dbt_is_deleted: Option<String>,
+    pub dbt_scd_id: Option<String>,
+    pub dbt_updated_at: Option<String>,
+    pub dbt_valid_from: Option<String>,
+    pub dbt_valid_to: Option<String>,
+    pub dbt_is_deleted: Option<String>,
 }
 
 impl SnapshotMetaColumnNames {
@@ -463,6 +480,7 @@ impl From<ProjectSnapshotConfig> for SnapshotConfig {
             target_database: config.target_database,
             target_schema: config.target_schema,
             enabled: config.enabled,
+            full_refresh: config.full_refresh,
             tags: config.tags,
             pre_hook: config.pre_hook,
             post_hook: config.post_hook,
@@ -476,8 +494,8 @@ impl From<ProjectSnapshotConfig> for SnapshotConfig {
             quote_columns: config.quote_columns,
             invalidate_hard_deletes: config.invalidate_hard_deletes,
             docs: config.docs,
-            description: config.description,
             __warehouse_specific_config__: WarehouseSpecificNodeConfig {
+                description: None, // Only for Bigquery models
                 adapter_properties: config.adapter_properties,
                 external_volume: config.external_volume,
                 base_location_root: config.base_location_root,
@@ -507,9 +525,15 @@ impl From<ProjectSnapshotConfig> for SnapshotConfig {
                 partitions: config.partitions,
                 enable_refresh: config.enable_refresh,
                 refresh_interval_minutes: config.refresh_interval_minutes,
+                resource_tags: None,
                 max_staleness: config.max_staleness,
+                jar_file_uri: None,
+                timeout: None,
+                batch_id: None,
+                dataproc_cluster_name: None,
 
                 file_format: config.file_format,
+                catalog_name: config.catalog_name,
                 location_root: config.location_root,
                 tblproperties: config.tblproperties,
                 include_full_name_in_path: config.include_full_name_in_path,
@@ -570,6 +594,7 @@ impl From<SnapshotConfig> for ProjectSnapshotConfig {
             target_database: config.target_database,
             target_schema: config.target_schema,
             enabled: config.enabled,
+            full_refresh: config.full_refresh,
             tags: config.tags,
             pre_hook: config.pre_hook,
             post_hook: config.post_hook,
@@ -583,7 +608,6 @@ impl From<SnapshotConfig> for ProjectSnapshotConfig {
             quote_columns: config.quote_columns,
             invalidate_hard_deletes: config.invalidate_hard_deletes,
             docs: config.docs,
-            description: config.description,
             // Snowflake fields
             adapter_properties: config.__warehouse_specific_config__.adapter_properties,
             external_volume: config.__warehouse_specific_config__.external_volume,
@@ -622,6 +646,7 @@ impl From<SnapshotConfig> for ProjectSnapshotConfig {
             max_staleness: config.__warehouse_specific_config__.max_staleness,
             // Databricks fields
             file_format: config.__warehouse_specific_config__.file_format,
+            catalog_name: config.__warehouse_specific_config__.catalog_name,
             location_root: config.__warehouse_specific_config__.location_root,
             tblproperties: config.__warehouse_specific_config__.tblproperties,
             include_full_name_in_path: config
@@ -700,6 +725,7 @@ impl DefaultTo<SnapshotConfig> for SnapshotConfig {
             target_database,
             target_schema,
             enabled,
+            full_refresh,
             tags,
             pre_hook,
             post_hook,
@@ -713,7 +739,6 @@ impl DefaultTo<SnapshotConfig> for SnapshotConfig {
             invalidate_hard_deletes,
             docs,
             static_analysis,
-            description,
             // Flattened configs
             __warehouse_specific_config__: warehouse_specific_config,
         } = self;
@@ -741,6 +766,7 @@ impl DefaultTo<SnapshotConfig> for SnapshotConfig {
             parent,
             [
                 enabled,
+                full_refresh,
                 alias,
                 schema,
                 database,
@@ -761,7 +787,6 @@ impl DefaultTo<SnapshotConfig> for SnapshotConfig {
                 hard_deletes,
                 check_cols,
                 static_analysis,
-                description,
                 materialized,
             ]
         );
