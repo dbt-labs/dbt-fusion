@@ -86,16 +86,40 @@ pub fn format_timestamp_utc_zulu(ts: SystemTime) -> String {
 mod tests {
     use super::*;
 
-     #[test]
+    #[test]
     fn test_format_duration_fixed_width() {
         use std::time::Duration;
-        assert_eq!(format_duration_fixed_width(Duration::from_secs(90061)), "   >24h");
-        assert_eq!(format_duration_fixed_width(Duration::from_secs(0)), "-------");
-        assert_eq!(format_duration_fixed_width(Duration::from_millis(760)), "  0.76s");
-        assert_eq!(format_duration_fixed_width(Duration::from_millis(52760)), " 52.76s");
-        assert_eq!(format_duration_fixed_width(Duration::from_secs(301)), "  5.02m");
-        assert_eq!(format_duration_fixed_width(Duration::from_secs(342)), "  5.70m");
-        assert_eq!(format_duration_fixed_width(Duration::from_secs(3900)), "  1.08h");
-        assert_eq!(format_duration_fixed_width(Duration::from_secs(83400)), " 23.17h");
+        assert_eq!(
+            format_duration_fixed_width(Duration::from_secs(90061)),
+            "   >24h"
+        );
+        assert_eq!(
+            format_duration_fixed_width(Duration::from_secs(0)),
+            "-------"
+        );
+        assert_eq!(
+            format_duration_fixed_width(Duration::from_millis(760)),
+            "  0.76s"
+        );
+        assert_eq!(
+            format_duration_fixed_width(Duration::from_millis(52760)),
+            " 52.76s"
+        );
+        assert_eq!(
+            format_duration_fixed_width(Duration::from_secs(301)),
+            "  5.02m"
+        );
+        assert_eq!(
+            format_duration_fixed_width(Duration::from_secs(342)),
+            "  5.70m"
+        );
+        assert_eq!(
+            format_duration_fixed_width(Duration::from_secs(3900)),
+            "  1.08h"
+        );
+        assert_eq!(
+            format_duration_fixed_width(Duration::from_secs(83400)),
+            " 23.17h"
+        );
     }
 }
