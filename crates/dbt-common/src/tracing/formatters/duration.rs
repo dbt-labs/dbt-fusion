@@ -59,10 +59,14 @@ pub fn format_duration_fixed_width(duration: Duration) -> String {
         format!("{total_secs:6.2}s")
     } else if total_secs < 3600.0 {
         let total_minutes = total_secs / 60.0;
-        format!("{total_minutes:6.2}m")
+        let minutes = total_minutes.floor();
+        let seconds = (total_secs % 60.0).floor();
+        format!(" {minutes:2.0}m{seconds:2.0}s")
     } else {
         let total_hours = total_secs / 3600.0;
-        format!("{total_hours:6.2}h")
+        let hours = total_hours.floor();
+        let minutes = ((total_secs % 3600.0) / 60.0).floor();
+        format!(" {hours:2.0}h{minutes:2.0}m")
     }
 }
 
@@ -107,19 +111,19 @@ mod tests {
         );
         assert_eq!(
             format_duration_fixed_width(Duration::from_secs(301)),
-            "  5.02m"
+            "  5m 1s"
         );
         assert_eq!(
             format_duration_fixed_width(Duration::from_secs(342)),
-            "  5.70m"
+            "  5m42s"
         );
         assert_eq!(
             format_duration_fixed_width(Duration::from_secs(3900)),
-            "  1.08h"
+            "  1h 5m"
         );
         assert_eq!(
             format_duration_fixed_width(Duration::from_secs(83400)),
-            " 23.17h"
+            " 23h10m"
         );
     }
 }
