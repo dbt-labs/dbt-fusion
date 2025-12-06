@@ -1,0 +1,7 @@
+kind: Fixes
+body: Make `print` macro consistent to dbt Core
+time: 2025-10-08T06:09:48.779488+09:00
+custom:
+    author: yu-iskw
+    issue: "869"
+    project: dbt-fusion
