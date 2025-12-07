@@ -166,7 +166,46 @@
   {% endif %}
 {% endmacro %}
 
+-- funcsign: () -> string
+{% macro get_current_warehouse() -%}
+  {{ return(run_query("select current_warehouse()").columns[0].values()[0]) }}
+{% endmacro %}
+
+-- funcsign: () -> optional[string]
+{% macro set_warehouse() -%}
+    {{ return(adapter.dispatch('set_warehouse', 'dbt')()) }}
+{% endmacro %}
+
+-- funcsign: () -> optional[string]
+{% macro snowflake__set_warehouse() -%}
+  {% set new_warehouse = config.get('snowflake_warehouse') %}
+  {% if new_warehouse %}
+    {% set original_warehouse = get_current_warehouse() %}
+    {{ log("Setting warehouse to '" ~ new_warehouse ~ "'. Will reset to '" ~ original_warehouse ~ "' after materialization.") }}
+    {% do run_query("use warehouse " ~ new_warehouse) %}
+    {{ return(original_warehouse) }}
+  {% endif %}
+  {{ return(none) }}
+{% endmacro %}
+
+-- funcsign: (optional[string]) -> string
+{% macro restore_warehouse(original_warehouse) -%}
+    {{ return(adapter.dispatch('restore_warehouse', 'dbt')(original_warehouse)) }}
+{% endmacro %}
+
+-- funcsign: (optional[string]) -> string
+{% macro snowflake__restore_warehouse(original_warehouse) -%}
+  {% set new_warehouse = config.get('snowflake_warehouse') %}
+  {% if new_warehouse %}
+    {% if original_warehouse %}
+      {{ log("Restoring warehouse to '" ~ original_warehouse ~ "'.") }}
+      {% do run_query("use warehouse " ~ original_warehouse) %}
+    {% endif %}
+  {% endif %}
+{% endmacro %}
+
 {% macro snowflake__get_column_data_type_for_alter(relation, column) %}
+
   {#
     Helper macro to get the correct data type for ALTER TABLE operations.
     For Iceberg tables, we need to handle VARCHAR constraints differently because
