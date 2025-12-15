@@ -87,13 +87,13 @@ fn convert_yml_value_ordered(yml: YmlValue) -> MinijinjaValue {
             for (k, v) in map {
                 value_map.insert(
                     MinijinjaValue::from(k.as_str().expect("key is not a string").to_string()),
-                    convert_yml_value(v),
+                    convert_yml_value_ordered(v),
                 );
             }
             MinijinjaValue::from_object(value_map)
         }
         YmlValue::Sequence(arr, _) => {
-            MinijinjaValue::from_iter(arr.into_iter().map(convert_yml_value))
+            MinijinjaValue::from_iter(arr.into_iter().map(convert_yml_value_ordered))
         }
         YmlValue::Null(_) => MinijinjaValue::from(None::<()>),
         _ => MinijinjaValue::from_serialize(yml),
