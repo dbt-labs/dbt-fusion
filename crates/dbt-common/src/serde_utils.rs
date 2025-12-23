@@ -87,13 +87,13 @@ fn convert_yml_value_ordered(yml: YmlValue) -> MinijinjaValue {
             for (k, v) in map {
                 value_map.insert(
                     MinijinjaValue::from(k.as_str().expect("key is not a string").to_string()),
-                    convert_yml_value(v),
+                    convert_yml_value_ordered(v),
                 );
             }
             MinijinjaValue::from_object(value_map)
         }
         YmlValue::Sequence(arr, _) => {
-            MinijinjaValue::from_iter(arr.into_iter().map(convert_yml_value))
+            MinijinjaValue::from_iter(arr.into_iter().map(convert_yml_value_ordered))
         }
         YmlValue::Null(_) => MinijinjaValue::from(None::<()>),
         _ => MinijinjaValue::from_serialize(yml),
@@ -501,6 +501,99 @@ properties:
   required_field:
     type: string
 "}
+        );
+    }
+
+    #[test]
+    fn test_convert_yml_to_value_map_preserves_nested_order() {
+        // This test verifies that convert_yml_to_value_map preserves the order of keys
+        // in nested mappings, which is critical for contract column ordering (issue #1051).
+        // The columns should maintain their definition order (id, b, c, a) not alphabetical order.
+        let yaml = indoc! {"
+            name: test_model
+            columns:
+              id:
+                name: id
+                data_type: integer
+              b:
+                name: b
+                data_type: string
+              c:
+                name: c
+                data_type: string
+              a:
+                name: a
+                data_type: string
+        "};
+
+        let yml_value: YmlValue = dbt_serde_yaml::from_str(yaml).unwrap();
+        let value_map = convert_yml_to_value_map(yml_value);
+
+        // Get the columns mapping
+        let columns = value_map.get("columns").expect("columns should exist");
+
+        // Iterate over the columns and collect the keys in order
+        let column_keys: Vec<String> = columns
+            .try_iter()
+            .expect("columns should be iterable")
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+
+        // The order should be preserved as defined in YAML: id, b, c, a
+        // NOT alphabetically sorted: a, b, c, id
+        assert_eq!(
+            column_keys,
+            vec!["id", "b", "c", "a"],
+            "Column order should be preserved as defined in YAML, not sorted alphabetically"
+        );
+    }
+
+    #[test]
+    fn test_convert_yml_to_value_map_preserves_deeply_nested_order() {
+        // Test that order is preserved even in deeply nested structures
+        let yaml = indoc! {"
+            level1:
+              z_first:
+                a_nested: value1
+                m_nested: value2
+                b_nested: value3
+              a_second:
+                data: test
+        "};
+
+        let yml_value: YmlValue = dbt_serde_yaml::from_str(yaml).unwrap();
+        let value_map = convert_yml_to_value_map(yml_value);
+
+        // Get level1 mapping
+        let level1 = value_map.get("level1").expect("level1 should exist");
+
+        // Check first level order is preserved
+        let level1_keys: Vec<String> = level1
+            .try_iter()
+            .expect("level1 should be iterable")
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+
+        assert_eq!(
+            level1_keys,
+            vec!["z_first", "a_second"],
+            "First level order should be preserved"
+        );
+
+        // Check nested level order is preserved
+        let z_first = level1
+            .get_item(&MinijinjaValue::from("z_first"))
+            .expect("z_first should exist");
+        let z_first_keys: Vec<String> = z_first
+            .try_iter()
+            .expect("z_first should be iterable")
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+
+        assert_eq!(
+            z_first_keys,
+            vec!["a_nested", "m_nested", "b_nested"],
+            "Nested level order should be preserved, not sorted alphabetically"
         );
     }
 }
