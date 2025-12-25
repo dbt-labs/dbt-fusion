@@ -1,0 +1,7 @@
+kind: Features
+body: Add comprehensive test cases for YAML and JSON file parsing in io_args.rs
+time: 2025-12-25T15:25:01.325732+09:00
+custom:
+    author: yu-iskw
+    issue: "402"
+    project: dbt-fusion
