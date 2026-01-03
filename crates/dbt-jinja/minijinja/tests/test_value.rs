@@ -1,5 +1,7 @@
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, LinkedList, VecDeque};
 use std::sync::Arc;
+use std::fmt;
 
 use insta::{assert_debug_snapshot, assert_snapshot};
 use similar_asserts::assert_eq;
@@ -1465,4 +1467,38 @@ fn test_bytes() {
         format!("{:?}", Value::from_bytes((&b"'foo\""[..]).into())),
         "b'\\'foo\"'"
     );
+}
+
+#[test]
+fn test_custom_object_compare() {
+    #[derive(Debug)]
+    struct X(i32);
+
+    impl Object for X {
+        fn repr(self: &Arc<Self>) -> ObjectRepr {
+            ObjectRepr::Plain
+        }
+
+        fn custom_cmp(self: &Arc<Self>, other: &DynObject) -> Option<Ordering> {
+            let other = other.downcast_ref::<Self>()?;
+            Some(self.0.cmp(&other.0))
+        }
+
+        fn render(self: &Arc<Self>, f: &mut fmt::Formatter<'_>) -> fmt::Result
+        where
+            Self: Sized + 'static,
+        {
+            write!(f, "{}", self.0)
+        }
+    }
+
+    let nums = (0..5)
+        .map(X)
+        .map(Value::from_object)
+        .rev()
+        .collect::<Vec<_>>();
+    let seq = Value::from_object(nums);
+
+    let rv = render!("{{ seq|sort|join('|') }}", seq);
+    assert_eq!(rv, "0|1|2|3|4");
 }
