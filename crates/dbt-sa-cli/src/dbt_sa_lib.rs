@@ -3,7 +3,7 @@ use dbt_common::cancellation::CancellationToken;
 use dbt_common::create_root_info_span;
 use dbt_common::io_utils::checkpoint_maybe_exit;
 use dbt_common::tracing::{
-    emit::{emit_error_log_from_fs_error, emit_info_log_message},
+    emit::{emit_error_log_from_fs_error, emit_info_log_message, emit_info_progress_message},
     invocation::create_invocation_attributes,
     metrics::get_exit_code_from_error_counter,
     FsTraceConfig,
@@ -19,14 +19,14 @@ use dbt_telemetry::ProgressMessage;
 use dbt_common::io_args::{EvalArgs, EvalArgsBuilder};
 use dbt_common::{
     ErrorCode, FsResult,
-    constants::{DBT_MANIFEST_JSON, INSTALLING, ERROR, PANIC, VALIDATING},
-    fs_err, fsinfo,
-    io_args::{Phases, SystemArgs},
+    constants::{DBT_MANIFEST_JSON, INSTALLING, PANIC, VALIDATING},
+    fs_err,
+    io_args::{Phases, ShowOptions, SystemArgs},
     logging::init_logger,
     pretty_string::{GREEN, RED},
 
-    show_progress, show_result_with_default_title, stdfs,
-    tracing::span_info::record_span_status,
+    stdfs,
+    tracing::{emit::emit_info_event, span_info:: record_span_status},
 };
 use dbt_telemetry::ShowResult;
 
