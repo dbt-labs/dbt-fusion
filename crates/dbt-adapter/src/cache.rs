@@ -54,15 +54,25 @@ struct SchemaEntry {
 /// use std::sync::Arc;
 /// use dbt_schemas::schemas::relations::base::BaseRelation;
 /// use dbt_adapter::cache::{RelationCache, RelationCacheEntry};
+/// use dbt_adapter::relation::create_relation;
+/// use dbt_common::adapter::AdapterType;
+/// use dbt_schemas::schemas::relations::DEFAULT_RESOLVED_QUOTING;
 ///
-/// let cache = RelationCache::new();
-/// let relation: Arc<dyn BaseRelation> = // ... some relation
+/// let cache = RelationCache::default();
+/// let relation = create_relation(
+///    AdapterType::Postgres,
+///    "db".to_string(),
+///    "schema".to_string(),
+///    Some("table".to_string()),
+///    None,
+///    DEFAULT_RESOLVED_QUOTING
+/// ).unwrap();
 ///
 /// // Insert relation into cache
-/// cache.insert_relation(relation.clone());
+/// cache.insert_relation(relation.clone(), None);
 ///
 /// // Retrieve cached relation
-/// let cached: Option<RelationCacheEntry> = cache.get_relation(relation);
+/// let cached: Option<RelationCacheEntry> = cache.get_relation(&relation);
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct RelationCache {
