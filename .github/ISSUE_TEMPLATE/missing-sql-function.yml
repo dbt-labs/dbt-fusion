@@ -42,6 +42,5 @@ body:
       label: What is the error message you're seeing?
       description: Paste the full error message you're encountering
       placeholder: Copy and paste the error message here
-      render: shell
     validations:
       required: true
