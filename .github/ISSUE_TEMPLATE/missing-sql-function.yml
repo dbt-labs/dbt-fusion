@@ -1,0 +1,46 @@
+name: Missing SQL Function
+description: Report a missing SQL function in dbt Fusion
+title: "[Missing Function]: "
+labels: ["bug", "enhancement", "SQL_understanding"]
+projects: ["dbt-labs/64"]
+body:
+  - type: dropdown
+    id: dwh-adapter
+    attributes:
+      label: What is the DWH adapter or dialect you're using?
+      description: Select the data warehouse adapter you're using
+      options:
+        - Snowflake
+        - Databricks
+        - BigQuery
+        - Redshift
+      default: 0
+    validations:
+      required: true
+  
+  - type: input
+    id: function-name
+    attributes:
+      label: What is the name of the function?
+      description: Enter the name of the missing SQL function
+      placeholder: e.g., ARRAY_AGG, LISTAGG, etc.
+    validations:
+      required: true
+  
+  - type: input
+    id: function-docs
+    attributes:
+      label: Please provide a link to the data platform docs for that function
+      description: Link to the official documentation for this function
+      placeholder: https://docs.snowflake.com/en/sql-reference/functions/...
+    validations:
+      required: true
+  
+  - type: textarea
+    id: error-message
+    attributes:
+      label: What is the error message you're seeing?
+      description: Paste the full error message you're encountering
+      placeholder: Copy and paste the error message here
+    validations:
+      required: true
