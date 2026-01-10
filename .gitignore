@@ -34,3 +34,10 @@ scratch/
 
 #redis
 dump.rdb
+
+# Python venv
+venv
+.venv
+
+# Cargo lock
+Cargo.lock
