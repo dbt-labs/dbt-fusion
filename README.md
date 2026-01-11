@@ -19,7 +19,7 @@ Beyond conformance with dbt Core, Fusion also contains new SQL Comprehension cap
 
 You can install dbt-fusion onto your local machine, a docker container, or a machine in the cloud. It is designed for flexible installation, with no dependencies on other libraries. The only libraries that dbt Fusion will load are it's corresponding database drivers.
 
-The dbt Fusion engine is being released to this repository incrementally, so, until this note is removed this repository contains only a subset of the crates that make the core of the engine work. These crates are published incrementally starting on May 28.
+The dbt Fusion engine is being released to this repository incrementally, so, until this note is removed this repository contains only a subset of the crates that make the core of the engine work. These crates are published incrementally starting on May 28, 2025.
 
 ## Getting Started with the dbt Fusion engine
 
@@ -120,7 +120,8 @@ Releases of various Fusion components will be iterative as each component reache
   |--------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------|---------------|
   | Unblocked    | You can adopt the dbt Fusion engine with no changes to your project                                                                                                 | ---                                                                        | ---           |
   | Soft blocked | Your project contains functionality (for more info: [How to get ready for the new dbt engine](https://www.getdbt.com/blog/how-to-get-ready-for-the-new-dbt-engine). | Resolve deprecations with the dbt-autofix script or workflow in dbt Studio | Users         |
-  | Hard blocked | Your project contains Python models or uses a not-yet-supported adapter                                                                                             | Remove unsupported functionality if possible                               | dbt Labs      |</details>
+  | Hard blocked | Your project contains Python models or uses a not-yet-supported adapter                                                                                             | Remove unsupported functionality if possible                               | dbt Labs      |
+</details>
 
 
 
