@@ -1,10 +1,11 @@
 use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::cmp::Ordering;
 
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
-use minijinja::{arg_utils::ArgParser, value::Object, Error, ErrorKind, Value};
+use minijinja::{arg_utils::ArgParser, value::{Object, ObjectRepr}, Error, ErrorKind, Value};
 
 use crate::modules::py_datetime::date::PyDate; // your date
 use crate::modules::py_datetime::time::PyTime;
@@ -844,8 +845,22 @@ impl PyDateTime {
 // Implement the `Object` trait for PyDateTime so Jinja can call methods
 //
 impl Object for PyDateTime {
+    fn repr(self: &Arc<Self>) -> ObjectRepr {
+        ObjectRepr::Plain
+    }
+    
     fn is_true(self: &Arc<Self>) -> bool {
         true
+    }
+
+    fn custom_cmp(self: &Arc<Self>, other: &minijinja::value::DynObject) -> Option<Ordering> {
+        // try to downcast the other object to PyDateTime
+        if let Some(other_dt) = other.downcast_ref::<PyDateTime>() {
+            // compare using timestamps, wrap in Some() to satisfy the trait bounds
+            Some(self.timestamp().total_cmp(&other_dt.timestamp()))
+        } else {
+            None
+        }
     }
 
     fn call_method(
