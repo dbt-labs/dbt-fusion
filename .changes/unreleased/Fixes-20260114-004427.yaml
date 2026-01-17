@@ -1,0 +1,7 @@
+kind: Fixes
+body: Fix incorrect scoping of nested exclude blocks in YAML selectors
+time: 2026-01-14T00:44:27.50129+09:00
+custom:
+    author: yu-iskw
+    issue: "836"
+    project: dbt-fusion
