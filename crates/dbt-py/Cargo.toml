@@ -1,0 +1,25 @@
+[package]
+authors.workspace = true
+description.workspace = true
+edition.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+license.workspace = true
+name = "dbt-fusion-py"
+repository.workspace = true
+version.workspace = true
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "dbt_fusion"
+crate-type = ["cdylib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+dbt-common = { workspace = true }
+dbt-sa-cli = { workspace = true }
+
+clap = { workspace = true, features = ["derive"] }
+pyo3 = { version = "0.25.0", features = ["multiple-pymethods"] }
