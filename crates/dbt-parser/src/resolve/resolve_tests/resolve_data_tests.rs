@@ -282,7 +282,7 @@ pub async fn resolve_data_tests(
     for SqlFileRenderResult {
         asset: dbt_asset,
         sql_file_info,
-        rendered_sql,
+        rendered_sql: _,
         macro_spans: _macro_spans,
         properties: maybe_properties,
         status,
@@ -425,7 +425,9 @@ pub async fn resolve_data_tests(
                 fqn,
                 // dbt-core: description is always default ''
                 description: Some(properties.description.clone().unwrap_or_default()),
-                checksum: DbtChecksum::hash(rendered_sql.trim().as_bytes()),
+                // Use empty checksum to match Python/Mantle behavior: FileHash.empty().to_dict(omit_none=True)
+                // This ensures stable checksums across test runs when schema names change
+                checksum: DbtChecksum::default(),
                 // TODO: hydrate for generic + singular tests
                 // Examples in Mantle:
                 // - Generic test: "{{ test_not_null(**_dbt_generic_test_kwargs) }}"
@@ -514,6 +516,9 @@ pub async fn resolve_data_tests(
                 test_metadata: inferred_test_metadata.clone(),
                 file_key_name: None,
                 introspection: IntrospectionKind::None,
+                original_name: test_path_to_test_asset
+                    .get(&dbt_asset.path)
+                    .and_then(|test_asset| test_asset.original_name.clone()),
             },
             deprecated_config: *test_config.clone(),
             __other__: BTreeMap::new(),
@@ -606,6 +611,7 @@ mod tests {
             test_metadata_column_name: Some("id".to_string()),
             test_metadata_combination_of_columns: None,
             test_metadata_model: None,
+            original_name: None,
         };
         let md = test_metadata_from_asset(&asset).expect("metadata");
         assert_eq!(md.name, "not_null");
@@ -639,6 +645,7 @@ mod tests {
             test_metadata_column_name: None,
             test_metadata_combination_of_columns: Some(vec!["a".to_string(), "b".to_string()]),
             test_metadata_model: None,
+            original_name: None,
         };
         let md = test_metadata_from_asset(&asset).expect("metadata");
         assert_eq!(md.name, "unique_combination_of_columns");

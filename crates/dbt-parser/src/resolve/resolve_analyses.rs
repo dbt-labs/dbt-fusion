@@ -176,7 +176,6 @@ pub async fn resolve_analyses(
             properties.columns.as_ref(),
             analysis_config.meta.clone(),
             analysis_config.tags.clone().map(|tags| tags.into()),
-            Some(original_file_path.to_string_lossy().as_ref()),
         )?;
 
         let is_enabled = matches!(status, ModelStatus::Enabled);

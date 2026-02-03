@@ -271,6 +271,7 @@ pub fn build_resolve_model_context<T: DefaultTo<T> + 'static>(
             event_time: None,
             catalog_name: None,
             table_format: None,
+            sync: None,
         },
         __adapter_attr__: AdapterAttr::default(),
         __other__: BTreeMap::new(),
@@ -801,6 +802,10 @@ impl<T: DefaultTo<T>> Object for ParseConfig<T> {
                 let _: String = args.get("name")?;
                 Ok(MinijinjaValue::from(""))
             }
+            // At parse time, return false (no column docs persistence during parsing)
+            "persist_column_docs" => Ok(MinijinjaValue::from(false)),
+            // At parse time, return false (no relation docs persistence during parsing)
+            "persist_relation_docs" => Ok(MinijinjaValue::from(false)),
             _ => Err(MinijinjaError::new(
                 MinijinjaErrorKind::UnknownMethod,
                 format!("Unknown method on parse: {name}"),

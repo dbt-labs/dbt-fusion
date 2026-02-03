@@ -3,16 +3,19 @@ use dbt_common::cancellation::CancellationToken;
 use dbt_common::io_args::IoArgs;
 use dbt_common::io_utils::try_read_yml_to_str;
 use dbt_common::tracing::emit::{emit_strict_parse_error, emit_warn_log_message};
-use dbt_common::{ErrorCode, FsResult, constants::PARSING, fs_err, fsinfo, show_progress};
+use dbt_common::tracing::span_info::SpanStatusRecorder as _;
+use dbt_common::{ErrorCode, FsResult, create_debug_span, fs_err};
 use dbt_jinja_utils::jinja_environment::JinjaEnv;
 use dbt_jinja_utils::serde::{from_yaml_raw, into_typed_with_jinja};
 use dbt_jinja_utils::utils::dependency_package_name_from_ctx;
 use dbt_schemas::schemas::properties::{
-    AnalysesProperties, DbtPropertiesFileValues, MinimalSchemaValue, MinimalTableValue,
+    AnalysesProperties, DbtPropertiesFileValues, MacrosProperties, MinimalSchemaValue,
+    MinimalTableValue, MinimalUnitTestValue,
 };
 use dbt_schemas::schemas::serde::FloatOrString;
 use dbt_schemas::state::DbtPackage;
 use dbt_serde_yaml::{Span, Verbatim};
+use dbt_telemetry::AssetParsed;
 use itertools::Itertools;
 use minijinja::Value as MinijinjaValue;
 use std::collections::BTreeMap;
@@ -43,6 +46,7 @@ pub struct MinimalProperties {
     pub metrics: BTreeMap<String, MinimalPropertiesEntry>,
     pub saved_queries: BTreeMap<String, MinimalPropertiesEntry>,
     pub groups: BTreeMap<String, MinimalPropertiesEntry>,
+    pub macros: BTreeMap<String, MinimalPropertiesEntry>,
     pub semantic_layer_spec_is_legacy: bool,
 }
 
@@ -400,7 +404,7 @@ impl MinimalProperties {
         }
         if let Some(unit_tests) = other.unit_tests {
             for unit_test_value in unit_tests {
-                let unit_test = into_typed_with_jinja::<MinimalSchemaValue, _>(
+                let unit_test = into_typed_with_jinja::<MinimalUnitTestValue, _>(
                     io_args,
                     unit_test_value.clone(),
                     false,
@@ -526,6 +530,38 @@ impl MinimalProperties {
                 }
             }
         }
+        if let Some(macros) = other.macros {
+            for macro_value in macros {
+                let macro_props = into_typed_with_jinja::<MacrosProperties, _>(
+                    io_args,
+                    macro_value.clone(),
+                    false,
+                    jinja_env,
+                    base_ctx,
+                    &[],
+                    dependency_package_name_from_ctx(jinja_env, base_ctx),
+                    true,
+                )?;
+                if let Some(existing_macro) = self.macros.get_mut(&macro_props.name) {
+                    existing_macro
+                        .duplicate_paths
+                        .push(properties_path.to_path_buf());
+                } else {
+                    self.macros.insert(
+                        macro_props.name.clone(),
+                        MinimalPropertiesEntry {
+                            name: validate_resource_name(&macro_props.name)?,
+                            name_span: Span::default(),
+                            relative_path: properties_path.to_path_buf(),
+                            schema_value: macro_value,
+                            table_value: None,
+                            version_info: None,
+                            duplicate_paths: vec![],
+                        },
+                    );
+                }
+            }
+        }
 
         Ok(())
     }
@@ -563,16 +599,19 @@ pub fn resolve_minimal_properties(
     for dbt_asset in package.dbt_properties.iter().dedup() {
         token.check_cancellation()?;
         let absolute_path = dbt_asset.base_path.join(&dbt_asset.path);
-        show_progress!(
-            arg.io,
-            fsinfo!(
-                PARSING.into(),
-                dbt_asset
-                    .to_display_path(&arg.io.in_dir)
-                    .display()
-                    .to_string()
-            )
-        );
+        let display_path = dbt_asset.to_display_path(&arg.io.in_dir);
+        let asset_name = dbt_asset
+            .path
+            .file_stem()
+            .expect("File name can't be empty")
+            .to_string_lossy();
+        let span = create_debug_span(AssetParsed::new_with_phase_from_context(
+            package.dbt_project.name.clone(),
+            asset_name.to_string(),
+            dbt_asset.path.display().to_string(),
+            display_path.display().to_string(),
+            None,
+        ));
 
         let dependency_package_name = if package.dbt_project.name != root_package_name {
             Some(package.dbt_project.name.as_str())
@@ -580,48 +619,58 @@ pub fn resolve_minimal_properties(
             None
         };
 
-        let input = try_read_yml_to_str(&absolute_path)?;
+        let result = {
+            let _guard = span.enter();
+            let input = try_read_yml_to_str(&absolute_path)?;
 
-        match from_yaml_raw::<DbtPropertiesFileValues>(
-            &arg.io,
-            &input,
-            Some(&absolute_path),
-            true,
-            dependency_package_name,
-        ) {
-            Ok(properties_file_values) => {
-                let properties_path = &dbt_asset.path;
-                minimal_resolved_properties.extend_from_minimal_properties_file(
-                    &arg.io,
-                    properties_file_values.clone(),
-                    jinja_env,
-                    properties_path,
-                    base_ctx,
-                )?;
+            match from_yaml_raw::<DbtPropertiesFileValues>(
+                &arg.io,
+                &input,
+                Some(&absolute_path),
+                true,
+                dependency_package_name,
+            ) {
+                Ok(properties_file_values) => {
+                    let properties_path = &dbt_asset.path;
+                    minimal_resolved_properties.extend_from_minimal_properties_file(
+                        &arg.io,
+                        properties_file_values.clone(),
+                        jinja_env,
+                        properties_path,
+                        base_ctx,
+                    )?;
 
-                if !minimal_resolved_properties.semantic_layer_spec_is_legacy
-                    && let Some(_semantic_models) = properties_file_values.semantic_models
-                {
-                    // Top level semantic models are not allowed anymore
-                    // TODO: edit copy to encourage user to use auto-fix.
+                    if !minimal_resolved_properties.semantic_layer_spec_is_legacy
+                        && let Some(_semantic_models) = properties_file_values.semantic_models
+                    {
+                        // Top level semantic models are not allowed anymore
+                        // TODO: edit copy to encourage user to use auto-fix.
 
-                    emit_warn_log_message(
-                        ErrorCode::SchemaError,
-                        format!(
-                            "The package '{}' defines semantic models and metrics using the legacy YAML. Please migrate to the new YAML to use the semantic layer with dbt Fusion.",
-                            &package.dbt_project.name,
-                        ),
-                        arg.io.status_reporter.as_ref(),
-                    );
+                        emit_warn_log_message(
+                            ErrorCode::SchemaError,
+                            format!(
+                                "The package '{}' defines semantic models and metrics using the legacy YAML. Please migrate to the new YAML to use the semantic layer with dbt Fusion.",
+                                &package.dbt_project.name,
+                            ),
+                            arg.io.status_reporter.as_ref(),
+                        );
 
-                    minimal_resolved_properties.semantic_layer_spec_is_legacy = true;
+                        minimal_resolved_properties.semantic_layer_spec_is_legacy = true;
+                    }
+
+                    Ok(())
+                }
+                Err(e) => {
+                    // Emit error and save it to apply to span, but continue processing other files
+                    emit_strict_parse_error(&e, dependency_package_name, &arg.io);
+                    Err(e)
                 }
             }
-            Err(e) => {
-                emit_strict_parse_error(&e, dependency_package_name, &arg.io);
-                continue; // processing other files
-            }
-        }
+        };
+
+        // Record both success and failure statuses to the span, but continue processing
+        // regardless of outcome
+        let _ = result.record_status(&span);
     }
     Ok(minimal_resolved_properties)
 }

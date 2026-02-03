@@ -20,7 +20,7 @@ use dbt_telemetry::UserLogMessage;
 use minijinja::{
     arg_utils::ArgsIter,
     constants::TARGET_PACKAGE_NAME,
-    value::{ValueMap, mutable_map::MutableMap},
+    value::{ValueKind, ValueMap, mutable_map::MutableMap},
 };
 
 use minijinja::{
@@ -95,6 +95,14 @@ pub fn register_base_functions(env: &mut Environment, io_args: IoArgs) {
         "exceptions".to_owned(),
         Value::from_object(Exceptions { io_args }),
     );
+    // dbt-core templates commonly use Python-ish constants (capitalized).
+    // In Jinja2 the canonical values are `none/true/false`, but many dbt projects
+    // (and dbt-core's Python context) also make `None/True/False` available.
+    // Missing these can cause `default=None` to be treated as an undefined variable,
+    // which in turn can make `var(..., default=None)` behave like a required var.
+    env.add_global("None", Value::from(()));
+    env.add_global("True", Value::from(true));
+    env.add_global("False", Value::from(false));
 
     env.add_func_func("fromjson", fromjson);
     env.add_func_func("tojson", tojson);
@@ -233,7 +241,7 @@ impl Object for DocMacro {
             Some(content) => Ok(Value::from_serialize(content)),
             None => {
                 let status_reporter = get_status_reporter(state.env());
-                let current_span = state.current_span();
+                let current_span = state.current_span_of_context();
                 let current_file_path = state.current_path().clone();
                 let location = CodeLocationWithFile::new(
                     current_span.start_line,
@@ -248,28 +256,6 @@ impl Object for DocMacro {
                 )))
             }
         }
-    }
-}
-
-// TODO: implement var class
-// https://github.com/dbt-labs/dbt-core/blob/31881d2a3bea030e700e9df126a3445298385698/core/dbt/context/base.py#L139
-// Vars have functions that are availble in the jinja context that need to be implemented
-/// A function that returns a variable from a map of variables
-pub fn var_fn(
-    vars: BTreeMap<String, dbt_serde_yaml::Value>,
-) -> impl Fn(String, Option<Value>) -> Result<Value, Error> {
-    move |var_name: String, default_value: Option<Value>| -> Result<Value, Error> {
-        let value = if let Some(value) = vars.get(&var_name) {
-            Value::from_serialize(value.clone())
-        } else if let Some(default) = default_value {
-            default
-        } else {
-            return Err(Error::new(
-                ErrorKind::InvalidOperation,
-                format!("'var': variable '{var_name}' not found"),
-            ));
-        };
-        Ok(value)
     }
 }
 
@@ -292,6 +278,230 @@ impl DocMacro {
 
     fn missing_doc_placeholder(package_name: &str, doc_name: &str) -> String {
         format!("<missing doc('{}', package='{}')>", doc_name, package_name)
+    }
+}
+
+// Shared behavior for dbt var-like functions
+pub trait VarFunction: Object {
+    // Type-specific presence lookup
+    fn contains_var(&self, state: &State<'_, '_>, var_name: &str) -> Result<bool, Error>;
+
+    // Type-specific call as function
+    fn call_as_function(
+        &self,
+        state: &State<'_, '_>,
+        var_name: String,
+        default_value: Option<Value>,
+    ) -> Result<Value, Error>;
+
+    // Parse var() arguments into (name, default)
+    fn parse_args(args: &[Value]) -> Result<(String, Option<Value>), Error> {
+        // NOTE: Minijinja encodes keyword arguments into `args` as a final map value.
+        // Using `ArgsIter` ensures we correctly support both:
+        // - var("name", "default")
+        // - var("name", default="default")
+        // and we don't accidentally treat the kwargs map itself as the default value.
+        let iter = ArgsIter::new("var", &["name", "default"], args);
+        // Jinja will happily pass "undefined" into functions if the caller writes `var(x)`
+        // and `x` is not defined. Jinja2's Undefined is string-coercible, so dbt-core will
+        // end up treating it like an empty string key and still honor the provided default.
+        //
+        // For compatibility (and to keep tests/fixtures stable), we explicitly coerce
+        // undefined/none to an empty string here instead of raising a type error.
+        let var_name_value = iter.next_arg::<Value>()?;
+        let var_name = if let Some(s) = var_name_value.as_str() {
+            s.to_string()
+        } else if var_name_value.is_undefined() || var_name_value.is_none() {
+            "".to_string()
+        } else {
+            return Err(Error::new(
+                ErrorKind::InvalidOperation,
+                "argument 'name' to var() has incompatible type; value is not a string",
+            ));
+        };
+
+        // IMPORTANT: ArgsIter's `next_kwarg::<Option<&Value>>` cannot distinguish between:
+        // - kwarg missing
+        // - kwarg present with value `none`
+        //
+        // dbt projects commonly do `var("x", default=None)`, so we need to preserve an
+        // explicit `none` default.
+        //
+        // We therefore parse the kwargs map ourselves (if present), and fall back to
+        // a true positional default only when the 2nd argument is not that kwargs map.
+        let mut default_value: Option<Value> = None;
+
+        // there are two ways for the second argument to be a map:
+        // 1. var("x", {"a": 1})
+        // 2. var("x", {"default": 1})
+        // The first use provides a default map-typed value for x
+        // The second use provides a default int-typed value for x
+
+        // Handling the default value
+        if args.len() == 2 {
+            let second = args.get(1).expect("second must be present");
+            let default_key = Value::from("default");
+            let keyword_default_value = if second.kind() == ValueKind::Map {
+                // NOTE: `get_item` can succeed and still return `undefined` when the key
+                // does not exist. Treat that as "not present".
+                match second.get_item(&default_key) {
+                    Ok(v) if !v.is_undefined() => Some(v),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            if let Some(v) = keyword_default_value {
+                // Keyword default: var("x", default=...)
+                default_value = Some(v);
+            } else {
+                // Positional default: var("x", "abc")
+                default_value = Some(second.clone());
+            }
+        }
+
+        Ok((var_name, default_value))
+    }
+
+    // Consistent missing-var error shape
+    fn missing_var_error<M>(package_name: &str, var_name: &str, vars_lookup: &M) -> Error
+    where
+        M: Serialize + ?Sized,
+    {
+        Error::new(
+            ErrorKind::InvalidOperation,
+            format!(
+                "Required var '{}' not found in config:\nVars supplied to {} = {}",
+                var_name,
+                package_name,
+                serde_json::to_string_pretty(vars_lookup).unwrap()
+            ),
+        )
+    }
+
+    // Common handler for `has_var`
+    fn call_has_var(&self, state: &State<'_, '_>, args: &[Value]) -> Result<Value, Error> {
+        if args.is_empty() {
+            return Err(Error::new(
+                ErrorKind::InvalidOperation,
+                "has_var requires 1 argument",
+            ));
+        }
+        let var_name = args[0].as_str().ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidOperation,
+                "argument 'name' to has_var() has incompatible type; value is not a string",
+            )
+        })?;
+        let present = self.contains_var(state, var_name)?;
+        Ok(Value::from(present))
+    }
+
+    // Common implementation for `Object::call`
+    fn call_impl(
+        self: &Arc<Self>,
+        state: &State<'_, '_>,
+        args: &[Value],
+        _listeners: &[Rc<dyn RenderingEventListener>],
+    ) -> Result<Value, Error> {
+        let (var_name, default_value) = Self::parse_args(args)?;
+        self.call_as_function(state, var_name, default_value)
+    }
+
+    // Common implementation for `Object::call_method`
+    fn call_method_impl(
+        self: &Arc<Self>,
+        state: &State<'_, '_>,
+        method: &str,
+        args: &[Value],
+        _listeners: &[Rc<dyn RenderingEventListener>],
+    ) -> Result<Value, Error> {
+        if method == "has_var" {
+            self.call_has_var(state, args)
+        } else {
+            Err(Error::new(
+                ErrorKind::InvalidOperation,
+                format!("Method {method} not found"),
+            ))
+        }
+    }
+}
+
+/// A struct that returns a variable from a map of variables (with optional overrides)
+/// https://github.com/dbt-labs/dbt-core/blob/31881d2a3bea030e700e9df126a3445298385698/core/dbt/context/base.py#L139
+#[derive(Debug)]
+pub struct Var {
+    vars: BTreeMap<String, dbt_serde_yaml::Value>,
+    overrides: Option<BTreeMap<String, dbt_serde_yaml::Value>>,
+}
+
+impl Var {
+    /// Make a new Var struct
+    pub fn new(vars: BTreeMap<String, dbt_serde_yaml::Value>) -> Self {
+        Self {
+            vars,
+            overrides: None,
+        }
+    }
+
+    /// Make a new Var struct with override values
+    pub fn with_overrides(
+        vars: BTreeMap<String, dbt_serde_yaml::Value>,
+        overrides: Option<BTreeMap<String, dbt_serde_yaml::Value>>,
+    ) -> Self {
+        Self { vars, overrides }
+    }
+}
+
+impl VarFunction for Var {
+    fn contains_var(&self, _state: &State<'_, '_>, var_name: &str) -> Result<bool, Error> {
+        // Preserve existing behavior: check only self.vars
+        Ok(self.vars.contains_key(var_name))
+    }
+
+    fn call_as_function(
+        &self,
+        _state: &State<'_, '_>,
+        var_name: String,
+        default_value: Option<Value>,
+    ) -> Result<Value, Error> {
+        if let Some(overrides) = &self.overrides
+            && let Some(value) = overrides.get(&var_name)
+        {
+            Ok(Value::from_serialize(value.clone()))
+        } else if let Some(value) = self.vars.get(&var_name) {
+            Ok(Value::from_serialize(value.clone()))
+        } else if let Some(default) = default_value {
+            Ok(default)
+        } else {
+            Err(Self::missing_var_error(
+                "<Configuration>",
+                &var_name,
+                &self.vars,
+            ))
+        }
+    }
+}
+
+impl Object for Var {
+    fn call(
+        self: &Arc<Self>,
+        state: &State<'_, '_>,
+        args: &[Value],
+        listeners: &[Rc<dyn RenderingEventListener>],
+    ) -> Result<Value, Error> {
+        self.call_impl(state, args, listeners)
+    }
+
+    fn call_method(
+        self: &Arc<Self>,
+        state: &State<'_, '_>,
+        method: &str,
+        args: &[Value],
+        listeners: &[Rc<dyn RenderingEventListener>],
+    ) -> Result<Value, Error> {
+        self.call_method_impl(state, method, args, listeners)
     }
 }
 
@@ -722,9 +932,20 @@ pub fn render_fn() -> impl Fn(&State, &[Value], Kwargs) -> Result<Value, Error> 
                 "render requires exactly one argument (the string to render)",
             ));
         }
-        let sql = args[0]
-            .as_str()
-            .ok_or_else(|| Error::new(ErrorKind::InvalidOperation, "Argument must be a string"))?;
+        // dbt-core (Jinja2/Python) effectively accepts any value here and stringifies it.
+        // In practice, many dbt projects call `render(...)` on values that can legitimately be
+        // `none` (e.g. optional metadata-driven SQL snippets from `run_query`), expecting
+        // `"None"` and handling that downstream.
+        //
+        // Fusion uses minijinja which is stricter by default; align behavior by accepting
+        // `none` and treating it like Python's `str(None)` => `"None"`.
+        let sql = if args[0].is_none() {
+            "None"
+        } else {
+            args[0].as_str().ok_or_else(|| {
+                Error::new(ErrorKind::InvalidOperation, "Argument must be a string")
+            })?
+        };
 
         let env = state.env();
 
@@ -1318,12 +1539,16 @@ pub fn build_flat_graph(nodes: &Nodes) -> MutableMap {
                         *desc_value = YmlValue::string("".to_string());
                     }
                 }
-                // Update path to only contain the filename (strip directory prefix)
-                if let Some(file_name) = model.__common_attr__.path.file_name() {
-                    map.insert(
-                        YmlValue::string("path".to_string()),
-                        YmlValue::string(file_name.to_string_lossy().to_string()),
-                    );
+                // Strip "models/" prefix from path if present.
+                // dbt-core's manifest stores paths relative to the models folder (e.g., "3-data_vault/...")
+                // not including "models/" prefix. Customer macros like bfs_find_all_downstream_nodes
+                // rely on path.startswith() checks that assume this format.
+                let path_key = YmlValue::string("path".to_string());
+                if let Some(path_value) = map.get(&path_key) {
+                    if let Some(path_str) = path_value.as_str() {
+                        let stripped = path_str.strip_prefix("models/").unwrap_or(path_str);
+                        map.insert(path_key, YmlValue::string(stripped.to_string()));
+                    }
                 }
             }
             (unique_id.clone(), Value::from_serialize(serialized))
@@ -1331,13 +1556,14 @@ pub fn build_flat_graph(nodes: &Nodes) -> MutableMap {
         .chain(nodes.snapshots.iter().map(|(unique_id, snapshot)| {
             let mut serialized =
                 (Arc::as_ref(snapshot) as &dyn InternalDbtNode).serialize_keep_none();
-            // Update path to only contain the filename (strip directory prefix)
+            // Strip resource folder prefix from path for consistency with dbt-core manifest format
             if let YmlValue::Mapping(ref mut map, _) = serialized {
-                if let Some(file_name) = snapshot.__common_attr__.path.file_name() {
-                    map.insert(
-                        YmlValue::string("path".to_string()),
-                        YmlValue::string(file_name.to_string_lossy().to_string()),
-                    );
+                let path_key = YmlValue::string("path".to_string());
+                if let Some(path_value) = map.get(&path_key) {
+                    if let Some(path_str) = path_value.as_str() {
+                        let stripped = path_str.strip_prefix("snapshots/").unwrap_or(path_str);
+                        map.insert(path_key, YmlValue::string(stripped.to_string()));
+                    }
                 }
             }
             (unique_id.clone(), Value::from_serialize(serialized))
@@ -1354,12 +1580,17 @@ pub fn build_flat_graph(nodes: &Nodes) -> MutableMap {
                         YmlValue::string(patch_path.display().to_string()),
                     );
                 }
-                // Update path to only contain the filename (strip directory prefix)
-                if let Some(file_name) = test.__common_attr__.path.file_name() {
-                    map.insert(
-                        YmlValue::string("path".to_string()),
-                        YmlValue::string(file_name.to_string_lossy().to_string()),
-                    );
+                // For tests, use just the file name (not the full path) for consistency with dbt-core manifest format
+                // Generic tests have paths like "tests/generic_tests/not_null_foo_id.sql" but manifest expects "not_null_foo_id.sql"
+                let path_key = YmlValue::string("path".to_string());
+                if let Some(path_value) = map.get(&path_key) {
+                    if let Some(path_str) = path_value.as_str() {
+                        let file_name = std::path::Path::new(path_str)
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or(path_str);
+                        map.insert(path_key.clone(), YmlValue::string(file_name.to_string()));
+                    }
                 }
                 // Set severity to ERROR in config if not already set
                 let config_key = YmlValue::string("config".to_string());
@@ -1378,13 +1609,14 @@ pub fn build_flat_graph(nodes: &Nodes) -> MutableMap {
         }))
         .chain(nodes.seeds.iter().map(|(unique_id, seed)| {
             let mut serialized = (Arc::as_ref(seed) as &dyn InternalDbtNode).serialize_keep_none();
-            // Update path to only contain the filename (strip directory prefix)
+            // Strip resource folder prefix from path for consistency with dbt-core manifest format
             if let YmlValue::Mapping(ref mut map, _) = serialized {
-                if let Some(file_name) = seed.__common_attr__.path.file_name() {
-                    map.insert(
-                        YmlValue::string("path".to_string()),
-                        YmlValue::string(file_name.to_string_lossy().to_string()),
-                    );
+                let path_key = YmlValue::string("path".to_string());
+                if let Some(path_value) = map.get(&path_key) {
+                    if let Some(path_str) = path_value.as_str() {
+                        let stripped = path_str.strip_prefix("seeds/").unwrap_or(path_str);
+                        map.insert(path_key, YmlValue::string(stripped.to_string()));
+                    }
                 }
             }
             (unique_id.clone(), Value::from_serialize(serialized))
@@ -1516,6 +1748,20 @@ mod tests {
     }
 
     #[test]
+    fn test_render_accepts_none() {
+        let mut env = Environment::new();
+        env.add_function("render", render_fn());
+
+        // dbt projects frequently pass `none` into `render(...)` (often after `run_query`)
+        // and expect it to stringify to "None" (Python/Jinja2 behavior).
+        let template_source = r#"{{ render(None) }}"#;
+        let tmpl = env.template_from_str(template_source).unwrap();
+        let output = tmpl.render(Value::UNDEFINED, &[]).unwrap();
+
+        assert_eq!(output.trim(), "None");
+    }
+
+    #[test]
     fn test_tojson_simple_dict() {
         let mut env = Environment::new();
         env.add_function("tojson", tojson);
@@ -1610,5 +1856,73 @@ mod tests {
             .unwrap();
         let output = tmpl.render(Value::UNDEFINED, &[]).unwrap();
         assert_eq!(output.trim(), "i_am_string");
+    }
+
+    fn make_env_with_var() -> minijinja::Environment<'static> {
+        let mut env = minijinja::Environment::new();
+
+        // Mirror Fusion's global Jinja context: dbt projects frequently use
+        // Python-ish constants (capitalized) like `None`.
+        env.add_global("None", Value::from(()));
+        env.add_global("True", Value::from(true));
+        env.add_global("False", Value::from(false));
+
+        env.add_global("var", Value::from_object(Var::new(BTreeMap::new())));
+        env
+    }
+
+    #[test]
+    fn var_default_keyword_none_is_treated_as_none() {
+        let env = make_env_with_var();
+        let template = env
+            .template_from_str(
+                "{% set x = var('x', default=None) %}{% if x is not none %}NOT{% else %}NONE{% endif %}",
+            )
+            .unwrap();
+
+        let rendered = template.render(minijinja::context!(), &[]).unwrap();
+        assert_eq!(rendered, "NONE");
+    }
+
+    #[test]
+    fn var_default_keyword_string_is_used_when_var_missing() {
+        let env = make_env_with_var();
+        let template = env
+            .template_from_str("{{ var('x', default='abc') }}")
+            .unwrap();
+
+        let rendered = template.render(minijinja::context!(), &[]).unwrap();
+        assert_eq!(rendered, "abc");
+    }
+
+    #[test]
+    fn var_default_positional_string_is_used_when_var_missing() {
+        let env = make_env_with_var();
+        let template = env.template_from_str("{{ var('x', 'abc') }}").unwrap();
+
+        let rendered = template.render(minijinja::context!(), &[]).unwrap();
+        assert_eq!(rendered, "abc");
+    }
+
+    #[test]
+    fn var_default_positional_map_is_used_when_var_missing() {
+        let env = make_env_with_var();
+        let template = env
+            .template_from_str("{{ var('config', {'materialized': 'table'}).materialized }}")
+            .unwrap();
+
+        let rendered = template.render(minijinja::context!(), &[]).unwrap();
+        assert_eq!(rendered, "table");
+    }
+
+    #[test]
+    fn var_has_var() {
+        let env = make_env_with_var();
+        let template = env
+            .template_from_str("{{ var.has_var('somevar') }}")
+            .unwrap();
+
+        let rendered = template.render(minijinja::context!(), &[]).unwrap();
+        assert_eq!(rendered, "False");
     }
 }

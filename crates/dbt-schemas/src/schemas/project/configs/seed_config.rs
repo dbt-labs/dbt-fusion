@@ -1,3 +1,7 @@
+use crate::schemas::common::ClusterConfig;
+use crate::schemas::serde::OmissibleGrantConfig;
+use crate::schemas::serde::QueryTag;
+use dbt_common::io_args::StaticAnalysisKind;
 use dbt_serde_yaml::JsonSchema;
 use dbt_serde_yaml::ShouldBe;
 use dbt_serde_yaml::Spanned;
@@ -16,10 +20,10 @@ use crate::schemas::common::DbtMaterialization;
 use crate::schemas::common::DbtQuoting;
 use crate::schemas::common::DocsConfig;
 use crate::schemas::common::Hooks;
+use crate::schemas::common::PartitionConfig;
 use crate::schemas::common::PersistDocsConfig;
 use crate::schemas::common::Schedule;
 use crate::schemas::manifest::GrantAccessToTarget;
-use crate::schemas::manifest::{BigqueryClusterConfig, PartitionConfig};
 use crate::schemas::project::DefaultTo;
 use crate::schemas::project::TypedRecursiveConfig;
 use crate::schemas::project::configs::common::WarehouseSpecificNodeConfig;
@@ -31,8 +35,7 @@ use crate::schemas::project::configs::common::default_to_grants;
 use crate::schemas::serde::StringOrArrayOfStrings;
 use crate::schemas::serde::bool_or_string_bool;
 use crate::schemas::serde::{
-    IndexesConfig, PrimaryKeyConfig, f64_or_string_f64, serialize_string_or_array_map,
-    u64_or_string_u64,
+    IndexesConfig, PrimaryKeyConfig, f64_or_string_f64, u64_or_string_u64,
 };
 
 #[skip_serializing_none]
@@ -54,8 +57,8 @@ pub struct ProjectSeedConfig {
     pub event_time: Option<String>,
     #[serde(rename = "+full_refresh")]
     pub full_refresh: Option<bool>,
-    #[serde(rename = "+grants", serialize_with = "serialize_string_or_array_map")]
-    pub grants: Option<BTreeMap<String, StringOrArrayOfStrings>>,
+    #[serde(rename = "+grants")]
+    pub grants: OmissibleGrantConfig,
     #[serde(rename = "+group")]
     pub group: Option<String>,
     #[serde(rename = "+meta")]
@@ -76,6 +79,8 @@ pub struct ProjectSeedConfig {
     pub schema: Option<String>,
     #[serde(rename = "+snowflake_warehouse")]
     pub snowflake_warehouse: Option<String>,
+    #[serde(rename = "+static_analysis")]
+    pub static_analysis: Option<Spanned<StaticAnalysisKind>>,
     #[serde(rename = "+tags")]
     pub tags: Option<StringOrArrayOfStrings>,
     #[serde(rename = "+transient")]
@@ -101,7 +106,7 @@ pub struct ProjectSeedConfig {
     #[serde(rename = "+tmp_relation_type")]
     pub tmp_relation_type: Option<String>,
     #[serde(rename = "+query_tag")]
-    pub query_tag: Option<String>,
+    pub query_tag: Option<QueryTag>,
     #[serde(rename = "+table_tag")]
     pub table_tag: Option<String>,
     #[serde(rename = "+row_access_policy")]
@@ -117,7 +122,7 @@ pub struct ProjectSeedConfig {
     #[serde(rename = "+partition_by")]
     pub partition_by: Option<PartitionConfig>,
     #[serde(rename = "+cluster_by")]
-    pub cluster_by: Option<BigqueryClusterConfig>,
+    pub cluster_by: Option<ClusterConfig>,
     #[serde(
         default,
         rename = "+hours_to_expiration",
@@ -289,8 +294,8 @@ pub struct SeedConfig {
     pub docs: Option<DocsConfig>,
     #[serde(default, deserialize_with = "bool_or_string_bool")]
     pub enabled: Option<bool>,
-    #[serde(default, serialize_with = "serialize_string_or_array_map")]
-    pub grants: Option<BTreeMap<String, StringOrArrayOfStrings>>,
+    #[serde(default)]
+    pub grants: OmissibleGrantConfig,
     #[serde(default, deserialize_with = "bool_or_string_bool")]
     pub quote_columns: Option<bool>,
     pub delimiter: Option<Spanned<String>>,
@@ -298,6 +303,7 @@ pub struct SeedConfig {
     pub full_refresh: Option<bool>,
     pub group: Option<String>,
     pub meta: Option<IndexMap<String, YmlValue>>,
+    pub static_analysis: Option<Spanned<StaticAnalysisKind>>,
     pub persist_docs: Option<PersistDocsConfig>,
     #[serde(alias = "post-hook")]
     pub post_hook: Verbatim<Option<Hooks>>,
@@ -327,6 +333,7 @@ impl From<ProjectSeedConfig> for SeedConfig {
             full_refresh: config.full_refresh,
             group: config.group,
             meta: config.meta,
+            static_analysis: config.static_analysis,
             persist_docs: config.persist_docs,
             post_hook: config.post_hook,
             pre_hook: config.pre_hook,
@@ -435,6 +442,7 @@ impl From<SeedConfig> for ProjectSeedConfig {
             persist_docs: config.persist_docs,
             post_hook: config.post_hook,
             pre_hook: config.pre_hook,
+            static_analysis: config.static_analysis,
             tags: config.tags,
             quoting: config.quoting,
             // Snowflake fields
@@ -558,6 +566,7 @@ impl DefaultTo<SeedConfig> for SeedConfig {
             group,
             persist_docs,
             materialized,
+            static_analysis,
             // Adapter specific configs
             __warehouse_specific_config__: warehouse_specific_config,
         } = self;
@@ -595,6 +604,7 @@ impl DefaultTo<SeedConfig> for SeedConfig {
                 full_refresh,
                 group,
                 persist_docs,
+                static_analysis,
                 materialized,
             ]
         );

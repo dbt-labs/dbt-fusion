@@ -9,24 +9,26 @@ use std::{
 
 use console::Term;
 use dbt_telemetry::{
-    AnyTelemetryEvent, CompiledCodeInline, DepsAddPackage, DepsAllPackagesInstalled,
+    AnyTelemetryEvent, AssetParsed, CompiledCodeInline, DepsAddPackage, DepsAllPackagesInstalled,
     DepsPackageInstalled, ExecutionPhase, GenericOpExecuted, GenericOpItemProcessed, Invocation,
     ListItemOutput, LogMessage, LogRecordInfo, NodeEvaluated, NodeOutcome, NodeProcessed,
     NodeSkipReason, NodeType, PhaseExecuted, ProgressMessage, QueryExecuted, SeverityNumber,
-    ShowDataOutput, ShowResult, SpanEndInfo, SpanStartInfo, SpanStatus, StatusCode,
-    TelemetryOutputFlags, UserLogMessage, node_processed,
+    ShowDataOutput, ShowResult, SpanEndInfo, SpanStartInfo, SpanStatus, StateModifiedDiff,
+    StatusCode, TelemetryOutputFlags, UserLogMessage, node_processed,
 };
 use dbt_tui_progress::ProgressController;
 
 use dbt_error::ErrorCode;
 use tracing::level_filters::LevelFilter;
 
+use crate::constants::DBT_GENERIC_TESTS_DIR_NAME;
 use crate::{
     io_args::{FsCommand, ShowOptions},
     logging::LogFormat,
     tracing::{
         data_provider::DataProvider,
         formatters::{
+            asset::format_asset_parsed_start,
             color::BLUE,
             constants::SELECTED_NODES_TITLE,
             deps::{
@@ -48,6 +50,7 @@ use crate::{
             },
             phase::get_phase_progress_text,
             progress::format_progress_message,
+            state_mod_diff::format_state_modified_diff_lines,
             test_result::format_test_failure,
         },
         layer::{ConsumerLayer, TelemetryConsumer},
@@ -240,11 +243,13 @@ pub fn should_show_progress_message(
         Some(ExecutionPhase::Render) => show_options.contains(&ShowOptions::ProgressRender),
         Some(ExecutionPhase::Analyze) => show_options.contains(&ShowOptions::ProgressAnalyze),
         Some(ExecutionPhase::Run) => show_options.contains(&ShowOptions::ProgressRun),
-        Some(
-            ExecutionPhase::NodeCacheHydration
-            | ExecutionPhase::DeferHydration
-            | ExecutionPhase::SchemaHydration,
-        ) => show_options.contains(&ShowOptions::ProgressHydrate),
+        Some(ExecutionPhase::NodeCacheHydration | ExecutionPhase::DeferHydration) => {
+            show_options.contains(&ShowOptions::ProgressHydrate)
+        }
+        Some(ExecutionPhase::SchemaHydration) => {
+            show_options.contains(&ShowOptions::ProgressHydrate)
+                || show_options.contains(&ShowOptions::Progress)
+        }
         // All other phases (including no Phase and Unspecified) match the general Progress option
         _ => show_options.contains(&ShowOptions::Progress),
     };
@@ -373,11 +378,15 @@ impl TelemetryConsumer for TuiLayer {
             // NodeEvaluated, NodeProcessed & GenericOp should always be let through
             // because of progress bars relying on them. Their output is controlled
             // in the handler based on the verbosity level.
-            && (span.attributes.is::<NodeEvaluated>() || span.attributes.is::<NodeProcessed>() || span
-                .attributes.is::<GenericOpExecuted>() || span.attributes.is::<GenericOpItemProcessed>()
-                || span
-                    .severity_number
-                    <= self.max_log_verbosity)
+            && (span.attributes.is::<NodeEvaluated>()
+                || span.attributes.is::<NodeProcessed>()
+                || span.attributes.is::<GenericOpExecuted>()
+                || span.attributes.is::<GenericOpItemProcessed>()
+                // TOD: This one is also allowed to pass at debug level due to multitude of
+                // tests recording prased messages using `progress` cli arg. Special casing
+                // should be removed and formatting unified with file layer
+                || span.attributes.is::<AssetParsed>()
+                || span.severity_number <= self.max_log_verbosity)
     }
 
     fn is_log_enabled(&self, log_record: &LogRecordInfo) -> bool {
@@ -405,6 +414,11 @@ impl TelemetryConsumer for TuiLayer {
                 seen_test: false,
                 seen_unit_test: false,
             });
+        }
+
+        if let Some(asset_parsed) = span.attributes.downcast_ref::<AssetParsed>() {
+            self.handle_asset_parsed_start(span, asset_parsed);
+            return;
         }
 
         // Handle NodeEvaluated start
@@ -514,6 +528,11 @@ impl TelemetryConsumer for TuiLayer {
         // Check if this is a LogMessage (error/warning)
         if let Some(log_msg) = log_record.attributes.downcast_ref::<LogMessage>() {
             self.handle_log_message(log_msg, log_record, data_provider);
+            return;
+        }
+
+        if let Some(state_mod_diff) = log_record.attributes.downcast_ref::<StateModifiedDiff>() {
+            self.handle_state_modified_diff(state_mod_diff);
             return;
         }
 
@@ -712,14 +731,14 @@ impl TuiLayer {
             | ExecutionPhase::TaskGraphBuild
             | ExecutionPhase::Debug
             | ExecutionPhase::DeferHydration
-            | ExecutionPhase::SchemaHydration => {
+            | ExecutionPhase::SchemaHydration
+            | ExecutionPhase::FreshnessAnalysis => {
                 progress.start_spinner(ProgressId::Phase(phase_enum), progress_text);
             }
             ExecutionPhase::Unspecified
             | ExecutionPhase::Compare
             | ExecutionPhase::InitAdapter
             | ExecutionPhase::NodeCacheHydration
-            | ExecutionPhase::FreshnessAnalysis
             | ExecutionPhase::Lineage => {
                 // Do not show progress for these phases
             }
@@ -764,14 +783,14 @@ impl TuiLayer {
             | ExecutionPhase::TaskGraphBuild
             | ExecutionPhase::Debug
             | ExecutionPhase::DeferHydration
-            | ExecutionPhase::SchemaHydration => {
+            | ExecutionPhase::SchemaHydration
+            | ExecutionPhase::FreshnessAnalysis => {
                 progress.remove_spinner(&ProgressId::Phase(phase_enum));
             }
             ExecutionPhase::Unspecified
             | ExecutionPhase::Compare
             | ExecutionPhase::InitAdapter
             | ExecutionPhase::NodeCacheHydration
-            | ExecutionPhase::FreshnessAnalysis
             | ExecutionPhase::Lineage => {
                 // Do not show progress for these phases
             }
@@ -998,6 +1017,16 @@ impl TuiLayer {
         }
     }
 
+    fn handle_state_modified_diff(&self, state_mod_diff: &StateModifiedDiff) {
+        let formatted = format_state_modified_diff_lines(state_mod_diff).join("\n");
+        self.write_suspended(|| {
+            io::stdout()
+                .lock()
+                .write_all(format!("{formatted}\n").as_bytes())
+                .expect("failed to write to stdout");
+        });
+    }
+
     fn handle_user_log_message(&self, log_record: &LogRecordInfo) {
         // Print user log messages immediately to stdout
         self.write_suspended(|| {
@@ -1112,6 +1141,27 @@ impl TuiLayer {
         }
 
         let formatted = format_progress_message(progress_msg, severity_number, true, true);
+        self.write_suspended(|| {
+            io::stdout()
+                .lock()
+                .write_all(format!("{}\n", formatted).as_bytes())
+                .expect("failed to write to stdout");
+        });
+    }
+
+    fn handle_asset_parsed_start(&self, _span: &SpanStartInfo, asset: &AssetParsed) {
+        // TODO: This is temporary legacy rendering for parse progress and should
+        // be replaced with the new end-span rendering (matching file log) once fully migrated.
+        // We ignore this span severity level and only check show options for progress.
+
+        if !should_show_progress_message(Some(asset.phase()), &self.show_options)
+            // Legacy filter exclusion for generic tests
+            || asset.display_path.contains(DBT_GENERIC_TESTS_DIR_NAME)
+        {
+            return;
+        }
+
+        let formatted = format_asset_parsed_start(asset, true);
         self.write_suspended(|| {
             io::stdout()
                 .lock()

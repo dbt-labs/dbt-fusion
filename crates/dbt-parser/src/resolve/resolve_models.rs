@@ -343,7 +343,6 @@ pub async fn resolve_models(
             properties.columns.as_ref(),
             model_config.meta.clone(),
             model_config.tags.clone().map(|tags| tags.into()),
-            Some(original_file_path.to_string_lossy().as_ref()),
         )?;
 
         if let Some(versions) = &properties.versions {
@@ -352,7 +351,6 @@ pub async fn resolve_models(
                 maybe_version.as_ref(),
                 versions,
                 columns,
-                Some(original_file_path.to_string_lossy().as_ref()),
             )?;
         }
 
@@ -512,6 +510,7 @@ pub async fn resolve_models(
                 event_time: model_config.event_time.clone(),
                 catalog_name: model_config.catalog_name.clone(),
                 table_format: model_config.table_format.clone(),
+                sync: model_config.sync.clone(),
             },
             __adapter_attr__: AdapterAttr::from_config_and_dialect(
                 &model_config.__warehouse_specific_config__,
@@ -663,7 +662,6 @@ fn process_versioned_columns(
     maybe_version: Option<&String>,
     versions: &[Versions],
     columns: Vec<DbtColumnRef>,
-    original_file_path: Option<&str>,
 ) -> Result<Vec<DbtColumnRef>, Box<dbt_common::FsError>> {
     for version in versions.iter() {
         if maybe_version.is_some_and(|v| Some(v) == version.get_version().as_ref())
@@ -686,7 +684,6 @@ fn process_versioned_columns(
                 Some(&column_map),
                 model_config.meta.clone(),
                 model_config.tags.clone().map(|tags| tags.into()),
-                original_file_path,
             )?;
 
             if let Some(rules) = ColumnInheritanceRules::from_version_columns(column_props) {
@@ -906,17 +903,37 @@ fn merge_python_config(
     let mut merged_config = project_config.clone();
 
     // Apply schema.yml config on top (medium priority)
-    if let Some(properties) = maybe_properties
-        && let Some(mut properties_config) = properties.config.clone()
-    {
-        properties_config.default_to(&merged_config);
-        merged_config = properties_config;
+    // For Python models, we always create a config layer with materialized="table" as default
+    // See https://github.com/dbt-labs/dbt-core/blob/34bb3f94dde716a3f9c36481d2ead85c211075dd/core/dbt/parser/base.py#L338
+    // This ensures the default overrides project config but can be overridden by Python file config
+    let mut properties_config = if let Some(properties) = maybe_properties {
+        // Schema.yml exists - use its config if present, otherwise create default
+        properties.config.clone().unwrap_or_default()
+    } else {
+        // No schema.yml - create default config
+        ModelConfig::default()
+    };
+
+    // Set default materialized if not specified
+    if properties_config.materialized.is_none() {
+        properties_config.materialized = Some(DbtMaterialization::Table);
     }
+
+    // Merge with project config (properties_config overrides project_config)
+    properties_config.default_to(&merged_config);
+    merged_config = properties_config;
 
     // Apply Python file config on top (highest priority)
     let mut python_config = *python_file_info.config.clone();
     python_config.default_to(&merged_config);
     merged_config = python_config;
+
+    // Transfer Python-specific config key tracking from PythonFileInfo to merged config
+    // These fields should come from the Python file analysis, not from project/schema configs
+    if !python_file_info.config_keys_used.is_empty() {
+        merged_config.config_keys_used = Some(python_file_info.config_keys_used.clone());
+        merged_config.config_keys_defaults = Some(python_file_info.config_keys_defaults.clone());
+    }
 
     // Warn if user explicitly enabled static_analysis for a Python model
     // This check happens after all config sources are merged

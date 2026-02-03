@@ -123,7 +123,12 @@ impl JinjaEnvBuilder {
         let is_replay = self
             .globals
             .get("invocation_args_dict")
-            .and_then(|v| v.get_item(&Value::from("REPLAY")).ok())
+            .and_then(|v| {
+                // Check both lowercase (from invocation_args_dict after filtering) and uppercase
+                v.get_item(&Value::from("replay"))
+                    .ok()
+                    .or_else(|| v.get_item(&Value::from("REPLAY")).ok())
+            })
             .map(|v| v.is_true())
             .unwrap_or(false);
 
@@ -140,6 +145,31 @@ impl JinjaEnvBuilder {
                 for unit in units.iter_mut() {
                     if unit.info.name == TARGET_MACRO {
                         unit.sql = NOOP_MACRO_SQL.to_string();
+                        break;
+                    }
+                }
+            }
+
+            // Replay-mode behavior: suppress dbt_project_evaluator graph materialization post-hooks.
+            //
+            // dbt_project_evaluator's staging graph models populate tables via post-hook INSERTs
+            // generated from `graph.*` (nodes/depends_on, etc.). Fusion and Mantle can have benign
+            // graph differences, which results in non-semantic SQL drift and replay mismatches.
+            //
+            // We rewrite `dbt_project_evaluator.insert_resources_from_graph` to a no-op, similar to
+            // the Elementary suppression above.
+            const DBT_PROJECT_EVALUATOR_PKG: &str = "dbt_project_evaluator";
+            const DBT_PROJECT_EVALUATOR_TARGET_MACRO: &str = "insert_resources_from_graph";
+            const DBT_PROJECT_EVALUATOR_NOOP_MACRO_SQL: &str = r#"{% macro insert_resources_from_graph(relation, resource_type='nodes', relationships=False, columns=False, batch_size=var('insert_batch_size') | int) %}
+  {# dbt-fusion replay: deliberately no-op to avoid graph-derived SQL drift #}
+  {{- return('') -}}
+{% endmacro %}
+"#;
+
+            if let Some(units) = macros.macros.get_mut(DBT_PROJECT_EVALUATOR_PKG) {
+                for unit in units.iter_mut() {
+                    if unit.info.name == DBT_PROJECT_EVALUATOR_TARGET_MACRO {
+                        unit.sql = DBT_PROJECT_EVALUATOR_NOOP_MACRO_SQL.to_string();
                         break;
                     }
                 }
@@ -286,6 +316,7 @@ impl JinjaEnvBuilder {
                     ))),
                 };
                 function_registry.insert(template_name.clone(), funcsign.clone());
+                function_registry.insert(macro_name.clone(), funcsign.clone());
 
                 macro_template_registry.insert(
                     Value::from(template_name),
@@ -550,7 +581,7 @@ impl Default for JinjaEnvBuilder {
 mod tests {
     use std::{collections::BTreeSet, path::PathBuf, sync::Mutex};
 
-    use dbt_adapter::ParseAdapter;
+    use dbt_adapter::BridgeAdapter;
     use dbt_adapter::sql_types::NaiveTypeOpsImpl;
     use dbt_common::adapter::AdapterType;
     use dbt_common::cancellation::never_cancels;
@@ -599,10 +630,10 @@ mod tests {
     }
 
     fn invocation_args_dict(replay: bool) -> Value {
-        Value::from_object(ValueMap::from([(
-            Value::from("REPLAY".to_string()),
-            Value::from(replay),
-        )]))
+        Value::from_object(ValueMap::from([
+            (Value::from("REPLAY".to_string()), Value::from(replay)),
+            (Value::from("replay".to_string()), Value::from(replay)),
+        ]))
     }
 
     #[test]
@@ -684,7 +715,7 @@ all okay!");
                 "{% macro default__one() %}test_package one{% endmacro %}",
             )],
         );
-        let adapter = ParseAdapter::new(
+        let adapter = BridgeAdapter::new_parse_phase_adapter(
             AdapterType::Postgres,
             dbt_serde_yaml::Mapping::default(),
             DEFAULT_DBT_QUOTING,
@@ -772,7 +803,7 @@ all okay!");
                 ),
             ],
         );
-        let adapter = ParseAdapter::new(
+        let adapter = BridgeAdapter::new_parse_phase_adapter(
             AdapterType::Postgres,
             dbt_serde_yaml::Mapping::default(),
             DEFAULT_DBT_QUOTING,
@@ -835,7 +866,7 @@ all okay!");
 
     #[test]
     fn test_macro_assignment() {
-        let adapter = ParseAdapter::new(
+        let adapter = BridgeAdapter::new_parse_phase_adapter(
             AdapterType::Postgres,
             dbt_serde_yaml::Mapping::default(),
             DEFAULT_DBT_QUOTING,
@@ -956,7 +987,7 @@ all okay!");
             )],
         );
 
-        let adapter = ParseAdapter::new(
+        let adapter = BridgeAdapter::new_parse_phase_adapter(
             AdapterType::Postgres,
             dbt_serde_yaml::Mapping::default(),
             DEFAULT_DBT_QUOTING,
@@ -1008,7 +1039,7 @@ all okay!");
             )],
         );
 
-        let adapter = ParseAdapter::new(
+        let adapter = BridgeAdapter::new_parse_phase_adapter(
             AdapterType::Postgres,
             dbt_serde_yaml::Mapping::default(),
             DEFAULT_DBT_QUOTING,
@@ -1054,7 +1085,7 @@ all okay!");
             )],
         );
 
-        let adapter = ParseAdapter::new(
+        let adapter = BridgeAdapter::new_parse_phase_adapter(
             AdapterType::Postgres,
             dbt_serde_yaml::Mapping::default(),
             DEFAULT_DBT_QUOTING,

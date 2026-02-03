@@ -31,15 +31,14 @@ pub fn get_relation(
     schema: &str,
     identifier: &str,
 ) -> AdapterResult<Option<Arc<dyn BaseRelation>>> {
-    let adapter_type = adapter.adapter_type();
-    match adapter_type {
+    match adapter.adapter_type() {
         AdapterType::Snowflake => {
             snowflake_get_relation(adapter, state, ctx, conn, database, schema, identifier)
         }
         AdapterType::Bigquery => {
             bigquery_get_relation(adapter, state, ctx, conn, database, schema, identifier)
         }
-        AdapterType::Databricks => {
+        AdapterType::Databricks | AdapterType::Spark => {
             databricks_get_relation(adapter, state, ctx, conn, database, schema, identifier)
         }
         AdapterType::Redshift => {
@@ -50,6 +49,13 @@ pub fn get_relation(
         }
         AdapterType::Salesforce => {
             salesforce_get_relation(adapter, state, ctx, conn, database, schema, identifier)
+        }
+        AdapterType::Sidecar => {
+            // This branch should not be reached - sidecar adapters override get_relation()
+            Err(AdapterError::new(
+                AdapterErrorKind::Internal,
+                "get_relation called on Sidecar adapter type without override",
+            ))
         }
     }
 }
@@ -281,9 +287,11 @@ fn databricks_get_relation(
     // more details see docs from DatabricksDescribeTableExtended::to_metadata
     // WARNING: system tables from DBX only supports the basic "DESCRIBE TABLE"
     // though I assume it's highly unlikely and unfathomable a user would want to call adapter.get_relation on a system table
-    let sql = format!(
-        "DESCRIBE TABLE EXTENDED {query_catalog}.{query_schema}.{query_identifier} AS JSON"
-    );
+    let sql = if database.is_empty() {
+        format!("DESCRIBE TABLE EXTENDED {query_schema}.{query_identifier} AS JSON")
+    } else {
+        format!("DESCRIBE TABLE EXTENDED {query_catalog}.{query_schema}.{query_identifier} AS JSON")
+    };
 
     let batch = adapter.engine().execute(Some(state), conn, ctx, &sql);
     if let Err(e) = &batch
@@ -307,8 +315,15 @@ fn databricks_get_relation(
         _ => Some(RelationType::Table),
     };
 
+    let db = if database.is_empty() {
+        None
+    } else {
+        Some(database.to_string())
+    };
+
     Ok(Some(Arc::new(DatabricksRelation::new(
-        Some(database.to_string()),
+        adapter.adapter_type(),
+        db,
         Some(schema.to_string()),
         Some(identifier.to_string()),
         relation_type,

@@ -15,8 +15,9 @@ use dbt_schemas::schemas::legacy_catalog::*;
 use dbt_schemas::schemas::relations::base::*;
 use dbt_xdbc::*;
 use minijinja::State;
+
 use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 /// Reference: https://github.com/dbt-labs/dbt-adapters/blob/87e81a47baa11c312003377091a9efc0ab72d88e/dbt-redshift/src/dbt/include/redshift/macros/adapters.sql#L226
@@ -112,6 +113,20 @@ fn build_relation_clauses_redshift(
     }
     Ok((where_clauses_by_database, relations_by_database))
 }
+
+// This list was created using brute force since I can't find docs for which tables support it
+const TABLES_WITH_OID: [&str; 10] = [
+    "pg_cast",
+    "pg_opclass",
+    "pg_class",
+    "pg_constraint",
+    "pg_database",
+    "pg_language",
+    "pg_namespace",
+    "pg_operator",
+    "pg_proc",
+    "pg_type",
+];
 
 pub struct RedshiftMetadataAdapter {
     adapter: ConcreteAdapter,
@@ -693,6 +708,19 @@ AND table_name = '{identifier}'"
                 fields.push(field);
             }
 
+            // Some pg_ tables contain an "invisible" oid column
+            // See: https://docs.aws.amazon.com/redshift/latest/dg/c_join_PG.html
+            if schema == "pg_catalog" && TABLES_WITH_OID.contains(&identifier.as_str()) {
+                let field = make_arrow_field_v2(
+                    adapter.engine().type_ops(),
+                    String::from("oid"),
+                    "oid",
+                    Some(false),
+                    None,
+                )?;
+                fields.push(field);
+            }
+
             if fields.is_empty() {
                 return Err(AdapterError::new(
                     AdapterErrorKind::UnexpectedResult,
@@ -739,8 +767,8 @@ AND table_name = '{identifier}'"
     fn create_schemas_if_not_exists(
         &self,
         state: &State<'_, '_>,
-        catalog_schemas: &BTreeMap<String, BTreeSet<String>>,
-    ) -> AdapterResult<Vec<(String, String, AdapterResult<()>)>> {
+        catalog_schemas: Vec<(String, String, String)>,
+    ) -> AdapterResult<Vec<(String, String, String, AdapterResult<()>)>> {
         create_schemas_if_not_exists(&self.adapter, self, state, catalog_schemas)
     }
 

@@ -5,6 +5,7 @@ use crate::adapter_config::{
 use crate::dbt_cloud_client::{CloudProject, DbtCloudClient, DbtCloudYml};
 use crate::yaml_utils::{has_top_level_key_parsed_file, remove_top_level_key_from_str};
 use dbt_common::adapter::AdapterType;
+use dbt_common::constants::DBT_PACKAGES_DIR_NAME;
 use dbt_common::pretty_string::GREEN;
 use dbt_common::tracing::emit::{emit_info_log_message, emit_warn_log_message};
 use dbt_common::{ErrorCode, FsResult, fs_err, io_args::IoArgs};
@@ -51,7 +52,7 @@ fn load_profile_with_loader(
     };
 
     let dbt_project = DbtProjectSimplified {
-        packages_install_path: Some("dbt_packages".to_string()),
+        packages_install_path: Some(DBT_PACKAGES_DIR_NAME.to_string()),
         profile: Some(profile_name.to_string()),
         dbt_cloud: None,
         data_paths: Default::default(),
@@ -180,6 +181,7 @@ impl ProfileSetup {
         Ok(adapters[selection])
     }
 
+    #[allow(unreachable_patterns)]
     pub fn create_profile_for_adapter(
         &self,
         adapter: AdapterType,
@@ -187,6 +189,13 @@ impl ProfileSetup {
         existing_config: Option<&DbConfig>,
     ) -> FsResult<ProfileTarget> {
         let db_config = match adapter {
+            AdapterType::Sidecar => {
+                return Err(fs_err!(
+                    ErrorCode::InvalidConfig,
+                    "Sidecar is an internal adapter type and cannot be used directly in profiles.yml. \
+                     Use 'type: snowflake' (or another warehouse) with 'execute: sidecar' instead."
+                ));
+            }
             AdapterType::Snowflake => {
                 let snowflake_config = match existing_config {
                     Some(DbConfig::Snowflake(config)) => Some(config),
@@ -224,12 +233,29 @@ impl ProfileSetup {
                 };
                 DbConfig::Redshift(setup_redshift_profile(redshift_config.map(Box::as_ref))?)
             }
+            AdapterType::Spark => {
+                let _salesforce_config = match existing_config {
+                    Some(DbConfig::Spark(config)) => Some(config),
+                    _ => None,
+                };
+                todo!("setup_spark_profile")
+            }
             AdapterType::Salesforce => {
                 let _salesforce_config = match existing_config {
                     Some(DbConfig::Salesforce(config)) => Some(config),
                     _ => None,
                 };
                 todo!("setup_salesforce_profile")
+            }
+
+            AdapterType::Sidecar => {
+                // DuckDB doesn't require credentials for local file-based operations
+                // For now, return a basic Postgres config as placeholder
+                // TODO: Create proper DuckDB profile setup
+                return Err(fs_err!(
+                    ErrorCode::Generic,
+                    "DuckDB profile setup not yet implemented. DuckDB runs locally without credentials."
+                ));
             }
         };
 

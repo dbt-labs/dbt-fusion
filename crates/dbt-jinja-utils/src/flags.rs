@@ -108,7 +108,41 @@ impl Flags {
 
     /// Get dictionary that represents this set of flags
     pub fn to_dict(&self) -> BTreeMap<String, Value> {
-        self.flags.clone()
+        // Reference: https://github.com/dbt-labs/dbt-core/blob/62757f198761ca3a8b8700535bc8c28f84d5c5d5/core/dbt/flags.py#L46
+        static FLAG_ATTR: &[&str] = &[
+            "use_experimental_parser",
+            "static_parser",
+            "warn_error",
+            "warn_error_options",
+            "write_json",
+            "partial_parse",
+            "use_colors",
+            "profiles_dir",
+            "debug",
+            "log_format",
+            "version_check",
+            "fail_fast",
+            "send_anonymous_usage_stats",
+            "printer_width",
+            "indirect_selection",
+            "log_cache_events",
+            "quiet",
+            "no_print",
+            "cache_selected_only",
+            "introspect",
+            "target_path",
+            "log_path",
+            "invocation_command",
+            "empty",
+        ];
+        FLAG_ATTR
+            .iter()
+            .filter_map(|&key| {
+                self.flags
+                    .get(&key.to_uppercase())
+                    .map(|value| (key.to_string(), value.clone()))
+            })
+            .collect()
     }
 
     /// Set the flag's according to https://github.com/dbt-labs/dbt-core/blob/HEAD/core/dbt/flags.py
@@ -131,6 +165,10 @@ impl Flags {
         self.flags.insert(
             "VERSION_CHECK".to_string(),
             Value::from(invocation_args.version_check),
+        );
+        self.flags.insert(
+            "INTROSPECT".to_string(),
+            Value::from(invocation_args.introspect),
         );
         self.flags
             .insert("DEFER".to_string(), Value::from(invocation_args.defer));
@@ -185,6 +223,10 @@ impl Flags {
         self.flags.insert(
             "WRITE_JSON".to_string(),
             Value::from(invocation_args.write_json),
+        );
+        self.flags.insert(
+            "STORE_FAILURES".to_string(),
+            Value::from(invocation_args.store_failures),
         );
     }
     /// Override self with other flags

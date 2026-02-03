@@ -76,8 +76,8 @@ pub mod schemas {
 
         pub mod common;
         pub use bigquery_partition::{
-            BigqueryClusterConfig, BigqueryPartitionConfig, BigqueryPartitionConfigInner,
-            GrantAccessToTarget, PartitionConfig, Range, RangeConfig, TimeConfig,
+            BigqueryPartitionConfig, BigqueryPartitionConfigInner, GrantAccessToTarget, Range,
+            RangeConfig, TimeConfig,
         };
         pub use group::ManifestGroup;
         pub use manifest::{
@@ -85,9 +85,9 @@ pub mod schemas {
             nodes_from_dbt_manifest,
         };
         pub use manifest_nodes::{
-            ManifestDataTest, ManifestExposure, ManifestFunction, ManifestMetric, ManifestModel,
-            ManifestSavedQuery, ManifestSeed, ManifestSemanticModel, ManifestSnapshot,
-            ManifestSource, ManifestUnitTest,
+            ManifestDataTest, ManifestExposure, ManifestFunction, ManifestMacro, ManifestMetric,
+            ManifestModel, ManifestSavedQuery, ManifestSeed, ManifestSemanticModel,
+            ManifestSnapshot, ManifestSource, ManifestUnitTest,
         };
         pub use metric::DbtMetric;
         pub use operation::DbtOperation;
@@ -182,9 +182,10 @@ pub mod schemas {
         pub use model_properties::ModelProperties;
         pub use properties::GroupConfig;
         pub use properties::GroupProperties;
+        pub use properties::MacrosProperties;
         pub use properties::{
             DbtPropertiesFile, DbtPropertiesFileValues, GetConfig, MinimalSchemaValue,
-            MinimalTableValue,
+            MinimalTableValue, MinimalUnitTestValue,
         };
         pub use saved_queries_properties::SavedQueriesProperties;
         pub use seed_properties::SeedProperties;

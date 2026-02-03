@@ -168,6 +168,12 @@ fn persist_inner(
         &jinja_set_vars,
         test_name_truncations,
     );
+
+    // Generate unique_id hash from UNCLEANED kwargs to match mantle's behavior.
+    let test_hash =
+        generate_test_unique_id_hash(&full_name, &test_macro_name, namespace.as_ref(), &kwargs);
+    let unique_id = format!("{}.{}", full_name, test_hash);
+
     let path = PathBuf::from(DBT_GENERIC_TESTS_DIR_NAME).join(format!("{full_name}.sql"));
     let test_file = io_args.out_dir.join(&path);
     let generated_test_sql = generate_test_macro(
@@ -177,7 +183,11 @@ fn persist_inner(
         &config,
         &jinja_set_vars,
     )?;
-    if !seen_tests.insert(full_name.clone()) {
+
+    // Check for duplicate tests using the unique_id (which includes kwargs hash)
+    // rather than just the cleaned name. This matches mantle's behavior where
+    // tests with different kwargs get different unique_ids.
+    if !seen_tests.insert(unique_id) {
         match column_name {
             Some(column_name) => {
                 return err!(
@@ -226,6 +236,9 @@ fn persist_inner(
         .and_then(|v| v.as_str())
         .map(|s| format!("{{{{ {} }}}}", s));
 
+    // If the test name was truncated, get the original name from the truncations map
+    let original_name = test_name_truncations.get(&full_name).cloned();
+
     Ok(GenericTestAsset {
         dbt_asset,
         resource_name: test_config.resource_name.clone(),
@@ -237,6 +250,7 @@ fn persist_inner(
         test_metadata_column_name: column_name,
         test_metadata_combination_of_columns: combination_of_columns,
         test_metadata_model,
+        original_name,
     })
 }
 
@@ -279,7 +293,7 @@ fn get_test_details(
         }
         _ => {
             if let Some(ref version_num) = test_config.version_num {
-                format!("ref('{}', v={})", &test_config.resource_name, version_num)
+                format!("ref('{}', v='{}')", &test_config.resource_name, version_num)
             } else {
                 format!("ref('{}')", &test_config.resource_name)
             }
@@ -510,9 +524,9 @@ fn extract_kwargs_and_jinja_vars_and_dep_kwarg_and_configs(
 
     // Process all combined args for jinja vars
     for (key, value) in combined_args {
-        let (kwarg_value, jinja_var) = process_kwarg(&key, &value);
+        let (kwarg_value, jinja_vars) = process_kwarg(&key, &value);
         kwargs.insert(key, kwarg_value);
-        if let Some((var_name, var_value)) = jinja_var {
+        for (var_name, var_value) in jinja_vars {
             jinja_set_vars.insert(var_name, var_value);
         }
     }
@@ -598,22 +612,53 @@ fn extract_config_keys_from_map(
 }
 
 /// Helper function to process a kwarg value and detect if it needs a Jinja set block
-/// Returns (kwarg_value, optional_jinja_var)
-fn process_kwarg(key: &str, value: &Value) -> (Value, Option<(String, String)>) {
-    if let Value::String(s) = value {
-        if needs_jinja_set_block(s) {
-            // Generate a unique var name based on the key with a prefix to avoid collisions
-            let var_name = format!("dbt_custom_arg_{key}");
-            let jinja_var = Some((var_name.clone(), s.clone()));
-            let kwarg_value = Value::String(var_name);
-            (kwarg_value, jinja_var)
-        } else {
-            // For simple values, just use the value directly
-            (value.clone(), None)
+/// Returns (kwarg_value, jinja_vars)
+fn process_kwarg(key: &str, value: &Value) -> (Value, Vec<(String, String)>) {
+    match value {
+        Value::String(s) => {
+            if needs_jinja_set_block(s) {
+                // Generate a unique var name based on the key with a prefix to avoid collisions
+                let var_name = format!("dbt_custom_arg_{key}");
+                let jinja_var = vec![(var_name.clone(), s.clone())];
+                let kwarg_value = Value::String(var_name);
+                (kwarg_value, jinja_var)
+            } else {
+                // For simple values, just use the value directly
+                (value.clone(), vec![])
+            }
         }
-    } else {
-        // For non-string values, use as is
-        (value.clone(), None)
+        Value::Array(arr) => {
+            // Process each array element
+            let mut new_array = Vec::new();
+            let mut all_jinja_vars = Vec::new();
+
+            for (idx, elem) in arr.iter().enumerate() {
+                let elem_key = format!("{key}_{idx}");
+                let (processed_elem, elem_jinja_vars) = process_kwarg(&elem_key, elem);
+                new_array.push(processed_elem);
+                all_jinja_vars.extend(elem_jinja_vars);
+            }
+
+            (Value::Array(new_array), all_jinja_vars)
+        }
+        Value::Object(obj) => {
+            // Process each object value
+            let mut new_object = serde_json::Map::new();
+            let mut all_jinja_vars = Vec::new();
+
+            for (obj_key, obj_val) in obj {
+                let nested_key = format!("{key}_{obj_key}");
+                let (processed_val, val_jinja_vars) = process_kwarg(&nested_key, obj_val);
+                new_object.insert(obj_key.clone(), processed_val);
+                all_jinja_vars.extend(val_jinja_vars);
+            }
+
+            (Value::Object(new_object), all_jinja_vars)
+        }
+        _ => {
+            // For other non-string values (numbers, bools, null), use as is
+            (value.clone(), vec![])
+        }
     }
 }
 
@@ -668,6 +713,123 @@ fn merge_yaml_values(
 
 static CLEAN_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[^0-9a-zA-Z_]+").expect("valid regex"));
+
+/// Generates a unique hash for a generic test based on uncleaned kwargs.
+/// This matches mantle's behavior where the unique_id includes a hash of the
+/// test metadata (namespace, name, kwargs) WITHOUT cleaning, ensuring that
+/// tests with different expressions (e.g., '> 0' vs '= 0') get different
+/// unique_ids even if their cleaned names would be identical.
+///
+/// https://github.com/dbt-labs/dbt-core/blob/2ef17b836e39d1b4c7a55f14b448a2254378302e/core/dbt/parser/schema_generic_tests.py#L104-L117
+fn generate_test_unique_id_hash(
+    fqn_name: &str,
+    test_macro_name: &str,
+    namespace: Option<&String>,
+    kwargs: &BTreeMap<String, Value>,
+) -> String {
+    const HASH_LENGTH: usize = 10;
+
+    // Mantle builds test_metadata as:
+    //   metadata = {"namespace": builder.namespace, "name": builder.name, "kwargs": builder.args}
+    // Then computes:
+    //   hashable_metadata = repr(get_hashable_md(test_metadata))
+    //   hash_string = name + hashable_metadata
+    //   test_hash = md5(hash_string)[-HASH_LENGTH:]
+    //
+    // get_hashable_md recursively processes:
+    //   - dicts: sorted by keys, recursively processed
+    //   - lists: recursively processed
+    //   - other: str(value)
+
+    // Build the test_metadata dict structure matching mantle
+    let hashable_metadata = build_hashable_metadata_repr(test_macro_name, namespace, kwargs);
+
+    // hash_string = name + hashable_metadata (name is fqn_name in mantle)
+    let hash_string = format!("{}{}", fqn_name, hashable_metadata);
+
+    // Compute MD5 hash and take last HASH_LENGTH characters
+    let digest = md5::compute(hash_string.as_bytes());
+    let hash_hex = format!("{:x}", digest);
+    hash_hex[hash_hex.len() - HASH_LENGTH..].to_string()
+}
+
+/// Builds a Python repr()-like string of the test metadata dict.
+/// https://github.com/dbt-labs/dbt-core/blob/2ef17b836e39d1b4c7a55f14b448a2254378302e/core/dbt/parser/schema_generic_tests.py#L104-L113
+fn build_hashable_metadata_repr(
+    test_macro_name: &str,
+    namespace: Option<&String>,
+    kwargs: &BTreeMap<String, Value>,
+) -> String {
+    use std::fmt::Write;
+
+    // Build the metadata dict: {"kwargs": {...}, "name": "...", "namespace": "..."}
+    let mut out = String::new();
+    out.push_str("{'kwargs': ");
+
+    // "kwargs" comes first alphabetically
+    write_value_to_hashable_repr(
+        &mut out,
+        &Value::Object(kwargs.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+    );
+
+    // "name" comes second
+    let _ = write!(out, ", 'name': '{}'", test_macro_name);
+
+    // "namespace" comes third (None is still represented)
+    match namespace {
+        Some(ns) => {
+            let _ = write!(out, ", 'namespace': '{}'", ns);
+        }
+        None => out.push_str(", 'namespace': None"),
+    }
+
+    out.push('}');
+    out
+}
+
+/// Writes a serde_json Value as a Python repr()-like string to a buffer.
+/// https://github.com/dbt-labs/dbt-core/blob/2ef17b836e39d1b4c7a55f14b448a2254378302e/core/dbt/parser/schema_generic_tests.py#L104-L113
+fn write_value_to_hashable_repr(out: &mut String, value: &Value) {
+    use std::fmt::Write;
+
+    match value {
+        Value::Object(map) => {
+            // Sort keys alphabetically (serde_json::Map may not be sorted)
+            let mut sorted_entries: Vec<_> = map.iter().collect();
+            sorted_entries.sort_by(|a, b| a.0.cmp(b.0));
+
+            out.push('{');
+            for (i, (k, v)) in sorted_entries.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                let _ = write!(out, "'{}': ", k);
+                write_value_to_hashable_repr(out, v);
+            }
+            out.push('}');
+        }
+        Value::Array(arr) => {
+            out.push('[');
+            for (i, v) in arr.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_value_to_hashable_repr(out, v);
+            }
+            out.push(']');
+        }
+        Value::String(s) => {
+            let _ = write!(out, "'{}'", s);
+        }
+        Value::Number(n) => {
+            let _ = write!(out, "{}", n);
+        }
+        Value::Bool(b) => {
+            out.push_str(if *b { "True" } else { "False" });
+        }
+        Value::Null => out.push_str("None"),
+    }
+}
 
 //https://github.com/dbt-labs/dbt-core/blob/31881d2a3bea030e700e9df126a3445298385698/core/dbt/parser/generic_test_builders.py#L26
 /// Generates a test name and alias for a generic test.
@@ -728,9 +890,16 @@ fn generate_test_name(
     let clean_flat_args: Vec<String> = flat_args
         .iter()
         .map(|arg| {
-            CLEAN_REGEX
-                .replace_all(arg.trim_matches('"'), "_")
-                .to_string()
+            // `Value::to_string()` may escape newlines into the two-character sequence `\n`.
+            // Treat both escaped and literal newlines as whitespace so we don't end up with
+            // artifacts like `_nand_` from `\nand`.
+            let normalized = arg
+                .trim_matches('"')
+                .replace("\\r\\n", " ")
+                .replace("\\n", " ")
+                .replace("\\r", " ")
+                .replace(['\n', '\r'], " ");
+            CLEAN_REGEX.replace_all(&normalized, "_").to_string()
         })
         .collect();
 
@@ -815,7 +984,7 @@ fn generate_test_macro(
                 &var_value[2..var_value.len() - 2].trim()
             )
         } else {
-            format!("{{% set {var_name} %}}\n{var_value}\n{{% endset %}}\n\n")
+            format!("{{% set {var_name} -%}}\n{var_value}\n{{%- endset %}}\n\n")
         };
         sql.push_str(&set_val);
     }
@@ -866,6 +1035,50 @@ fn generate_test_macro(
     } else {
         format!("test_{test_macro_name}")
     };
+
+    /// Helper function to recursively format a JSON value for Jinja macro calls
+    fn format_value_for_jinja(value: &Value, jinja_set_vars: &BTreeMap<String, String>) -> String {
+        match value {
+            Value::String(s) => {
+                // Check if this is a reference to one of our Jinja set variables
+                if s.starts_with("get_where_subquery(")
+                    || s.starts_with("ref(")
+                    || s.starts_with("source(")
+                    || jinja_set_vars.iter().any(|(var_name, _)| var_name == s)
+                {
+                    s.to_string() // Don't add quotes if it's already a ref, source, or jinja var
+                } else {
+                    let escaped = s
+                        .replace('\\', "\\\\") // Escape backslashes
+                        .replace('"', "\\\""); // Escape double quotes
+                    format!("\"{escaped}\"")
+                }
+            }
+            Value::Array(arr) => {
+                let formatted_elements: Vec<String> = arr
+                    .iter()
+                    .map(|elem| format_value_for_jinja(elem, jinja_set_vars))
+                    .collect();
+                format!("[{}]", formatted_elements.join(","))
+            }
+            Value::Object(obj) => {
+                // Deterministic ordering for stable SQL/tests
+                let mut keys: Vec<&String> = obj.keys().collect();
+                keys.sort();
+                let formatted_pairs: Vec<String> = keys
+                    .iter()
+                    .map(|k| {
+                        let formatted_val = format_value_for_jinja(&obj[*k], jinja_set_vars);
+                        format!("\"{k}\":{formatted_val}")
+                    })
+                    .collect();
+                format!("{{{}}}", formatted_pairs.join(","))
+            }
+            // For non-string primitives, use json_to_jinja_literal to properly convert null->none, etc.
+            _ => json_to_jinja_literal(value),
+        }
+    }
+
     // Format all kwargs, handling ref calls specially
     // Exclude an embedded 'config' kwarg as it is emitted via config(...) above
     // Exclude reserved 'name' kwarg (used to name the test node, not passed to the macro).
@@ -873,27 +1086,7 @@ fn generate_test_macro(
         .iter()
         .filter(|(k, _)| k.as_str() != "config" && k.as_str() != "name")
         .map(|(k, v)| {
-            let value_str = if let Value::String(s) = v {
-                // Check if this is a reference to one of our Jinja set variables
-                if s.starts_with("get_where_subquery(")
-                    || s.starts_with("ref(")
-                    || s.starts_with("source(")
-                    || jinja_set_vars.iter().any(|(var_name, _)| var_name == s)
-                // Check if this is a reference to one of our Jinja set variables
-                {
-                    s.to_string() // Don't add quotes if it's already a ref, source, or already quoted
-                } else {
-                    let escaped = s
-                        .replace('\\', "\\\\") // Escape backslashes
-                        .replace('"', "\\\"") // Escape double quotes
-                        .replace('{', "\\{") // Escape curly braces
-                        .replace('}', "\\}"); // Escape closing curly braces
-
-                    format!("\"{escaped}\"") // Do NOT add extra quotes
-                }
-            } else {
-                v.to_string()
-            };
+            let value_str = format_value_for_jinja(v, jinja_set_vars);
             format!("{k}={value_str}")
         })
         .collect();
@@ -903,6 +1096,49 @@ fn generate_test_macro(
         formatted_args.join(", ")
     ));
     Ok(sql)
+}
+
+fn json_to_jinja_literal(v: &Value) -> String {
+    match v {
+        Value::Null => "none".to_string(),
+        Value::Bool(b) => {
+            if *b {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
+        }
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string()),
+        Value::Array(arr) => {
+            let mut out = String::from("[");
+            for (i, item) in arr.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&json_to_jinja_literal(item));
+            }
+            out.push(']');
+            out
+        }
+        Value::Object(map) => {
+            // Deterministic ordering for stable SQL/tests
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let mut out = String::from("{");
+            for (i, k) in keys.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                let key = serde_json::to_string(k).unwrap_or_else(|_| "\"\"".to_string());
+                out.push_str(&key);
+                out.push(':');
+                out.push_str(&json_to_jinja_literal(&map[*k]));
+            }
+            out.push('}');
+            out
+        }
+    }
 }
 
 impl<T> TryFrom<&TestableNode<'_, T>> for Vec<GenericTestConfig>
@@ -1563,6 +1799,60 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_generate_test_name_treats_escaped_newlines_as_whitespace() {
+        // Regression: `Value::to_string()` may escape newlines into `\n`, which previously
+        // yielded `_nand_` from `\nand` after CLEAN_REGEX sanitization. We want `_and_`.
+
+        let test_config = GenericTestConfig {
+            resource_type: "model".to_string(),
+            resource_name: "my_model".to_string(),
+            version_num: None,
+            model_tests: None,
+            column_tests: None,
+            source_name: None,
+        };
+
+        let mut kwargs = BTreeMap::new();
+        kwargs.insert(
+            "model".to_string(),
+            Value::String("ref('my_model')".to_string()),
+        );
+        kwargs.insert(
+            "compare_row_condition".to_string(),
+            // Represents a multi-line condition serialized as an escaped newline.
+            Value::String("x = 1\\nand y = 2".to_string()),
+        );
+
+        let mut test_name_truncations = HashMap::new();
+        let generated = generate_test_name(
+            "dbt_expectations_expect_table_aggregation_to_equal_other_table",
+            None,
+            "my_project",
+            &test_config,
+            &kwargs,
+            None,
+            &BTreeMap::new(),
+            &mut test_name_truncations,
+        );
+
+        // The returned name may be truncated to <=63 chars (dbt-core behavior).
+        // When that happens, the un-truncated full name is stored in `test_name_truncations`.
+        let full = test_name_truncations
+            .get(&generated)
+            .cloned()
+            .unwrap_or_else(|| generated.clone());
+
+        assert!(
+            !full.contains("_nand_"),
+            "Full generated name should not contain `_nand_`: {full}"
+        );
+        assert!(
+            full.contains("x_1_and_y_2"),
+            "Full generated name should treat escaped newlines as whitespace: {full}"
+        );
+    }
     #[test]
     fn test_generate_test_name_with_name_longer_than_63_chars() {
         //This test is to ensure that if the generated test name is longer than 63 characters
@@ -1928,6 +2218,556 @@ mod tests {
         assert!(
             !sql.contains("name="),
             "Reserved 'name' must not be passed as a macro kwarg, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_json_to_jinja_literal_null_becomes_none_in_list() {
+        let v = Value::Array(vec![Value::String("x".to_string()), Value::Null]);
+        assert_eq!(json_to_jinja_literal(&v), "[\"x\",none]");
+    }
+
+    #[test]
+    fn test_jinja_extraction_from_arrays() {
+        // Test that Jinja expressions inside arrays are properly extracted
+        let mut test_args = serde_json::Map::new();
+        test_args.insert(
+            "values".to_string(),
+            Value::Array(vec![
+                Value::String("{% raw %}{{true}}{% endraw %}".to_string()),
+                Value::Null,
+                Value::String("regular_string".to_string()),
+            ]),
+        );
+        test_args.insert(
+            "another_arg".to_string(),
+            Value::String("{{ var('myvar', 'baz') }}-bar".to_string()),
+        );
+
+        // Convert to the format expected by the extraction function
+        let test_args_btree: BTreeMap<String, Value> = test_args.into_iter().collect();
+        let yaml_value = dbt_serde_yaml::to_value(&test_args_btree).unwrap();
+        let verbatim_wrapper = Verbatim::from(Some(yaml_value));
+        let empty_deprecated = Verbatim::from(BTreeMap::new());
+        let existing_config = None;
+        let io_args = IoArgs::default();
+
+        let extraction_result = extract_kwargs_and_jinja_vars_and_dep_kwarg_and_configs(
+            &verbatim_wrapper,
+            &empty_deprecated,
+            &existing_config,
+            &io_args,
+            None,
+        )
+        .unwrap();
+
+        // Check that both the array element and the string arg had their Jinja extracted
+        assert!(
+            extraction_result.jinja_set_vars.len() >= 2,
+            "Expected at least 2 Jinja set vars to be extracted, got: {}",
+            extraction_result.jinja_set_vars.len()
+        );
+
+        // Check that the array was modified to use variable references
+        let values_kwarg = extraction_result.kwargs.get("values").unwrap();
+        if let Value::Array(arr) = values_kwarg {
+            // First element should be a variable reference
+            if let Value::String(s) = &arr[0] {
+                assert!(
+                    s.starts_with("dbt_custom_arg_values_0"),
+                    "Expected first array element to be replaced with variable reference, got: {s}"
+                );
+                // And that variable should map to the original Jinja expression
+                assert!(
+                    extraction_result
+                        .jinja_set_vars
+                        .get(s)
+                        .map(|v| v == "{% raw %}{{true}}{% endraw %}")
+                        .unwrap_or(false),
+                    "Variable reference should map to original Jinja expression"
+                );
+            }
+            // Second element should remain null
+            assert_eq!(arr[1], Value::Null);
+            // Third element should remain a regular string
+            assert_eq!(arr[2], Value::String("regular_string".to_string()));
+        } else {
+            panic!("Expected values kwarg to be an array");
+        }
+
+        // Test that generate_test_macro properly handles the array with variable references
+        let mut kwargs = extraction_result.kwargs;
+        kwargs.insert(
+            "model".to_string(),
+            Value::String("get_where_subquery(ref('my_model'))".to_string()),
+        );
+
+        let sql = generate_test_macro(
+            "accepted_values",
+            &kwargs,
+            None,
+            &None,
+            &extraction_result.jinja_set_vars,
+        )
+        .unwrap();
+
+        // Should have the set blocks with whitespace control
+        assert!(
+            sql.contains("{% set dbt_custom_arg_values_0 -%}"),
+            "Expected set block with whitespace control for array element, got: {sql}"
+        );
+        assert!(
+            sql.contains("{% raw %}{{true}}{% endraw %}"),
+            "Expected original Jinja expression in set block, got: {sql}"
+        );
+        assert!(
+            sql.contains("{%- endset %}"),
+            "Expected endset with whitespace control, got: {sql}"
+        );
+
+        // The macro call should have the variable reference without quotes
+        // Note: json_to_jinja_literal converts null to "none" for proper Jinja syntax
+        assert!(
+            sql.contains("values=[dbt_custom_arg_values_0,none,\"regular_string\"]"),
+            "Expected array with variable reference (unquoted), none, and quoted string, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_jinja_set_block_whitespace_control() {
+        // Test that the generated set blocks use whitespace control to avoid newlines
+        let mut jinja_set_vars = BTreeMap::new();
+        jinja_set_vars.insert(
+            "dbt_custom_arg_values_0".to_string(),
+            "{% raw %}{{true}}{% endraw %}".to_string(),
+        );
+
+        let mut kwargs = BTreeMap::new();
+        kwargs.insert(
+            "model".to_string(),
+            Value::String("get_where_subquery(ref('one'))".to_string()),
+        );
+        kwargs.insert("column_name".to_string(), Value::String("id".to_string()));
+        kwargs.insert(
+            "values".to_string(),
+            Value::Array(vec![
+                Value::String("dbt_custom_arg_values_0".to_string()),
+                Value::Null,
+            ]),
+        );
+
+        let sql =
+            generate_test_macro("accepted_values", &kwargs, None, &None, &jinja_set_vars).unwrap();
+
+        // Verify that the set block uses whitespace control (-%} and {%-)
+        assert!(
+            sql.contains("{% set dbt_custom_arg_values_0 -%}"),
+            "Set block should use trailing whitespace control (-%}}), got: {sql}"
+        );
+        assert!(
+            sql.contains("{%- endset %}"),
+            "Set block should use leading whitespace control ({{%-), got: {sql}"
+        );
+
+        // The generated SQL should have the format:
+        // {% set dbt_custom_arg_values_0 -%}
+        // {% raw %}{{true}}{% endraw %}
+        // {%- endset %}
+        //
+        // {{ test_accepted_values(...) }}
+        //
+        // When this is rendered by Jinja, the whitespace control will strip
+        // the newlines, so the value of dbt_custom_arg_values_0 will be
+        // "{{true}}" without leading/trailing newlines
+    }
+
+    #[test]
+    fn test_jinja_extraction_from_objects() {
+        // Test that Jinja expressions inside objects are properly extracted and formatted
+        let mut test_args = serde_json::Map::new();
+        let mut nested_obj = serde_json::Map::new();
+        nested_obj.insert(
+            "query".to_string(),
+            Value::String("SELECT * FROM {{ ref('model') }}".to_string()),
+        );
+        nested_obj.insert("limit".to_string(), Value::Number(100.into()));
+        test_args.insert("config_obj".to_string(), Value::Object(nested_obj));
+
+        // Convert to the format expected by the extraction function
+        let test_args_btree: BTreeMap<String, Value> = test_args.into_iter().collect();
+        let yaml_value = dbt_serde_yaml::to_value(&test_args_btree).unwrap();
+        let verbatim_wrapper = Verbatim::from(Some(yaml_value));
+        let empty_deprecated = Verbatim::from(BTreeMap::new());
+        let existing_config = None;
+        let io_args = IoArgs::default();
+
+        let extraction_result = extract_kwargs_and_jinja_vars_and_dep_kwarg_and_configs(
+            &verbatim_wrapper,
+            &empty_deprecated,
+            &existing_config,
+            &io_args,
+            None,
+        )
+        .unwrap();
+
+        // Check that the jinja expression in the object was extracted
+        assert!(
+            !extraction_result.jinja_set_vars.is_empty(),
+            "Expected Jinja set vars to be extracted from nested object"
+        );
+
+        // Test that generate_test_macro properly handles objects with variable references
+        let mut kwargs = extraction_result.kwargs;
+        kwargs.insert(
+            "model".to_string(),
+            Value::String("get_where_subquery(ref('my_model'))".to_string()),
+        );
+
+        let sql = generate_test_macro(
+            "custom_test",
+            &kwargs,
+            None,
+            &None,
+            &extraction_result.jinja_set_vars,
+        )
+        .unwrap();
+
+        // Should have the set block for the nested query
+        assert!(
+            sql.contains("{% set dbt_custom_arg_config_obj_query -%}"),
+            "Expected set block for nested object query, got: {sql}"
+        );
+
+        // The macro call should have the object formatted with the variable reference unquoted
+        // Note: BTreeMap iterates in sorted key order, so "limit" comes before "query"
+        assert!(
+            sql.contains("config_obj={\"limit\":100,\"query\":dbt_custom_arg_config_obj_query}"),
+            "Expected object with variable reference (unquoted) and regular value, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_generate_test_macro_does_not_escape_curly_braces_in_string_kwargs() {
+        // Curly braces are common in regex quantifiers (e.g. {1,2}) and should be preserved.
+        // They are not special inside a quoted Jinja string literal; escaping them mutates the
+        // argument value and changes the downstream compiled SQL.
+        let mut kwargs = BTreeMap::new();
+        kwargs.insert(
+            "model".to_string(),
+            Value::String("ref('my_model')".to_string()),
+        );
+        kwargs.insert(
+            "column_name".to_string(),
+            Value::String("postcode".to_string()),
+        );
+        kwargs.insert(
+            "regex".to_string(),
+            Value::String("^[A-Z]{1,2}\\\\d{1,2}[A-Z]?$".to_string()),
+        );
+
+        let sql = generate_test_macro(
+            "expect_column_values_to_match_regex",
+            &kwargs,
+            Some("dbt_expectations"),
+            &None,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+
+        // We expect backslashes and quotes to be escaped for the Jinja string literal,
+        // but curly braces must remain unescaped.
+        assert!(
+            sql.contains("regex=\"^[A-Z]{1,2}\\\\\\\\d{1,2}[A-Z]?$\""),
+            "Expected regex kwarg to preserve braces while escaping backslashes, got: {sql}"
+        );
+        assert!(
+            !sql.contains("\\{") && !sql.contains("\\}"),
+            "Curly braces should not be backslash-escaped in generated macro args, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_write_value_to_hashable_repr_string() {
+        let mut out = String::new();
+        write_value_to_hashable_repr(&mut out, &Value::String("hello".to_string()));
+        assert_eq!(out, "'hello'");
+    }
+
+    #[test]
+    fn test_write_value_to_hashable_repr_number() {
+        let mut out = String::new();
+        write_value_to_hashable_repr(&mut out, &Value::Number(42.into()));
+        assert_eq!(out, "42");
+    }
+
+    #[test]
+    fn test_write_value_to_hashable_repr_bool() {
+        let mut out = String::new();
+        write_value_to_hashable_repr(&mut out, &Value::Bool(true));
+        assert_eq!(out, "True");
+
+        out.clear();
+        write_value_to_hashable_repr(&mut out, &Value::Bool(false));
+        assert_eq!(out, "False");
+    }
+
+    #[test]
+    fn test_write_value_to_hashable_repr_null() {
+        let mut out = String::new();
+        write_value_to_hashable_repr(&mut out, &Value::Null);
+        assert_eq!(out, "None");
+    }
+
+    #[test]
+    fn test_write_value_to_hashable_repr_array() {
+        let mut out = String::new();
+        write_value_to_hashable_repr(
+            &mut out,
+            &Value::Array(vec![
+                Value::String("a".to_string()),
+                Value::Number(1.into()),
+            ]),
+        );
+        assert_eq!(out, "['a', 1]");
+    }
+
+    #[test]
+    fn test_write_value_to_hashable_repr_object_sorted_keys() {
+        // Keys should be sorted alphabetically
+        let mut map = serde_json::Map::new();
+        map.insert("zebra".to_string(), Value::String("z".to_string()));
+        map.insert("apple".to_string(), Value::String("a".to_string()));
+        map.insert("mango".to_string(), Value::String("m".to_string()));
+
+        let mut out = String::new();
+        write_value_to_hashable_repr(&mut out, &Value::Object(map));
+        assert_eq!(out, "{'apple': 'a', 'mango': 'm', 'zebra': 'z'}");
+    }
+
+    #[test]
+    fn test_build_hashable_metadata_repr_with_namespace() {
+        let mut kwargs = BTreeMap::new();
+        kwargs.insert("expression".to_string(), Value::String("> 0".to_string()));
+
+        let repr = build_hashable_metadata_repr(
+            "expression_is_true",
+            Some(&"dbt_utils".to_string()),
+            &kwargs,
+        );
+
+        // Should have sorted keys: kwargs, name, namespace
+        assert!(repr.starts_with("{'kwargs': "));
+        assert!(repr.contains("'name': 'expression_is_true'"));
+        assert!(repr.contains("'namespace': 'dbt_utils'"));
+    }
+
+    #[test]
+    fn test_build_hashable_metadata_repr_without_namespace() {
+        let kwargs = BTreeMap::new();
+        let repr = build_hashable_metadata_repr("unique", None, &kwargs);
+
+        assert!(repr.contains("'namespace': None"));
+    }
+
+    #[test]
+    fn test_generate_test_unique_id_hash_different_expressions() {
+        // This is the key test: expressions '> 0' and '= 0' should produce different hashes
+        // even though they would clean to the same value '_0'
+        let mut kwargs_gt = BTreeMap::new();
+        kwargs_gt.insert(
+            "model".to_string(),
+            Value::String("get_where_subquery(ref('model'))".to_string()),
+        );
+        kwargs_gt.insert(
+            "column_name".to_string(),
+            Value::String("effective_conc".to_string()),
+        );
+        kwargs_gt.insert("expression".to_string(), Value::String("> 0".to_string()));
+
+        let mut kwargs_eq = BTreeMap::new();
+        kwargs_eq.insert(
+            "model".to_string(),
+            Value::String("get_where_subquery(ref('model'))".to_string()),
+        );
+        kwargs_eq.insert(
+            "column_name".to_string(),
+            Value::String("effective_conc".to_string()),
+        );
+        kwargs_eq.insert("expression".to_string(), Value::String("= 0".to_string()));
+
+        let namespace = Some("dbt_utils".to_string());
+        let full_name = "dbt_utils_expression_is_true_model__0";
+
+        let hash_gt = generate_test_unique_id_hash(
+            full_name,
+            "expression_is_true",
+            namespace.as_ref(),
+            &kwargs_gt,
+        );
+        let hash_eq = generate_test_unique_id_hash(
+            full_name,
+            "expression_is_true",
+            namespace.as_ref(),
+            &kwargs_eq,
+        );
+
+        assert_ne!(
+            hash_gt, hash_eq,
+            "Hashes should differ for '> 0' vs '= 0' expressions"
+        );
+        assert_eq!(hash_gt.len(), 10, "Hash should be 10 characters");
+        assert_eq!(hash_eq.len(), 10, "Hash should be 10 characters");
+    }
+
+    #[test]
+    fn test_generate_test_unique_id_hash_same_kwargs_same_hash() {
+        // Same kwargs should produce same hash
+        let mut kwargs = BTreeMap::new();
+        kwargs.insert(
+            "model".to_string(),
+            Value::String("ref('model')".to_string()),
+        );
+        kwargs.insert("column_name".to_string(), Value::String("col".to_string()));
+
+        let hash1 = generate_test_unique_id_hash("test_name", "unique", None, &kwargs);
+        let hash2 = generate_test_unique_id_hash("test_name", "unique", None, &kwargs);
+
+        assert_eq!(hash1, hash2, "Same kwargs should produce same hash");
+    }
+
+    #[test]
+    fn test_duplicate_detection_with_different_expressions() {
+        // Simulate what happens with two expression_is_true tests with '> 0' and '= 0'
+        // Both clean to '_0' in the test name, but should have different unique_ids
+
+        let test_config = GenericTestConfig {
+            resource_type: "model".to_string(),
+            resource_name: "stg_model".to_string(),
+            version_num: None,
+            model_tests: None,
+            column_tests: None,
+            source_name: None,
+        };
+
+        // Test 1: expression '> 0'
+        let mut kwargs1 = BTreeMap::new();
+        kwargs1.insert(
+            "model".to_string(),
+            Value::String("get_where_subquery(ref('stg_model'))".to_string()),
+        );
+        kwargs1.insert(
+            "column_name".to_string(),
+            Value::String("effective_conc".to_string()),
+        );
+        kwargs1.insert("expression".to_string(), Value::String("> 0".to_string()));
+
+        // Test 2: expression '= 0'
+        let mut kwargs2 = BTreeMap::new();
+        kwargs2.insert(
+            "model".to_string(),
+            Value::String("get_where_subquery(ref('stg_model'))".to_string()),
+        );
+        kwargs2.insert(
+            "column_name".to_string(),
+            Value::String("effective_conc".to_string()),
+        );
+        kwargs2.insert("expression".to_string(), Value::String("= 0".to_string()));
+
+        let namespace = Some("dbt_utils".to_string());
+        let mut test_name_truncations = HashMap::new();
+
+        // Generate test names (these will be the same due to cleaning)
+        let name1 = generate_test_name(
+            "expression_is_true",
+            None,
+            "my_project",
+            &test_config,
+            &kwargs1,
+            namespace.as_ref(),
+            &BTreeMap::new(),
+            &mut test_name_truncations,
+        );
+        let name2 = generate_test_name(
+            "expression_is_true",
+            None,
+            "my_project",
+            &test_config,
+            &kwargs2,
+            namespace.as_ref(),
+            &BTreeMap::new(),
+            &mut test_name_truncations,
+        );
+
+        // Names should be identical (both clean to '_0')
+        assert_eq!(name1, name2, "Cleaned names should be identical");
+
+        // But unique_ids should differ
+        let hash1 = generate_test_unique_id_hash(
+            &name1,
+            "expression_is_true",
+            namespace.as_ref(),
+            &kwargs1,
+        );
+        let hash2 = generate_test_unique_id_hash(
+            &name2,
+            "expression_is_true",
+            namespace.as_ref(),
+            &kwargs2,
+        );
+
+        let unique_id1 = format!("{}.{}", name1, hash1);
+        let unique_id2 = format!("{}.{}", name2, hash2);
+
+        assert_ne!(
+            unique_id1, unique_id2,
+            "Unique IDs should differ even when cleaned names are the same"
+        );
+
+        // Verify that using unique_id for duplicate detection would NOT flag these as duplicates
+        let mut seen_tests = HashSet::new();
+        assert!(
+            seen_tests.insert(unique_id1),
+            "First test should be inserted"
+        );
+        assert!(
+            seen_tests.insert(unique_id2),
+            "Second test should also be inserted (not a duplicate)"
+        );
+    }
+
+    #[test]
+    fn test_versioned_ref_is_quoted_in_persisted_generic_tests() {
+        let test_config = GenericTestConfig {
+            resource_type: "model".to_string(),
+            resource_name: "turmoenster".to_string(),
+            version_num: Some("1_1".to_string()),
+            model_tests: None,
+            column_tests: None,
+            source_name: None,
+        };
+
+        let io_args = IoArgs::default();
+        let details = get_test_details(
+            &DataTests::String("not_null".to_string().into()),
+            &test_config,
+            None,
+            &io_args,
+            None,
+        )
+        .unwrap();
+
+        let model = details
+            .kwargs
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap();
+        assert_eq!(
+            model, "get_where_subquery(ref('turmoenster', v='1_1'))",
+            "Version should be emitted as a quoted string to avoid Jinja interpreting 1_1 as numeric 11"
+        );
+        assert!(
+            !model.contains("v=1_1"),
+            "Unquoted v=1_1 would be parsed by Jinja as the numeric literal 11"
         );
     }
 }

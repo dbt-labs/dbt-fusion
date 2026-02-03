@@ -1,5 +1,6 @@
 use crate::adapter_engine::AdapterEngine;
 use crate::base_adapter::backend_of;
+use crate::cache::RelationCache;
 use crate::config::AdapterConfig;
 use crate::errors::AdapterResult;
 use crate::query_comment::QueryCommentConfig;
@@ -90,10 +91,26 @@ fn compute_file_name(node_id: Option<&String>, sql: Option<&str>) -> AdbcResult<
     Ok(file_name)
 }
 
-fn compute_file_name_for_node_id(node_id: Option<&str>) -> String {
-    let id = node_id.unwrap_or("unknown");
-    let mut entry = COUNTERS.entry(id.to_string()).or_insert(0);
-    let file_name = format!("{}-{}", id, *entry);
+/// Compute a file name for get_table_schema based on the table identifier.
+/// Uses a hash of the fully qualified table name.
+fn compute_file_name_for_table_schema(
+    catalog: Option<&str>,
+    db_schema: Option<&str>,
+    table_name: &str,
+) -> String {
+    // TODO(jason): This format is hard to review - we should actually migrate multi-command
+    // invocations to individual invocation scoped folders
+    let fqn = format!(
+        "{}.{}.{}",
+        catalog.unwrap_or("_"),
+        db_schema.unwrap_or("_"),
+        table_name
+    );
+    let hash = checksum8(&fqn);
+    // Use counter to handle multiple calls to the same table (e.g., before/after creation)
+    let counter_key = format!("get_table_schema.{hash}");
+    let mut entry = COUNTERS.entry(counter_key).or_insert(0);
+    let file_name = format!("get_table_schema.{hash}-{}", *entry);
     *entry += 1;
     file_name
 }
@@ -473,6 +490,10 @@ impl RecordEngine {
     pub fn cancellation_token(&self) -> CancellationToken {
         self.0.engine.cancellation_token()
     }
+
+    pub fn relation_cache(&self) -> &Arc<RelationCache> {
+        self.0.engine.relation_cache()
+    }
 }
 
 struct RecordEngineConnection(Arc<RecordEngineInner>, Box<dyn Connection>, Option<String>);
@@ -513,9 +534,8 @@ impl Connection for RecordEngineConnection {
         let path = self.0.path.clone();
         create_dir_all(&path).map_err(|e| from_fs_error(e.into(), Some(&path)))?;
 
-        let file_name = compute_file_name_for_node_id(self.2.as_deref());
+        let full_file_name = compute_file_name_for_table_schema(catalog, db_schema, table_name);
         let handler = FileHandler::new_for_record();
-        let full_file_name = format!("{file_name}.get_table_schema");
 
         match result {
             Ok(schema) => {
@@ -715,6 +735,8 @@ struct ReplayEngineInner {
     stmt_splitter: Arc<dyn StmtSplitter>,
     query_comment: QueryCommentConfig,
     type_ops: Box<dyn TypeOps>,
+    /// Relation cache - caches warehouse relation metadata
+    relation_cache: Arc<RelationCache>,
     /// Global CLI cancellation token
     cancellation_token: CancellationToken,
 }
@@ -738,6 +760,7 @@ impl ReplayEngine {
         stmt_splitter: Arc<dyn StmtSplitter>,
         query_comment: QueryCommentConfig,
         type_ops: Box<dyn TypeOps>,
+        relation_cache: Arc<RelationCache>,
         token: CancellationToken,
     ) -> Self {
         let inner = ReplayEngineInner {
@@ -749,6 +772,7 @@ impl ReplayEngine {
             stmt_splitter,
             query_comment,
             type_ops,
+            relation_cache,
             cancellation_token: token,
         };
         ReplayEngine(Arc::new(inner))
@@ -798,6 +822,10 @@ impl ReplayEngine {
     pub fn cancellation_token(&self) -> CancellationToken {
         self.0.cancellation_token.clone()
     }
+
+    pub fn relation_cache(&self) -> &Arc<RelationCache> {
+        &self.0.relation_cache
+    }
 }
 
 #[allow(dead_code)]
@@ -829,13 +857,13 @@ impl Connection for ReplayEngineConnection {
 
     fn get_table_schema(
         &self,
-        _catalog: Option<&str>,
-        _db_schema: Option<&str>,
-        _table_name: &str,
+        catalog: Option<&str>,
+        db_schema: Option<&str>,
+        table_name: &str,
     ) -> AdbcResult<Schema> {
         let path = self.0.path.clone();
-        let file_name = compute_file_name_for_node_id(self.1.as_deref());
-        let full_file_name = format!("{file_name}.get_table_schema");
+        // Use table identifier for deterministic file naming (order-independent)
+        let full_file_name = compute_file_name_for_table_schema(catalog, db_schema, table_name);
 
         // FIXME: Compat layer
         // Try Arrow IPC first, fall back to Parquet
@@ -941,8 +969,8 @@ impl Statement for ReplayEngineStatement {
         let record_sql = handler
             .read_sql(&path, &file_name)
             .map_err(|e| from_fs_error(e, Some(&path)))?;
-        if normalize_dbt_tmp_name(&record_sql)
-            != normalize_dbt_tmp_name(replay_sql)
+        if normalize_sql_for_comparison(&record_sql)
+            != normalize_sql_for_comparison(replay_sql)
                 // we need to normalize
                 // in CI, FUSION_SLT_WAREHOUSE is used,
                 // locally, FUSION_ADAPTER_TESTING is used,
@@ -1062,6 +1090,14 @@ pub fn normalize_dbt_tmp_name(sql: &str) -> String {
     DBT_TMP_UUID_PATTERN
         .replace_all(sql, "dbt_tmp_")
         .to_string()
+}
+
+/// Normalizes SQL for comparison by:
+/// 1. Normalizing dbt_tmp UUIDs
+/// 2. Collapsing all whitespace (spaces, tabs, newlines) into single spaces
+fn normalize_sql_for_comparison(sql: &str) -> String {
+    let normalized = normalize_dbt_tmp_name(sql);
+    normalized.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]

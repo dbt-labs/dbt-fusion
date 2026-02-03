@@ -1,3 +1,4 @@
+pub mod asset;
 pub mod color;
 pub mod constants;
 pub mod deps;
@@ -11,4 +12,5 @@ pub mod node;
 pub mod phase;
 pub mod progress;
 pub mod query_log;
+pub mod state_mod_diff;
 pub mod test_result;

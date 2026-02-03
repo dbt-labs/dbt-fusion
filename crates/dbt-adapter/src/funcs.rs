@@ -11,10 +11,9 @@ use crate::snapshots::SnapshotStrategy;
 
 use arrow::array::RecordBatch;
 use dbt_agate::AgateTable;
+use dbt_schemas::schemas::common::{ClusterConfig, PartitionConfig};
 use dbt_schemas::schemas::dbt_column::DbtColumn;
-use dbt_schemas::schemas::manifest::{
-    BigqueryClusterConfig, BigqueryPartitionConfig, GrantAccessToTarget, PartitionConfig,
-};
+use dbt_schemas::schemas::manifest::{BigqueryPartitionConfig, GrantAccessToTarget};
 use dbt_schemas::schemas::properties::ModelConstraint;
 use dbt_schemas::schemas::serde::minijinja_value_to_typed_struct;
 use indexmap::IndexMap;
@@ -28,6 +27,7 @@ use minijinja_contrib::modules::py_datetime::datetime::PyDateTime;
 use serde::Deserialize;
 
 use std::collections::{BTreeMap, HashMap};
+use std::error::Error;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -603,13 +603,14 @@ pub fn dispatch_adapter_calls(
                     None
                 } else {
                     Some(
-                        minijinja_value_to_typed_struct::<BigqueryClusterConfig>(cb.clone())
-                            .map_err(|e| {
+                        minijinja_value_to_typed_struct::<ClusterConfig>(cb.clone()).map_err(
+                            |e| {
                                 minijinja::Error::new(
                                     minijinja::ErrorKind::SerdeDeserializeError,
                                     e.to_string(),
                                 )
-                            })?,
+                            },
+                        )?,
                     )
                 }
             } else {
@@ -964,14 +965,7 @@ pub fn dispatch_adapter_calls(
 
             adapter.redact_credentials(state, sql)
         }
-        // only available for databricks
         "is_cluster" => {
-            if adapter.adapter_type() != AdapterType::Databricks {
-                return Err(minijinja::Error::new(
-                    minijinja::ErrorKind::InvalidOperation,
-                    "adapter.is_cluster is only available with the Databricks adapter",
-                ));
-            }
             if adapter.is_parse() {
                 return Ok(Value::from(false));
             }
@@ -1281,8 +1275,14 @@ pub fn execute_macro_with_package(
     let func = state
         .lookup(macro_name)
         .unwrap_or_else(|| panic!("{macro_name} exists"));
-    func.call(&state, args, &[])
-        .map_err(|err| AdapterError::new(AdapterErrorKind::UnexpectedResult, err.to_string()))
+    func.call(&state, args, &[]).map_err(|err| {
+        if let Some(source) = err.source() {
+            if let Some(adapter_err) = source.downcast_ref::<AdapterError>() {
+                return adapter_err.clone();
+            }
+        }
+        AdapterError::new(AdapterErrorKind::UnexpectedResult, err.to_string())
+    })
 }
 
 /// Returns a value that represents the absence of a value of a Object method return.

@@ -301,12 +301,10 @@ pub async fn resolve_snapshots(
 
             final_config.enabled = Some(!(status == ModelStatus::Disabled));
 
-            let file_path_str = patch_path.as_ref().map(|p| p.to_string_lossy().to_string());
             let columns = process_columns(
                 properties.columns.as_ref(),
                 final_config.meta.clone(),
                 final_config.tags.clone().map(|tags| tags.into()),
-                file_path_str.as_deref(),
             )?;
 
             if final_config.materialized.is_none() {
@@ -433,6 +431,7 @@ pub async fn resolve_snapshots(
                     } else {
                         IntrospectionKind::None
                     },
+                    sync: final_config.sync.clone(),
                 },
                 __adapter_attr__: AdapterAttr::from_config_and_dialect(
                     &final_config.__warehouse_specific_config__,

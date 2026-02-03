@@ -3,6 +3,52 @@
 use indexmap::IndexMap;
 use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
+use std::time::Duration;
+
+/// Indicates where schema metadata originates from.
+///
+/// - `Remote` (default): Schema is fetched from the remote warehouse
+/// - `Local`: Schema is derived from YAML column definitions
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum SchemaOrigin {
+    /// Schema metadata comes from the remote warehouse (default)
+    #[default]
+    Remote,
+    /// Schema metadata is derived from YAML column definitions
+    Local,
+}
+
+impl SchemaOrigin {
+    /// Returns the string representation of the schema origin.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Remote => "remote",
+            Self::Local => "local",
+        }
+    }
+}
+
+impl std::fmt::Display for SchemaOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl FromStr for SchemaOrigin {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "remote" => Ok(Self::Remote),
+            "local" => Ok(Self::Local),
+            _ => Err(format!(
+                "Invalid schema_origin '{}': expected 'remote' or 'local'",
+                s
+            )),
+        }
+    }
+}
 
 use dbt_common::adapter::AdapterType;
 use dbt_common::{CodeLocationWithFile, ErrorCode, FsError, FsResult, err, fs_err};
@@ -19,12 +65,16 @@ use strum::{Display, EnumIter, EnumString};
 
 use crate::dbt_types::RelationType;
 use crate::schemas::dbt_column::{ColumnPropertiesDimensionType, Granularity};
+use crate::schemas::manifest::BigqueryPartitionConfig;
 use crate::schemas::manifest::common::SourceFileMetadata;
 use crate::schemas::semantic_layer::semantic_manifest::SemanticLayerElementConfig;
 
-use super::serde::{StringOrArrayOfStrings, bool_or_string_bool};
+use super::serde::{
+    StringOrArrayOfStrings, bool_or_string_bool, bool_or_string_bool_default, i64_or_string_i64,
+};
 #[derive(Default, Deserialize, Serialize, Debug, Clone, JsonSchema, PartialEq, Eq)]
 pub struct FreshnessRules {
+    #[serde(deserialize_with = "i64_or_string_i64")]
     pub count: Option<i64>,
     pub period: Option<FreshnessPeriod>,
 }
@@ -80,11 +130,30 @@ impl FromStr for UpdatesOn {
     }
 }
 
-#[derive(Default, Deserialize, Serialize, Debug, Clone, JsonSchema, PartialEq, Eq)]
+#[derive(Default, Deserialize, Serialize, Debug, Clone, JsonSchema)]
 pub struct ModelFreshnessRules {
     pub count: Option<i64>,
     pub period: Option<FreshnessPeriod>,
     pub updates_on: Option<UpdatesOn>,
+}
+
+impl PartialEq for ModelFreshnessRules {
+    fn eq(&self, other: &Self) -> bool {
+        self.count == other.count
+            && self.period == other.period
+            && updates_on_eq(&self.updates_on, &other.updates_on)
+    }
+}
+
+impl Eq for ModelFreshnessRules {}
+
+fn updates_on_eq(a: &Option<UpdatesOn>, b: &Option<UpdatesOn>) -> bool {
+    match (a.as_ref(), b.as_ref()) {
+        (None, None) => true,
+        (Some(a_val), Some(b_val)) => a_val == b_val,
+        (None, Some(b_val)) => b_val == &UpdatesOn::default(),
+        (Some(a_val), None) => a_val == &UpdatesOn::default(),
+    }
 }
 
 impl ModelFreshnessRules {
@@ -374,8 +443,11 @@ pub struct NodeDependsOn {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Copy, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct ResolvedQuoting {
+    #[serde(deserialize_with = "bool_or_string_bool_default")]
     pub database: bool,
+    #[serde(deserialize_with = "bool_or_string_bool_default")]
     pub identifier: bool,
+    #[serde(deserialize_with = "bool_or_string_bool_default")]
     pub schema: bool,
 }
 
@@ -721,6 +793,14 @@ impl PartialEq for DbtChecksum {
 }
 
 impl DbtChecksum {
+    /// Returns the checksum string value regardless of variant.
+    pub fn as_checksum_string(&self) -> &str {
+        match self {
+            Self::String(s) => s,
+            Self::Object(o) => &o.checksum,
+        }
+    }
+
     pub fn hash(s: &[u8]) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(s);
@@ -1015,9 +1095,6 @@ pub struct Dimension {
     pub expr: Option<String>,
     pub metadata: Option<SourceFileMetadata>,
     pub config: Option<SemanticLayerElementConfig>,
-    // for internal use only, n/a for derived dimensions
-    #[serde(skip_serializing)]
-    pub column_name: Option<String>,
 }
 
 fn default_false() -> bool {
@@ -1147,13 +1224,26 @@ pub fn _normalize_quote(quoting: bool, dialect: &Dialect, name: &str) -> (String
     }
 }
 
-/// Normalize SQL by removing all whitespace and converting to lowercase.
-/// This ensures consistent checksums regardless of formatting differences.
+/// Normalize SQL by compacting multiple spaces and newlines into a single space.
+/// This ensures consistent checksums regardless of formatting differences
+/// due to multiple spaces and newlines.
 pub fn normalize_sql(sql: &str) -> String {
-    sql.chars()
-        .filter(|c| !c.is_whitespace())
-        .collect::<String>()
-        .to_lowercase()
+    let mut result = String::with_capacity(sql.len());
+    let mut last_was_whitespace = false;
+
+    for c in sql.chars() {
+        if c.is_whitespace() {
+            if !last_was_whitespace {
+                result.push(' ');
+                last_was_whitespace = true;
+            }
+        } else {
+            result.push(c);
+            last_was_whitespace = false;
+        }
+    }
+
+    result.trim().to_string()
 }
 
 /// Merge two meta maps, with the second map's values taking precedence on key conflicts.
@@ -1232,9 +1322,251 @@ pub fn conform_normalized_snapshot_raw_code_to_mantle_format(normalized_full: &s
     normalized_sql.to_string()
 }
 
+/// Schema refresh interval configuration.
+///
+/// This type represents how often to refresh source schemas from remote.
+/// Default: 1 hour.
+///
+/// Examples:
+/// - `"30m"`, `"2h"`, `"1d"` - refresh after the specified duration
+/// - `"never"` - never automatically refresh (only manual sync)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SchemaRefreshInterval {
+    /// Refresh after the specified duration
+    Duration(Duration), //todo validate that this deserializes as claimed
+    /// Never automatically refresh
+    Never,
+}
+
+impl schemars::JsonSchema for SchemaRefreshInterval {
+    fn schema_name() -> String {
+        "SchemaRefreshInterval".to_string()
+    }
+
+    fn json_schema(_gen: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        schemars::schema::Schema::Object(schemars::schema::SchemaObject {
+            instance_type: Some(schemars::schema::InstanceType::String.into()),
+            metadata: Some(Box::new(schemars::schema::Metadata {
+                description: Some(
+                    "Schema refresh interval: '30m', '2h', '1d', or 'never'".to_string(),
+                ),
+                ..Default::default()
+            })),
+            ..Default::default()
+        })
+    }
+}
+
+impl Default for SchemaRefreshInterval {
+    fn default() -> Self {
+        Self::Duration(Duration::from_hours(1))
+    }
+}
+
+impl SchemaRefreshInterval {
+    /// Creates a new interval from hours.
+    pub fn from_hours(hours: u64) -> Self {
+        Self::Duration(Duration::from_hours(hours))
+    }
+
+    /// Returns the duration as seconds, or None if set to never refresh.
+    pub fn as_secs(&self) -> Option<u64> {
+        match self {
+            Self::Duration(d) => Some(d.as_secs()),
+            Self::Never => None,
+        }
+    }
+
+    /// Returns the duration, or None if set to never refresh.
+    pub fn as_duration(&self) -> Option<Duration> {
+        match self {
+            Self::Duration(d) => Some(*d),
+            Self::Never => None,
+        }
+    }
+
+    /// Returns true if this interval is set to never refresh.
+    pub fn is_never(&self) -> bool {
+        matches!(self, Self::Never)
+    }
+}
+
+impl From<Duration> for SchemaRefreshInterval {
+    fn from(duration: Duration) -> Self {
+        Self::Duration(duration)
+    }
+}
+
+impl From<SchemaRefreshInterval> for Option<Duration> {
+    fn from(interval: SchemaRefreshInterval) -> Self {
+        interval.as_duration()
+    }
+}
+
+impl FromStr for SchemaRefreshInterval {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.eq_ignore_ascii_case("never") {
+            return Ok(Self::Never);
+        }
+        // Use humantime to parse duration strings like "30m", "2h", "1d"
+        let duration = humantime::parse_duration(s).map_err(|e| {
+            format!(
+                "Invalid schema_refresh_interval '{}': {}. \
+                 Expected format like '30m', '2h', '1d', or 'never'",
+                s, e
+            )
+        })?;
+
+        // Validate duration bounds
+        const MIN_DURATION: Duration = Duration::from_secs(0); // 0 seconds (always refresh)
+        const MAX_DURATION: Duration = Duration::from_secs(365 * 24 * 60 * 60); // 1 year
+
+        if duration < MIN_DURATION {
+            return Err(format!(
+                "schema_refresh_interval '{}' is invalid. Must be non-negative",
+                s
+            ));
+        }
+
+        if duration > MAX_DURATION {
+            return Err(format!(
+                "schema_refresh_interval '{}' is too long. Maximum allowed is 1 year",
+                s
+            ));
+        }
+
+        Ok(Self::Duration(duration))
+    }
+}
+
+impl<'de> Deserialize<'de> for SchemaRefreshInterval {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+impl Serialize for SchemaRefreshInterval {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Duration(d) => {
+                serializer.serialize_str(&humantime::format_duration(*d).to_string())
+            }
+            Self::Never => serializer.serialize_str("never"),
+        }
+    }
+}
+
+impl std::fmt::Display for SchemaRefreshInterval {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Duration(d) => write!(f, "{}", humantime::format_duration(*d)),
+            Self::Never => write!(f, "never"),
+        }
+    }
+}
+
+/// Configuration for schema synchronization behavior.
+///
+/// This can be specified at source level (default for all tables) or
+/// at individual table level (overrides source-level settings).
+#[skip_serializing_none]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+pub struct SyncConfig {
+    /// How often to refresh the schema from the warehouse.
+    /// Examples: "30m", "2h", "1d", "never"
+    pub schema_refresh_interval: Option<SchemaRefreshInterval>,
+}
+
+/// Configuration for cluster by columns.
+///
+/// dbt-core allows either of the variants for the `cluster_by`
+/// to allow cluster on a single column or on multiple columns
+#[derive(Debug, Clone, Serialize, UntaggedEnumDeserialize, PartialEq, Eq, JsonSchema)]
+#[serde(untagged)]
+pub enum ClusterConfig {
+    String(String),
+    List(Vec<String>),
+}
+
+impl ClusterConfig {
+    /// Normalize the enum as a list of cluster_by fields
+    pub fn fields(&self) -> Vec<&str> {
+        match self {
+            ClusterConfig::String(s) => vec![s.as_ref()],
+            ClusterConfig::List(l) => l.iter().map(|s| s.as_ref()).collect(),
+        }
+    }
+
+    /// Normalize the enum as a list of cluster_by fields
+    pub fn into_fields(self) -> Vec<String> {
+        match self {
+            ClusterConfig::String(s) => vec![s],
+            ClusterConfig::List(l) => l,
+        }
+    }
+}
+
+/// Configuration for partition by columns.
+///
+/// dbt-core allows either of the variants for the `partition_by` in the model config
+/// but the bigquery-adapter throws RunTime error
+/// the behaviors are tested from the latest dbt-core + bigquery-adapter as this is written
+/// we're conformant to this behavior via here and via the `into_bigquery()` method
+#[derive(Debug, Clone, Serialize, UntaggedEnumDeserialize, PartialEq, Eq, JsonSchema)]
+#[serde(untagged)]
+pub enum PartitionConfig {
+    String(String),
+    List(Vec<String>),
+    BigqueryPartitionConfig(BigqueryPartitionConfig),
+}
+
+impl PartitionConfig {
+    pub fn into_bigquery(self) -> Option<BigqueryPartitionConfig> {
+        match self {
+            PartitionConfig::BigqueryPartitionConfig(bq) => Some(bq),
+            _ => None,
+        }
+    }
+
+    pub fn as_bigquery(&self) -> Option<&BigqueryPartitionConfig> {
+        match self {
+            PartitionConfig::BigqueryPartitionConfig(bq) => Some(bq),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::schemas::serde::minijinja_value_to_typed_struct;
+
     use super::*;
+    use minijinja::value::Value as MinijinjaValue;
+
+    #[test]
+    fn model_freshness_rules_eq_defaults_updates_on_to_any() {
+        let base = ModelFreshnessRules {
+            count: Some(1),
+            period: Some(FreshnessPeriod::hour),
+            updates_on: None,
+        };
+        let other = ModelFreshnessRules {
+            count: Some(1),
+            period: Some(FreshnessPeriod::hour),
+            updates_on: Some(UpdatesOn::Any),
+        };
+
+        assert_eq!(base, other);
+    }
 
     #[test]
     fn test_hooks_equal_array_of_strings_vs_hook_config_array() {
@@ -1376,6 +1708,147 @@ mod tests {
         assert_eq!(actual_quoting, expected_quoting);
     }
 
+    mod schema_refresh_interval_tests {
+        use super::*;
+
+        #[test]
+        fn test_parsing() {
+            // Duration variants
+            assert_eq!(
+                "30m".parse::<SchemaRefreshInterval>().unwrap().as_secs(),
+                Some(30 * 60)
+            );
+            assert_eq!(
+                "2h".parse::<SchemaRefreshInterval>().unwrap().as_secs(),
+                Some(2 * 60 * 60)
+            );
+            assert_eq!(
+                "1d".parse::<SchemaRefreshInterval>().unwrap().as_secs(),
+                Some(24 * 60 * 60)
+            );
+
+            // Never variant (case insensitive)
+            assert!("never".parse::<SchemaRefreshInterval>().unwrap().is_never());
+            assert!("NEVER".parse::<SchemaRefreshInterval>().unwrap().is_never());
+            assert!("Never".parse::<SchemaRefreshInterval>().unwrap().is_never());
+
+            // Never returns None for duration
+            let never: SchemaRefreshInterval = "never".parse().unwrap();
+            assert_eq!(never.as_secs(), None);
+            assert_eq!(never.as_duration(), None);
+        }
+
+        #[test]
+        fn test_default_and_constructors() {
+            // Default is 1 hour
+            let default = SchemaRefreshInterval::default();
+            assert_eq!(default.as_secs(), Some(60 * 60));
+            assert!(!default.is_never());
+
+            // from_hours constructor
+            assert_eq!(
+                SchemaRefreshInterval::from_hours(3).as_secs(),
+                Some(3 * 60 * 60)
+            );
+        }
+
+        #[test]
+        fn test_yaml_roundtrip() {
+            #[derive(Serialize, Deserialize, PartialEq, Debug)]
+            struct Config {
+                interval: SchemaRefreshInterval,
+            }
+
+            // Duration roundtrip
+            let duration_config = Config {
+                interval: "2h".parse().unwrap(),
+            };
+            let yaml = dbt_serde_yaml::to_string(&duration_config).unwrap();
+            assert_eq!(
+                dbt_serde_yaml::from_str::<Config>(&yaml).unwrap(),
+                duration_config
+            );
+
+            // Never roundtrip
+            let never_config = Config {
+                interval: SchemaRefreshInterval::Never,
+            };
+            let yaml = dbt_serde_yaml::to_string(&never_config).unwrap();
+            assert_eq!(
+                dbt_serde_yaml::from_str::<Config>(&yaml).unwrap(),
+                never_config
+            );
+        }
+
+        #[test]
+        fn test_conversions() {
+            // Into Option<Duration>
+            let duration: Option<Duration> = "1h".parse::<SchemaRefreshInterval>().unwrap().into();
+            assert_eq!(duration.unwrap().as_secs(), 60 * 60);
+
+            let none: Option<Duration> = SchemaRefreshInterval::Never.into();
+            assert!(none.is_none());
+
+            // Display
+            assert_eq!(
+                format!("{}", "30m".parse::<SchemaRefreshInterval>().unwrap()),
+                "30m"
+            );
+            assert_eq!(format!("{}", SchemaRefreshInterval::Never), "never");
+        }
+
+        #[test]
+        fn test_zero_ttl() {
+            // 0s TTL means always refresh
+            let zero_ttl = "0s".parse::<SchemaRefreshInterval>().unwrap();
+            assert_eq!(zero_ttl.as_secs(), Some(0));
+            assert!(!zero_ttl.is_never());
+
+            // Verify 0s is different from "never"
+            let never = SchemaRefreshInterval::Never;
+            assert_ne!(zero_ttl, never);
+        }
+
+        #[test]
+        fn test_validation_bounds() {
+            // Test minimum duration validation (0s and above should succeed)
+            assert!("-1s".parse::<SchemaRefreshInterval>().is_err());
+            assert!("0s".parse::<SchemaRefreshInterval>().is_ok());
+            assert!("30s".parse::<SchemaRefreshInterval>().is_ok());
+            assert!("59s".parse::<SchemaRefreshInterval>().is_ok());
+
+            // Test 1 minute (should succeed)
+            assert!("1m".parse::<SchemaRefreshInterval>().is_ok());
+            assert!("60s".parse::<SchemaRefreshInterval>().is_ok());
+
+            // Test maximum duration validation (> 1 year should fail)
+            assert!("366d".parse::<SchemaRefreshInterval>().is_err());
+            assert!("2y".parse::<SchemaRefreshInterval>().is_err());
+
+            // Test exactly 1 year (should succeed)
+            assert!("365d".parse::<SchemaRefreshInterval>().is_ok());
+            assert!("8760h".parse::<SchemaRefreshInterval>().is_ok());
+        }
+
+        #[test]
+        fn test_error_messages() {
+            // Test invalid format error
+            let err = "invalid".parse::<SchemaRefreshInterval>().unwrap_err();
+            assert!(err.contains("Invalid schema_refresh_interval"));
+            assert!(err.contains("Expected format like '30m', '2h', '1d', or 'never'"));
+
+            // Test negative duration error
+            let err = "-1s".parse::<SchemaRefreshInterval>().unwrap_err();
+            assert!(err.contains("Invalid schema_refresh_interval"));
+            assert!(err.contains("Expected format"));
+
+            // Test too long error
+            let err = "2y".parse::<SchemaRefreshInterval>().unwrap_err();
+            assert!(err.contains("too long"));
+            assert!(err.contains("Maximum allowed is 1 year"));
+        }
+    }
+
     #[test]
     fn test_schedule_parses_string_format() {
         // Test parsing schedule as a plain string (the format that was failing before)
@@ -1458,5 +1931,63 @@ models:
             Some("USING CRON 0,15,30,45 * * * * UTC".to_string())
         );
         assert_eq!(schedule_config.time_zone_value, None);
+    }
+
+    #[test]
+    fn test_freshness_rules_count_as_number() {
+        let yaml = r#"
+count: 24
+period: hour
+"#;
+        let rules: FreshnessRules = dbt_serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(rules.count, Some(24));
+        assert_eq!(rules.period, Some(FreshnessPeriod::hour));
+    }
+
+    #[test]
+    fn test_freshness_rules_count_as_string() {
+        let yaml = r#"
+count: "24"
+period: hour
+"#;
+        let rules: FreshnessRules = dbt_serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(rules.count, Some(24));
+        assert_eq!(rules.period, Some(FreshnessPeriod::hour));
+    }
+
+    #[test]
+    fn test_bigquery_partition_config_legacy_deserialize_from_jinja_values() {
+        // Test String variant
+        let string_value = MinijinjaValue::from("partition_field");
+        let result = minijinja_value_to_typed_struct::<PartitionConfig>(string_value).unwrap();
+        assert!(matches!(result, PartitionConfig::String(s) if s == "partition_field"));
+
+        // Test List variant
+        let list_value = MinijinjaValue::from(vec!["field1", "field2"]);
+        let result = minijinja_value_to_typed_struct::<PartitionConfig>(list_value).unwrap();
+        assert!(
+            matches!(result, PartitionConfig::List(ref list) if list == &vec!["field1".to_string(), "field2".to_string()])
+        );
+
+        // Test BigqueryPartitionConfig variant with time partitioning
+        let config_json: YmlValue = dbt_serde_yaml::from_str(
+            r#"
+            field: "partition_date"
+            data_type: "date"
+            granularity: "day"
+            time_ingestion_partitioning: true
+        "#,
+        )
+        .unwrap();
+        let config_value = MinijinjaValue::from_serialize(&config_json);
+        let result = minijinja_value_to_typed_struct::<PartitionConfig>(config_value).unwrap();
+        if let PartitionConfig::BigqueryPartitionConfig(config) = result {
+            assert_eq!(config.field, "partition_date");
+            assert_eq!(config.data_type, "date");
+            assert!(config.time_ingestion_partitioning());
+            assert_eq!(config.granularity().unwrap(), "day");
+        } else {
+            panic!("Expected BigqueryPartitionConfig variant");
+        }
     }
 }

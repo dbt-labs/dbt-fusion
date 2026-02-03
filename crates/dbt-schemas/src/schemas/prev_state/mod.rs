@@ -1,11 +1,13 @@
 use super::{RunResultsArtifact, manifest::DbtManifest, sources::FreshnessResultsArtifact};
 use crate::schemas::common::{DbtQuoting, ResolvedQuoting};
 use crate::schemas::manifest::nodes_from_dbt_manifest;
+use crate::schemas::project::configs::common::log_state_mod_diff;
 use crate::schemas::serde::typed_struct_from_json_file;
 use crate::schemas::{
     InternalDbtNode, Nodes, nodes::DbtModel, nodes::is_invalid_for_relation_comparison,
 };
-use dbt_common::{FsResult, constants::DBT_MANIFEST_JSON};
+use dbt_common::tracing::emit::emit_warn_log_message;
+use dbt_common::{ErrorCode, FsResult, constants::DBT_MANIFEST_JSON};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -37,33 +39,56 @@ impl fmt::Display for PreviousState {
 
 impl PreviousState {
     pub fn try_new(state_path: &Path, root_project_quoting: ResolvedQuoting) -> FsResult<Self> {
-        Self::try_new_with_target_path(state_path, root_project_quoting, None)
+        Self::try_new_with_target_path(state_path, root_project_quoting, None, true)
     }
 
+    /// Creates a new `PreviousState` from the given state path.
+    ///
+    /// # Arguments
+    /// * `state_path` - The path to the state directory containing manifest.json and other artifacts
+    /// * `root_project_quoting` - The quoting configuration for the root project
+    /// * `target_path` - Optional target path for the output directory
+    /// * `warn_on_manifest_load_failure` - If true, emits a warning when manifest.json fails to load.
+    ///   This should be set to true when the selector includes `state:modified` or `state:new`,
+    ///   and false for other selectors like `source_status:fresher+` that don't require the manifest.
     pub fn try_new_with_target_path(
         state_path: &Path,
         root_project_quoting: ResolvedQuoting,
         target_path: Option<PathBuf>,
+        warn_on_manifest_load_failure: bool,
     ) -> FsResult<Self> {
         // Try to load manifest.json, but make it optional
-        let nodes = if let Ok(manifest) =
-            typed_struct_from_json_file::<DbtManifest>(&state_path.join(DBT_MANIFEST_JSON))
-        {
-            let dbt_quoting = DbtQuoting {
-                database: Some(root_project_quoting.database),
-                schema: Some(root_project_quoting.schema),
-                identifier: Some(root_project_quoting.identifier),
-                snowflake_ignore_case: None,
-            };
-            let quoting = if let Some(mut mantle_quoting) = manifest.metadata.quoting {
-                mantle_quoting.default_to(&dbt_quoting);
-                mantle_quoting
-            } else {
-                dbt_quoting
-            };
-            Some(nodes_from_dbt_manifest(manifest, quoting))
-        } else {
-            None
+        let manifest_path = state_path.join(DBT_MANIFEST_JSON);
+        let nodes = match typed_struct_from_json_file::<DbtManifest>(&manifest_path) {
+            Ok(manifest) => {
+                let dbt_quoting = DbtQuoting {
+                    database: Some(root_project_quoting.database),
+                    schema: Some(root_project_quoting.schema),
+                    identifier: Some(root_project_quoting.identifier),
+                    snowflake_ignore_case: None,
+                };
+                let quoting = if let Some(mut mantle_quoting) = manifest.metadata.quoting {
+                    mantle_quoting.default_to(&dbt_quoting);
+                    mantle_quoting
+                } else {
+                    dbt_quoting
+                };
+                Some(nodes_from_dbt_manifest(manifest, quoting))
+            }
+            Err(e) => {
+                if warn_on_manifest_load_failure {
+                    emit_warn_log_message(
+                        ErrorCode::ManifestLoadFailed,
+                        format!(
+                            "Failed to load manifest.json from state path '{}': {}",
+                            state_path.display(),
+                            e
+                        ),
+                        None,
+                    );
+                }
+                None
+            }
         };
 
         Ok(Self {
@@ -101,6 +126,11 @@ impl PreviousState {
     ) -> bool {
         // If it's new, it's also considered modified
         if self.is_new(node) {
+            log_state_mod_diff(
+                &node.common().unique_id,
+                node.resource_type().as_static_ref(),
+                [("new node", false, None)],
+            );
             return true;
         }
 
@@ -183,7 +213,22 @@ impl PreviousState {
         let normalized_current = normalize_alias(current_alias);
         let normalized_previous = normalize_alias(previous_alias);
 
-        normalized_current != normalized_previous
+        let is_same_relation = normalized_current == normalized_previous;
+        if !is_same_relation {
+            log_state_mod_diff(
+                &current_node.common().unique_id,
+                "relation",
+                [(
+                    "alias",
+                    false,
+                    Some((
+                        format!("{:?}", current_alias),
+                        format!("{:?}", previous_alias),
+                    )),
+                )],
+            );
+        }
+        !is_same_relation
     }
 
     fn check_persisted_descriptions_modified(&self, current_node: &dyn InternalDbtNode) -> bool {
@@ -210,8 +255,23 @@ impl PreviousState {
                 .map(|s| s.trim_matches('\n').to_string())
         }
 
-        normalize_description(&current_node.common().description)
-            != normalize_description(&previous_node.common().description)
+        let is_same_desc = normalize_description(&current_node.common().description)
+            == normalize_description(&previous_node.common().description);
+        if !is_same_desc {
+            log_state_mod_diff(
+                &current_node.common().unique_id,
+                "persisted_descriptions",
+                [(
+                    "description",
+                    false,
+                    Some((
+                        format!("{:?}", &current_node.common().description),
+                        format!("{:?}", &previous_node.common().description),
+                    )),
+                )],
+            );
+        }
+        !is_same_desc
     }
 
     fn check_contract_modified(&self, current_node: &dyn InternalDbtNode) -> bool {
@@ -229,7 +289,15 @@ impl PreviousState {
             current_node.as_any().downcast_ref::<DbtModel>(),
             previous_node.as_any().downcast_ref::<DbtModel>(),
         ) {
-            !current_model.same_contract(previous_model)
+            let is_same_contract = current_model.same_contract(previous_model);
+            if !is_same_contract {
+                log_state_mod_diff(
+                    &current_node.common().unique_id,
+                    "contract",
+                    [("contract", false, None)],
+                );
+            }
+            !is_same_contract
         } else {
             false
         }

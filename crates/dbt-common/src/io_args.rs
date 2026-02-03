@@ -29,6 +29,7 @@ pub enum LocalExecutionBackendKind {
 }
 
 use crate::adapter::AdapterType;
+use crate::constants::DBT_TARGET_DIR_NAME;
 use crate::{
     constants::{DBT_GENERIC_TESTS_DIR_NAME, DBT_SNAPSHOTS_DIR_NAME},
     io_utils::StatusReporter,
@@ -47,24 +48,26 @@ pub enum FsCommand {
     #[default]
     Unset,
     /// Standard dbt commands
-    Build,
-    Clean,
-    Clone,
-    Compile,
-    Debug,
-    Deps,
     Init,
-    List,
-    Man,
+    Deps,
     Parse,
+    List, // aka: Ls
+    Compile,
     Run,
     RunOperation,
-    Seed,
-    Show,
-    Snapshot,
-    Source,
-    System,
     Test,
+    Seed,
+    Snapshot,
+    Show,
+    Build,
+    Clean,
+    Source,
+    Clone,
+    System,
+    Man,
+    Debug,
+    Hydrate,
+    Retry,
     /// All other commands provided by private cli's
     Extension(&'static str),
 }
@@ -73,24 +76,26 @@ impl FsCommand {
     pub const fn as_str(&self) -> &'static str {
         match self {
             FsCommand::Unset => "",
-            FsCommand::Build => "build",
-            FsCommand::Clean => "clean",
-            FsCommand::Clone => "clone",
-            FsCommand::Compile => "compile",
-            FsCommand::Debug => "debug",
-            FsCommand::Deps => "deps",
             FsCommand::Init => "init",
-            FsCommand::List => "list",
-            FsCommand::Man => "man",
+            FsCommand::Deps => "deps",
             FsCommand::Parse => "parse",
+            FsCommand::List => "list",
+            FsCommand::Compile => "compile",
             FsCommand::Run => "run",
             FsCommand::RunOperation => "run-operation",
-            FsCommand::Seed => "seed",
-            FsCommand::Show => "show",
-            FsCommand::Snapshot => "snapshot",
-            FsCommand::Source => "freshness",
-            FsCommand::System => "system",
             FsCommand::Test => "test",
+            FsCommand::Seed => "seed",
+            FsCommand::Snapshot => "snapshot",
+            FsCommand::Show => "show",
+            FsCommand::Build => "build",
+            FsCommand::Clean => "clean",
+            FsCommand::Source => "freshness",
+            FsCommand::Clone => "clone",
+            FsCommand::System => "system",
+            FsCommand::Man => "man",
+            FsCommand::Debug => "debug",
+            FsCommand::Hydrate => "hydrate",
+            FsCommand::Retry => "retry",
             FsCommand::Extension(s) => s,
         }
     }
@@ -106,6 +111,10 @@ pub struct IoArgs {
     pub is_compile: bool,
     pub in_dir: PathBuf,
     pub out_dir: PathBuf,
+    /// Root directory for sidecar/DuckDB state. Defaults to out_dir if not set.
+    /// Structure: {db_root}/db/state/{catalog}.db (persistent)
+    ///            {db_root}/db/sessions/{session-id}/... (ephemeral)
+    pub db_root: Option<PathBuf>,
     pub log_path: Option<PathBuf>,
     pub otel_file_name: Option<String>,
     pub otel_parquet_file_name: Option<String>,
@@ -138,6 +147,53 @@ impl IoArgs {
         let rel_first = rel_path.components().next();
         out_dir_last == rel_first
     }
+
+    // -----------------------------------------------------------------------------------------
+    // Sidecar/DuckDB path helpers
+    // -----------------------------------------------------------------------------------------
+
+    /// Returns the db_root, defaulting to out_dir if not explicitly set.
+    pub fn db_root(&self) -> &Path {
+        self.db_root.as_deref().unwrap_or(&self.out_dir)
+    }
+
+    /// Path to persistent DuckDB state directory: {db_root}/db/state/
+    pub fn db_state_dir(&self) -> PathBuf {
+        self.db_root().join("db").join("state")
+    }
+
+    /// Path to a specific catalog's DuckDB file: {db_root}/db/state/{catalog}.db
+    pub fn db_catalog_path(&self, catalog: &str) -> PathBuf {
+        self.db_state_dir()
+            .join(format!("{}.db", catalog.to_ascii_lowercase()))
+    }
+
+    /// Path to session-scoped directory: {db_root}/db/sessions/{invocation_id}/
+    pub fn db_session_dir(&self) -> PathBuf {
+        self.db_root()
+            .join("db")
+            .join("sessions")
+            .join(self.invocation_id.to_string())
+    }
+
+    /// Path to session logs: {db_root}/db/sessions/{invocation_id}/logs/
+    pub fn db_session_logs_dir(&self) -> PathBuf {
+        self.db_session_dir().join("logs")
+    }
+
+    /// Path to session pull data: {db_root}/db/sessions/{invocation_id}/pull/
+    pub fn db_session_pull_dir(&self) -> PathBuf {
+        self.db_session_dir().join("pull")
+    }
+
+    /// Path to session pull data for a specific table:
+    /// {db_root}/db/sessions/{invocation_id}/pull/{catalog}/{schema}/{table}/
+    pub fn db_session_table_dir(&self, catalog: &str, schema: &str, table: &str) -> PathBuf {
+        self.db_session_pull_dir()
+            .join(catalog.to_ascii_lowercase())
+            .join(schema.to_ascii_lowercase())
+            .join(table.to_ascii_lowercase())
+    }
 }
 
 impl fmt::Debug for IoArgs {
@@ -147,6 +203,7 @@ impl fmt::Debug for IoArgs {
             .field("show", &self.show)
             .field("in_dir", &self.in_dir)
             .field("out_dir", &self.out_dir)
+            .field("db_root", &self.db_root)
             .field("log_path", &self.log_path)
             .field("otel_file_name", &self.otel_file_name)
             .field("status_reporter", &self.status_reporter.is_some())
@@ -172,7 +229,7 @@ impl IoArgs {
             return relative_path.to_string_lossy().to_string();
         }
         if path.is_relative() {
-            let target_path = in_dir.join("target").join(path);
+            let target_path = in_dir.join(DBT_TARGET_DIR_NAME).join(path);
             if target_path.exists() {
                 return format!("target/{}", path.to_string_lossy());
             }
@@ -335,11 +392,13 @@ pub struct EvalArgs {
     pub warn_error: bool,
     pub warn_error_options: BTreeMap<String, Value>,
     pub version_check: bool,
+    pub introspect: bool,
     pub defer: bool,
     pub fail_fast: bool,
     pub empty: bool,
     pub sample: Option<String>,
     pub full_refresh: bool,
+    pub store_failures: bool,
     pub favor_state: bool,
     pub refresh_sources: bool,
     pub send_anonymous_usage_stats: bool,
@@ -363,6 +422,7 @@ impl fmt::Debug for EvalArgs {
             .field("vars", &self.vars)
             .field("show", &self.io.show)
             .field("optimize_tests", &self.optimize_tests)
+            .field("store_failures", &self.store_failures)
             .field("stage", &self.phase)
             .field("format", &self.format)
             .field("limit", &self.limit)

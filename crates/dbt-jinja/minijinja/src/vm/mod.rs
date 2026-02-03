@@ -20,8 +20,6 @@ use crate::machinery::Span;
 use crate::output::{CaptureMode, Output};
 use crate::utils::{untrusted_size_hint, AutoEscape};
 use crate::value::mutable_map::MutableMap;
-use crate::value::mutable_vec::MutableVec;
-use crate::value::namespace_name::NamespaceName;
 use crate::value::namespace_object::Namespace;
 use crate::value::Object;
 use crate::value::{
@@ -144,11 +142,11 @@ fn call_wrapper(
     listeners.iter().for_each(|listener| {
         listener.on_function_start();
     });
-    let rv = function_call()?;
+    let rv = function_call();
     listeners.iter().for_each(|listener| {
         listener.on_function_end();
     });
-    Ok(rv)
+    rv
 }
 
 impl<'env> Vm<'env> {
@@ -216,7 +214,7 @@ impl<'env> Vm<'env> {
         context_base: Value,
         caller: Option<Value>,
         varargs: Vec<Value>,
-        kwargs: ValueMap,
+        kwargs: MutableMap,
         state: &State,
         args: Vec<Value>,
         listeners: &[Rc<dyn RenderingEventListener>],
@@ -238,7 +236,8 @@ impl<'env> Vm<'env> {
             ctx.store("caller", caller);
         }
         ctx.store("varargs", Value::from(varargs));
-        ctx.store("kwargs", Value::from(kwargs));
+        // kwargs is already a MutableMap, supporting .pop() and other mutating methods
+        ctx.store("kwargs", Value::from_object(kwargs));
 
         ok!(ctx.incr_depth(state.ctx.depth() + MACRO_RECURSION_COST));
         self.do_eval(
@@ -346,7 +345,6 @@ impl<'env> Vm<'env> {
             }};
         }
 
-        let namespace_registry = self.env.get_macro_namespace_registry().unwrap_or_default();
         let root_package_name = self.env.get_root_package_name();
         let template_registry = self.env.get_macro_template_registry();
 
@@ -454,10 +452,7 @@ impl<'env> Vm<'env> {
                             .is_undefined()
                     {
                         stack.push(state.lookup(name).expect("we just checked that it is some"));
-                    } else if namespace_registry.contains_key(&Value::from(name as &str)) {
-                        stack.push(Value::from_object(NamespaceName::new(name)));
-                    // check if it is a regular variable in state first
-                    // Somehow a macro try to set all varibale it uses to undefined
+                    // Try to resolve as a macro name (e.g., bare `get_revoke_sql`)
                     } else if let Some(template_name) =
                         macro_namespace_template_resolver(state, name, &mut Vec::new())
                     {
@@ -469,6 +464,8 @@ impl<'env> Vm<'env> {
                                 auto_execute: false,
                                 context: Some(state.get_base_context()),
                             }));
+                        } else {
+                            stack.push(Value::UNDEFINED);
                         }
                     // check if it is a regular variable in the state
                     } else {
@@ -477,53 +474,24 @@ impl<'env> Vm<'env> {
                 }
                 Instruction::GetAttr(name, span) => {
                     let a = stack.pop();
-                    // This is a common enough operation that it's interesting to consider a fast
-                    // path here.  This is slightly faster than the regular attr lookup because we
-                    // do not need to pass down the error object for the more common success case.
-                    // Only when we cannot look up something, we start to consider the undefined
-                    // special case.
-                    stack.push(match a.get_attr_fast(name) {
-                        Some(value) => value
-                            .validate()
-                            .map_err(|e| state.with_span_error(e, span))?,
-                        None => {
-                            if let Some(namespace) = a.downcast_object_ref::<NamespaceName>() {
-                                let ns_name = Value::from(namespace.get_name());
-                                // a could be a package name, we need to check if there's a macro in the namespace
-                                if namespace_registry.get(&ns_name).is_some_and(|val| {
-                                    val.downcast_object::<MutableVec<Value>>()
-                                        .unwrap_or_default()
-                                        .contains(&Value::from(name as &str))
-                                }) {
-                                    let template_registry_entry = template_registry.get(&ns_name);
-                                    let path = template_registry_entry
-                                        .and_then(|entry| entry.get_attr_fast("path"))
-                                        .unwrap_or(ns_name);
-                                    let span = template_registry_entry
-                                        .and_then(|entry| entry.get_attr_fast("span"))
-                                        .unwrap_or_else(|| Value::from_serialize(Span::default()));
-
-                                    let context =
-                                        state.get_base_context_with_path_and_span(&path, &span);
-                                    Value::from_object(DispatchObject {
-                                        macro_name: (*name).to_string(),
-                                        package_name: Some(namespace.get_name().to_string()),
-                                        strict: true,
-                                        auto_execute: false,
-                                        context: Some(context),
-                                    })
-                                } else {
-                                    undefined_behavior
-                                        .handle_undefined(a.is_undefined())
-                                        .map_err(|e| state.with_span_error(e, span))?
-                                }
-                            } else {
-                                undefined_behavior
-                                    .handle_undefined(a.is_undefined())
-                                    .map_err(|e| state.with_span_error(e, span))?
-                            }
-                        }
-                    });
+                    if let Some(value) = a.get_attr_fast(name) {
+                        stack.push(
+                            value
+                                .validate()
+                                .map_err(|e| state.with_span_error(e, span))?,
+                        );
+                    } else if let Some(result) = a
+                        .as_object()
+                        .and_then(|obj| obj.get_property(state, name, listeners).ok())
+                    {
+                        stack.push(result);
+                    } else {
+                        stack.push(
+                            undefined_behavior
+                                .handle_undefined(a.is_undefined())
+                                .map_err(|e| state.with_span_error(e, span))?,
+                        );
+                    }
                 }
                 Instruction::SetAttr(name, span) => {
                     let b = stack.pop();
@@ -769,10 +737,14 @@ impl<'env> Vm<'env> {
                         }
                     };
                     match next {
-                        Some(item) => stack.push(
-                            item.validate()
-                                .map_err(|e| state.with_span_error(e, span))?,
-                        ),
+                        Some(item) => {
+                            // each iteration should start with clean local vars to match Python
+                            state.ctx.current_locals_mut().clear();
+                            stack.push(
+                                item.validate()
+                                    .map_err(|e| state.with_span_error(e, span))?,
+                            );
+                        }
                         None => {
                             pc = *jump_target;
                             continue;
@@ -888,7 +860,7 @@ impl<'env> Vm<'env> {
                     stack.drop_top(arg_count);
                     stack.push(Value::from(rv));
                 }
-                Instruction::CallFunction(name, arg_count, this_span, _) => {
+                Instruction::CallFunction(name, arg_count, _, this_span, _) => {
                     // reset_span is a special function that resets the current span
                     // it is only used internally like in run_operation.rs,
                     // where we want to set the location to yml file
@@ -1125,47 +1097,11 @@ impl<'env> Vm<'env> {
                     stack.drop_top(arg_count);
                     stack.push(rv);
                 }
-                Instruction::CallMethod(name, arg_count, this_span) => {
+                Instruction::CallMethod(name, arg_count, _, this_span) => {
                     let args = stack.get_call_args(*arg_count);
                     let arg_count = args.len();
 
-                    let a = if let Some(ns) = args[0].downcast_object_ref::<NamespaceName>() {
-                        let ns_name = ns.get_name();
-                        let args = &args[1..];
-
-                        // For namespaced calls, report the full qualified name
-                        let qualified_name = format!("{ns_name}.{name}");
-                        // if not found, attempt to lookup the template and function using name stripped of test_
-                        // see generate_test_macro in resolve_generic_tests.rs -> a subset of generated macro names are prefixed with test_
-                        let Ok(template) = self.env.get_template(&qualified_name) else {
-                            return Err(state.with_span_error(
-                                Error::new(
-                                    ErrorKind::UnknownFunction,
-                                    format!("Jinja macro or function `{name}` is unknown"),
-                                ),
-                                this_span,
-                            ));
-                        };
-
-                        let template_registry_entry =
-                            template_registry.get(&Value::from(qualified_name.clone()));
-                        let path = template_registry_entry
-                            .and_then(|entry| entry.get_attr_fast("path"))
-                            .unwrap_or_else(|| Value::from(qualified_name));
-                        let span = template_registry_entry
-                            .and_then(|entry| entry.get_attr_fast("span"))
-                            .unwrap_or_else(|| Value::from_serialize(Span::default()));
-
-                        let ctx = state.get_base_context_with_path_and_span(&path, &span);
-                        let macro_state = template.eval_to_state_with_outer_stack_depth(
-                            ctx,
-                            listeners,
-                            state.ctx.depth() + MACRO_RECURSION_COST,
-                        )?;
-                        let func = macro_state.lookup(name).unwrap();
-                        call_wrapper(listeners, || func.call(&macro_state, args, listeners))
-                            .map_err(|err| state.with_span_error(err, this_span))?
-                    } else {
+                    let a = {
                         // For non-namespaced calls, report just the name
                         let function_name = args[0]
                             .get_attr_fast("function_name")
@@ -1203,7 +1139,18 @@ impl<'env> Vm<'env> {
                                 _ => rv,
                             },
                             Err(err) => {
-                                return Err(state.with_span_error(err, this_span));
+                                // try arg[0].get_property(name)(args[1..])
+                                if let Some(property) = args[0]
+                                    .as_object()
+                                    .and_then(|obj| obj.get_property(state, name, listeners).ok())
+                                {
+                                    call_wrapper(listeners, || {
+                                        property.call(state, &args[1..], listeners)
+                                    })
+                                    .map_err(|e| state.with_span_error(e, this_span))?
+                                } else {
+                                    return Err(state.with_span_error(err, this_span));
+                                }
                             }
                         }
                     };

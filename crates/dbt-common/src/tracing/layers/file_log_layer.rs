@@ -1,10 +1,11 @@
 use dbt_error::ErrorCode;
 use dbt_telemetry::{
-    CompiledCodeInline, DepsAddPackage, DepsAllPackagesInstalled, DepsPackageInstalled,
-    GenericOpExecuted, GenericOpItemProcessed, Invocation, ListItemOutput, LogMessage,
-    LogRecordInfo, NodeEvaluated, NodeOutcome, NodeProcessed, NodeType, PhaseExecuted,
+    AssetParsed, CompiledCodeInline, DepsAddPackage, DepsAllPackagesInstalled,
+    DepsPackageInstalled, GenericOpExecuted, GenericOpItemProcessed, Invocation, ListItemOutput,
+    LogMessage, LogRecordInfo, NodeEvaluated, NodeOutcome, NodeProcessed, NodeType, PhaseExecuted,
     ProgressMessage, QueryExecuted, SeverityNumber, ShowDataOutput, ShowResult, SpanEndInfo,
-    SpanStartInfo, StatusCode, TelemetryOutputFlags, UserLogMessage, node_processed,
+    SpanStartInfo, StateModifiedDiff, StatusCode, TelemetryOutputFlags, UserLogMessage,
+    node_processed,
 };
 use std::{
     sync::atomic::{AtomicBool, Ordering},
@@ -16,6 +17,7 @@ use super::super::{
     background_writer::BackgroundWriter,
     data_provider::DataProvider,
     formatters::{
+        asset::format_asset_parsed_end,
         constants::SELECTED_NODES_TITLE,
         deps::{
             format_package_add_end, format_package_add_start, format_package_install_end,
@@ -37,6 +39,7 @@ use super::super::{
         },
         phase::{format_phase_executed_end, format_phase_executed_start},
         progress::format_progress_message,
+        state_mod_diff::format_state_modified_diff_lines,
         test_result::format_test_failure,
     },
     layer::{ConsumerLayer, TelemetryConsumer},
@@ -183,6 +186,11 @@ impl TelemetryConsumer for FileLogLayer {
             return;
         }
 
+        if let Some(asset_parsed) = span.attributes.downcast_ref::<AssetParsed>() {
+            self.handle_asset_parsed_end(span, asset_parsed);
+            return;
+        }
+
         // Handle NodeProcessed events for completed nodes
         if let Some(node_processed) = span.attributes.downcast_ref::<NodeProcessed>() {
             self.handle_node_processed(span, node_processed);
@@ -235,6 +243,11 @@ impl TelemetryConsumer for FileLogLayer {
         // Check if this is a LogMessage (error/warning)
         if let Some(log_msg) = log_record.attributes.downcast_ref::<LogMessage>() {
             self.handle_log_message(log_msg, log_record);
+            return;
+        }
+
+        if let Some(state_mod_diff) = log_record.attributes.downcast_ref::<StateModifiedDiff>() {
+            self.handle_state_modified_diff(log_record, state_mod_diff);
             return;
         }
 
@@ -480,6 +493,28 @@ impl FileLogLayer {
             log_record.time_unix_nano,
             log_record.severity_number,
             &[formatted],
+        );
+    }
+
+    fn handle_asset_parsed_end(&self, span: &SpanEndInfo, asset: &AssetParsed) {
+        let duration = span
+            .end_time_unix_nano
+            .duration_since(span.start_time_unix_nano)
+            .unwrap_or_default();
+        let formatted = format_asset_parsed_end(asset, duration, false);
+        self.write_log_lines(span.end_time_unix_nano, span.severity_number, &[formatted]);
+    }
+
+    fn handle_state_modified_diff(
+        &self,
+        log_record: &LogRecordInfo,
+        state_mod_diff: &StateModifiedDiff,
+    ) {
+        let lines = format_state_modified_diff_lines(state_mod_diff);
+        self.write_log_lines(
+            log_record.time_unix_nano,
+            log_record.severity_number,
+            &lines,
         );
     }
 

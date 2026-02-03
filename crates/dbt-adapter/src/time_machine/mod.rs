@@ -78,13 +78,14 @@ pub mod semantic;
 pub mod serde;
 pub mod serializable;
 mod serializable_impls;
+mod validation;
 pub mod writer;
 
 // Re-export commonly used types
 pub use engine::{EventReplayer, ReplayCallError, ReplayerStats, TimeMachine};
 pub use event::{
     AdapterCallEvent, CatalogSchema, CatalogSchemas, MetadataCallArgs, MetadataCallEvent,
-    NodeIndex, RecordedEvent, RecordingHeader,
+    NodeIndex, RecordedEvent, RecordingHeader, SaoEvent, SaoStatus,
 };
 pub use event_recorder::EventRecorder;
 pub use event_replay::{

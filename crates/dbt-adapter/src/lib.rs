@@ -34,6 +34,10 @@ pub mod sql_types;
 pub mod statement;
 pub mod stmt_splitter;
 
+/// Sidecar adapter for local DuckDB execution
+pub mod sidecar_adapter;
+pub mod sidecar_client;
+
 /// Cross-Version Record/Replay System
 pub mod time_machine;
 pub mod typed_adapter;
@@ -69,7 +73,6 @@ pub use bridge_adapter::BridgeAdapter;
 pub use column::{Column, ColumnBuilder};
 pub use errors::AdapterResult;
 pub use funcs::{execute_macro_with_package, execute_macro_wrapper_with_package};
-pub use parse::adapter::ParseAdapter;
 pub use response::AdapterResponse;
 pub use typed_adapter::TypedBaseAdapter;
 

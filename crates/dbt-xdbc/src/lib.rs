@@ -28,6 +28,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
+#[cfg(debug_assertions)]
+pub(crate) mod env_var;
+
 pub mod driver;
 pub use driver::Backend;
 pub use driver::Driver;
@@ -83,10 +86,10 @@ pub fn str_from_sqlstate(sqlstate: &[c_char; 5]) -> &str {
     res.unwrap_or("")
 }
 
-pub const SNOWFLAKE_DRIVER_VERSION: &str = "0.21.0+dbt0.21.3";
+pub const SNOWFLAKE_DRIVER_VERSION: &str = "0.21.0+dbt0.21.4";
 pub const BIGQUERY_DRIVER_VERSION: &str = "0.21.0+dbt0.21.5";
 pub const POSTGRES_DRIVER_VERSION: &str = "0.21.0+dbt0.21.0";
-pub const DATABRICKS_DRIVER_VERSION: &str = "0.21.0+dbt0.21.6";
+pub const DATABRICKS_DRIVER_VERSION: &str = "0.21.0+dbt0.21.7";
 pub const REDSHIFT_DRIVER_VERSION: &str = "0.18.0+dbt0.18.4";
 pub const DUCKDB_DRIVER_VERSION: &str = "0.21.0+dbt0.0.3";
 pub const SALESFORCE_DRIVER_VERSION: &str = "0.21.0+dbt0.21.1";

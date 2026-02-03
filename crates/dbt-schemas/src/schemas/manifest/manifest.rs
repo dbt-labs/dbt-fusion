@@ -116,7 +116,7 @@ pub fn build_manifest(invocation_id: &str, resolver_state: &ResolverState) -> Db
     DbtManifest {
         metadata: ManifestMetadata {
             __base__: BaseMetadata {
-                dbt_schema_version: get_dbt_schema_version("manifest", 20),
+                dbt_schema_version: get_dbt_schema_version("manifest", 12),
                 dbt_version: env!("CARGO_PKG_VERSION").to_string(),
                 generated_at: Utc::now(),
                 invocation_id: Some(invocation_id.to_string()),
@@ -231,7 +231,12 @@ pub fn build_manifest(invocation_id: &str, resolver_state: &ResolverState) -> Db
             .iter()
             .map(|(id, unit_test)| (id.clone(), (**unit_test).clone().into()))
             .collect(),
-        macros: resolver_state.macros.macros.clone(),
+        macros: resolver_state
+            .macros
+            .macros
+            .iter()
+            .map(|(id, macro_)| (id.clone(), macro_.clone().into()))
+            .collect(),
         functions: resolver_state
             .nodes
             .functions
@@ -634,6 +639,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                             test_metadata: test.test_metadata,
                             file_key_name: test.file_key_name,
                             introspection: IntrospectionKind::None,
+                            original_name: None,
                         },
                         deprecated_config: test.config,
                         __other__: test.__other__,
@@ -721,6 +727,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                                 .clone()
                                 .unwrap_or_default(),
                             introspection: IntrospectionKind::None,
+                            sync: snapshot.config.sync.clone(),
                         },
                         __adapter_attr__: AdapterAttr::from_config_and_dialect(
                             &snapshot.config.__warehouse_specific_config__,
@@ -942,6 +949,8 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                     loaded_at_field: source.loaded_at_field,
                     loaded_at_query: source.loaded_at_query,
                     freshness: source.freshness,
+                    schema_origin: source.config.schema_origin.unwrap_or_default(),
+                    sync: source.config.sync.clone(),
                 },
                 deprecated_config: source.config,
                 __other__: source.__other__,
@@ -1297,6 +1306,7 @@ pub fn manifest_model_to_dbt_model(
             event_time: model.config.event_time.clone(),
             catalog_name: model.config.catalog_name.clone(),
             table_format: model.config.table_format.clone(),
+            sync: model.config.sync.clone(),
         },
         __adapter_attr__: AdapterAttr::from_config_and_dialect(
             &model.config.__warehouse_specific_config__,

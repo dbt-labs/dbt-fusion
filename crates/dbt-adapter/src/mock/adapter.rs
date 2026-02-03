@@ -1,6 +1,7 @@
 use crate::AdapterEngine;
 use crate::adapter_engine::MockEngine;
 use crate::base_adapter::{AdapterType, AdapterTyping};
+use crate::cache::RelationCache;
 use crate::errors::{AdapterError, AdapterErrorKind, AdapterResult};
 use crate::funcs::none_value;
 use crate::metadata::*;
@@ -64,11 +65,19 @@ impl MockAdapter {
                 adapter_type,
                 type_ops,
                 quoting,
+                Arc::new(RelationCache::default()),
             ))),
             flags,
             quoting,
             cancellation_token: token,
         }
+    }
+
+    fn introspect_enabled(&self) -> bool {
+        self.flags
+            .get("introspect")
+            .map(|value| value.is_true())
+            .unwrap_or(true)
     }
 }
 
@@ -114,6 +123,12 @@ impl TypedBaseAdapter for MockAdapter {
         _limit: Option<i64>,
         _options: Option<HashMap<String, String>>,
     ) -> AdapterResult<(AdapterResponse, AgateTable)> {
+        if !self.introspect_enabled() {
+            return Err(AdapterError::new(
+                AdapterErrorKind::NotSupported,
+                "Introspective queries are disabled (--no-introspect).",
+            ));
+        }
         let response = AdapterResponse {
             message: "execute".to_string(),
             code: sql.to_string(),
@@ -160,6 +175,12 @@ impl TypedBaseAdapter for MockAdapter {
         schema: &str,
         identifier: &str,
     ) -> AdapterResult<Option<Arc<dyn BaseRelation>>> {
+        if !self.introspect_enabled() {
+            return Err(AdapterError::new(
+                AdapterErrorKind::NotSupported,
+                "Introspective queries are disabled (--no-introspect).",
+            ));
+        }
         Ok(Some(Arc::new(SnowflakeRelation::new(
             Some(database.to_string()),
             Some(schema.to_string()),
@@ -185,6 +206,12 @@ impl TypedBaseAdapter for MockAdapter {
         _conn: &'_ mut dyn Connection,
         _db_schema: &CatalogAndSchema,
     ) -> AdapterResult<Vec<Arc<dyn BaseRelation>>> {
+        if !self.introspect_enabled() {
+            return Err(AdapterError::new(
+                AdapterErrorKind::NotSupported,
+                "Introspective queries are disabled (--no-introspect).",
+            ));
+        }
         Err(AdapterError::new(
             AdapterErrorKind::Internal,
             format!(

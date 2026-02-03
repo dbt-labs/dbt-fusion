@@ -7,13 +7,14 @@ use crate::sql_file_info::SqlFileInfo;
 use crate::utils::{get_node_fqn, register_duplicate_resource, trigger_duplicate_errors};
 use dbt_common::adapter::AdapterType;
 use dbt_common::cancellation::CancellationToken;
-use dbt_common::constants::PARSING;
+use dbt_common::constants::{DBT_TARGET_DIR_NAME, PARSING};
 use dbt_common::io_args::{IoArgs, StaticAnalysisKind};
 use dbt_common::tokiofs::read_to_string;
 use dbt_common::tracing::emit::{
     emit_error_log_from_fs_error, emit_error_log_message, emit_warn_log_from_fs_error,
 };
-use dbt_common::{ErrorCode, FsError, FsResult, fs_err, fsinfo, show_progress};
+use dbt_common::tracing::span_info::SpanStatusRecorder as _;
+use dbt_common::{ErrorCode, FsError, FsResult, create_debug_span, fs_err};
 use dbt_jinja_utils::jinja_environment::JinjaEnv;
 use dbt_jinja_utils::listener::{
     DefaultRenderingEventListenerFactory, JinjaTypeCheckingEventListenerFactory,
@@ -33,6 +34,7 @@ use dbt_schemas::schemas::properties::GetConfig;
 use dbt_schemas::schemas::telemetry::NodeType;
 use dbt_schemas::schemas::{InternalDbtNodeAttributes, IntrospectionKind, Nodes};
 use dbt_schemas::state::{DbtAsset, DbtRuntimeConfig, ModelStatus};
+use dbt_telemetry::AssetParsed;
 use std::fmt::Debug;
 use tracing::Instrument as _;
 
@@ -65,18 +67,14 @@ pub struct SqlFileRenderResult<T: DefaultTo<T>, S> {
 
 /// Extracts model and version configuration from node properties
 fn extract_model_and_version_config<T: DefaultTo<T>, S: GetConfig<T> + Debug>(
-    ref_name: &str,
     mpe: &mut MinimalPropertiesEntry,
-    duplicate_errors: &mut Vec<FsError>,
     arg: &ResolveArgs,
     jinja_env: &JinjaEnv,
     base_ctx: &BTreeMap<String, MinijinjaValue>,
     dependency_package_name: Option<&str>,
 ) -> FsResult<(Option<S>, Option<T>)> {
-    if !mpe.duplicate_paths.is_empty() {
-        register_duplicate_resource(mpe, ref_name, "model", duplicate_errors);
-        return Ok((None, None));
-    }
+    // Note: Duplicate checking is deferred until after we determine if the model is enabled.
+    // This matches dbt-core behavior which only checks for duplicates among enabled models.
     // Can occur if a model asset is duplicated, but does not have duplicate property.yml definitions.
     if mpe.schema_value.is_null() {
         return Ok((None, None));
@@ -131,6 +129,61 @@ where
     T: DefaultTo<T> + 'static,
     S: GetConfig<T> + Debug,
 {
+    let RenderCtx { inner, .. } = render_ctx;
+
+    let RenderCtxInner {
+        args, package_name, ..
+    } = &**inner;
+
+    let ref_name = dbt_asset.path.file_stem().unwrap().to_str().unwrap();
+
+    let display_path = if dbt_asset.base_path == args.io.out_dir {
+        PathBuf::from(DBT_TARGET_DIR_NAME).join(dbt_asset.to_display_path(&args.io.out_dir))
+    } else {
+        dbt_asset.to_display_path(&args.io.in_dir)
+    };
+    let display_path_str = display_path.display().to_string();
+
+    let span = create_debug_span(AssetParsed::new_with_phase_from_context(
+        package_name.clone(),
+        ref_name.to_string(),
+        dbt_asset.path.display().to_string(),
+        display_path_str.clone(),
+        None,
+    ));
+
+    render_sql_file_inner(
+        render_ctx,
+        dbt_asset,
+        node_properties,
+        duplicate_errors,
+        token,
+        jinja_type_checking_event_listener_factory,
+        display_path,
+        display_path_str,
+        ref_name,
+    )
+    .instrument(span.clone())
+    .await
+    .record_status(&span)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn render_sql_file_inner<T, S>(
+    render_ctx: &RenderCtx<T>,
+    dbt_asset: &DbtAsset,
+    node_properties: &mut BTreeMap<String, MinimalPropertiesEntry>,
+    duplicate_errors: &mut Vec<FsError>,
+    token: &CancellationToken,
+    jinja_type_checking_event_listener_factory: Arc<dyn JinjaTypeCheckingEventListenerFactory>,
+    display_path: PathBuf,
+    display_path_str: String,
+    ref_name: &str,
+) -> FsResult<Option<SqlFileRenderResult<T, S>>>
+where
+    T: DefaultTo<T> + 'static,
+    S: GetConfig<T> + Debug,
+{
     let RenderCtx {
         inner,
         jinja_env,
@@ -159,13 +212,15 @@ where
         None
     };
 
-    let ref_name = dbt_asset.path.file_stem().unwrap().to_str().unwrap();
+    let has_duplicate_paths = node_properties
+        .get(ref_name)
+        .map(|mpe| !mpe.duplicate_paths.is_empty())
+        .unwrap_or(false);
+
     let (maybe_model, maybe_version_config) = {
         if let Some(mpe) = node_properties.get_mut(ref_name) {
             extract_model_and_version_config::<T, S>(
-                ref_name,
                 mpe,
-                duplicate_errors,
                 args,
                 jinja_env,
                 base_ctx,
@@ -177,17 +232,7 @@ where
         }
     };
 
-    if maybe_model.is_none() && maybe_version_config.is_none() && !duplicate_errors.is_empty() {
-        return Ok(None);
-    }
-
-    let model_name = dbt_asset
-        .path
-        .file_stem()
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_string();
+    let model_name = ref_name.to_string();
 
     let fqn = get_node_fqn(
         package_name,
@@ -228,12 +273,6 @@ where
     let execute_exists = Arc::new(AtomicBool::new(false));
 
     let mut resolve_model_context = base_ctx.clone();
-    let display_path = if dbt_asset.base_path == args.io.out_dir {
-        PathBuf::from("target").join(dbt_asset.to_display_path(&args.io.out_dir))
-    } else {
-        dbt_asset.to_display_path(&args.io.in_dir)
-    };
-
     resolve_model_context.extend(build_resolve_model_context(
         &properties_config,
         *adapter_type,
@@ -251,10 +290,9 @@ where
         &args.io,
     ));
 
-    show_progress!(
-        args.io,
-        fsinfo!(PARSING.into(), display_path.display().to_string())
-    );
+    if let Some(status_reporter) = &args.io.status_reporter {
+        status_reporter.show_progress(PARSING, &display_path_str, None);
+    }
 
     if let Some(model) = resolve_model_context.get("model")
         && let Ok(unique_id) = model.get_attr("unique_id")
@@ -272,11 +310,12 @@ where
             &sql,
             &dbt_common::CodeLocationWithFile::new(1, 1, 0, display_path.clone()),
             unique_id,
+            Some(*adapter_type),
         );
     }
 
     let listener_factory = DefaultRenderingEventListenerFactory::new(true);
-    match render_sql(
+    let (sql_file_info, status, rendered_sql, macro_spans) = match render_sql(
         &sql,
         jinja_env.as_ref(),
         &resolve_model_context,
@@ -341,17 +380,12 @@ where
 
             let macro_spans = listener_factory.drain_macro_spans(&display_path);
 
-            Ok(Some(SqlFileRenderResult {
-                asset: dbt_asset.clone(),
+            (
                 sql_file_info,
-                rendered_sql: rendered_sql_except_node_resolver,
-                macro_spans,
-                properties: maybe_model,
                 status,
-                patch_path: node_properties
-                    .get(ref_name)
-                    .map(|mpe| mpe.relative_path.clone()),
-            }))
+                rendered_sql_except_node_resolver,
+                macro_spans,
+            )
         }
         Err(err) => {
             // Build minimal info for error/disabled outcome
@@ -390,19 +424,35 @@ where
                 }
             };
 
-            Ok(Some(SqlFileRenderResult {
-                asset: dbt_asset.clone(),
-                sql_file_info,
-                rendered_sql: "".to_string(),
-                macro_spans: MacroSpans::default(),
-                properties: maybe_model,
-                status,
-                patch_path: node_properties
-                    .get(ref_name)
-                    .map(|mpe| mpe.relative_path.clone()),
-            }))
+            (sql_file_info, status, String::new(), MacroSpans::default())
         }
+    };
+
+    // Only check for duplicate resource definitions for enabled models to match dbt-core behavior.
+    if status == ModelStatus::Enabled
+        && has_duplicate_paths
+        && node_properties.get(ref_name).is_some()
+    {
+        register_duplicate_resource(
+            node_properties.get(ref_name).unwrap(),
+            ref_name,
+            "model",
+            duplicate_errors,
+        );
+        return Ok(None);
     }
+
+    Ok(Some(SqlFileRenderResult {
+        asset: dbt_asset.clone(),
+        sql_file_info,
+        rendered_sql,
+        macro_spans,
+        properties: maybe_model,
+        status,
+        patch_path: node_properties
+            .get(ref_name)
+            .map(|mpe| mpe.relative_path.clone()),
+    }))
 }
 
 /// Inner context for rendering sql files
@@ -582,7 +632,11 @@ async fn render_unresolved_sql_files_parallel<
         }
     }
 
-    *node_properties = merged_node_properties;
+    // Merge back node_properties - update entries that were processed while preserving
+    // entries that weren't (e.g., Python models that go through a different code path)
+    for (key, value) in merged_node_properties {
+        node_properties.insert(key, value);
+    }
 
     Ok(results)
 }
@@ -655,8 +709,8 @@ pub async fn collect_adapter_identifiers_detect_unsafe<T: InternalDbtNodeAttribu
     let chunk_size = model_vec.len().div_ceil(max_concurrency);
 
     let parse_adapter = jinja_env
-        .get_parse_adapter()
-        .expect("Adapter should be parse");
+        .get_adapter()
+        .expect("Adapter should be available during parse phase");
 
     // Use sequential processing if num_threads is 1, otherwise use parallel processing
     let mut dbt_nodes = if max_concurrency == 1 {
@@ -711,15 +765,21 @@ async fn process_model_chunk_for_unsafe_detection<T: InternalDbtNodeAttributes +
     package_name: String,
     root_project_name: String,
     runtime_config: Arc<DbtRuntimeConfig>,
-    parse_adapter: Arc<dbt_adapter::ParseAdapter>,
+    parse_adapter: Arc<dbt_adapter::BridgeAdapter>,
     token: &CancellationToken,
 ) -> FsResult<Vec<(T, bool)>> {
     let mut nodes = Vec::new();
+    let namespace_keys: Vec<String> = jinja_env
+        .env
+        .get_macro_namespace_registry()
+        .map(|r| r.keys().map(|k| k.to_string()).collect())
+        .unwrap_or_default();
     let mut render_base_context = build_compile_and_run_base_context(
         Arc::new(node_resolver.clone()),
         &package_name,
         &Nodes::default(),
         runtime_config.clone(),
+        namespace_keys,
     );
     silence_base_context(&mut render_base_context);
 
@@ -766,7 +826,7 @@ async fn process_model_chunk_for_unsafe_detection<T: InternalDbtNodeAttributes +
             .join(&model.common().original_file_path)
             .exists()
         {
-            PathBuf::from("target").join(&model.common().original_file_path)
+            PathBuf::from(DBT_TARGET_DIR_NAME).join(&model.common().original_file_path)
         } else {
             arg.io.in_dir.join(&model.common().original_file_path)
         };
@@ -779,6 +839,8 @@ async fn process_model_chunk_for_unsafe_detection<T: InternalDbtNodeAttributes +
             &display_path,
         );
         let is_unsafe = parse_adapter
+            .parse_adapter_state()
+            .expect("Adapter must be configured for the parse phase")
             .unsafe_nodes()
             .contains(&model.common().unique_id);
         nodes.push((model, is_unsafe));
@@ -806,7 +868,7 @@ async fn collect_adapter_identifiers_sequential<T: InternalDbtNodeAttributes + '
     package_name: &str,
     root_project_name: &str,
     runtime_config: Arc<DbtRuntimeConfig>,
-    parse_adapter: Arc<dbt_adapter::ParseAdapter>,
+    parse_adapter: Arc<dbt_adapter::BridgeAdapter>,
     chunk_size: usize,
     token: &CancellationToken,
 ) -> FsResult<Vec<(T, bool)>> {
@@ -845,7 +907,7 @@ async fn collect_adapter_identifiers_parallel<T: InternalDbtNodeAttributes + 'st
     package_name: &str,
     root_project_name: &str,
     runtime_config: Arc<DbtRuntimeConfig>,
-    parse_adapter: Arc<dbt_adapter::ParseAdapter>,
+    parse_adapter: Arc<dbt_adapter::BridgeAdapter>,
     chunk_size: usize,
     token: &CancellationToken,
 ) -> FsResult<Vec<(T, bool)>> {
@@ -956,6 +1018,7 @@ pub fn collect_hook_dependencies_from_config<T: DefaultTo<T> + 'static>(
                 sql,
                 &dbt_common::CodeLocationWithFile::new(1, 1, 0, resource_path.to_path_buf()),
                 unique_id,
+                None,
             );
         }
         let listener_factory = DefaultRenderingEventListenerFactory::default();

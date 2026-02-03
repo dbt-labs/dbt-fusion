@@ -1,7 +1,7 @@
 #![allow(unused_qualifications)]
 
 use crate::schemas::relations::DEFAULT_DATABRICKS_DATABASE;
-use crate::schemas::serde::{StringOrInteger, StringOrMap};
+use crate::schemas::serde::{QueryTag, StringOrInteger, StringOrMap};
 
 use dbt_common::adapter::AdapterType;
 use dbt_serde_yaml::JsonSchema;
@@ -44,7 +44,7 @@ pub enum DbConfig {
     Datafusion(Box<DatafusionDbConfig>),
     // SqlServer,
     // SingleStore,
-    // Spark,
+    Spark(Box<SparkDbConfig>),
     Databricks(Box<DatabricksDbConfig>),
     Salesforce(Box<SalesforceDbConfig>),
     // Hive,
@@ -112,6 +112,7 @@ impl DbConfig {
             DbConfig::Redshift(config) => config.host.as_ref(),
             DbConfig::Databricks(config) => config.host.as_ref(),
             DbConfig::Salesforce(config) => config.client_id.as_ref(),
+            DbConfig::Spark(config) => config.host.as_ref(),
         }
     }
 
@@ -215,6 +216,8 @@ impl DbConfig {
             DbConfig::Databricks(_) => &["host", "http_path", "schema"],
             // TODO: Salesforce connection keys
             DbConfig::Salesforce(_) => &["login_url", "database", "data_transform_run_timeout"],
+            // TODO(serramatutu): Spark connection keys
+            DbConfig::Spark(_) => &[],
             // TODO: Trino and Datafusion connection keys
             DbConfig::Trino(_) => &[],
             DbConfig::Datafusion(_) => &[],
@@ -250,6 +253,7 @@ impl DbConfig {
             DbConfig::Redshift(config) => dbt_serde_yaml::to_value(config),
             DbConfig::Databricks(config) => dbt_serde_yaml::to_value(config),
             DbConfig::Salesforce(config) => dbt_serde_yaml::to_value(config),
+            DbConfig::Spark(config) => dbt_serde_yaml::to_value(config),
         }
     }
 
@@ -264,6 +268,7 @@ impl DbConfig {
             DbConfig::Datafusion(..) => "datafusion",
             DbConfig::Databricks(..) => "databricks",
             DbConfig::Salesforce(..) => "salesforce",
+            DbConfig::Spark(..) => "spark",
         }
     }
 
@@ -277,6 +282,7 @@ impl DbConfig {
             DbConfig::Datafusion(..) => None,
             DbConfig::Databricks(..) => Some(AdapterType::Databricks),
             DbConfig::Salesforce(..) => Some(AdapterType::Salesforce),
+            DbConfig::Spark(..) => Some(AdapterType::Spark),
         }
     }
 
@@ -290,6 +296,7 @@ impl DbConfig {
             DbConfig::Datafusion(config) => config.database.as_ref(),
             DbConfig::Databricks(config) => config.database.as_ref(),
             DbConfig::Salesforce(config) => config.database.as_ref(),
+            DbConfig::Spark(_) => None,
         }
     }
 
@@ -302,6 +309,7 @@ impl DbConfig {
             DbConfig::Bigquery(config) => config.schema.as_ref(),
             DbConfig::Datafusion(config) => config.schema.as_ref(),
             DbConfig::Databricks(config) => config.schema.as_ref(),
+            DbConfig::Spark(config) => config.schema.as_ref(),
             DbConfig::Salesforce(_) => None,
         }
     }
@@ -316,6 +324,7 @@ impl DbConfig {
             DbConfig::Trino(config) => config.threads.as_ref(),
             DbConfig::Datafusion(_) => None,
             DbConfig::Salesforce(_) => None,
+            DbConfig::Spark(_) => None,
         }
     }
 
@@ -329,6 +338,7 @@ impl DbConfig {
             DbConfig::Redshift(config) => config.threads = threads,
             DbConfig::Datafusion(_) => (),
             DbConfig::Salesforce(_) => (),
+            DbConfig::Spark(_) => (),
         }
     }
 
@@ -369,6 +379,8 @@ pub enum Execute {
     #[default]
     Remote,
     Local,
+    Sidecar,
+    Service,
 }
 
 impl Display for Execute {
@@ -376,6 +388,8 @@ impl Display for Execute {
         match self {
             Execute::Remote => write!(f, "remote"),
             Execute::Local => write!(f, "local"),
+            Execute::Sidecar => write!(f, "sidecar"),
+            Execute::Service => write!(f, "service"),
         }
     }
 }
@@ -491,7 +505,7 @@ pub struct SnowflakeDbConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub threads: Option<StringOrInteger>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub query_tag: Option<String>,
+    pub query_tag: Option<QueryTag>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_all: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -771,6 +785,92 @@ fn default_data_transform_run_timeout() -> Option<i64> {
     Some(180000) // 3 mins
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SparkMethod {
+    Thrift,
+    Livy,
+    // TODO: HTTP, Spark Connect, EMR StartJob, Session (?)
+}
+
+#[derive(Default, Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum SparkAuth {
+    NoSasl,
+    SaslCustom,
+    SaslKerberos,
+    SaslLdap,
+    #[default]
+    SaslNone,
+    SaslPlain,
+}
+
+impl Display for SparkAuth {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::NoSasl => write!(f, "NOSASL"),
+            Self::SaslCustom => write!(f, "CUSTOM"),
+            Self::SaslKerberos => write!(f, "KERBEROS"),
+            Self::SaslLdap => write!(f, "LDAP"),
+            Self::SaslNone => write!(f, "NONE"),
+            Self::SaslPlain => write!(f, "PLAIN"),
+        }
+    }
+}
+
+impl std::str::FromStr for SparkAuth {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "CUSTOM" => Ok(Self::SaslCustom),
+            "KERBEROS" => Ok(Self::SaslKerberos),
+            "LDAP" => Ok(Self::SaslLdap),
+            "NONE" => Ok(Self::SaslNone),
+            "NOSASL" => Ok(Self::NoSasl),
+            "PLAIN" => Ok(Self::SaslPlain),
+            _ => Err(format!("Invalid Spark auth mode: {s}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, Merge)]
+#[merge(strategy = merge_strategies_extend::overwrite_option)]
+#[serde(rename_all = "snake_case")]
+pub struct SparkDbConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth: Option<SparkAuth>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub use_ssl: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<SparkMethod>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kerberos_service_name: Option<String>,
+    // TODO: python supports some extra properties:
+    // - cluster
+    // - connect_retries
+    // - connect_timeout
+    // - connection_string_suffix
+    // - database (same as schema)
+    // - driver
+    // - endpoint
+    // - organization
+    // - poll_interval
+    // - query_retries
+    // - query_timeout
+    // - retry_all
+    // - server_side_parameters
+    // - token
+}
+
 #[derive(Serialize, JsonSchema)]
 #[serde(untagged)]
 #[serde(rename_all = "snake_case")]
@@ -784,6 +884,7 @@ pub enum TargetContext {
     Databricks(DatabricksTargetEnv),
     Redshift(RedshiftTargetEnv),
     Salesforce(SalesforceTargetEnv),
+    Spark(SparkTargetEnv),
     // Add other variants as needed
 }
 
@@ -818,7 +919,7 @@ pub struct SnowflakeTargetEnv {
     pub role: Option<String>,
     pub authenticator: Option<String>,
     pub oauth_client_id: Option<String>,
-    pub query_tag: Option<String>,
+    pub query_tag: Option<QueryTag>,
     pub client_session_keep_alive: bool, // Default: false
     pub host: Option<String>,
     pub port: Option<String>,
@@ -925,6 +1026,18 @@ pub struct RedshiftTargetEnv {
 #[derive(Serialize, JsonSchema)]
 pub struct SalesforceTargetEnv {
     pub __common__: CommonTargetContext,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct SparkTargetEnv {
+    pub __common__: CommonTargetContext,
+    pub method: SparkMethod,
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub auth: SparkAuth,
+    pub use_ssl: bool,
+    pub kerberos_service_name: String,
 }
 
 fn missing(field: &str) -> String {
@@ -1136,6 +1249,24 @@ impl TryFrom<DbConfig> for TargetContext {
                     database: config.database.ok_or_else(|| missing("database"))?,
                     // `SalesforceDbConfig` doesn't have `schema`
                     schema: "".to_string(),
+                    type_: adapter_type,
+                    threads: None,
+                },
+            })),
+
+            DbConfig::Spark(config) => Ok(TargetContext::Spark(SparkTargetEnv {
+                method: config.method.ok_or_else(|| missing("method"))?,
+                host: config.host.ok_or_else(|| missing("host"))?,
+                port: config.port.unwrap_or(10000),
+                user: config.user.unwrap_or_default(),
+
+                kerberos_service_name: config.kerberos_service_name.unwrap_or_default(),
+                use_ssl: config.use_ssl.unwrap_or(false),
+                auth: config.auth.unwrap_or_default(),
+
+                __common__: CommonTargetContext {
+                    database: "".to_string(),
+                    schema: config.schema.ok_or_else(|| missing("schema"))?,
                     type_: adapter_type,
                     threads: None,
                 },

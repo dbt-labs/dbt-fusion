@@ -1,3 +1,6 @@
+use crate::schemas::common::ClusterConfig;
+use crate::schemas::serde::OmissibleGrantConfig;
+use crate::schemas::serde::QueryTag;
 use dbt_common::io_args::StaticAnalysisKind;
 use dbt_serde_yaml::JsonSchema;
 use dbt_serde_yaml::ShouldBe;
@@ -19,10 +22,11 @@ use crate::schemas::common::DbtQuoting;
 use crate::schemas::common::DocsConfig;
 use crate::schemas::common::HardDeletes;
 use crate::schemas::common::Hooks;
+use crate::schemas::common::PartitionConfig;
 use crate::schemas::common::PersistDocsConfig;
 use crate::schemas::common::Schedule;
+use crate::schemas::common::SyncConfig;
 use crate::schemas::manifest::GrantAccessToTarget;
-use crate::schemas::manifest::{BigqueryClusterConfig, PartitionConfig};
 use crate::schemas::project::DefaultTo;
 use crate::schemas::project::TypedRecursiveConfig;
 use crate::schemas::project::configs::common::WarehouseSpecificNodeConfig;
@@ -33,8 +37,7 @@ use crate::schemas::project::configs::common::default_to_grants;
 use crate::schemas::serde::StringOrArrayOfStrings;
 use crate::schemas::serde::bool_or_string_bool;
 use crate::schemas::serde::{
-    IndexesConfig, PrimaryKeyConfig, f64_or_string_f64, serialize_string_or_array_map,
-    u64_or_string_u64,
+    IndexesConfig, PrimaryKeyConfig, f64_or_string_f64, u64_or_string_u64,
 };
 
 // NOTE: No #[skip_serializing_none] - we handle None serialization in serialize_with_mode
@@ -86,8 +89,8 @@ pub struct ProjectSnapshotConfig {
     pub post_hook: Verbatim<Option<Hooks>>,
     #[serde(rename = "+persist_docs")]
     pub persist_docs: Option<PersistDocsConfig>,
-    #[serde(rename = "+grants", serialize_with = "serialize_string_or_array_map")]
-    pub grants: Option<BTreeMap<String, StringOrArrayOfStrings>>,
+    #[serde(rename = "+grants")]
+    pub grants: OmissibleGrantConfig,
     #[serde(rename = "+event_time")]
     pub event_time: Option<String>,
     #[serde(rename = "+quoting")]
@@ -144,7 +147,7 @@ pub struct ProjectSnapshotConfig {
     #[serde(rename = "+initialize")]
     pub initialize: Option<String>,
     #[serde(rename = "+query_tag")]
-    pub query_tag: Option<String>,
+    pub query_tag: Option<QueryTag>,
     #[serde(rename = "+table_tag")]
     pub table_tag: Option<String>,
     #[serde(rename = "+row_access_policy")]
@@ -167,7 +170,7 @@ pub struct ProjectSnapshotConfig {
     pub transient: Option<bool>,
     // Adapter-specific fields (BigQuery)
     #[serde(rename = "+cluster_by")]
-    pub cluster_by: Option<BigqueryClusterConfig>,
+    pub cluster_by: Option<ClusterConfig>,
     #[serde(
         default,
         rename = "+enable_refresh",
@@ -308,6 +311,11 @@ pub struct ProjectSnapshotConfig {
     // Schedule (Databricks streaming tables)
     #[serde(rename = "+schedule")]
     pub schedule: Option<Schedule>,
+
+    /// Schema synchronization configuration
+    #[serde(rename = "+sync")]
+    pub sync: Option<SyncConfig>,
+
     // Flattened field:
     pub __additional_properties__: BTreeMap<String, ShouldBe<ProjectSnapshotConfig>>,
 }
@@ -354,8 +362,8 @@ pub struct SnapshotConfig {
     #[serde(alias = "post-hook")]
     pub post_hook: Verbatim<Option<Hooks>>,
     pub persist_docs: Option<PersistDocsConfig>,
-    #[serde(default, serialize_with = "serialize_string_or_array_map")]
-    pub grants: Option<BTreeMap<String, StringOrArrayOfStrings>>,
+    #[serde(default)]
+    pub grants: OmissibleGrantConfig,
     pub event_time: Option<String>,
     pub quoting: Option<DbtQuoting>,
     pub static_analysis: Option<Spanned<StaticAnalysisKind>>,
@@ -366,6 +374,8 @@ pub struct SnapshotConfig {
     #[serde(default, deserialize_with = "bool_or_string_bool")]
     pub invalidate_hard_deletes: Option<bool>,
     pub docs: Option<DocsConfig>,
+    /// Schema synchronization configuration
+    pub sync: Option<SyncConfig>,
     // Adapter specific configs
     pub __warehouse_specific_config__: WarehouseSpecificNodeConfig,
 }
@@ -499,6 +509,7 @@ impl From<ProjectSnapshotConfig> for SnapshotConfig {
             quote_columns: config.quote_columns,
             invalidate_hard_deletes: config.invalidate_hard_deletes,
             docs: config.docs,
+            sync: config.sync,
             __warehouse_specific_config__: WarehouseSpecificNodeConfig {
                 description: None, // Only for Bigquery models
                 adapter_properties: config.adapter_properties,
@@ -697,6 +708,7 @@ impl From<SnapshotConfig> for ProjectSnapshotConfig {
             indexes: config.__warehouse_specific_config__.indexes,
             // Schedule (Databricks streaming tables)
             schedule: config.__warehouse_specific_config__.schedule,
+            sync: config.sync,
             __additional_properties__: BTreeMap::new(),
         }
     }
@@ -745,6 +757,7 @@ impl DefaultTo<SnapshotConfig> for SnapshotConfig {
             invalidate_hard_deletes,
             docs,
             static_analysis,
+            sync,
             // Flattened configs
             __warehouse_specific_config__: warehouse_specific_config,
         } = self;
@@ -794,6 +807,7 @@ impl DefaultTo<SnapshotConfig> for SnapshotConfig {
                 check_cols,
                 static_analysis,
                 materialized,
+                sync,
             ]
         );
     }

@@ -9,14 +9,16 @@ use std::collections::btree_map::Iter;
 
 use super::config_keys::ConfigKeys;
 use crate::default_to;
-use crate::schemas::common::{DbtQuoting, FreshnessDefinition, Schedule};
+use crate::schemas::common::PartitionConfig;
+use crate::schemas::common::{
+    ClusterConfig, DbtQuoting, FreshnessDefinition, Schedule, SchemaOrigin, SyncConfig,
+};
 use crate::schemas::manifest::GrantAccessToTarget;
-use crate::schemas::manifest::{BigqueryClusterConfig, PartitionConfig};
 use crate::schemas::project::configs::common::WarehouseSpecificNodeConfig;
 use crate::schemas::project::configs::common::{default_meta_and_tags, default_quoting};
 use crate::schemas::project::{DefaultTo, TypedRecursiveConfig};
 use crate::schemas::serde::{
-    IndexesConfig, PrimaryKeyConfig, StringOrArrayOfStrings, bool_or_string_bool,
+    IndexesConfig, PrimaryKeyConfig, QueryTag, StringOrArrayOfStrings, bool_or_string_bool,
     f64_or_string_f64, u64_or_string_u64,
 };
 
@@ -62,7 +64,7 @@ pub struct ProjectSourceConfig {
     #[serde(rename = "+tmp_relation_type")]
     pub tmp_relation_type: Option<String>,
     #[serde(rename = "+query_tag")]
-    pub query_tag: Option<String>,
+    pub query_tag: Option<QueryTag>,
     #[serde(rename = "+table_tag")]
     pub table_tag: Option<String>,
     #[serde(rename = "+row_access_policy")]
@@ -92,7 +94,7 @@ pub struct ProjectSourceConfig {
     #[serde(rename = "+partition_by")]
     pub partition_by: Option<PartitionConfig>,
     #[serde(rename = "+cluster_by")]
-    pub cluster_by: Option<BigqueryClusterConfig>,
+    pub cluster_by: Option<ClusterConfig>,
     #[serde(
         default,
         rename = "+hours_to_expiration",
@@ -243,6 +245,13 @@ pub struct ProjectSourceConfig {
     #[serde(rename = "+schedule")]
     pub schedule: Option<Schedule>,
 
+    /// Specifies where the schema metadata originates: 'remote' (default) or 'local'
+    #[serde(rename = "+schema_origin")]
+    pub schema_origin: Option<SchemaOrigin>,
+    /// Schema synchronization configuration
+    #[serde(rename = "+sync")]
+    pub sync: Option<SyncConfig>,
+
     // Flattened fields
     pub __additional_properties__: BTreeMap<String, ShouldBe<ProjectSourceConfig>>,
 }
@@ -270,6 +279,10 @@ pub struct SourceConfig {
     pub loaded_at_field: Option<String>,
     pub loaded_at_query: Verbatim<Option<String>>,
     pub static_analysis: Option<Spanned<StaticAnalysisKind>>,
+    /// Specifies where the schema metadata originates: 'remote' (default) or 'local'
+    pub schema_origin: Option<SchemaOrigin>,
+    /// Schema synchronization configuration
+    pub sync: Option<SyncConfig>,
     // Adapter specific configs
     pub __warehouse_specific_config__: WarehouseSpecificNodeConfig,
 }
@@ -286,6 +299,8 @@ impl From<ProjectSourceConfig> for SourceConfig {
             loaded_at_field: config.loaded_at_field,
             loaded_at_query: config.loaded_at_query,
             static_analysis: config.static_analysis,
+            schema_origin: config.schema_origin,
+            sync: config.sync,
             __warehouse_specific_config__: WarehouseSpecificNodeConfig {
                 description: None, // Only for Bigquery Models
                 adapter_properties: config.adapter_properties,
@@ -382,6 +397,8 @@ impl From<SourceConfig> for ProjectSourceConfig {
             loaded_at_field: config.loaded_at_field,
             loaded_at_query: config.loaded_at_query,
             static_analysis: config.static_analysis,
+            schema_origin: config.schema_origin,
+            sync: config.sync,
             // Snowflake fields
             adapter_properties: config.__warehouse_specific_config__.adapter_properties,
             external_volume: config.__warehouse_specific_config__.external_volume,
@@ -486,6 +503,8 @@ impl DefaultTo<SourceConfig> for SourceConfig {
             loaded_at_field,
             loaded_at_query,
             static_analysis,
+            schema_origin,
+            sync,
             __warehouse_specific_config__: warehouse_specific_config,
         } = self;
 
@@ -510,6 +529,8 @@ impl DefaultTo<SourceConfig> for SourceConfig {
                 loaded_at_field,
                 loaded_at_query,
                 static_analysis,
+                schema_origin,
+                sync,
             ]
         );
     }

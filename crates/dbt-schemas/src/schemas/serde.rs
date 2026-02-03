@@ -1,4 +1,5 @@
 use crate::schemas::manifest::postgres::PostgresIndex;
+use dbt_common::serde_utils::Omissible;
 use dbt_common::{CodeLocationWithFile, ErrorCode, FsError, FsResult, stdfs};
 use dbt_serde_yaml::{JsonSchema, Spanned, UntaggedEnumDeserialize};
 use indexmap::IndexMap;
@@ -163,6 +164,16 @@ where
         .or_else(|| value.as_str().and_then(|s| s.parse::<u64>().ok())))
 }
 
+pub fn i64_or_string_i64<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = dbt_serde_yaml::Value::deserialize(deserializer)?;
+    Ok(value
+        .as_i64()
+        .or_else(|| value.as_str().and_then(|s| s.parse::<i64>().ok())))
+}
+
 pub fn f64_or_string_f64<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
 where
     D: Deserializer<'de>,
@@ -175,6 +186,91 @@ where
 
 pub fn default_true() -> Option<bool> {
     Some(true)
+}
+
+// =============================================================================
+// QueryTag - Wrapper type for query_tag that converts maps/sequences to JSON strings
+// =============================================================================
+//
+// This type matches dbt-core's query_tag behavior:
+// - String values are kept as-is
+// - Map/dict values are JSON-serialized to strings
+// - Sequence/list values are JSON-serialized to strings
+// - Always serializes as a string
+// - Use as Option<QueryTag> for optional fields
+
+/// A wrapper type for the `query_tag` config field that handles flexible deserialization.
+///
+/// Accepts strings, dictionaries, or sequences for query_tag. Maps and sequences
+/// are JSON-serialized to strings.
+///
+/// # Example
+///
+/// ```ignore
+/// // Input: "my-tag"
+/// // Stores as: "my-tag"
+///
+/// // Input: {"project": "foo", "env": "prod"}
+/// // Stores as: "{\"project\":\"foo\",\"env\":\"prod\"}"
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, JsonSchema)]
+pub struct QueryTag(pub String);
+
+impl QueryTag {
+    /// Creates a QueryTag from a String
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    /// Consumes self and returns the inner value
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+
+    /// Returns a reference to the inner value
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Serialize for QueryTag {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for QueryTag {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = dbt_serde_yaml::Value::deserialize(deserializer)?;
+        match value {
+            dbt_serde_yaml::Value::String(s, _) => Ok(QueryTag(s)),
+            dbt_serde_yaml::Value::Mapping(_, _) | dbt_serde_yaml::Value::Sequence(_, _) => {
+                // Convert map or sequence to JSON string to match dbt-core behavior
+                let json_string = serde_json::to_string(&value)
+                    .map_err(|e| de::Error::custom(format!("Failed to serialize to JSON: {e}")))?;
+                Ok(QueryTag(json_string))
+            }
+            _ => Err(de::Error::custom("expected a string, a map, or a sequence")),
+        }
+    }
+}
+
+impl From<String> for QueryTag {
+    fn from(value: String) -> Self {
+        QueryTag(value)
+    }
+}
+
+impl From<QueryTag> for String {
+    fn from(config: QueryTag) -> Self {
+        config.0
+    }
 }
 
 pub fn try_from_value<T: DeserializeOwned>(
@@ -376,28 +472,138 @@ impl Serialize for AsArray<'_> {
     }
 }
 
-/// Serialize a map of `StringOrArrayOfStrings` values, normalizing all values to arrays.
-/// This is useful for config fields like `grants` where the input can be
-/// either a single string or an array of strings, but should always serialize as an array.
-/// If the value is `None`, serializes as an empty map `{}`.
-pub fn serialize_string_or_array_map<S>(
-    value: &Option<BTreeMap<String, StringOrArrayOfStrings>>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    use serde::ser::SerializeMap;
+/// Wrapper type for grant configurations that normalizes values to arrays during serialization.
+///
+/// This type handles grant configurations with the following behavior:
+/// - Normalizes string values to arrays during serialization
+/// - Preserves insertion order using IndexMap
+#[derive(Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
+pub struct GrantConfig(pub IndexMap<String, StringOrArrayOfStrings>);
 
-    match value {
-        Some(map) => {
-            let mut map_ser = serializer.serialize_map(Some(map.len()))?;
-            for (k, v) in map {
-                map_ser.serialize_entry(k, &AsArray(v))?;
-            }
-            map_ser.end()
+/// Wrapper around `Omissible<GrantConfig>` with Jinja-compatible serialization.
+///
+/// Serializes `Omitted` as `{}` instead of `null` for dbt-core compat
+/// All other behavior delegates to `Omissible<GrantConfig>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OmissibleGrantConfig(pub Omissible<GrantConfig>);
+
+impl Default for OmissibleGrantConfig {
+    fn default() -> Self {
+        OmissibleGrantConfig(Omissible::Omitted)
+    }
+}
+
+impl<'de> Deserialize<'de> for OmissibleGrantConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use dbt_common::serde_utils::Omissible;
+        Omissible::<GrantConfig>::deserialize(deserializer).map(OmissibleGrantConfig)
+    }
+}
+
+impl Serialize for OmissibleGrantConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use dbt_common::serde_utils::Omissible;
+        match &self.0 {
+            Omissible::Present(grant_config) => grant_config.serialize(serializer),
+            // Omitted -> {} instead of null (for Jinja compatibility)
+            Omissible::Omitted => GrantConfig::default().serialize(serializer),
         }
-        None => serializer.serialize_map(Some(0))?.end(),
+    }
+}
+
+impl OmissibleGrantConfig {
+    pub fn is_omitted(&self) -> bool {
+        self.0.is_omitted()
+    }
+
+    pub fn as_ref(&self) -> Option<&GrantConfig> {
+        self.0.as_ref()
+    }
+
+    pub fn as_mut(&mut self) -> Option<&mut GrantConfig> {
+        self.0.as_mut()
+    }
+}
+
+impl schemars::JsonSchema for OmissibleGrantConfig {
+    fn schema_name() -> String {
+        GrantConfig::schema_name()
+    }
+
+    fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        GrantConfig::json_schema(generator)
+    }
+
+    fn is_referenceable() -> bool {
+        GrantConfig::is_referenceable()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        GrantConfig::schema_id()
+    }
+
+    #[doc(hidden)]
+    fn _schemars_private_non_optional_json_schema(
+        generator: &mut schemars::r#gen::SchemaGenerator,
+    ) -> schemars::schema::Schema {
+        GrantConfig::_schemars_private_non_optional_json_schema(generator)
+    }
+
+    #[doc(hidden)]
+    fn _schemars_private_is_option() -> bool {
+        true
+    }
+}
+
+impl<'de> Deserialize<'de> for GrantConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let map = IndexMap::<String, StringOrArrayOfStrings>::deserialize(deserializer)?;
+        Ok(GrantConfig(map))
+    }
+}
+
+impl Serialize for GrantConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        // Serialize to {} by default for dbt-core Compat. Used in things like iterators.
+        let mut map_ser = serializer.serialize_map(Some(self.0.len()))?;
+        for (k, v) in &self.0 {
+            map_ser.serialize_entry(k, &AsArray(v))?;
+        }
+        map_ser.end()
+    }
+}
+
+impl GrantConfig {
+    /// Get a reference to the value associated with a key
+    pub fn get(&self, key: &str) -> Option<&StringOrArrayOfStrings> {
+        self.0.get(key)
+    }
+
+    /// Check if a key exists in the grants
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.0.contains_key(key)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
     }
 }
 
@@ -770,23 +976,24 @@ impl std::fmt::Display for FloatOrString {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dbt_common::serde_utils::Omissible;
 
-    #[derive(Serialize, Deserialize, Default)]
+    #[derive(Serialize, Deserialize)]
     struct TestConfig {
-        #[serde(default, serialize_with = "serialize_string_or_array_map")]
-        grants: Option<BTreeMap<String, StringOrArrayOfStrings>>,
+        #[serde(default)]
+        grants: OmissibleGrantConfig,
     }
 
     #[test]
-    fn test_serialize_string_or_array_map_normalizes_string_to_array() {
-        let mut grants: BTreeMap<String, StringOrArrayOfStrings> = BTreeMap::new();
+    fn test_grant_config_normalizes_string_to_array() {
+        let mut grants: IndexMap<String, StringOrArrayOfStrings> = IndexMap::new();
         grants.insert(
             "select".to_string(),
             StringOrArrayOfStrings::String("ROLE_A".to_string()),
         );
 
         let config = TestConfig {
-            grants: Some(grants),
+            grants: OmissibleGrantConfig(Omissible::Present(GrantConfig(grants))),
         };
         let json = serde_json::to_string(&config).unwrap();
 
@@ -795,8 +1002,8 @@ mod tests {
     }
 
     #[test]
-    fn test_serialize_string_or_array_map_preserves_array() {
-        let mut grants = BTreeMap::new();
+    fn test_grant_config_preserves_array() {
+        let mut grants = IndexMap::new();
         grants.insert(
             "select".to_string(),
             StringOrArrayOfStrings::ArrayOfStrings(vec![
@@ -806,7 +1013,7 @@ mod tests {
         );
 
         let config = TestConfig {
-            grants: Some(grants),
+            grants: OmissibleGrantConfig(Omissible::Present(GrantConfig(grants))),
         };
         let json = serde_json::to_string(&config).unwrap();
 
@@ -814,167 +1021,23 @@ mod tests {
     }
 
     #[test]
-    fn test_serialize_string_or_array_map_none_becomes_empty_map() {
-        let config = TestConfig { grants: None };
-        let json = serde_json::to_string(&config).unwrap();
-
-        // None should serialize as empty map, not null
-        assert_eq!(json, r#"{"grants":{}}"#);
-    }
-
-    #[test]
-    fn test_serialize_string_or_array_map_empty_map() {
+    fn test_grant_config_omitted_serializes_as_empty_map() {
         let config = TestConfig {
-            grants: Some(BTreeMap::new()),
+            grants: OmissibleGrantConfig(Omissible::Omitted),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+
+        // Omitted should serialize as empty map for Jinja compatibility
+        assert_eq!(json, r#"{"grants":{}}"#);
+    }
+
+    #[test]
+    fn test_grant_config_empty_map() {
+        let config = TestConfig {
+            grants: OmissibleGrantConfig(Omissible::Present(GrantConfig(IndexMap::new()))),
         };
         let json = serde_json::to_string(&config).unwrap();
 
         assert_eq!(json, r#"{"grants":{}}"#);
-    }
-
-    // ==========================================================================
-    // Tests for PrimaryKeyConfig (sadboy's wrapper type approach)
-    // ==========================================================================
-
-    #[derive(Serialize, Deserialize, Default)]
-    struct TestModelConfig {
-        #[serde(default)]
-        primary_key: PrimaryKeyConfig,
-    }
-
-    #[test]
-    fn test_primary_key_config_normalizes_string_to_array() {
-        let config = TestModelConfig {
-            primary_key: PrimaryKeyConfig::from_value(StringOrArrayOfStrings::String(
-                "id".to_string(),
-            )),
-        };
-        let json = serde_json::to_string(&config).unwrap();
-
-        // String should be normalized to array
-        assert_eq!(json, r#"{"primary_key":["id"]}"#);
-    }
-
-    #[test]
-    fn test_primary_key_config_preserves_array() {
-        let config = TestModelConfig {
-            primary_key: PrimaryKeyConfig::from_value(StringOrArrayOfStrings::ArrayOfStrings(
-                vec!["id".to_string(), "tenant_id".to_string()],
-            )),
-        };
-        let json = serde_json::to_string(&config).unwrap();
-
-        assert_eq!(json, r#"{"primary_key":["id","tenant_id"]}"#);
-    }
-
-    #[test]
-    fn test_primary_key_config_none_serializes_as_null() {
-        let config = TestModelConfig {
-            primary_key: PrimaryKeyConfig::new(),
-        };
-        let json = serde_json::to_string(&config).unwrap();
-
-        // None should serialize as null
-        assert_eq!(json, r#"{"primary_key":null}"#);
-    }
-
-    #[test]
-    fn test_primary_key_config_deserialize_string() {
-        let json = r#"{"primary_key":"id"}"#;
-        let config: TestModelConfig = serde_json::from_str(json).unwrap();
-
-        assert!(config.primary_key.is_some());
-        assert_eq!(
-            config.primary_key.to_strings(),
-            Some(vec!["id".to_string()])
-        );
-    }
-
-    #[test]
-    fn test_primary_key_config_deserialize_array() {
-        let json = r#"{"primary_key":["id","tenant_id"]}"#;
-        let config: TestModelConfig = serde_json::from_str(json).unwrap();
-
-        assert!(config.primary_key.is_some());
-        assert_eq!(
-            config.primary_key.to_strings(),
-            Some(vec!["id".to_string(), "tenant_id".to_string()])
-        );
-    }
-
-    #[test]
-    fn test_primary_key_config_deserialize_null() {
-        let json = r#"{"primary_key":null}"#;
-        let config: TestModelConfig = serde_json::from_str(json).unwrap();
-
-        assert!(config.primary_key.is_none());
-    }
-
-    #[test]
-    fn test_primary_key_config_deserialize_missing() {
-        let json = r#"{}"#;
-        let config: TestModelConfig = serde_json::from_str(json).unwrap();
-
-        assert!(config.primary_key.is_none());
-    }
-
-    // ==========================================================================
-    // Tests for IndexesConfig (sadboy's wrapper type approach)
-    // ==========================================================================
-
-    #[derive(Serialize, Deserialize, Default)]
-    struct TestPostgresConfig {
-        #[serde(default)]
-        indexes: IndexesConfig,
-    }
-
-    #[test]
-    fn test_indexes_config_deserialize_list_format() {
-        let json = r#"{"indexes":[{"columns":["id"],"unique":true}]}"#;
-        let config: TestPostgresConfig = serde_json::from_str(json).unwrap();
-
-        assert!(config.indexes.is_some());
-        assert_eq!(config.indexes.len(), 1);
-    }
-
-    #[test]
-    fn test_indexes_config_deserialize_dict_format() {
-        // Dictionary format where keys are names and values are the index configs
-        let json = r#"{"indexes":{"my_idx":{"columns":["id"],"unique":true},"other_idx":{"columns":["name"]}}}"#;
-        let config: TestPostgresConfig = serde_json::from_str(json).unwrap();
-
-        assert!(config.indexes.is_some());
-        // Keys are discarded, we just get the values
-        assert_eq!(config.indexes.len(), 2);
-    }
-
-    #[test]
-    fn test_indexes_config_deserialize_null() {
-        let json = r#"{"indexes":null}"#;
-        let config: TestPostgresConfig = serde_json::from_str(json).unwrap();
-
-        assert!(config.indexes.is_none());
-    }
-
-    #[test]
-    fn test_indexes_config_deserialize_missing() {
-        let json = r#"{}"#;
-        let config: TestPostgresConfig = serde_json::from_str(json).unwrap();
-
-        assert!(config.indexes.is_none());
-    }
-
-    #[test]
-    fn test_indexes_config_serializes_as_list() {
-        let json_input = r#"{"indexes":{"my_idx":{"columns":["id"],"unique":true}}}"#;
-        let config: TestPostgresConfig = serde_json::from_str(json_input).unwrap();
-
-        // Serialize back - should be a list (not a dict)
-        let json_output = serde_json::to_string(&config).unwrap();
-
-        // Output should contain array brackets
-        assert!(json_output.contains("[{"));
-        // And should NOT be a dict with keys
-        assert!(!json_output.contains("my_idx"));
     }
 }

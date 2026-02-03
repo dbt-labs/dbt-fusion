@@ -265,6 +265,22 @@ pub trait Object: fmt::Debug + Send + Sync {
         Err(Error::from(ErrorKind::UnknownMethod))
     }
 
+    /// Try to get a property from this object dynamically.
+    ///
+    /// Override this method if your type supports dynamic property access.
+    /// Returns `None` by default, meaning the normal attribute lookup path will be used.
+    fn get_property(
+        self: &Arc<Self>,
+        _state: &State<'_, '_>,
+        _name: &str,
+        _listeners: &[Rc<dyn RenderingEventListener>],
+    ) -> Result<Value, Error> {
+        Err(Error::new(
+            ErrorKind::InvalidOperation,
+            "object does not support get_property",
+        ))
+    }
+
     /// Formats the object for stringification.
     ///
     /// The default implementation is specific to the behavior of
@@ -678,6 +694,13 @@ type_erase! {
             state: &State<'_, '_>,
             method: &str,
             args: &[Value],
+            listeners: &[Rc<dyn RenderingEventListener>]
+        ) -> Result<Value, Error>;
+
+        fn get_property(
+            &self,
+            state: &State<'_, '_>,
+            name: &str,
             listeners: &[Rc<dyn RenderingEventListener>]
         ) -> Result<Value, Error>;
 
@@ -1390,6 +1413,11 @@ pub mod mutable_map {
         /// Get a value corresponding to the given `key`` from the map.
         pub fn get(&self, key: &Value) -> Option<Value> {
             lock_read!(self).get(key).cloned()
+        }
+
+        /// Check if the map contains the given `key`.
+        pub fn contains(&self, key: &Value) -> bool {
+            lock_read!(self).contains_key(key)
         }
 
         /// Return all keys in the map.

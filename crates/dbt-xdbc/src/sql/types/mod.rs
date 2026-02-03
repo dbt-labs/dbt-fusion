@@ -645,6 +645,8 @@ impl SqlType {
                 }
             },
 
+            // Snowflake uses VARIANT for JSON data
+            (Snowflake, Json | Jsonb) => write!(out, "VARIANT"),
             (_, Json) => write!(out, "JSON"),
             (_, Jsonb) => write!(out, "JSONB"),
             (_, Geometry(srid)) => {
@@ -735,6 +737,10 @@ impl SqlType {
             (_, Other(s)) => write!(out, "{s}"),
             // }}}
         }
+    }
+
+    pub fn display(&self, backend: Backend) -> SqlTypeDisplay<'_> {
+        SqlTypeDisplay(self, backend)
     }
 
     /// Best-effort conversion from an Arrow `DataType` to a `SqlType`.
@@ -1091,6 +1097,12 @@ impl SqlType {
                 // https://docs.aws.amazon.com/redshift/latest/dg/r_Numeric_types201.html#r_Numeric_types201-decimal-or-numeric-type
                 DataType::Decimal128(18, 0)
             }
+            // Redshift system tables have a variety of odd types that come in as Other. Most of them can be safely treated
+            // as Utf8, but oid is known BIGINT.
+            (Redshift | RedshiftODBC, Other(name)) if name.eq_ignore_ascii_case("oid") => {
+                DataType::Int64
+            }
+            (Redshift | RedshiftODBC, Other(_)) => DataType::Utf8,
             // }}}
 
             // DuckDB {{{
@@ -1408,6 +1420,18 @@ impl SqlType {
             }
         };
         data_type
+    }
+}
+
+pub struct SqlTypeDisplay<'a>(&'a SqlType, Backend);
+
+impl fmt::Display for SqlTypeDisplay<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // TODO(felipecrv): change SqlType::write to take a [fmt::Write] instead of
+        // [String] so I can pass `f` directly here.
+        let mut buffer = String::new();
+        self.0.write(self.1, &mut buffer)?;
+        write!(f, "{}", buffer)
     }
 }
 

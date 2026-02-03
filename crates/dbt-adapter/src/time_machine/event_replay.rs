@@ -25,12 +25,31 @@ use std::path::Path;
 use flate2::read::GzDecoder;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use similar::{ChangeTag, TextDiff};
 
 use super::event::{
-    AdapterCallEvent, MetadataCallArgs, MetadataCallEvent, RecordedEvent, RecordingHeader,
+    AdapterCallEvent, MetadataCallArgs, MetadataCallEvent, RecordedEvent, RecordingHeader, SaoEvent,
 };
 use super::semantic::SemanticCategory;
 use super::serde::values_match;
+use crate::sql::diff::compare_sql;
+
+/// Extract the SQL string from args (first string in array, or the string itself).
+///
+/// For execute/run_query, args are serialized as `[sql, auto_begin, fetch, limit, options]`
+/// so SQL is the first element of the array.
+fn extract_sql_from_args(args: &serde_json::Value) -> Option<&str> {
+    match args {
+        serde_json::Value::String(s) => Some(s.as_str()),
+        serde_json::Value::Array(arr) => arr.first().and_then(|v| v.as_str()),
+        _ => None,
+    }
+}
+
+/// Check if a method executes input SQL.
+fn is_sql_method(method: &str) -> bool {
+    method == "execute" || method == "run_query"
+}
 
 /// Compare two MetadataCallArgs for semantic equality.
 ///
@@ -57,7 +76,7 @@ fn metadata_args_match(recorded: &MetadataCallArgs, actual: &MetadataCallArgs) -
                 .iter()
                 .all(|rel| recorded_set.contains(rel))
         }
-        // For other types, the args are not volatile
+        // For other types, use exact value matching
         _ => {
             std::mem::discriminant(recorded) == std::mem::discriminant(actual) && {
                 match (serde_json::to_value(recorded), serde_json::to_value(actual)) {
@@ -193,6 +212,8 @@ pub struct Recording {
     adapter_events_by_node: HashMap<String, Vec<AdapterCallEvent>>,
     /// Metadata call events indexed by caller_id, sorted by seq
     metadata_events_by_caller: HashMap<String, Vec<MetadataCallEvent>>,
+    /// SAO skip events indexed by node_id
+    sao_events: HashMap<String, SaoEvent>,
     /// Current replay position per node for adapter calls (strict mode)
     adapter_positions: RwLock<HashMap<String, usize>>,
     /// Current replay position per caller for metadata calls (strict mode)
@@ -253,6 +274,7 @@ impl Recording {
         // Index events by node_id/caller_id
         let mut adapter_events_by_node: HashMap<String, Vec<AdapterCallEvent>> = HashMap::new();
         let mut metadata_events_by_caller: HashMap<String, Vec<MetadataCallEvent>> = HashMap::new();
+        let mut sao_events: HashMap<String, SaoEvent> = HashMap::new();
 
         for event in events {
             match event {
@@ -267,6 +289,11 @@ impl Recording {
                         .entry(metadata_event.caller_id.clone())
                         .or_default()
                         .push(metadata_event);
+                }
+                RecordedEvent::Sao(sao_event) => {
+                    // SAO events are keyed by node_id
+                    // ASSUMPTION: node_id is unique and 1-1 with SAO events
+                    sao_events.insert(sao_event.node_id.clone(), sao_event);
                 }
             }
         }
@@ -283,11 +310,38 @@ impl Recording {
             header,
             adapter_events_by_node,
             metadata_events_by_caller,
+            sao_events,
             adapter_positions: RwLock::new(HashMap::new()),
             metadata_positions: RwLock::new(HashMap::new()),
             semantic_adapter_state: RwLock::new(HashMap::new()),
             semantic_metadata_state: RwLock::new(HashMap::new()),
         })
+    }
+
+    // -------------------------------------------------------------------------
+    // SAO (State Aware Orchestration) methods
+    // -------------------------------------------------------------------------
+
+    /// Get SAO skip event for a node, if one was recorded.
+    ///
+    /// Returns the SAO event if the node was skipped due to a cache hit during recording.
+    pub fn get_sao_event(&self, node_id: &str) -> Option<&SaoEvent> {
+        self.sao_events.get(node_id)
+    }
+
+    /// Check if a node has a recorded SAO skip event.
+    pub fn has_sao_event(&self, node_id: &str) -> bool {
+        self.sao_events.contains_key(node_id)
+    }
+
+    /// Get all node IDs that have SAO skip events.
+    pub fn sao_node_ids(&self) -> impl Iterator<Item = &str> {
+        self.sao_events.keys().map(|s| s.as_str())
+    }
+
+    /// Get total number of SAO skip events.
+    pub fn total_sao_events(&self) -> usize {
+        self.sao_events.len()
     }
 
     // -------------------------------------------------------------------------
@@ -352,8 +406,8 @@ impl Recording {
         match category {
             SemanticCategory::Write => {
                 // Writes are barriers - must match the next write in sequence.
-                // Writes ARE tracked and consumed. Args must also match.
-                self.find_next_write_in_segment(events, node_state, method, args)
+                // Writes ARE tracked and consumed.
+                self.find_next_write_in_segment(events, node_state, method)
             }
             SemanticCategory::MetadataRead => {
                 // Reads can match any read in the current segment with matching args.
@@ -369,15 +423,13 @@ impl Recording {
     /// Find the next write operation in sequence (barrier semantics).
     ///
     /// Writes are tracked and consumed. They act as segment barriers.
-    /// In semantic mode, we only match by method name - the sequence order
-    /// provides correctness, and SQL content may contain dynamic values
-    /// (timestamps, query tags, invocation IDs) that differ between runs.
+    /// Matching is by method name only - the sequence order provides correctness.
+    /// SQL validation happens separately via `validate_replay()`.
     fn find_next_write_in_segment<'a>(
         &'a self,
         events: &'a [AdapterCallEvent],
         state: &mut SemanticReplayState,
         method: &str,
-        _args: &serde_json::Value,
     ) -> Option<&'a AdapterCallEvent> {
         let search_start = state.segment_start;
 
@@ -388,18 +440,19 @@ impl Recording {
                 continue;
             }
 
-            // Found a write - method name must match (args are not checked in semantic mode
-            // because SQL may contain dynamic content like timestamps, query tags, etc.)
-            if event.method == method {
-                // Advance the segment past this write
-                let abs_idx = search_start + idx;
-                state.segment_start = abs_idx + 1;
-                state.last_write_barrier = Some(abs_idx);
-                return Some(event);
-            } else {
+            // Found a write - check method name matches
+            if event.method != method {
                 // Write mismatch (method) - sequencing error
                 return None;
             }
+
+            // Match found. SQL validation should happen separately
+
+            // Advance the segment past this write
+            let abs_idx = search_start + idx;
+            state.segment_start = abs_idx + 1;
+            state.last_write_barrier = Some(abs_idx);
+            return Some(event);
         }
 
         None
@@ -412,7 +465,8 @@ impl Recording {
     /// and the replay code may call them more or fewer times than recorded.
     ///
     /// Matching is done on both method name AND arguments to ensure we return
-    /// the correct result for the specific call.
+    /// the correct result for the specific call. SQL strings within the args
+    /// are compared using fuzzy SQL matching to tolerate formatting differences.
     fn find_read_in_segment_untracked<'a>(
         &'a self,
         events: &'a [AdapterCallEvent],
@@ -676,7 +730,7 @@ impl Recording {
     // Statistics and reset
     // -------------------------------------------------------------------------
 
-    /// Get the total number of events (both adapter and metadata).
+    /// Get the total number of events (adapter, metadata, and SAO).
     pub fn total_events(&self) -> usize {
         self.adapter_events_by_node
             .values()
@@ -687,6 +741,7 @@ impl Recording {
                 .values()
                 .map(|v| v.len())
                 .sum::<usize>()
+            + self.sao_events.len()
     }
 
     /// Get total adapter events count.
@@ -783,6 +838,55 @@ pub enum ReplayDifference {
         expected: serde_json::Value,
         actual: serde_json::Value,
     },
+    SqlMismatch {
+        expected: String,
+        actual: String,
+    },
+}
+
+impl std::fmt::Display for ReplayDifference {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReplayDifference::MethodMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "Method mismatch: expected '{}', got '{}'",
+                    expected, actual
+                )
+            }
+            ReplayDifference::ArgCountMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "Arg count mismatch: expected {}, got {}",
+                    expected, actual
+                )
+            }
+            ReplayDifference::ArgValueMismatch {
+                index,
+                expected,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "Arg[{}] mismatch:\n  expected: {}\n  actual: {}",
+                    index, expected, actual
+                )
+            }
+            ReplayDifference::SqlMismatch { expected, actual } => {
+                writeln!(f, "SQL mismatch:")?;
+                let diff = TextDiff::from_lines(expected, actual);
+                for change in diff.iter_all_changes() {
+                    let sign = match change.tag() {
+                        ChangeTag::Delete => "-",
+                        ChangeTag::Insert => "+",
+                        ChangeTag::Equal => " ",
+                    };
+                    write!(f, "{}{}", sign, change)?;
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 /// Validate a replay call against a recorded event.
@@ -801,8 +905,39 @@ pub fn validate_replay(
         });
     }
 
-    // Check args
-    if let (Some(recorded_args), Some(actual_args)) = (recorded.args.as_array(), args.as_array()) {
+    // For SQL methods, validate the SQL string
+    if is_sql_method(method) {
+        // Extract SQL from first arg
+        let recorded_sql = extract_sql_from_args(&recorded.args);
+        let actual_sql = extract_sql_from_args(args);
+
+        match (recorded_sql, actual_sql) {
+            (Some(exp_sql), Some(act_sql)) => {
+                match compare_sql(exp_sql, act_sql) {
+                    Ok(()) => {
+                        // SQL is semantically equivalent, no difference to report
+                    }
+                    Err(_) => {
+                        differences.push(ReplayDifference::SqlMismatch {
+                            expected: exp_sql.to_string(),
+                            actual: act_sql.to_string(),
+                        });
+                    }
+                }
+            }
+            (None, None) => {}
+            _ => {
+                differences.push(ReplayDifference::ArgValueMismatch {
+                    index: 0,
+                    expected: recorded.args.clone(),
+                    actual: args.clone(),
+                });
+            }
+        }
+    } else if let (Some(recorded_args), Some(actual_args)) =
+        (recorded.args.as_array(), args.as_array())
+    {
+        // Non-SQL methods: validate all args
         if recorded_args.len() != actual_args.len() {
             differences.push(ReplayDifference::ArgCountMismatch {
                 expected: recorded_args.len(),
@@ -835,6 +970,19 @@ pub fn validate_replay(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::diff::compare_sql;
+
+    /// Compare SQL args for execute/run_query methods.
+    fn sql_args_match(recorded: &serde_json::Value, actual: &serde_json::Value) -> bool {
+        let recorded_sql = extract_sql_from_args(recorded);
+        let actual_sql = extract_sql_from_args(actual);
+
+        match (recorded_sql, actual_sql) {
+            (Some(r), Some(a)) => compare_sql(r, a).is_ok(),
+            (None, None) => true,
+            _ => false,
+        }
+    }
 
     /// Helper to create a test AdapterCallEvent
     fn make_event(
@@ -885,6 +1033,7 @@ mod tests {
             },
             adapter_events_by_node,
             metadata_events_by_caller: HashMap::new(),
+            sao_events: HashMap::new(),
             adapter_positions: RwLock::new(HashMap::new()),
             metadata_positions: RwLock::new(HashMap::new()),
             semantic_adapter_state: RwLock::new(HashMap::new()),
@@ -1421,6 +1570,7 @@ mod tests {
             },
             adapter_events_by_node,
             metadata_events_by_caller: HashMap::new(),
+            sao_events: HashMap::new(),
             adapter_positions: RwLock::new(HashMap::new()),
             metadata_positions: RwLock::new(HashMap::new()),
             semantic_adapter_state: RwLock::new(HashMap::new()),
@@ -1462,5 +1612,312 @@ mod tests {
             SemanticCategory::MetadataRead,
         );
         assert!(result.is_none(), "Should not find TABLE_C");
+    }
+
+    #[test]
+    fn test_sql_args_match_handles_whitespace_differences() {
+        // Test that SQL values are matched using fuzzy comparison
+        let sql1 = serde_json::json!(["SELECT   *\nFROM    users"]);
+        let sql2 = serde_json::json!(["SELECT*FROMusers"]);
+        assert!(
+            sql_args_match(&sql1, &sql2),
+            "SQL strings should match ignoring whitespace"
+        );
+    }
+
+    #[test]
+    fn test_sql_args_match_handles_query_tag_differences() {
+        // Test that query tag payloads are canonicalized
+        let sql1 = serde_json::json!([r#"alter session set query_tag = '{"model": "a"}'"#]);
+        let sql2 = serde_json::json!([r#"alter session set query_tag = '{"model": "b"}'"#]);
+        assert!(
+            sql_args_match(&sql1, &sql2),
+            "Query tag payloads should be canonicalized"
+        );
+    }
+
+    #[test]
+    fn test_sql_args_match_handles_uuid_differences() {
+        // Test that UUID literals are canonicalized
+        let sql1 = serde_json::json!(["SELECT '8f439b7e-752f-460a-8d1a-f469231d169c' AS id"]);
+        let sql2 = serde_json::json!(["SELECT '019a71ca-e5ad-7ca3-99d8-49b58a470d82' AS id"]);
+        assert!(
+            sql_args_match(&sql1, &sql2),
+            "UUID literals should be canonicalized"
+        );
+    }
+
+    #[test]
+    fn test_sql_args_match_handles_timestamp_differences() {
+        // Test that timestamp literals are matched flexibly
+        let sql1 = serde_json::json!(["WHERE created_at >= '2025-09-10T18:07:45'"]);
+        let sql2 = serde_json::json!(["WHERE created_at >= '2025-09-10T14:16:52'"]);
+        assert!(
+            sql_args_match(&sql1, &sql2),
+            "Timestamp literals should be matched flexibly"
+        );
+    }
+
+    #[test]
+    fn test_sql_args_match_detects_real_differences() {
+        // Test that actual semantic differences are still detected
+        let sql1 = serde_json::json!(["SELECT * FROM users"]);
+        let sql2 = serde_json::json!(["SELECT * FROM orders"]);
+        assert!(
+            !sql_args_match(&sql1, &sql2),
+            "Different table names should not match"
+        );
+    }
+
+    #[test]
+    fn test_sql_args_match_string_format() {
+        // Test that SQL can be passed as a direct string (not wrapped in array)
+        let sql1 = serde_json::json!("SELECT   *  FROM  users");
+        let sql2 = serde_json::json!("SELECT * FROM users");
+        assert!(
+            sql_args_match(&sql1, &sql2),
+            "Direct SQL strings should be matched with fuzzy comparison"
+        );
+    }
+
+    #[test]
+    fn test_semantic_mode_matches_sql_with_whitespace_differences() {
+        // Helper to create an event with SQL args
+        fn make_sql_event(
+            node_id: &str,
+            seq: u32,
+            method: &str,
+            sql: &str,
+            category: SemanticCategory,
+        ) -> AdapterCallEvent {
+            AdapterCallEvent {
+                node_id: node_id.to_string(),
+                seq,
+                method: method.to_string(),
+                semantic_category: category,
+                args: serde_json::json!([sql]),
+                result: serde_json::json!({"rows": 0}),
+                success: true,
+                error: None,
+                timestamp_ns: seq as u64 * 1000,
+            }
+        }
+
+        // Create events with SQL that differs only by whitespace
+        let events = vec![make_sql_event(
+            "node1",
+            0,
+            "execute",
+            "SELECT   *\nFROM    users\nWHERE   id = 1",
+            SemanticCategory::Write,
+        )];
+        let recording = make_recording(events);
+
+        // Should match with compact SQL (whitespace removed)
+        let compact_sql = serde_json::json!(["SELECT * FROM users WHERE id = 1"]);
+        let event = recording
+            .take_semantic_match("node1", "execute", &compact_sql, SemanticCategory::Write)
+            .expect("Should match SQL ignoring whitespace differences");
+        assert_eq!(event.method, "execute");
+    }
+
+    // -------------------------------------------------------------------------
+    // SAO (State Aware Orchestration) tests
+    // -------------------------------------------------------------------------
+
+    use super::super::event::SaoStatus;
+
+    /// Helper to create a test Recording with SAO events
+    fn make_recording_with_sao(
+        adapter_events: Vec<AdapterCallEvent>,
+        sao_events: Vec<SaoEvent>,
+    ) -> Recording {
+        let mut adapter_events_by_node: HashMap<String, Vec<AdapterCallEvent>> = HashMap::new();
+        for event in adapter_events {
+            adapter_events_by_node
+                .entry(event.node_id.clone())
+                .or_default()
+                .push(event);
+        }
+        for events in adapter_events_by_node.values_mut() {
+            events.sort_by_key(|e| e.seq);
+        }
+
+        let mut sao_events_map: HashMap<String, SaoEvent> = HashMap::new();
+        for event in sao_events {
+            sao_events_map.insert(event.node_id.clone(), event);
+        }
+
+        Recording {
+            header: RecordingHeader {
+                format_version: 1,
+                fusion_version: "test".to_string(),
+                adapter_type: "snowflake".to_string(),
+                recorded_at: "2024-01-01T00:00:00Z".to_string(),
+                invocation_id: "test-123".to_string(),
+                metadata: serde_json::Map::new(),
+            },
+            adapter_events_by_node,
+            metadata_events_by_caller: HashMap::new(),
+            sao_events: sao_events_map,
+            adapter_positions: RwLock::new(HashMap::new()),
+            metadata_positions: RwLock::new(HashMap::new()),
+            semantic_adapter_state: RwLock::new(HashMap::new()),
+            semantic_metadata_state: RwLock::new(HashMap::new()),
+        }
+    }
+
+    #[test]
+    fn test_sao_event_lookup() {
+        let sao_events = vec![
+            SaoEvent {
+                node_id: "model.test.orders".to_string(),
+                status: SaoStatus::ReusedNoChanges,
+                message: "No new changes on any upstreams".to_string(),
+                stored_hash: "abc123".to_string(),
+                timestamp_ns: 1000,
+            },
+            SaoEvent {
+                node_id: "model.test.customers".to_string(),
+                status: SaoStatus::ReusedStillFresh {
+                    freshness_seconds: 3600,
+                    last_updated_seconds: 1800,
+                },
+                message: "Still within freshness period".to_string(),
+                stored_hash: "def456".to_string(),
+                timestamp_ns: 2000,
+            },
+        ];
+        let recording = make_recording_with_sao(vec![], sao_events);
+
+        // Should find SAO events by node_id
+        let event = recording.get_sao_event("model.test.orders").unwrap();
+        assert!(matches!(event.status, SaoStatus::ReusedNoChanges));
+        assert_eq!(event.message, "No new changes on any upstreams");
+        assert_eq!(event.stored_hash, "abc123");
+
+        let event = recording.get_sao_event("model.test.customers").unwrap();
+        if let SaoStatus::ReusedStillFresh {
+            freshness_seconds,
+            last_updated_seconds,
+        } = event.status
+        {
+            assert_eq!(freshness_seconds, 3600);
+            assert_eq!(last_updated_seconds, 1800);
+        } else {
+            panic!("Expected ReusedStillFresh status");
+        }
+
+        // Should return None for unknown node
+        assert!(recording.get_sao_event("model.test.unknown").is_none());
+    }
+
+    #[test]
+    fn test_has_sao_event() {
+        let sao_events = vec![SaoEvent {
+            node_id: "model.test.orders".to_string(),
+            status: SaoStatus::ReusedNoChanges,
+            message: "No new changes".to_string(),
+            stored_hash: "abc123".to_string(),
+            timestamp_ns: 1000,
+        }];
+        let recording = make_recording_with_sao(vec![], sao_events);
+
+        assert!(recording.has_sao_event("model.test.orders"));
+        assert!(!recording.has_sao_event("model.test.unknown"));
+    }
+
+    #[test]
+    fn test_sao_node_ids() {
+        let sao_events = vec![
+            SaoEvent {
+                node_id: "model.test.orders".to_string(),
+                status: SaoStatus::ReusedNoChanges,
+                message: "No new changes".to_string(),
+                stored_hash: "abc123".to_string(),
+                timestamp_ns: 1000,
+            },
+            SaoEvent {
+                node_id: "model.test.customers".to_string(),
+                status: SaoStatus::ReusedStillFreshNoChanges,
+                message: "Still fresh".to_string(),
+                stored_hash: "def456".to_string(),
+                timestamp_ns: 2000,
+            },
+        ];
+        let recording = make_recording_with_sao(vec![], sao_events);
+
+        let node_ids: Vec<_> = recording.sao_node_ids().collect();
+        assert_eq!(node_ids.len(), 2);
+        assert!(node_ids.contains(&"model.test.orders"));
+        assert!(node_ids.contains(&"model.test.customers"));
+    }
+
+    #[test]
+    fn test_total_sao_events() {
+        let sao_events = vec![
+            SaoEvent {
+                node_id: "model.test.orders".to_string(),
+                status: SaoStatus::ReusedNoChanges,
+                message: "No new changes".to_string(),
+                stored_hash: "abc123".to_string(),
+                timestamp_ns: 1000,
+            },
+            SaoEvent {
+                node_id: "model.test.customers".to_string(),
+                status: SaoStatus::ReusedNoChanges,
+                message: "No new changes".to_string(),
+                stored_hash: "def456".to_string(),
+                timestamp_ns: 2000,
+            },
+        ];
+        let recording = make_recording_with_sao(vec![], sao_events);
+
+        assert_eq!(recording.total_sao_events(), 2);
+    }
+
+    #[test]
+    fn test_total_events_includes_sao() {
+        let adapter_events = vec![make_event("node1", 0, "execute", SemanticCategory::Write)];
+        let sao_events = vec![SaoEvent {
+            node_id: "model.test.orders".to_string(),
+            status: SaoStatus::ReusedNoChanges,
+            message: "No new changes".to_string(),
+            stored_hash: "abc123".to_string(),
+            timestamp_ns: 1000,
+        }];
+        let recording = make_recording_with_sao(adapter_events, sao_events);
+
+        // Total should include both adapter events and SAO events
+        assert_eq!(recording.total_events(), 2);
+        assert_eq!(recording.total_adapter_events(), 1);
+        assert_eq!(recording.total_sao_events(), 1);
+    }
+
+    #[test]
+    fn test_mixed_adapter_and_sao_events() {
+        // Some nodes have adapter events, some have SAO events
+        let adapter_events = vec![make_event(
+            "model.test.executed",
+            0,
+            "execute",
+            SemanticCategory::Write,
+        )];
+        let sao_events = vec![SaoEvent {
+            node_id: "model.test.skipped".to_string(),
+            status: SaoStatus::ReusedNoChanges,
+            message: "No new changes".to_string(),
+            stored_hash: "abc123".to_string(),
+            timestamp_ns: 1000,
+        }];
+        let recording = make_recording_with_sao(adapter_events, sao_events);
+
+        // Should have adapter events for executed node
+        assert!(recording.events_for_node("model.test.executed").is_some());
+        assert!(!recording.has_sao_event("model.test.executed"));
+
+        // Should have SAO event for skipped node
+        assert!(recording.events_for_node("model.test.skipped").is_none());
+        assert!(recording.has_sao_event("model.test.skipped"));
     }
 }

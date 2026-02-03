@@ -1,5 +1,4 @@
 use crate::adapter_engine::AdapterEngine;
-use crate::cache::RelationCache;
 use crate::column::ColumnStatic;
 use crate::metadata::*;
 use crate::query_cache::QueryCache;
@@ -38,6 +37,8 @@ pub fn backend_of(adapter_type: AdapterType) -> Backend {
         AdapterType::Databricks => Backend::Databricks,
         AdapterType::Redshift => Backend::Redshift,
         AdapterType::Salesforce => Backend::Salesforce,
+        AdapterType::Spark => Backend::Spark,
+        AdapterType::Sidecar => Backend::DuckDB,
     }
 }
 
@@ -838,7 +839,7 @@ pub trait BaseAdapter: fmt::Debug + AdapterTyping + Send + Sync {
         _state: &State,
         _relation: Option<Arc<dyn BaseRelation>>,
         _partition_by: Option<dbt_schemas::schemas::manifest::BigqueryPartitionConfig>,
-        _cluster_by: Option<dbt_schemas::schemas::manifest::BigqueryClusterConfig>,
+        _cluster_by: Option<dbt_schemas::schemas::common::ClusterConfig>,
     ) -> Result<Value, minijinja::Error> {
         unimplemented!("only available with BigQuery adapter")
     }
@@ -1129,25 +1130,19 @@ pub trait BaseAdapter: fmt::Debug + AdapterTyping + Send + Sync {
     /// This adapter as a Value
     fn as_value(&self) -> Value;
 
-    // TODO(felipecrv): remove these default implementations
-
     /// Used internally to attempt executing a Snowflake `use warehouse [name]` statement from BridgeAdapter
     /// For other BaseAdapter types, this is noop
     ///
     /// # Returns
     ///
     /// Returns true if the warehouse was overridden, false otherwise
-    fn use_warehouse(&self, _warehouse: Option<String>, _node_id: &str) -> FsResult<bool> {
-        Ok(false)
-    }
+    fn use_warehouse(&self, _warehouse: Option<String>, _node_id: &str) -> FsResult<bool>;
 
     /// Used internally to attempt executing a Snowflake `use warehouse [name]` statement from BridgeAdapter
     ///
     /// To restore to the warehouse configured in profiles.yml
     /// For other BaseAdapter types, this is noop
-    fn restore_warehouse(&self, _node_id: &str) -> FsResult<()> {
-        Ok(())
-    }
+    fn restore_warehouse(&self, _node_id: &str) -> FsResult<()>;
 
     /// Used internally to hydrate the relation cache with the given schema -> relation map
     ///
@@ -1155,19 +1150,13 @@ pub trait BaseAdapter: fmt::Debug + AdapterTyping + Send + Sync {
     fn update_relation_cache(
         &self,
         _schema_to_relations_map: BTreeMap<CatalogAndSchema, Vec<Arc<dyn BaseRelation>>>,
-    ) -> FsResult<()> {
-        Ok(())
-    }
+    ) -> FsResult<()>;
 
     /// Used internally to identify if a schema is already cached
-    fn is_already_fully_cached(&self, _schema: &CatalogAndSchema) -> bool {
-        false
-    }
+    fn is_already_fully_cached(&self, _schema: &CatalogAndSchema) -> bool;
 
     /// Used internally to identify if a relation is already cached
-    fn is_cached(&self, _relation: &Arc<dyn BaseRelation>) -> bool {
-        false
-    }
+    fn is_cached(&self, _relation: &Arc<dyn BaseRelation>) -> bool;
 }
 
 impl fmt::Display for dyn BaseAdapter {
@@ -1213,9 +1202,6 @@ pub trait AdapterFactory: Send + Sync {
         node: &dyn InternalDbtNodeAttributes,
         adapter_type: AdapterType,
     ) -> Result<Arc<dyn BaseRelation>, minijinja::Error>;
-
-    /// Return a new instance of the factory with a different relation cache.
-    fn with_relation_cache(&self, relation_cache: Arc<RelationCache>) -> Arc<dyn AdapterFactory>;
 }
 
 /// Check if the adapter type is supported

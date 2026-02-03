@@ -86,7 +86,6 @@ pub const PARSING: &str = "   Parsing";
 // not being issued right now
 pub const SCHEDULING: &str = "Scheduling";
 //
-pub const DOWNLOADING: &str = " Downloading";
 pub const DOWNLOADED: &str = " Downloaded";
 pub const COMPILING: &str = " Compiling";
 pub const RENDERING: &str = " Rendering";
@@ -107,7 +106,6 @@ pub const STALE: &str = "     Stale";
 pub const SKIPPED: &str = "   Skipped";
 pub const ANALYZED: &str = "  Analyzed";
 pub const RENDERED: &str = "  Rendered";
-pub const FRESHNESS: &str = " Freshness";
 pub const TEST: &str = "      Test";
 
 // debug command

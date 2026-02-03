@@ -2,11 +2,16 @@ use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike, Utc};
+use chrono::{
+    offset::Offset, DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime, TimeZone,
+    Timelike, Utc,
+};
 use chrono_tz::Tz;
+use minijinja::arg_utils::ArgsIter;
 use minijinja::{arg_utils::ArgParser, value::Object, Error, ErrorKind, Value};
 
 use crate::modules::py_datetime::date::PyDate; // your date
+use crate::modules::py_datetime::strptime;
 use crate::modules::py_datetime::time::PyTime;
 use crate::modules::py_datetime::timedelta::PyTimeDelta;
 use crate::modules::pytz::PytzTimezone; // your timedelta // your trait // your time
@@ -309,11 +314,20 @@ impl PyDateTimeClass {
     // datetime.strptime(date_string, format)
     // ------------------------------------------------------------------
     fn strptime(args: &[Value]) -> Result<PyDateTime, Error> {
-        let mut parser = ArgParser::new(args, None);
-        let date_str: String = parser.next_positional()?;
-        let fmt_str: String = parser.next_positional()?;
+        let iter = ArgsIter::new("strptime", &["date_string", "format"], args);
+        let date_str = iter.next_arg::<&str>()?;
+        let fmt_str = iter.next_arg::<&str>()?;
+        iter.finish()?;
 
-        let naive = Self::parse_datetime_with_fallback(&date_str, &fmt_str).map_err(|e| {
+        if let Ok(naive) = strptime::strptime(date_str, fmt_str) {
+            return Ok(PyDateTime {
+                state: DateTimeState::Naive(naive),
+                tzinfo: None,
+            });
+        }
+
+        // Fall back on old strptime since new version is not fully implemented yet
+        let naive = Self::parse_datetime_with_fallback(date_str, fmt_str).map_err(|e| {
             Error::new(
                 ErrorKind::InvalidArgument,
                 format!("strptime parsing error: {e}"),
@@ -898,12 +912,48 @@ impl Object for PyDateTime {
             // "isoformat()"
             "isoformat" => Ok(Value::from(self.isoformat())),
 
+            // "utcoffset()"
+            // Python semantics:
+            // - naive datetime => None
+            // - aware datetime => timedelta
+            "utcoffset" => {
+                if !args.is_empty() {
+                    return Err(Error::new(
+                        ErrorKind::InvalidArgument,
+                        "utcoffset() takes no arguments",
+                    ));
+                }
+                match &self.state {
+                    DateTimeState::Naive(_) => Ok(Value::from(())),
+                    DateTimeState::Aware(adt) => {
+                        let secs = adt.offset().fix().local_minus_utc();
+                        Ok(Value::from_object(PyTimeDelta::new(Duration::seconds(
+                            secs as i64,
+                        ))))
+                    }
+                    DateTimeState::FixedOffset(fdt) => {
+                        let secs = fdt.offset().local_minus_utc();
+                        Ok(Value::from_object(PyTimeDelta::new(Duration::seconds(
+                            secs as i64,
+                        ))))
+                    }
+                }
+            }
+
             // "timestamp()"
             "timestamp" => Ok(Value::from(self.timestamp())),
 
             // Arithmetic
             "__add__" => self.add_op(args, true),
             "__sub__" => self.add_op(args, false),
+
+            "fromtimestamp" => Ok(Value::from_object(PyDateTimeClass::from_timestamp(args)?)),
+            "now" => Ok(Value::from_object(PyDateTimeClass::now(args)?)),
+            "utcnow" => Ok(Value::from_object(PyDateTimeClass::utcnow(args)?)),
+            "today" => Ok(Value::from_object(PyDateTimeClass::today(args)?)),
+            "strptime" => Ok(Value::from_object(PyDateTimeClass::strptime(args)?)),
+            "combine" => Ok(Value::from_object(PyDateTimeClass::combine(args)?)),
+            "fromisoformat" => Ok(Value::from_object(PyDateTimeClass::fromisoformat(args)?)),
 
             _ => Err(Error::new(
                 ErrorKind::UnknownMethod,
@@ -937,6 +987,8 @@ mod tests {
     use super::*;
     use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
     use minijinja::args;
+    use minijinja::Environment;
+    use minijinja::Value;
 
     #[test]
     fn test_strptime_with_fallback() {
@@ -1171,5 +1223,28 @@ mod tests {
             }
             _ => panic!("Expected aware datetime"),
         }
+    }
+
+    #[test]
+    fn test_utcoffset() {
+        let env = Environment::new();
+
+        // fixed offset => timedelta with the corresponding offset in seconds
+        let dt = PyDateTimeClass::fromisoformat(args!("2026-01-29T08:20:52-05:00")).unwrap();
+        let template = env
+            .template_from_str("{{ dt.utcoffset().total_seconds() }}")
+            .unwrap();
+        let result = template
+            .render(minijinja::context!(dt => Value::from_object(dt)), &[])
+            .unwrap();
+        assert_eq!(result, "-18000.0");
+
+        // naive => None
+        let dt = PyDateTimeClass::fromisoformat(args!("2026-01-29T08:20:52")).unwrap();
+        let template = env.template_from_str("{{ dt.utcoffset() }}").unwrap();
+        let result = template
+            .render(minijinja::context!(dt => Value::from_object(dt)), &[])
+            .unwrap();
+        assert_eq!(result, "None");
     }
 }

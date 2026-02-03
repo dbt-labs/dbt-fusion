@@ -29,6 +29,7 @@ use dbt_schemas::state::{
     PatternedDanglingSources, RenderResults,
 };
 use dbt_schemas::state::{DbtRuntimeConfig, Operations};
+use minijinja::constants::CURRENT_PATH;
 use tracing::Instrument as _;
 
 use crate::args::ResolveArgs;
@@ -46,10 +47,12 @@ use std::sync::Arc;
 use crate::resolve::resolve_analyses::resolve_analyses;
 use crate::resolve::resolve_exposures::resolve_exposures;
 use crate::resolve::resolve_functions::resolve_functions;
+use crate::resolve::resolve_macros::apply_macro_patches;
 use crate::resolve::resolve_macros::resolve_docs_macros;
 use crate::resolve::resolve_macros::resolve_macros;
 use crate::resolve::resolve_metrics::resolve_metrics;
 use crate::resolve::resolve_models::resolve_models;
+use crate::resolve::resolve_properties;
 use crate::resolve::resolve_properties::resolve_minimal_properties;
 use crate::resolve::resolve_saved_queries::resolve_saved_queries;
 use crate::resolve::resolve_seeds::resolve_seeds;
@@ -186,6 +189,10 @@ pub async fn resolve(
 
     let mut semantic_layer_spec_is_legacy = false;
     let mut test_name_truncations: HashMap<String, String> = HashMap::new();
+    let all_macro_properties: BTreeMap<
+        String,
+        BTreeMap<String, resolve_properties::MinimalPropertiesEntry>,
+    >;
 
     // Use sequential processing if num_threads is 1, otherwise use parallel processing
     if arg.num_threads == Some(1) {
@@ -195,6 +202,7 @@ pub async fn resolve(
             resolved_collector,
             resolved_semantic_layer_spec_is_legacy,
             resolved_test_name_truncations,
+            resolved_macro_properties,
         ) = resolve_packages_sequentially(
             package_waves,
             arg,
@@ -217,6 +225,7 @@ pub async fn resolve(
             .extend(resolved_collector.rendering_results);
         semantic_layer_spec_is_legacy |= resolved_semantic_layer_spec_is_legacy;
         test_name_truncations.extend(resolved_test_name_truncations);
+        all_macro_properties = resolved_macro_properties;
     } else {
         // Parallel processing (original implementation)
         let (
@@ -225,6 +234,7 @@ pub async fn resolve(
             resolved_collector,
             resolved_semantic_layer_spec_is_legacy,
             resolved_test_name_truncations,
+            resolved_macro_properties,
         ) = resolve_packages_parallel(
             package_waves,
             arg,
@@ -247,7 +257,40 @@ pub async fn resolve(
             .extend(resolved_collector.rendering_results);
         semantic_layer_spec_is_legacy |= resolved_semantic_layer_spec_is_legacy;
         test_name_truncations.extend(resolved_test_name_truncations);
+        all_macro_properties = resolved_macro_properties;
     }
+
+    // Apply macro patches from YAML schema files
+    for (package_name, macro_properties) in all_macro_properties {
+        // Get the jinja env and base context for this package
+        let package = dbt_state
+            .packages
+            .iter()
+            .find(|p| p.dbt_project.name == package_name);
+        if let Some(package) = package {
+            let namespace_keys: Vec<String> = jinja_env
+                .env
+                .get_macro_namespace_registry()
+                .map(|r| r.keys().map(|k| k.to_string()).collect())
+                .unwrap_or_default();
+            let base_ctx = build_resolve_context(
+                root_project_name,
+                package.dbt_project.name.as_str(),
+                &macros.docs_macros,
+                DISPATCH_CONFIG.get().unwrap().read().unwrap().clone(),
+                namespace_keys,
+            );
+            apply_macro_patches(
+                &arg.io,
+                &mut macros.macros,
+                &macro_properties,
+                &package_name,
+                &jinja_env,
+                &base_ctx,
+            )?;
+        }
+    }
+
     // Ensure that there are no duplicate relations
     check_relation_uniqueness(&nodes)?;
 
@@ -259,13 +302,16 @@ pub async fn resolve(
     }
 
     let parse_adapter = jinja_env
-        .get_parse_adapter()
+        .get_adapter()
         .expect("parse adapter must be initialized");
+    let parse_adapter_state = parse_adapter
+        .parse_adapter_state()
+        .expect("adapter must be configured for the parse phase");
     let (
         get_relation_calls_from_parse,
         get_columns_in_relation_calls_from_parse,
         patterned_dangling_sources_from_parse,
-    ) = parse_adapter.relations_to_fetch();
+    ) = parse_adapter_state.relations_to_fetch();
     get_relation_calls.extend(get_relation_calls_from_parse?);
     get_columns_in_relation_calls.extend(get_columns_in_relation_calls_from_parse?);
     patterned_dangling_sources.extend(patterned_dangling_sources_from_parse);
@@ -448,7 +494,14 @@ pub async fn resolve_inner(
     test_name_truncations: &mut HashMap<String, String>,
     token: &CancellationToken,
     jinja_type_checking_event_listener_factory: Arc<dyn JinjaTypeCheckingEventListenerFactory>,
-) -> FsResult<(Nodes, Nodes, RenderResults, NodeResolver, bool)> {
+) -> FsResult<(
+    Nodes,
+    Nodes,
+    RenderResults,
+    NodeResolver,
+    bool,
+    BTreeMap<String, resolve_properties::MinimalPropertiesEntry>,
+)> {
     let mut nodes = Nodes::default();
     let mut disabled_nodes = Nodes::default();
 
@@ -458,11 +511,17 @@ pub async fn resolve_inner(
 
     let package_quoting = resolve_package_quoting(*package.dbt_project.quoting, adapter_type);
 
+    let namespace_keys: Vec<String> = jinja_env
+        .env
+        .get_macro_namespace_registry()
+        .map(|r| r.keys().map(|k| k.to_string()).collect())
+        .unwrap_or_default();
     let base_ctx = build_resolve_context(
         root_package_name,
         package.dbt_project.name.as_str(),
         &macros.docs_macros,
         DISPATCH_CONFIG.get().unwrap().read().unwrap().clone(),
+        namespace_keys,
     );
     // Resolve the dbt properties (schema.yml) files
     let mut min_properties = resolve_minimal_properties(
@@ -476,6 +535,9 @@ pub async fn resolve_inner(
 
     let package_name = package.dbt_project.name.as_str();
 
+    // Collect macro properties for patching later (after all packages resolved)
+    let macro_properties = std::mem::take(&mut min_properties.macros);
+
     let mut collected_generic_tests: Vec<GenericTestAsset> = Vec::new();
 
     let dbt_tests_dir = arg.io.out_dir.join(DBT_GENERIC_TESTS_DIR_NAME);
@@ -487,6 +549,17 @@ pub async fn resolve_inner(
     let semantic_layer_spec_is_legacy = min_properties.semantic_layer_spec_is_legacy;
 
     for (model_name, minimal_model_props) in &min_properties.models {
+        // Update base context with the relative yaml file path.
+        // We do this for accurate error reporting.
+        let base_ctx = {
+            let mut base_ctx = base_ctx.clone();
+            base_ctx.insert(
+                CURRENT_PATH.to_string(),
+                minijinja::Value::from(minimal_model_props.relative_path.to_string_lossy()),
+            );
+            base_ctx
+        };
+
         // Extract metrics to be parsed separately because they are not supposed to be rendered with Jinja
         let mut maybe_model_metrics_yml: Option<YmlValue> = None;
         let mut model_yml = minimal_model_props.clone().schema_value;
@@ -791,6 +864,7 @@ pub async fn resolve_inner(
         collector,
         node_resolver.clone(),
         semantic_layer_spec_is_legacy,
+        macro_properties,
     ))
 }
 
@@ -850,6 +924,7 @@ async fn resolve_package(
     NodeResolver,
     bool,
     HashMap<String, String>,
+    BTreeMap<String, resolve_properties::MinimalPropertiesEntry>,
 )> {
     let package = dbt_state
         .packages
@@ -883,6 +958,7 @@ async fn resolve_package(
         rendering_results,
         updated_node_resolver,
         semantic_layer_spec_is_legacy,
+        macro_properties,
     ) = resolve_inner(
         &arg,
         package,
@@ -910,6 +986,7 @@ async fn resolve_package(
         updated_node_resolver,
         semantic_layer_spec_is_legacy,
         test_name_truncations,
+        macro_properties,
     ))
 }
 
@@ -928,7 +1005,14 @@ async fn resolve_packages_sequentially(
     all_runtime_configs: &mut BTreeMap<String, Arc<DbtRuntimeConfig>>,
     token: &CancellationToken,
     jinja_type_checking_event_listener_factory: Arc<dyn JinjaTypeCheckingEventListenerFactory>,
-) -> FsResult<(Nodes, Nodes, RenderResults, bool, HashMap<String, String>)> {
+) -> FsResult<(
+    Nodes,
+    Nodes,
+    RenderResults,
+    bool,
+    HashMap<String, String>,
+    BTreeMap<String, BTreeMap<String, resolve_properties::MinimalPropertiesEntry>>,
+)> {
     let mut nodes = Nodes::default();
     let mut disabled_nodes = Nodes::default();
     let mut collector = RenderResults {
@@ -936,6 +1020,10 @@ async fn resolve_packages_sequentially(
     };
     let mut semantic_layer_spec_is_legacy = false;
     let mut test_name_truncations: HashMap<String, String> = HashMap::new();
+    let mut all_macro_properties: BTreeMap<
+        String,
+        BTreeMap<String, resolve_properties::MinimalPropertiesEntry>,
+    > = BTreeMap::new();
     for package_wave in package_waves {
         token.check_cancellation()?;
 
@@ -965,12 +1053,23 @@ async fn resolve_packages_sequentially(
                 updated_node_resolver,
                 resolved_semantic_layer_spec_is_legacy,
                 resolved_test_name_truncations,
+                macro_properties,
             ) = result;
 
             semantic_layer_spec_is_legacy |= resolved_semantic_layer_spec_is_legacy;
 
             // Update runtime configs for next wave
-            all_runtime_configs.insert(package_name, runtime_config);
+            dbt_schemas::state::register_global_runtime_config(
+                package_name.clone(),
+                runtime_config.clone(),
+            );
+            all_runtime_configs.insert(package_name.clone(), runtime_config);
+
+            // Collect macro properties for patching later
+            if !macro_properties.is_empty() {
+                all_macro_properties.insert(package_name.clone(), macro_properties);
+            }
+
             // Merge results
             nodes.extend(new_nodes);
             disabled_nodes.extend(new_disabled_nodes);
@@ -989,6 +1088,7 @@ async fn resolve_packages_sequentially(
         collector,
         semantic_layer_spec_is_legacy,
         test_name_truncations,
+        all_macro_properties,
     ))
 }
 
@@ -1007,7 +1107,14 @@ async fn resolve_packages_parallel(
     all_runtime_configs: &mut BTreeMap<String, Arc<DbtRuntimeConfig>>,
     token: &CancellationToken,
     jinja_type_checking_event_listener_factory: Arc<dyn JinjaTypeCheckingEventListenerFactory>,
-) -> FsResult<(Nodes, Nodes, RenderResults, bool, HashMap<String, String>)> {
+) -> FsResult<(
+    Nodes,
+    Nodes,
+    RenderResults,
+    bool,
+    HashMap<String, String>,
+    BTreeMap<String, BTreeMap<String, resolve_properties::MinimalPropertiesEntry>>,
+)> {
     let mut nodes = Nodes::default();
     let mut disabled_nodes = Nodes::default();
     let mut collector = RenderResults {
@@ -1015,6 +1122,10 @@ async fn resolve_packages_parallel(
     };
     let mut semantic_layer_spec_is_legacy = false;
     let mut test_name_truncations: HashMap<String, String> = HashMap::new();
+    let mut all_macro_properties: BTreeMap<
+        String,
+        BTreeMap<String, resolve_properties::MinimalPropertiesEntry>,
+    > = BTreeMap::new();
     for package_wave in package_waves {
         token.check_cancellation()?;
 
@@ -1067,6 +1178,7 @@ async fn resolve_packages_parallel(
                 updated_node_resolver,
                 resolved_semantic_layer_spec_is_legacy,
                 resolved_test_name_truncations,
+                macro_properties,
             ) = match result {
                 Ok(Ok(val)) => val,
                 Ok(Err(e)) => return Err(Box::new(e)),
@@ -1075,7 +1187,15 @@ async fn resolve_packages_parallel(
             semantic_layer_spec_is_legacy |= resolved_semantic_layer_spec_is_legacy;
 
             // Update runtime configs for next wave
+            dbt_schemas::state::register_global_runtime_config(
+                package_name.clone(),
+                runtime_config.clone(),
+            );
             all_runtime_configs.insert(package_name.clone(), runtime_config);
+            // Collect macro properties for patching later
+            if !macro_properties.is_empty() {
+                all_macro_properties.insert(package_name.clone(), macro_properties);
+            }
             // Merge results in main thread
             nodes.extend(new_nodes);
             disabled_nodes.extend(new_disabled_nodes);
@@ -1094,5 +1214,6 @@ async fn resolve_packages_parallel(
         collector,
         semantic_layer_spec_is_legacy,
         test_name_truncations,
+        all_macro_properties,
     ))
 }

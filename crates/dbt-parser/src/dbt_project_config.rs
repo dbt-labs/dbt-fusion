@@ -2,10 +2,9 @@
 //! load and propagate configuration properties from the root `dbt_project.yml`
 //! to the individual model directories.
 
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
+
+use indexmap::IndexMap;
 
 use dbt_common::{
     FsResult, adapter::AdapterType, io_args::IoArgs, tracing::emit::emit_strict_parse_error,
@@ -45,8 +44,8 @@ use dbt_serde_yaml::ShouldBe;
 pub struct DbtProjectConfig<T: DefaultTo<T>> {
     /// The root configuration (i.e. at the `dbt_project.yml` level or inherited from `profiles.yml`)
     pub config: T,
-    /// Child configuration applied by path part
-    pub children: HashMap<String, DbtProjectConfig<T>>,
+    /// Child configuration applied by path part (preserves insertion order like Python dicts)
+    pub children: IndexMap<String, DbtProjectConfig<T>>,
 }
 
 impl<T: DefaultTo<T>> DbtProjectConfig<T> {
@@ -75,12 +74,12 @@ impl<T: DefaultTo<T>> DbtProjectConfig<T> {
     /// ```rust
     /// use dbt_parser::dbt_project_config::DbtProjectConfig;
     /// use dbt_schemas::schemas::project::ModelConfig;
-    /// use std::collections::HashMap;
+    /// use indexmap::IndexMap;
     ///
     /// // Minimal config tree; in practice this is built from dbt_project.yml
     /// let config = DbtProjectConfig::<ModelConfig> {
     ///     config: ModelConfig::default(),
-    ///     children: HashMap::new(),
+    ///     children: IndexMap::new(),
     /// };
     /// let fqn = vec!["analytics".to_string(), "weekly_revenue_report".to_string()];
     /// let _cfg = config.get_config_for_fqn(&fqn);
@@ -116,7 +115,7 @@ pub fn recur_build_dbt_project_config<T: DefaultTo<T>, S: Into<T> + TypedRecursi
 ) -> FsResult<DbtProjectConfig<T>> {
     let mut child_config: T = child.clone().into();
     child_config.default_to(parent_config);
-    let mut children = HashMap::new();
+    let mut children = IndexMap::new();
 
     // Handle additional properties generically - each child inherits from current config
     for (key, maybe_child_config_variant) in child.iter_children() {
@@ -224,6 +223,7 @@ pub fn build_root_project_configs(
             ModelConfig {
                 enabled: Some(true),
                 quoting: Some(root_project_quoting),
+                sync: root_project.sync.clone(),
                 ..Default::default()
             },
             None,
@@ -234,6 +234,7 @@ pub fn build_root_project_configs(
             SourceConfig {
                 enabled: Some(true),
                 quoting: Some(source_default_quoting),
+                sync: root_project.sync.clone(),
                 ..Default::default()
             },
             None,
@@ -244,6 +245,7 @@ pub fn build_root_project_configs(
             SnapshotConfig {
                 enabled: Some(true),
                 quoting: Some(root_project_quoting),
+                sync: root_project.sync.clone(),
                 ..Default::default()
             },
             None,
@@ -347,7 +349,7 @@ pub fn init_project_config<T: DefaultTo<T>, S: TypedRecursiveConfig + Into<T>>(
     } else {
         DbtProjectConfig {
             config: default_config,
-            children: HashMap::new(),
+            children: IndexMap::new(),
         }
     };
     Ok(project_config)
@@ -531,14 +533,14 @@ mod tests {
     fn test_get_config_for_fqn_basic() {
         let mut config = DbtProjectConfig {
             config: ModelConfig::default(),
-            children: HashMap::new(),
+            children: IndexMap::new(),
         };
         config.config.enabled = Some(true);
 
         // Add a child config for project "test_project"
         let mut project_config = DbtProjectConfig {
             config: ModelConfig::default(),
-            children: HashMap::new(),
+            children: IndexMap::new(),
         };
         project_config.config.enabled = Some(false);
         config
@@ -555,21 +557,21 @@ mod tests {
     fn test_get_config_for_fqn_nested() {
         let mut config = DbtProjectConfig {
             config: ModelConfig::default(),
-            children: HashMap::new(),
+            children: IndexMap::new(),
         };
         config.config.enabled = Some(true);
 
         // Add project config
         let mut project_config = DbtProjectConfig {
             config: ModelConfig::default(),
-            children: HashMap::new(),
+            children: IndexMap::new(),
         };
         project_config.config.enabled = Some(false);
 
         // Add staging subdirectory config
         let mut staging_config = DbtProjectConfig {
             config: ModelConfig::default(),
-            children: HashMap::new(),
+            children: IndexMap::new(),
         };
         staging_config.config.enabled = Some(true);
         staging_config.config.materialized =
@@ -596,28 +598,28 @@ mod tests {
     fn test_get_config_for_fqn_node_specific() {
         let mut config = DbtProjectConfig {
             config: ModelConfig::default(),
-            children: HashMap::new(),
+            children: IndexMap::new(),
         };
         config.config.enabled = Some(true);
 
         // Add project config
         let mut project_config = DbtProjectConfig {
             config: ModelConfig::default(),
-            children: HashMap::new(),
+            children: IndexMap::new(),
         };
         project_config.config.enabled = Some(false);
 
         // Add staging subdirectory config
         let mut staging_config = DbtProjectConfig {
             config: ModelConfig::default(),
-            children: HashMap::new(),
+            children: IndexMap::new(),
         };
         staging_config.config.enabled = Some(true);
 
         // Add node-specific config
         let mut node_config = DbtProjectConfig {
             config: ModelConfig::default(),
-            children: HashMap::new(),
+            children: IndexMap::new(),
         };
         node_config.config.enabled = Some(false);
         node_config.config.materialized =
@@ -651,21 +653,21 @@ mod tests {
     fn test_get_config_for_fqn_partial_match() {
         let mut config = DbtProjectConfig {
             config: ModelConfig::default(),
-            children: HashMap::new(),
+            children: IndexMap::new(),
         };
         config.config.enabled = Some(true);
 
         // Add project config
         let mut project_config = DbtProjectConfig {
             config: ModelConfig::default(),
-            children: HashMap::new(),
+            children: IndexMap::new(),
         };
         project_config.config.enabled = Some(false);
 
         // Add staging subdirectory config - only staging exists, not finance
         let mut staging_config = DbtProjectConfig {
             config: ModelConfig::default(),
-            children: HashMap::new(),
+            children: IndexMap::new(),
         };
         staging_config.config.enabled = Some(false);
         staging_config.config.materialized =
@@ -699,7 +701,7 @@ mod tests {
     fn test_get_config_for_fqn_nonexistent_project() {
         let mut config = DbtProjectConfig {
             config: ModelConfig::default(),
-            children: HashMap::new(),
+            children: IndexMap::new(),
         };
         config.config.enabled = Some(true);
         config.config.materialized = Some(dbt_schemas::schemas::common::DbtMaterialization::Table);
@@ -723,7 +725,7 @@ mod tests {
     fn test_get_config_for_fqn_empty() {
         let mut config = DbtProjectConfig {
             config: ModelConfig::default(),
-            children: HashMap::new(),
+            children: IndexMap::new(),
         };
         config.config.enabled = Some(true);
         config.config.materialized = Some(dbt_schemas::schemas::common::DbtMaterialization::View);
@@ -744,40 +746,40 @@ mod tests {
         // Test a complex hierarchy that might occur with non-file-based nodes
         let mut config = DbtProjectConfig {
             config: ModelConfig::default(),
-            children: HashMap::new(),
+            children: IndexMap::new(),
         };
         config.config.enabled = Some(true);
 
         // Set up: my_project -> marts -> finance -> revenue_reports -> monthly_revenue
         let mut project_config = DbtProjectConfig {
             config: ModelConfig::default(),
-            children: HashMap::new(),
+            children: IndexMap::new(),
         };
         project_config.config.enabled = Some(true);
 
         let mut marts_config = DbtProjectConfig {
             config: ModelConfig::default(),
-            children: HashMap::new(),
+            children: IndexMap::new(),
         };
         marts_config.config.materialized =
             Some(dbt_schemas::schemas::common::DbtMaterialization::Table);
 
         let mut finance_config = DbtProjectConfig {
             config: ModelConfig::default(),
-            children: HashMap::new(),
+            children: IndexMap::new(),
         };
         finance_config.config.enabled = Some(false);
 
         let mut revenue_reports_config = DbtProjectConfig {
             config: ModelConfig::default(),
-            children: HashMap::new(),
+            children: IndexMap::new(),
         };
         revenue_reports_config.config.materialized =
             Some(dbt_schemas::schemas::common::DbtMaterialization::View);
 
         let mut monthly_revenue_config = DbtProjectConfig {
             config: ModelConfig::default(),
-            children: HashMap::new(),
+            children: IndexMap::new(),
         };
         monthly_revenue_config.config.enabled = Some(true);
         monthly_revenue_config.config.materialized =
@@ -822,22 +824,22 @@ mod tests {
         // This tests traversing a full deep path hierarchy
         let mut config = DbtProjectConfig {
             config: ModelConfig::default(),
-            children: HashMap::new(),
+            children: IndexMap::new(),
         };
         config.config.enabled = Some(true);
 
         // Add project config with nested subdirectory structure
         let mut project_config = DbtProjectConfig {
             config: ModelConfig::default(),
-            children: HashMap::new(),
+            children: IndexMap::new(),
         };
         let mut models_config = DbtProjectConfig {
             config: ModelConfig::default(),
-            children: HashMap::new(),
+            children: IndexMap::new(),
         };
         let mut example_config = DbtProjectConfig {
             config: ModelConfig::default(),
-            children: HashMap::new(),
+            children: IndexMap::new(),
         };
         example_config.config.materialized =
             Some(dbt_schemas::schemas::common::DbtMaterialization::Table);
@@ -875,7 +877,7 @@ mod tests {
         // Test a realistic DBT project scenario end-to-end with FQN
         let mut config = DbtProjectConfig {
             config: ModelConfig::default(),
-            children: HashMap::new(),
+            children: IndexMap::new(),
         };
         config.config.enabled = Some(true);
         config.config.materialized = Some(dbt_schemas::schemas::common::DbtMaterialization::View);
@@ -883,13 +885,13 @@ mod tests {
         // Set up project structure like: my_project -> staging -> +materialized: table
         let mut project_config = DbtProjectConfig {
             config: ModelConfig::default(),
-            children: HashMap::new(),
+            children: IndexMap::new(),
         };
         project_config.config.enabled = Some(true);
 
         let mut staging_config = DbtProjectConfig {
             config: ModelConfig::default(),
-            children: HashMap::new(),
+            children: IndexMap::new(),
         };
         staging_config.config.materialized =
             Some(dbt_schemas::schemas::common::DbtMaterialization::Table);
@@ -898,7 +900,7 @@ mod tests {
         // Add specific model config
         let mut customers_config = DbtProjectConfig {
             config: ModelConfig::default(),
-            children: HashMap::new(),
+            children: IndexMap::new(),
         };
         customers_config.config.materialized =
             Some(dbt_schemas::schemas::common::DbtMaterialization::Incremental);

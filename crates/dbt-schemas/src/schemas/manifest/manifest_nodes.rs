@@ -4,6 +4,7 @@ use std::{collections::BTreeMap, path::PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 
+use crate::schemas::serde::OmissibleGrantConfig;
 use dbt_common::serde_utils::Omissible;
 use dbt_serde_yaml::JsonSchema;
 use dbt_serde_yaml::Spanned;
@@ -28,9 +29,10 @@ use crate::schemas::{
     DbtSource, DbtTest, DbtUnitTest, NodeBaseAttributes,
     common::{
         Access, DbtChecksum, DbtContract, DbtMaterialization, DbtQuoting, Expect,
-        FreshnessDefinition, Given, IncludeExclude, NodeDependsOn, PersistDocsConfig,
+        FreshnessDefinition, Given, IncludeExclude, NodeDependsOn, PersistDocsConfig, SyncConfig,
     },
     dbt_column::{DbtColumnRef, deserialize_dbt_columns, serialize_dbt_columns},
+    macros::{DbtMacro, MacroArgument, MacroDependsOn},
     manifest::{
         DbtMetric, DbtOperation, DbtSavedQuery, DbtSemanticModel,
         common::{DbtOwner, SourceFileMetadata, WhereFilterIntersection},
@@ -53,7 +55,7 @@ use crate::schemas::{
     },
     ref_and_source::{DbtRef, DbtSourceWrapper},
     semantic_layer::semantic_manifest::SemanticLayerElementConfig,
-    serde::{StringOrArrayOfStrings, StringOrInteger, serialize_string_or_array_map},
+    serde::{StringOrArrayOfStrings, StringOrInteger},
 };
 
 use dbt_common::io_args::StaticAnalysisKind;
@@ -523,6 +525,49 @@ impl From<DbtSource> for ManifestSource {
     }
 }
 
+/// Macro as represented in the v12 manifest (has arguments, not args)
+#[skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub struct ManifestMacro {
+    pub name: String,
+    pub package_name: String,
+    pub path: PathBuf,
+    pub original_file_path: PathBuf,
+    pub unique_id: String,
+    pub macro_sql: String,
+    pub depends_on: MacroDependsOn,
+    pub description: String,
+    pub meta: BTreeMap<String, YmlValue>,
+    pub docs: Option<DocsConfig>,
+    pub patch_path: Option<PathBuf>,
+    #[serde(default)]
+    pub arguments: Vec<MacroArgument>,
+    pub __other__: BTreeMap<String, YmlValue>,
+}
+
+impl From<DbtMacro> for ManifestMacro {
+    fn from(macro_: DbtMacro) -> Self {
+        // dbt-core: macro.arguments in manifest only come from YAML definitions.
+        // If no YAML, arguments is an empty list.
+        Self {
+            name: macro_.name,
+            package_name: macro_.package_name,
+            path: macro_.path,
+            original_file_path: macro_.original_file_path,
+            unique_id: macro_.unique_id,
+            macro_sql: macro_.macro_sql,
+            depends_on: macro_.depends_on,
+            description: macro_.description,
+            meta: macro_.meta,
+            docs: macro_.docs,
+            patch_path: macro_.patch_path,
+            arguments: macro_.arguments,
+            __other__: macro_.__other__,
+        }
+    }
+}
+
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -577,11 +622,15 @@ pub struct ManifestModelConfig {
     pub unique_key: Option<DbtUniqueKey>,
     pub on_schema_change: Option<OnSchemaChange>,
     pub on_configuration_change: Option<OnConfigurationChange>,
-    #[serde(rename = "+grants", serialize_with = "serialize_string_or_array_map")]
-    pub grants: Option<BTreeMap<String, StringOrArrayOfStrings>>,
+    #[serde(rename = "+grants", alias = "grants")]
+    pub grants: OmissibleGrantConfig,
     pub packages: Option<StringOrArrayOfStrings>,
     pub python_version: Option<String>,
     pub imports: Option<StringOrArrayOfStrings>,
+    pub secrets: Option<BTreeMap<String, YmlValue>>,
+    pub external_access_integrations: Option<StringOrArrayOfStrings>,
+    #[serde(default, deserialize_with = "bool_or_string_bool")]
+    pub use_anonymous_sproc: Option<bool>,
     pub docs: Option<DocsConfig>,
     pub contract: Option<DbtContract>,
     pub event_time: Option<String>,
@@ -602,10 +651,15 @@ pub struct ManifestModelConfig {
     pub custom_checks: Option<CustomChecks>,
     pub submission_method: Option<String>,
     pub job_cluster_config: Option<BTreeMap<String, YmlValue>>,
+    pub python_job_config: Option<BTreeMap<String, YmlValue>>,
+    pub cluster_id: Option<String>,
+    pub http_path: Option<String>,
     pub create_notebook: Option<bool>,
     pub index_url: Option<String>,
     pub additional_libs: Option<Vec<YmlValue>>,
     pub user_folder_for_python: Option<bool>,
+    /// Schema synchronization configuration
+    pub sync: Option<SyncConfig>,
     // Adapter specific configs
     pub __warehouse_specific_config__: WarehouseSpecificNodeConfig,
 }
@@ -623,8 +677,8 @@ pub struct ManifestSeedConfig {
     pub docs: Option<DocsConfig>,
     #[serde(default, deserialize_with = "bool_or_string_bool")]
     pub enabled: Option<bool>,
-    #[serde(default, serialize_with = "serialize_string_or_array_map")]
-    pub grants: Option<BTreeMap<String, StringOrArrayOfStrings>>,
+    #[serde(default)]
+    pub grants: OmissibleGrantConfig,
     #[serde(default, deserialize_with = "bool_or_string_bool")]
     pub quote_columns: Option<bool>,
     pub delimiter: Option<Spanned<String>>,
@@ -637,6 +691,7 @@ pub struct ManifestSeedConfig {
     pub post_hook: Verbatim<Option<Hooks>>,
     #[serde(alias = "pre-hook")]
     pub pre_hook: Verbatim<Option<Hooks>>,
+    pub static_analysis: Option<Spanned<StaticAnalysisKind>>,
     pub tags: Option<StringOrArrayOfStrings>,
     pub quoting: Option<DbtQuoting>,
     pub materialized: Option<DbtMaterialization>,
@@ -664,6 +719,7 @@ impl From<SeedConfig> for ManifestSeedConfig {
             persist_docs: config.persist_docs,
             post_hook: config.post_hook,
             pre_hook: config.pre_hook,
+            static_analysis: config.static_analysis,
             tags: config.tags,
             quoting: config.quoting,
             materialized: config.materialized,
@@ -692,6 +748,7 @@ impl From<ManifestSeedConfig> for SeedConfig {
             persist_docs: config.persist_docs,
             post_hook: config.post_hook,
             pre_hook: config.pre_hook,
+            static_analysis: config.static_analysis,
             tags: config.tags,
             quoting: config.quoting,
             materialized: config.materialized,
@@ -730,6 +787,9 @@ impl From<ModelConfig> for ManifestModelConfig {
             packages: config.packages,
             python_version: config.python_version,
             imports: config.imports,
+            secrets: config.secrets,
+            external_access_integrations: config.external_access_integrations,
+            use_anonymous_sproc: config.use_anonymous_sproc,
             docs: config.docs,
             contract: config.contract,
             event_time: config.event_time,
@@ -747,10 +807,14 @@ impl From<ModelConfig> for ManifestModelConfig {
             custom_checks: config.custom_checks,
             submission_method: config.submission_method.clone(),
             job_cluster_config: config.job_cluster_config.clone(),
+            python_job_config: config.python_job_config.clone(),
+            cluster_id: config.cluster_id.clone(),
+            http_path: config.http_path.clone(),
             create_notebook: config.create_notebook,
             index_url: config.index_url.clone(),
             additional_libs: config.additional_libs.clone(),
             user_folder_for_python: config.user_folder_for_python,
+            sync: config.sync,
             __warehouse_specific_config__: config.__warehouse_specific_config__,
         }
     }
@@ -786,6 +850,9 @@ impl From<ManifestModelConfig> for ModelConfig {
             packages: config.packages,
             python_version: config.python_version,
             imports: config.imports,
+            secrets: config.secrets,
+            external_access_integrations: config.external_access_integrations,
+            use_anonymous_sproc: config.use_anonymous_sproc,
             docs: config.docs,
             contract: config.contract,
             event_time: config.event_time,
@@ -803,11 +870,19 @@ impl From<ManifestModelConfig> for ModelConfig {
             custom_checks: config.custom_checks,
             submission_method: config.submission_method.clone(),
             job_cluster_config: config.job_cluster_config.clone(),
+            python_job_config: config.python_job_config.clone(),
+            cluster_id: config.cluster_id.clone(),
+            http_path: config.http_path.clone(),
             create_notebook: config.create_notebook,
             index_url: config.index_url.clone(),
             additional_libs: config.additional_libs.clone(),
             user_folder_for_python: config.user_folder_for_python,
+            sync: config.sync,
             __warehouse_specific_config__: config.__warehouse_specific_config__,
+            // config_keys_used and config_keys_defaults are not in ManifestModelConfig
+            // They're only in ModelConfig and not persisted to the manifest
+            config_keys_used: None,
+            config_keys_defaults: None,
         }
     }
 }

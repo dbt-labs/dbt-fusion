@@ -1,10 +1,11 @@
 use chrono_tz::Tz;
 use dbt_serde_yaml::{Spanned, UntaggedEnumDeserialize};
+use indexmap::IndexMap;
 use std::{
     any::Any,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock, RwLock},
     time::SystemTime,
 };
 
@@ -25,10 +26,7 @@ use crate::schemas::{
 };
 use blake3::Hasher;
 use chrono::{DateTime, Local, Utc};
-use dbt_common::{
-    ErrorCode, FsResult, adapter::AdapterType, fs_err, io_args::FsCommand,
-    serde_utils::convert_yml_to_map,
-};
+use dbt_common::{ErrorCode, FsResult, adapter::AdapterType, fs_err, io_args::FsCommand};
 use minijinja::{MacroSpans, Value as MinijinjaValue, value::Object};
 use serde::Deserialize;
 use serde::Serialize;
@@ -125,6 +123,10 @@ pub struct GenericTestAsset {
     pub test_metadata_combination_of_columns: Option<Vec<String>>,
     /// The model kwarg for generic tests, e.g. "{{ get_where_subquery(ref('foo')) }}"
     pub test_metadata_model: Option<String>,
+    /// The original (untruncated) test name, if truncation occurred.
+    /// When test names exceed 63 characters, dbt truncates to `<first 30 chars>_<md5 hash>`.
+    /// This field stores the original name for selector matching purposes.
+    pub original_name: Option<String>,
 }
 
 impl fmt::Display for GenericTestAsset {
@@ -212,7 +214,7 @@ pub struct DbtState {
     pub run_started_at: DateTime<Tz>,
     pub packages: Vec<DbtPackage>,
     /// Key is the package name, value are all package scoped vars
-    pub vars: BTreeMap<String, BTreeMap<String, DbtVars>>,
+    pub vars: BTreeMap<String, IndexMap<String, DbtVars>>,
     pub cli_vars: BTreeMap<String, dbt_serde_yaml::Value>,
     pub catalogs: Option<Arc<DbtCatalogs>>,
 }
@@ -638,6 +640,33 @@ pub struct DbtRuntimeConfig {
     pub inner: DbtRuntimeConfigInner,
 }
 
+type RuntimeConfigMap = BTreeMap<String, Arc<DbtRuntimeConfig>>;
+type SharedRuntimeConfigMap = Arc<RwLock<RuntimeConfigMap>>;
+
+/// Global registry of runtime configs, used to populate `config.dependencies` in a way that matches
+/// dbt-core’s effective behavior ("all loaded packages"), even when direct deps are skipped
+/// (e.g. `--skip-private-deps` but packages exist on disk in a repro bundle).
+static GLOBAL_RUNTIME_CONFIGS: OnceLock<SharedRuntimeConfigMap> = OnceLock::new();
+
+fn global_runtime_configs() -> &'static SharedRuntimeConfigMap {
+    GLOBAL_RUNTIME_CONFIGS.get_or_init(|| Arc::new(RwLock::new(RuntimeConfigMap::new())))
+}
+
+/// Register a package runtime config into the global registry.
+pub fn register_global_runtime_config(package_name: String, cfg: Arc<DbtRuntimeConfig>) {
+    let mut map = global_runtime_configs().write().expect("poisoned lock");
+    map.insert(package_name, cfg);
+}
+
+fn snapshot_global_runtime_configs() -> Option<RuntimeConfigMap> {
+    let map = global_runtime_configs().read().ok()?;
+    if map.is_empty() {
+        None
+    } else {
+        Some(map.clone())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct InvocationArgs {
@@ -705,7 +734,7 @@ pub struct DbtRuntimeConfigInner {
     pub query_comment: Option<QueryComment>,
 
     // Variables and hooks
-    pub vars: BTreeMap<String, DbtVars>,
+    pub vars: IndexMap<String, DbtVars>,
     pub cli_vars: BTreeMap<String, dbt_serde_yaml::Value>,
     pub on_run_start: Vec<Spanned<String>>,
     pub on_run_end: Vec<Spanned<String>>,
@@ -737,7 +766,7 @@ impl DbtRuntimeConfig {
         package: &DbtPackage,
         profile: &DbtProfile,
         dependency_lookup: &BTreeMap<String, Arc<DbtRuntimeConfig>>,
-        vars: &BTreeMap<String, DbtVars>,
+        vars: &IndexMap<String, DbtVars>,
         cli_vars: &BTreeMap<String, dbt_serde_yaml::Value>,
     ) -> Self {
         let runtime_config_inner = DbtRuntimeConfigInner {
@@ -825,13 +854,17 @@ impl DbtRuntimeConfig {
 
         // TODO(anna): Look into whether this should also be Index map
         let mut runtime_config = Self {
-            runtime_config: BTreeMap::from_iter(convert_yml_to_map(
+            runtime_config: Deserialize::deserialize(
                 dbt_serde_yaml::to_value(&runtime_config_inner).unwrap(),
-            )),
+            )
+            .unwrap(),
             dependencies: BTreeMap::new(),
-            vars: minijinja::Value::from_object(VarProvider::new(BTreeMap::from_iter(
-                convert_yml_to_map(dbt_serde_yaml::to_value(&runtime_config_inner.vars).unwrap()),
-            ))),
+            vars: minijinja::Value::from_object(VarProvider::new(
+                Deserialize::deserialize(
+                    dbt_serde_yaml::to_value(&runtime_config_inner.vars).unwrap(),
+                )
+                .unwrap(),
+            )),
             inner: runtime_config_inner,
         };
 
@@ -878,6 +911,20 @@ impl Object for DbtRuntimeConfig {
             // We use the to_minijinja_map helper to convert dependencies recursively
             "dependencies" => {
                 let mut deps = BTreeMap::new();
+                // Prefer the global registry (all loaded packages) if it has been populated, but
+                // always merge in this config’s local dependency map.
+                //
+                // This preserves the invariant that `config.dependencies[<this_project>]` exists
+                // (via `add_self_to_dependencies`) even when the global registry is only partially
+                // populated during early compile phases.
+                if let Some(global) = snapshot_global_runtime_configs() {
+                    for (key, value) in global.iter() {
+                        deps.insert(
+                            key.clone(),
+                            minijinja::Value::from_object(value.to_minijinja_map()),
+                        );
+                    }
+                }
                 for (key, value) in self.dependencies.iter() {
                     deps.insert(
                         key.clone(),

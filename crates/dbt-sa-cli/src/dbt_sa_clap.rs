@@ -1,5 +1,6 @@
 use clap::{ArgAction, builder::BoolishValueParser};
 use console::Style;
+use dbt_common::cli_parser_trait::CliParserTrait;
 use dbt_common::constants::{DBT_PROJECT_YML, DBT_TARGET_DIR_NAME};
 use dbt_common::io_utils::determine_project_dir;
 use dbt_common::logging::LogFormat;
@@ -7,6 +8,7 @@ use dbt_common::{ErrorCode, FsResult, fs_err, stdfs};
 use dbt_serde_yaml::Value;
 use log::LevelFilter;
 use serde::{Deserialize, Serialize};
+use std::ffi::OsString;
 use std::sync::LazyLock;
 use std::{
     collections::{BTreeMap, HashSet},
@@ -48,6 +50,41 @@ static AFTER_HELP: LazyLock<String> = LazyLock::new(|| {
         )
     )
 });
+
+#[derive(Default)]
+pub struct CliParser {}
+
+impl CliParserTrait for CliParser {
+    type CliType = Cli;
+
+    /// Parse from `std::env::args_os()`, [exit][Error::exit] on error.
+    fn parse(&self) -> Cli {
+        Cli::parse()
+    }
+
+    /// Parse from `std::env::args_os()`, return Err on error.
+    fn try_parse(&self) -> Result<Cli, clap::Error> {
+        Cli::try_parse()
+    }
+
+    /// Parse from iterator, return Err on error.
+    fn try_parse_from<I, T>(&self, itr: I) -> Result<Cli, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString> + Clone,
+    {
+        Cli::try_parse_from(itr)
+    }
+
+    /// Parse from iterator, return Err on error.
+    fn parse_from<I, T>(&self, itr: I) -> Self::CliType
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString> + Clone,
+    {
+        Cli::parse_from(itr)
+    }
+}
 
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -308,6 +345,10 @@ pub struct CommonArgs {
     #[arg(global = true, long, short = 'd', default_value = "false", action = ArgAction::SetTrue,  env = "DBT_DEBUG", value_parser = BoolishValueParser::new(),hide = true)]
     pub debug: bool,
 
+    /// Root directory for sidecar/DuckDB state. Defaults to target-path if not set.
+    #[arg(global = true, long, env = "DBT_DB_ROOT", hide = true)]
+    pub db_root: Option<PathBuf>,
+
     /// Show produced artifacts [default: 'progress']
     #[clap(long, num_args(0..), help = "Show produced artifacts [default: 'progress']")]
     pub show: Vec<ShowOptions>,
@@ -491,6 +532,7 @@ impl InitArgs {
                 beta_use_query_cache: arg.io.beta_use_query_cache,
                 host: arg.io.host,
                 port: arg.io.port,
+                db_root: arg.io.db_root.clone(),
             },
             send_anonymous_usage_stats: self.common_args.get_send_anonymous_usage_stats(),
             ..Default::default()
@@ -581,6 +623,7 @@ impl CommonArgs {
                 beta_use_query_cache: arg.io.beta_use_query_cache,
                 host: arg.io.host,
                 port: arg.io.port,
+                db_root: arg.io.db_root.clone(),
             },
             profiles_dir: self.profiles_dir.clone(),
             packages_install_path: self.packages_install_path.clone(),
@@ -679,6 +722,7 @@ pub fn from_main(cli: &Cli) -> SystemArgs {
             beta_use_query_cache: false,
             host: "localhost".to_string(),
             port: 8000,
+            db_root: cli.common_args().db_root,
         },
         from_main: true,
 
@@ -717,6 +761,7 @@ pub fn from_lib(cli: &Cli) -> SystemArgs {
             beta_use_query_cache: false,
             host: "localhost".to_string(),
             port: 8000,
+            db_root: cli.common_args().db_root,
         },
         from_main: false,
         target: cli.common_args().target,

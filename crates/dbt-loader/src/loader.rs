@@ -5,6 +5,7 @@ use dbt_common::cancellation::CancellationToken;
 use dbt_common::constants::{
     DBT_CATALOGS_YML, DBT_DEPENDENCIES_YML, DBT_PACKAGES_LOCK_FILE, DBT_PACKAGES_YML,
 };
+use dbt_common::io_args::{ReplayMode, TimeMachineMode};
 use dbt_common::once_cell_vars::DISPATCH_CONFIG;
 use dbt_common::tracing::span_info::SpanStatusRecorder;
 use dbt_jinja_utils::invocation_args::InvocationArgs;
@@ -18,6 +19,7 @@ use dbt_schemas::state::DbtProfile;
 use dbt_serde_yaml;
 use dbt_telemetry::GenericOpItemProcessed;
 use fs_deps::get_or_install_packages;
+use indexmap::IndexMap;
 use pathdiff::diff_paths;
 use serde::Deserialize;
 use std::collections::BTreeSet;
@@ -52,11 +54,43 @@ use crate::{
     load_internal_packages, load_packages, load_profiles, load_vars, persist_internal_packages,
 };
 
+use dbt_jinja_utils::Var;
 use dbt_jinja_utils::phases::load::secret_renderer::secret_context_env_var;
 use dbt_jinja_utils::serde::{into_typed_with_jinja, value_from_file};
-use dbt_jinja_utils::var_fn;
 
 use dbt_common::tracing::event_info::store_event_attributes;
+
+fn resolve_and_set_threads(
+    dbt_profile: &mut DbtProfile,
+    iarg: &InvocationArgs,
+) -> FsResult<Option<usize>> {
+    let final_threads = if iarg.num_threads.is_none() {
+        if let Some(threads) = dbt_profile.db_config.get_threads() {
+            // Convert StringOrInteger to Option<usize>
+            match threads {
+                StringOrInteger::Integer(n) => Some(*n as usize),
+                StringOrInteger::String(s) => Some(s.parse::<usize>().map_err(|_| {
+                    fs_err!(
+                        ErrorCode::Generic,
+                        "Invalid number of threads in profiles.yml: {s}",
+                    )
+                })?),
+            }
+        } else {
+            None
+        }
+    } else {
+        iarg.num_threads
+    };
+
+    dbt_profile
+        .db_config
+        .set_threads(Some(StringOrInteger::Integer(
+            final_threads.unwrap_or(0) as i64
+        )));
+
+    Ok(final_threads)
+}
 
 #[tracing::instrument(
     skip_all,
@@ -95,31 +129,7 @@ pub async fn load(
     let env = initialize_load_profile_jinja_environment();
     load_catalogs(arg, &env).await?;
 
-    let final_threads = if iarg.num_threads.is_none() {
-        if let Some(threads) = dbt_profile.db_config.get_threads() {
-            // Convert StringOrInteger to Option<usize>
-            match threads {
-                StringOrInteger::Integer(n) => Some(*n as usize),
-                StringOrInteger::String(s) => Some(s.parse::<usize>().map_err(|_| {
-                    fs_err!(
-                        ErrorCode::Generic,
-                        "Invalid number of threads in profiles.yml: {}",
-                        s
-                    )
-                })?),
-            }
-        } else {
-            None
-        }
-    } else {
-        iarg.num_threads
-    };
-
-    dbt_profile
-        .db_config
-        .set_threads(Some(StringOrInteger::Integer(
-            final_threads.unwrap_or(0) as i64
-        )));
+    let final_threads = resolve_and_set_threads(&mut dbt_profile, iarg)?;
 
     let iarg = InvocationArgs {
         num_threads: final_threads,
@@ -226,12 +236,23 @@ pub async fn load(
         arg.vars.clone(),
         arg.version_check,
         arg.skip_private_deps,
+        iarg.replay.as_ref(),
         token,
     )
     .await?;
 
-    // get publication artifact for each upstream project
-    download_publication_artifacts(&upstream_projects, &dbt_cloud_project, &arg.io).await?;
+    // Skip downloading publication artifacts in Time Machine replay mode
+    // In replay mode, we're replaying a recorded session and don't need to download anything
+    let is_time_machine_replay = matches!(
+        &iarg.replay,
+        Some(ReplayMode::TimeMachine(TimeMachineMode::Replay(_)))
+    );
+
+    if !is_time_machine_replay {
+        // get publication artifact for each upstream project
+        download_publication_artifacts(&upstream_projects, &dbt_cloud_project, &arg.io).await?;
+    }
+
     // If we are running `dbt deps` we don't need to collect files
     if arg.install_deps {
         return Ok((dbt_state, dbt_cloud_project));
@@ -296,6 +317,34 @@ pub async fn load(
     Ok((dbt_state, dbt_cloud_project))
 }
 
+/// Lightweight load function for the `clean` command.
+///
+/// This function loads only the minimal state needed for cleaning
+#[tracing::instrument(
+    skip_all,
+    fields(
+        _e = ?store_event_attributes(PhaseExecuted::start_general(ExecutionPhase::LoadProject)),
+    )
+)]
+pub async fn load_for_clean(arg: &LoadArgs) -> FsResult<DbtState> {
+    let (_simplified_dbt_project, dbt_profile) = load_simplified_project_and_profiles(arg).await?;
+
+    let env = initialize_load_profile_jinja_environment();
+    load_catalogs(arg, &env).await?;
+
+    // Create minimal DbtState - no packages, no vars
+    let dbt_state = DbtState {
+        dbt_profile,
+        run_started_at: run_started_at(),
+        packages: vec![],
+        vars: BTreeMap::new(),
+        cli_vars: arg.vars.clone(),
+        catalogs: load_catalogs::fetch_catalogs(),
+    };
+
+    Ok(dbt_state)
+}
+
 pub async fn load_catalogs(arg: &LoadArgs, env: &JinjaEnv) -> FsResult<()> {
     let ctx: BTreeMap<String, minijinja::Value> = BTreeMap::from([
         (
@@ -304,7 +353,7 @@ pub async fn load_catalogs(arg: &LoadArgs, env: &JinjaEnv) -> FsResult<()> {
         ),
         (
             "var".to_owned(),
-            minijinja::Value::from_function(var_fn(arg.vars.clone())),
+            minijinja::Value::from_object(Var::new(arg.vars.clone())),
         ),
     ]);
     let catalogs_yml_path = arg.io.in_dir.join(DBT_CATALOGS_YML);
@@ -340,7 +389,13 @@ pub async fn load_simplified_project_and_profiles(
         ),
         (
             "var".to_owned(),
-            minijinja::Value::from_function(var_fn(arg.vars.clone())),
+            minijinja::Value::from_object(Var::new(arg.vars.clone())),
+        ),
+        (
+            // Add empty context object (mimics dbt-core's BaseContext.to_dict() pattern)
+            // This allows profiles.yml to use: context.project_name or ''
+            "context".to_owned(),
+            minijinja::Value::from_serialize(BTreeMap::<String, minijinja::Value>::new()),
         ),
     ]);
 
@@ -436,7 +491,7 @@ pub async fn load_inner(
     is_dependency: bool,
     package_lookup_map: &BTreeMap<String, String>,
     skip_dependencies: bool,
-    collected_vars: &mut Vec<(String, BTreeMap<String, DbtVars>)>,
+    collected_vars: &mut Vec<(String, IndexMap<String, DbtVars>)>,
 ) -> FsResult<DbtPackage> {
     // all read files
     let mut all_files: HashMap<ResourcePathKind, Vec<(PathBuf, SystemTime)>> = HashMap::new();
@@ -566,6 +621,14 @@ pub async fn load_inner(
         &all_files,
     );
 
+    let macro_ymls = find_files_by_kind_and_extension(
+        package_path,
+        &dbt_project.name,
+        &ResourcePathKind::MacroPaths,
+        &["yml", "yaml"],
+        &all_files,
+    );
+
     // todo: change dbt_properties to be BTreeSet, this may require many goldies updates
     for item in seed_ymls
         .iter()
@@ -573,6 +636,7 @@ pub async fn load_inner(
         .chain(&analysis_ymls)
         .chain(&test_ymls)
         .chain(&function_ymls)
+        .chain(&macro_ymls)
     {
         if !dbt_properties.contains(item) {
             dbt_properties.push(item.clone());
@@ -604,13 +668,24 @@ pub async fn load_inner(
         model_sql_files.extend(python_model_files);
         model_sql_files.sort_by(|a, b| a.path.cmp(&b.path));
     }
-    let function_sql_files = find_files_by_kind_and_extension(
+    let mut function_sql_files = find_files_by_kind_and_extension(
         package_path,
         &dbt_project.name,
         &ResourcePathKind::FunctionPaths,
         &["sql"],
         &all_files,
     );
+    let python_function_files = find_files_by_kind_and_extension(
+        package_path,
+        &dbt_project.name,
+        &ResourcePathKind::FunctionPaths,
+        &["py"],
+        &all_files,
+    );
+    if !python_function_files.is_empty() {
+        function_sql_files.extend(python_function_files);
+        function_sql_files.sort_by(|a, b| a.path.cmp(&b.path));
+    }
     let macro_files = find_files_by_kind_and_extension(
         package_path,
         &dbt_project.name,

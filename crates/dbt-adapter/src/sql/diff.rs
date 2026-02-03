@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use dbt_common::{AdapterError, AdapterErrorKind, AdapterResult};
 
 use super::tokenizer::{AbstractToken, Token, abstract_tokenize, tokenize};
@@ -23,6 +25,7 @@ pub fn compare_sql(actual: &str, expected: &str) -> AdapterResult<()> {
     let expected = canonicalize_test_temp_relation_identifiers(&expected);
     let actual = canonicalize_elementary_metadata_pkg_version(&actual);
     let expected = canonicalize_elementary_metadata_pkg_version(&expected);
+    let actual = canonicalize_python_config_dict(&actual, &expected);
 
     // Short-circuit: Elementary-generated SQL is allowed to drift across recorders/runners.
     // We only short-circuit when BOTH sides are clearly Elementary-originated.
@@ -75,7 +78,7 @@ pub fn compare_sql(actual: &str, expected: &str) -> AdapterResult<()> {
         return Ok(());
     }
 
-    // lightweight structural comparison
+    // lightweight structural comparison (includes CTE normalization)
     if compare_sql_structurally(&actual, &expected) {
         return Ok(());
     }
@@ -92,6 +95,7 @@ pub fn compare_sql(actual: &str, expected: &str) -> AdapterResult<()> {
 /// Lightweight structural comparator for SQL to relax overly strict mismatches.
 /// Rules:
 /// - Normalize whitespace significance by skipping it during parsing (inputs themselves are not mutated).
+/// - Normalize redundant dbt-generated nested CTEs (where inner CTEs duplicate outer scope definitions).
 /// - If both look like: `select * from (<subquery>) <rest>` then recursively compare both `<subquery>` and `<rest>`.
 /// - Else, if both look like: `with n1 as (<sub1>), ..., nk as (<subk>) <sub>` then
 ///   ensure corresponding names match and recursively compare each `<subi>`, then compare `<sub>`.
@@ -115,8 +119,14 @@ fn compare_sql_structurally(actual: &str, expected: &str) -> bool {
     }
 
     // 2) with n1 as (<sub1>), ..., nk as (<subk>) <sub>
+    // Normalize redundant nested CTEs before structural comparison
+    // This handles cases where one SQL has redundant nested CTE definitions
+    // that match outer scope definitions, while the other reuses outer CTEs
+    let a = canonicalize_redundant_nested_ctes(a);
+    let b = canonicalize_redundant_nested_ctes(b);
+
     if let (Some((a_ctes, a_tail)), Some((b_ctes, b_tail))) =
-        (parse_with_clause(a), parse_with_clause(b))
+        (parse_with_clause(&a), parse_with_clause(&b))
     {
         if a_ctes.len() != b_ctes.len() {
             return false;
@@ -135,14 +145,14 @@ fn compare_sql_structurally(actual: &str, expected: &str) -> bool {
 
     // 3) CREATE [OR REPLACE] <stuff> AS (<subquery>)
     if let (Some((a_stuff, a_sub)), Some((b_stuff, b_sub))) =
-        (parse_create_as_subquery(a), parse_create_as_subquery(b))
+        (parse_create_as_subquery(&a), parse_create_as_subquery(&b))
     {
         return a_stuff == b_stuff && compare_sql(a_sub, b_sub).is_ok();
     }
 
     // 4) <sub1> union all <sub2> ... union all <sub_q>
     if let (Some(mut a_parts), Some(mut b_parts)) =
-        (split_union_all_top_level(a), split_union_all_top_level(b))
+        (split_union_all_top_level(&a), split_union_all_top_level(&b))
     {
         if a_parts.len() > 1 && b_parts.len() > 1 && a_parts.len() == b_parts.len() {
             // Key-less lexicographic sort for deterministic pairing
@@ -417,10 +427,22 @@ fn canonicalize_uuid_literals(sql: &str) -> String {
 /// The specific package version string isn't semantically meaningful for replay comparison, but
 /// we scope this canonicalization narrowly to avoid masking legitimate literal differences.
 fn canonicalize_elementary_metadata_pkg_version(sql: &str) -> String {
-    // Fast-path: only touch the known Elementary metadata table and field.
+    // Fast-path: only touch likely Elementary `model.elementary.metadata` materializations.
+    //
+    // Projects can change where Elementary models land (database/schema), so we cannot rely on a
+    // fixed schema/table prefix like `analytics_elementary_metadata.metadata`.
+    //
+    // Instead, we scope this canonicalization to DDL that creates a `... .metadata` table and
+    // contains the `dbt_pkg_version` field literal.
     let lower = sql.to_ascii_lowercase();
-    if !(lower.contains("analytics_elementary_metadata.metadata")
-        && lower.contains("dbt_pkg_version"))
+    if !lower.contains("dbt_pkg_version") {
+        return sql.to_string();
+    }
+    // Must look like DDL for a table named `metadata`.
+    // We keep this intentionally conservative to avoid masking unrelated literals.
+    if !(lower.contains("create or replace")
+        && lower.contains("table")
+        && lower.contains(".metadata"))
     {
         return sql.to_string();
     }
@@ -436,6 +458,175 @@ fn is_elementary_query(sql: &str) -> bool {
     // Elementary appends an explicit marker comment to its generated SQL.
     // We treat any SQL containing this marker as Elementary-originated.
     sql.contains("--ELEMENTARY-METADATA--")
+}
+
+/// The prefix used by dbt for ephemeral model CTEs.
+const DBT_CTE_PREFIX: &str = "__dbt__cte__";
+
+/// Canonicalize SQL by removing redundant nested dbt CTEs that match definitions in scope.
+///
+/// This is necessary because mantle sporadically materializes unnecessary CTEs (potential
+/// race condition in mantle) while fusion does not. This normalization allows comparing
+/// SQL from both systems by treating redundant nested dbt CTEs as equivalent to referencing
+/// the outer CTE that is already in scope.
+///
+/// **Important**: This normalization only applies to CTEs with the `__dbt__cte__` prefix,
+/// which are generated by dbt for ephemeral models. User-defined CTEs are not affected.
+///
+/// The normalization works recursively at arbitrary nesting levels. A nested dbt CTE is
+/// considered redundant if it has the same name AND the same definition as a CTE
+/// that is already in scope (from any parent level).
+///
+/// Example - these two are semantically equivalent:
+/// ```sql
+/// -- Query 1: with nested redundant dbt CTEs at multiple levels
+/// with __dbt__cte__abc as (select a from A),
+/// __dbt__cte__efg as (
+///     with __dbt__cte__abc as (select a from A),  -- redundant, same as outer
+///     __dbt__cte__hij as (select b from B),
+///     __dbt__cte__lll as (
+///         with __dbt__cte__hij as (select b from B)  -- redundant
+///         select hij.b as b
+///     )
+///     select abc.a, hij.b, lll.b
+/// )
+/// select * from __dbt__cte__abc, __dbt__cte__efg
+/// ```
+/// ```sql
+/// -- Query 2: reuses dbt CTEs from outer scopes
+/// with __dbt__cte__abc as (select a from A),
+/// __dbt__cte__efg as (
+///     with __dbt__cte__hij as (select b from B),
+///     __dbt__cte__lll as (select hij.b as b)
+///     select abc.a, hij.b, lll.b
+/// )
+/// select * from __dbt__cte__abc, __dbt__cte__efg
+/// ```
+fn canonicalize_redundant_nested_ctes(sql: &str) -> String {
+    // Start with an empty scope and process recursively
+    let scope = HashMap::new();
+    canonicalize_nested_ctes_with_scope(sql, &scope)
+}
+
+/// Recursively canonicalize CTEs with an accumulated scope of CTEs from parent levels.
+///
+/// The scope contains all CTEs that are "in scope" at this level - i.e., CTEs defined
+/// at this level or any parent level that can be referenced without re-definition.
+fn canonicalize_nested_ctes_with_scope(
+    sql: &str,
+    parent_scope: &HashMap<String, String>,
+) -> String {
+    // Parse CTEs at this level
+    let Some((ctes, tail)) = parse_with_clause(sql) else {
+        return sql.to_string();
+    };
+
+    // Build accumulated scope: start with parent scope
+    let mut current_scope = parent_scope.clone();
+
+    // First pass: add all CTE definitions at this level to the scope
+    // (we need this for sibling CTE references)
+    for (name, body) in &ctes {
+        let normalized_body = normalize_sql_for_cte_comparison(body);
+        current_scope.insert(name.to_lowercase(), normalized_body);
+    }
+
+    // Second pass: process each CTE body, removing redundant nested CTEs
+    let mut new_ctes: Vec<(String, String)> = Vec::new();
+    for (cte_name, cte_body) in ctes {
+        let new_body = remove_redundant_nested_ctes_recursive(&cte_body, &current_scope);
+        new_ctes.push((cte_name, new_body));
+    }
+
+    // Rebuild the SQL
+    if new_ctes.is_empty() {
+        tail.to_string()
+    } else {
+        let cte_parts: Vec<String> = new_ctes
+            .iter()
+            .map(|(name, body)| format!("{} as ({})", name, body))
+            .collect();
+        format!("with {} {}", cte_parts.join(", "), tail)
+    }
+}
+
+/// Normalize SQL for CTE comparison (remove whitespace, lowercase).
+fn normalize_sql_for_cte_comparison(sql: &str) -> String {
+    sql.chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_lowercase()
+}
+
+/// Check if a CTE name is a dbt-generated ephemeral CTE (has __dbt__cte__ prefix).
+fn is_dbt_cte(name: &str) -> bool {
+    name.to_lowercase()
+        .starts_with(&DBT_CTE_PREFIX.to_lowercase())
+}
+
+/// Remove redundant nested dbt CTEs from a CTE body, recursively handling arbitrary nesting.
+///
+/// A nested dbt CTE is redundant if:
+/// 1. Its name starts with `__dbt__cte__`
+/// 2. It has the same name as a CTE in the current scope
+/// 3. Its definition (after normalization) matches the in-scope CTE's definition
+///
+/// Non-dbt CTEs (without the prefix) are never considered redundant and are always kept.
+/// All CTEs (dbt or not) are added to the scope for deeper nested levels.
+fn remove_redundant_nested_ctes_recursive(
+    body: &str,
+    parent_scope: &HashMap<String, String>,
+) -> String {
+    // Try to parse as a WITH clause
+    let Some((inner_ctes, inner_tail)) = parse_with_clause(body) else {
+        return body.to_string();
+    };
+
+    // Build accumulated scope for this level
+    let mut current_scope = parent_scope.clone();
+
+    // Filter out inner dbt CTEs that match definitions in scope
+    let mut keep_ctes: Vec<(String, String)> = Vec::new();
+    for (inner_name, inner_body) in inner_ctes {
+        let inner_name_lower = inner_name.to_lowercase();
+        let inner_body_normalized = normalize_sql_for_cte_comparison(&inner_body);
+
+        // Only consider dbt CTEs (with __dbt__cte__ prefix) for redundancy removal
+        let is_redundant = if is_dbt_cte(&inner_name) {
+            // Check if this dbt CTE matches one already in scope
+            if let Some(scope_body) = parent_scope.get(&inner_name_lower) {
+                scope_body == &inner_body_normalized
+            } else {
+                false
+            }
+        } else {
+            // Non-dbt CTEs are never considered redundant
+            false
+        };
+
+        if is_redundant {
+            // Skip this redundant dbt CTE - it's already available in the parent scope
+            continue;
+        }
+
+        // This CTE is not redundant - add it to scope for nested processing
+        current_scope.insert(inner_name_lower, inner_body_normalized);
+
+        // Recursively process nested CTEs in the body with the updated scope
+        let processed_body = remove_redundant_nested_ctes_recursive(&inner_body, &current_scope);
+        keep_ctes.push((inner_name, processed_body));
+    }
+
+    // Rebuild the body
+    if keep_ctes.is_empty() {
+        inner_tail.to_string()
+    } else {
+        let cte_parts: Vec<String> = keep_ctes
+            .iter()
+            .map(|(name, body)| format!("{} as ({})", name, body))
+            .collect();
+        format!("with {} {}", cte_parts.join(", "), inner_tail)
+    }
 }
 
 /// Canonicalize string literals that embed `invocation_id` (UUID) + dbt test unique_id.
@@ -624,6 +815,273 @@ fn canonicalize_typographic_quotes_in_dollar_quoted_strings(sql: &str) -> String
     }
 
     out
+}
+
+/// For Python models, canonicalize config_dict when actual differs from expected only by extra meta keys.
+/// This handles cases where project-level configs add extra meta keys that dbt-core doesn't serialize.
+/// Only replaces the entire config_dict if:
+/// 1. Actual's meta contains all expected meta keys with same values (superset)
+/// 2. All non-meta keys match exactly between actual and expected
+fn canonicalize_python_config_dict(actual: &str, expected: &str) -> String {
+    // Check if both contain config_dict (Python model indicator)
+    if !actual.contains("config_dict = {") || !expected.contains("config_dict = {") {
+        return actual.to_string();
+    }
+
+    // Extract config_dict from both
+    let actual_config_dict = extract_config_dict(actual);
+    let expected_config_dict = extract_config_dict(expected);
+
+    if actual_config_dict.is_none() || expected_config_dict.is_none() {
+        return actual.to_string();
+    }
+
+    let (actual_dict_start, actual_dict_end, actual_dict_str) = actual_config_dict.unwrap();
+    let (_expected_dict_start, _expected_dict_end, expected_dict_str) =
+        expected_config_dict.unwrap();
+
+    // Try to parse both as Python dicts
+    if let (Ok(actual_dict), Ok(expected_dict)) = (
+        parse_python_dict(&actual_dict_str),
+        parse_python_dict(&expected_dict_str),
+    ) {
+        // Check if actual's meta is a superset of expected's meta
+        if let (Some(actual_meta), Some(expected_meta)) = (
+            actual_dict.get("meta").and_then(|v| v.as_dict()),
+            expected_dict.get("meta").and_then(|v| v.as_dict()),
+        ) {
+            // Verify all expected meta keys are in actual and have the same value
+            let meta_is_superset = expected_meta
+                .iter()
+                .all(|(k, v)| actual_meta.get(k) == Some(v));
+
+            // Verify all non-meta keys in expected also exist in actual with same values
+            // This ensures we only canonicalize when the dicts differ only in meta's extra keys
+            let non_meta_keys_match = expected_dict
+                .iter()
+                .filter(|(k, _)| k.as_str() != "meta")
+                .all(|(k, v)| actual_dict.get(k) == Some(v));
+
+            if meta_is_superset && non_meta_keys_match {
+                // Safe to canonicalize by replacing actual's config_dict with expected's
+                let mut result = String::with_capacity(actual.len());
+                result.push_str(&actual[..actual_dict_start]);
+                result.push_str(&expected_dict_str);
+                result.push_str(&actual[actual_dict_end..]);
+                return result;
+            }
+        }
+    }
+
+    actual.to_string()
+}
+
+/// Extract config_dict string from Python SQL
+/// Returns (start_offset, end_offset, dict_string)
+fn extract_config_dict(sql: &str) -> Option<(usize, usize, String)> {
+    let start_pattern = "config_dict = ";
+    let start = sql.find(start_pattern)?;
+    let dict_start = start + start_pattern.len();
+
+    // Verify the next character is {
+    if !sql[dict_start..].starts_with('{') {
+        return None;
+    }
+
+    // Start scanning from after the opening {
+    let scan_start = dict_start + 1;
+
+    // Find the matching closing brace
+    let mut depth = 0;
+    let mut string_quote: Option<char> = None;
+    let mut escape_next = false;
+    let mut dict_end = dict_start;
+
+    for (i, ch) in sql[scan_start..].chars().enumerate() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+
+        match ch {
+            '\\' => escape_next = true,
+            '\'' | '"' => {
+                if let Some(quote) = string_quote {
+                    // We're in a string, check if this closes it
+                    if ch == quote {
+                        string_quote = None;
+                    }
+                } else {
+                    // We're not in a string, this opens one
+                    string_quote = Some(ch);
+                }
+            }
+            '{' if string_quote.is_none() => {
+                depth += 1;
+            }
+            '}' if string_quote.is_none() => {
+                if depth == 0 {
+                    dict_end = scan_start + i + 1;
+                    break;
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+
+    if dict_end == dict_start {
+        return None;
+    }
+
+    Some((dict_start, dict_end, sql[dict_start..dict_end].to_string()))
+}
+
+/// Simple Python dict value representation
+#[derive(Debug, Clone, PartialEq)]
+enum PyValue {
+    String(String),
+    Dict(HashMap<String, PyValue>),
+    None,
+}
+
+impl PyValue {
+    fn as_dict(&self) -> Option<&HashMap<String, PyValue>> {
+        match self {
+            PyValue::Dict(d) => Some(d),
+            _ => None,
+        }
+    }
+}
+
+/// Parse a simple Python dict literal (limited to what we need for config_dict)
+fn parse_python_dict(s: &str) -> Result<HashMap<String, PyValue>, String> {
+    let s = s.trim();
+    if !s.starts_with('{') || !s.ends_with('}') {
+        return Err("Not a dict".to_string());
+    }
+
+    let inner = &s[1..s.len() - 1].trim();
+    if inner.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut result = HashMap::new();
+    let mut remaining = *inner;
+
+    while !remaining.is_empty() {
+        remaining = remaining.trim_start();
+        if remaining.is_empty() {
+            break;
+        }
+
+        // Parse key (quoted string)
+        if !remaining.starts_with('\'') && !remaining.starts_with('"') {
+            return Err("Expected quoted key".to_string());
+        }
+
+        let quote_char = remaining.chars().next().unwrap();
+        let key_end = remaining[1..].find(quote_char).ok_or("Unterminated key")?;
+        let key = remaining[1..=key_end].to_string();
+        remaining = remaining[key_end + 2..].trim_start();
+
+        // Expect colon
+        if !remaining.starts_with(':') {
+            return Err("Expected colon".to_string());
+        }
+        remaining = remaining[1..].trim_start();
+
+        // Parse value
+        let (value, rest) = parse_python_value(remaining)?;
+        result.insert(key, value);
+        remaining = rest.trim_start();
+
+        // Handle comma
+        if remaining.starts_with(',') {
+            remaining = &remaining[1..];
+        }
+    }
+
+    Ok(result)
+}
+
+fn parse_python_value(s: &str) -> Result<(PyValue, &str), String> {
+    let s = s.trim_start();
+
+    if s.starts_with('{') {
+        // Parse nested dict
+        let mut depth = 0;
+        let mut end = 0;
+        let mut string_quote: Option<char> = None;
+        let mut escape_next = false;
+
+        for (i, ch) in s.chars().enumerate() {
+            if escape_next {
+                escape_next = false;
+                continue;
+            }
+
+            match ch {
+                '\\' => escape_next = true,
+                '\'' | '"' => {
+                    if let Some(quote) = string_quote {
+                        // We're in a string, check if this closes it
+                        if ch == quote {
+                            string_quote = None;
+                        }
+                    } else {
+                        // We're not in a string, this opens one
+                        string_quote = Some(ch);
+                    }
+                }
+                '{' if string_quote.is_none() => depth += 1,
+                '}' if string_quote.is_none() => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if end == 0 {
+            return Err("Unterminated dict".to_string());
+        }
+
+        let dict_str = &s[..end];
+        let dict = parse_python_dict(dict_str)?;
+        Ok((PyValue::Dict(dict), &s[end..]))
+    } else if s.starts_with('\'') || s.starts_with('"') {
+        // Parse string
+        let quote_char = s.chars().next().unwrap();
+        let mut end = 1;
+        let mut escape_next = false;
+
+        for (i, ch) in s[1..].chars().enumerate() {
+            if escape_next {
+                escape_next = false;
+                end = i + 2;
+                continue;
+            }
+
+            if ch == '\\' {
+                escape_next = true;
+            } else if ch == quote_char {
+                end = i + 2;
+                break;
+            }
+            end = i + 2;
+        }
+
+        let value = s[1..end - 1].to_string();
+        Ok((PyValue::String(value), &s[end..]))
+    } else if let Some(stripped) = s.strip_prefix("None") {
+        Ok((PyValue::None, stripped))
+    } else {
+        Err("Unknown value type".to_string())
+    }
 }
 
 fn fuzzy_compare_sql(actual: &str, expected: &str) -> bool {
@@ -2430,6 +2888,34 @@ SELECT
     }
 
     #[test]
+    fn test_compare_sql_elementary_pkg_version_drift_ignored_with_renamed_schema() {
+        // Regression: some projects materialize Elementary's `metadata` model into the project's
+        // target schema (or other renamed schemas), not `analytics_elementary_metadata`.
+        let actual = r#"
+create or replace transient  table SAM_CLARK_SANDBOX.weather_analytics_prd.metadata
+    as (
+SELECT
+    '0.21.0' as dbt_pkg_version
+    )
+;
+"#;
+        let expected = r#"
+create or replace transient table SAM_CLARK_SANDBOX.weather_analytics_prd.metadata
+    as (
+SELECT
+    '0.20.1' as dbt_pkg_version
+    )
+;
+"#;
+
+        let result = compare_sql(actual, expected);
+        assert!(
+            result.is_ok(),
+            "Elementary metadata package version drift should be ignored even when schema is renamed"
+        );
+    }
+
+    #[test]
     fn test_compare_sql_elementary_metadata_comment_ignored() {
         let actual = r#"select metadata_hash 
     from OPERATIONS_PRD.MFG_INSTRUMENTS.dbt_exposures
@@ -2444,6 +2930,323 @@ SELECT
         assert!(
             result.is_ok(),
             "Elementary metadata comments should be ignored"
+        );
+    }
+
+    #[test]
+    fn test_compare_sql_nested_redundant_dbt_ctes_equivalent() {
+        // Query with nested redundant dbt CTE definition
+        let sql_with_nested_cte = r#"
+with __dbt__cte__abc as (
+    select a from A
+),
+__dbt__cte__efg as (
+    with __dbt__cte__abc as (
+        select a from A
+    )
+    select abc.a as a from __dbt__cte__abc
+)
+select abc.a from __dbt__cte__abc, efg.a from __dbt__cte__efg
+"#;
+
+        // Query that reuses outer dbt CTE
+        let sql_reusing_outer_cte = r#"
+with __dbt__cte__abc as (
+    select a from A
+),
+__dbt__cte__efg as (
+    select abc.a as a from __dbt__cte__abc
+)
+select abc.a from __dbt__cte__abc, efg.a from __dbt__cte__efg
+"#;
+
+        let result = compare_sql(sql_with_nested_cte, sql_reusing_outer_cte);
+        assert!(
+            result.is_ok(),
+            "Nested redundant dbt CTEs should be treated as equivalent to outer CTE reuse"
+        );
+
+        // Also test in reverse order
+        let result_reversed = compare_sql(sql_reusing_outer_cte, sql_with_nested_cte);
+        assert!(result_reversed.is_ok(), "Comparison should be symmetric");
+    }
+
+    #[test]
+    fn test_compare_sql_nested_dbt_ctes_different_definitions() {
+        // Query with nested dbt CTE that has DIFFERENT definition
+        let sql_with_different_nested = r#"
+with __dbt__cte__abc as (
+    select a from A
+),
+__dbt__cte__efg as (
+    with __dbt__cte__abc as (
+        select b from B
+    )
+    select abc.a as a from __dbt__cte__abc
+)
+select abc.a from __dbt__cte__abc, efg.a from __dbt__cte__efg
+"#;
+
+        // Query that reuses outer dbt CTE
+        let sql_reusing_outer_cte = r#"
+with __dbt__cte__abc as (
+    select a from A
+),
+__dbt__cte__efg as (
+    select abc.a as a from __dbt__cte__abc
+)
+select abc.a from __dbt__cte__abc, efg.a from __dbt__cte__efg
+"#;
+
+        let result = compare_sql(sql_with_different_nested, sql_reusing_outer_cte);
+        assert!(
+            result.is_err(),
+            "Nested dbt CTEs with different definitions should NOT be treated as equivalent"
+        );
+    }
+
+    #[test]
+    fn test_compare_sql_multiple_nested_redundant_dbt_ctes() {
+        // Query with multiple nested redundant dbt CTEs
+        let sql_with_nested = r#"
+with __dbt__cte__abc as (
+    select a from A
+),
+__dbt__cte__def as (
+    select d from D
+),
+__dbt__cte__efg as (
+    with __dbt__cte__abc as (
+        select a from A
+    ),
+    __dbt__cte__def as (
+        select d from D
+    )
+    select abc.a, def.d from __dbt__cte__abc, __dbt__cte__def
+)
+select * from __dbt__cte__efg
+"#;
+
+        // Query that reuses outer dbt CTEs
+        let sql_reusing = r#"
+with __dbt__cte__abc as (
+    select a from A
+),
+__dbt__cte__def as (
+    select d from D
+),
+__dbt__cte__efg as (
+    select abc.a, def.d from __dbt__cte__abc, __dbt__cte__def
+)
+select * from __dbt__cte__efg
+"#;
+
+        let result = compare_sql(sql_with_nested, sql_reusing);
+        assert!(
+            result.is_ok(),
+            "Multiple nested redundant dbt CTEs should be treated as equivalent"
+        );
+    }
+
+    #[test]
+    fn test_canonicalize_redundant_nested_dbt_ctes() {
+        let sql_with_nested = r#"with __dbt__cte__abc as (select a from A), __dbt__cte__efg as (with __dbt__cte__abc as (select a from A) select abc.a from __dbt__cte__abc) select * from __dbt__cte__efg"#;
+
+        let canonicalized = canonicalize_redundant_nested_ctes(sql_with_nested);
+
+        // The canonicalized version should not contain the nested "with __dbt__cte__abc"
+        assert!(
+            !canonicalized.to_lowercase().contains(
+                "with __dbt__cte__abc as (select a from a) select abc.a from __dbt__cte__abc"
+            ),
+            "Redundant nested dbt CTE should be removed. Got: {canonicalized}"
+        );
+    }
+
+    #[test]
+    fn test_compare_sql_deeply_nested_redundant_dbt_ctes() {
+        // Query with deeply nested redundant dbt CTEs (3 levels)
+        // - __dbt__cte__abc is defined at outer level
+        // - __dbt__cte__hij is defined inside __dbt__cte__efg
+        // - __dbt__cte__lll re-defines __dbt__cte__hij inside it (redundant)
+        let sql_with_deep_nesting = r#"
+with __dbt__cte__abc as (select a from A),
+__dbt__cte__efg as (
+    with __dbt__cte__abc as (select a from A),
+    __dbt__cte__hij as (select b from B),
+    __dbt__cte__lll as (
+        with __dbt__cte__hij as (select b from B)
+        select hij.b as b from __dbt__cte__hij
+    )
+    select abc.a, hij.b, lll.b from __dbt__cte__abc, __dbt__cte__hij, __dbt__cte__lll
+)
+select * from __dbt__cte__abc, __dbt__cte__efg
+"#;
+
+        // Query that reuses dbt CTEs from parent scopes
+        let sql_reusing_parent_scopes = r#"
+with __dbt__cte__abc as (select a from A),
+__dbt__cte__efg as (
+    with __dbt__cte__hij as (select b from B),
+    __dbt__cte__lll as (select hij.b as b from __dbt__cte__hij)
+    select abc.a, hij.b, lll.b from __dbt__cte__abc, __dbt__cte__hij, __dbt__cte__lll
+)
+select * from __dbt__cte__abc, __dbt__cte__efg
+"#;
+
+        let result = compare_sql(sql_with_deep_nesting, sql_reusing_parent_scopes);
+        assert!(
+            result.is_ok(),
+            "Deeply nested redundant dbt CTEs should be treated as equivalent"
+        );
+
+        // Also test in reverse order
+        let result_reversed = compare_sql(sql_reusing_parent_scopes, sql_with_deep_nesting);
+        assert!(result_reversed.is_ok(), "Comparison should be symmetric");
+    }
+
+    #[test]
+    fn test_compare_sql_deeply_nested_dbt_ctes_different_at_inner_level() {
+        // Query where the deeply nested dbt CTE has a DIFFERENT definition
+        let sql_with_different_deep_nested = r#"
+with __dbt__cte__abc as (select a from A),
+__dbt__cte__efg as (
+    with __dbt__cte__hij as (select b from B),
+    __dbt__cte__lll as (
+        with __dbt__cte__hij as (select c from C)
+        select hij.c as c from __dbt__cte__hij
+    )
+    select abc.a, hij.b, lll.c from __dbt__cte__abc, __dbt__cte__hij, __dbt__cte__lll
+)
+select * from __dbt__cte__abc, __dbt__cte__efg
+"#;
+
+        // Query that reuses __dbt__cte__hij from parent scope
+        let sql_reusing_parent = r#"
+with __dbt__cte__abc as (select a from A),
+__dbt__cte__efg as (
+    with __dbt__cte__hij as (select b from B),
+    __dbt__cte__lll as (select hij.b as b from __dbt__cte__hij)
+    select abc.a, hij.b, lll.b from __dbt__cte__abc, __dbt__cte__hij, __dbt__cte__lll
+)
+select * from __dbt__cte__abc, __dbt__cte__efg
+"#;
+
+        let result = compare_sql(sql_with_different_deep_nested, sql_reusing_parent);
+        assert!(
+            result.is_err(),
+            "Nested dbt CTEs with different definitions at inner levels should NOT be equivalent"
+        );
+    }
+
+    #[test]
+    fn test_compare_sql_sibling_dbt_cte_reference() {
+        // Test that sibling dbt CTEs at the same level are properly in scope
+        // Query where a CTE references a sibling CTE and later re-defines it redundantly
+        let sql_with_redundant_sibling = r#"
+with __dbt__cte__abc as (select a from A),
+__dbt__cte__def as (select d from D),
+__dbt__cte__efg as (
+    with __dbt__cte__abc as (select a from A),
+    __dbt__cte__def as (select d from D),
+    __dbt__cte__ghi as (
+        with __dbt__cte__def as (select d from D)
+        select def.d from __dbt__cte__def
+    )
+    select abc.a, def.d, ghi.d from __dbt__cte__abc, __dbt__cte__def, __dbt__cte__ghi
+)
+select * from __dbt__cte__efg
+"#;
+
+        let sql_without_redundant = r#"
+with __dbt__cte__abc as (select a from A),
+__dbt__cte__def as (select d from D),
+__dbt__cte__efg as (
+    with __dbt__cte__ghi as (select def.d from __dbt__cte__def)
+    select abc.a, def.d, ghi.d from __dbt__cte__abc, __dbt__cte__def, __dbt__cte__ghi
+)
+select * from __dbt__cte__efg
+"#;
+
+        let result = compare_sql(sql_with_redundant_sibling, sql_without_redundant);
+        assert!(
+            result.is_ok(),
+            "Sibling dbt CTE references should be properly handled"
+        );
+    }
+
+    #[test]
+    fn test_non_dbt_ctes_not_normalized() {
+        // Test that user-defined CTEs (without __dbt__cte__ prefix) are NOT normalized
+        // Even if they have the same definition, they should be kept as-is
+        let sql_with_nested_user_cte = r#"
+with user_cte as (
+    select a from A
+),
+outer_cte as (
+    with user_cte as (
+        select a from A
+    )
+    select a from user_cte
+)
+select * from outer_cte
+"#;
+
+        let sql_without_nested = r#"
+with user_cte as (
+    select a from A
+),
+outer_cte as (
+    select a from user_cte
+)
+select * from outer_cte
+"#;
+
+        let result = compare_sql(sql_with_nested_user_cte, sql_without_nested);
+        // This should NOT be equivalent because user CTEs are not normalized
+        assert!(
+            result.is_err(),
+            "Non-dbt CTEs should NOT be normalized - they are user-defined and should be preserved"
+        );
+    }
+
+    #[test]
+    fn test_compare_sql_python_config_dict_with_nested_quotes() {
+        // Test that config_dict with nested quotes (like env_var template syntax) is properly canonicalized
+        let actual = r#"config_dict = {'meta': {'indirect_selection': "{{ env_var('DBT_INDIRECT_SELECTION', 'cautious') }}", 'dbt_environment': 'Prod'}, 'database': 'REPORTING_PROD', 'schema': 'exports', 'backup_config': {}}"#;
+        let expected = r#"config_dict = {'meta': {'dbt_environment': 'Prod'}, 'database': 'REPORTING_PROD', 'schema': 'exports', 'backup_config': {}}"#;
+
+        let canonicalized = canonicalize_python_config_dict(actual, expected);
+
+        // Should canonicalize to the expected format (ours has a superset meta)
+        assert!(
+            canonicalized.contains("{'dbt_environment': 'Prod'}"),
+            "Should canonicalize to expected config_dict, got: {}",
+            canonicalized
+        );
+        assert!(
+            !canonicalized.contains("indirect_selection"),
+            "Should remove the indirect_selection key"
+        );
+    }
+
+    #[test]
+    fn test_compare_sql_python_config_dict_different_non_meta_keys() {
+        // Test that config_dict is NOT canonicalized when non-meta keys differ
+        let actual = r#"config_dict = {'meta': {'indirect_selection': 'cautious', 'dbt_environment': 'Prod'}, 'database': 'REPORTING_DEV', 'schema': 'exports', 'backup_config': {}}"#;
+        let expected = r#"config_dict = {'meta': {'dbt_environment': 'Prod'}, 'database': 'REPORTING_PROD', 'schema': 'exports', 'backup_config': {}}"#;
+
+        let canonicalized = canonicalize_python_config_dict(actual, expected);
+
+        // Should NOT canonicalize because database differs (REPORTING_DEV vs REPORTING_PROD)
+        assert!(
+            canonicalized.contains("REPORTING_DEV"),
+            "Should preserve actual's database when non-meta keys differ, got: {}",
+            canonicalized
+        );
+        assert!(
+            canonicalized.contains("indirect_selection"),
+            "Should preserve actual's extra meta keys when non-meta keys differ"
         );
     }
 }

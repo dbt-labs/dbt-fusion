@@ -15,15 +15,17 @@ use crate::metadata::redshift::RedshiftMetadataAdapter;
 use crate::metadata::salesforce::SalesforceMetadataAdapter;
 use crate::metadata::snowflake::SnowflakeMetadataAdapter;
 use crate::metadata::{self, CatalogAndSchema, MetadataAdapter};
-use crate::query_ctx::query_ctx_from_state;
-use crate::record_batch_utils::{extract_first_value_as_i64, get_column_values};
+use crate::query_ctx::{node_id_from_state, query_ctx_from_state};
+use crate::record_batch_utils::{
+    RenamedColumn, disambiguate_column_names, extract_first_value_as_i64, get_column_values,
+};
 use crate::relation::RelationObject;
 use crate::relation::bigquery::{
     BigqueryMaterializedViewConfig, BigqueryMaterializedViewConfigObject,
     BigqueryPartitionConfigExt, cluster_by_from_schema, partitions_match,
 };
 use crate::relation::config_v2::{ComponentConfigLoader, RelationConfig};
-use crate::relation::databricks::config_v2::DatabricksRelationMetadata;
+use crate::relation::databricks::config::DatabricksRelationMetadata;
 use crate::render_constraint::render_column_constraint;
 use crate::response::{AdapterResponse, ResultObject};
 use crate::snapshots::SnapshotStrategy;
@@ -41,17 +43,16 @@ use dashmap::DashMap;
 use dbt_agate::AgateTable;
 use dbt_common::adapter::AdapterType;
 use dbt_common::behavior_flags::BehaviorFlag;
-use dbt_common::{FsResult, unexpected_fs_err};
+use dbt_common::tracing::emit::emit_warn_log_message;
+use dbt_common::{ErrorCode, FsResult, unexpected_fs_err};
 use dbt_frontend_common::dialect::Dialect;
 use dbt_schemas::dbt_types::RelationType;
-use dbt_schemas::schemas::common::ConstraintSupport;
 use dbt_schemas::schemas::common::ConstraintType;
 use dbt_schemas::schemas::common::DbtIncrementalStrategy;
+use dbt_schemas::schemas::common::{ClusterConfig, ConstraintSupport, PartitionConfig};
 use dbt_schemas::schemas::common::{Constraint, DbtMaterialization};
 use dbt_schemas::schemas::dbt_column::{DbtColumn, DbtColumnRef};
-use dbt_schemas::schemas::manifest::{
-    BigqueryClusterConfig, BigqueryPartitionConfig, PartitionConfig,
-};
+use dbt_schemas::schemas::manifest::BigqueryPartitionConfig;
 use dbt_schemas::schemas::project::ModelConfig;
 use dbt_schemas::schemas::properties::ModelConstraint;
 use dbt_schemas::schemas::relations::base::{BaseRelation, ComponentName};
@@ -62,8 +63,9 @@ use dbt_xdbc::bigquery::*;
 use dbt_xdbc::salesforce::DATA_TRANSFORM_RUN_TIMEOUT;
 use dbt_xdbc::{Connection, QueryCtx};
 use indexmap::IndexMap;
-use minijinja;
+use minijinja::dispatch_object::DispatchObject;
 use minijinja::value::ValueMap;
+use minijinja::{self, invalid_argument, invalid_argument_inner};
 use minijinja::{State, Value, args};
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -83,6 +85,33 @@ static CREDENTIAL_IN_COPY_INTO_REGEX: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"credential\s*(\(\s*'[\w\-]+'\s*=\s*'.*?'\s*(?:,\s*'[\w\-]+'\s*=\s*'.*?'\s*)*\))")
         .expect("CREDENTIALS_IN_COPY_INTO_REGEX invalid")
 });
+
+/// Returns a callback that emits a warning when duplicate column names are renamed.
+fn warn_duplicate_columns(node_id: Option<String>) -> impl FnOnce(&[RenamedColumn<'_>]) {
+    use std::fmt::Write;
+
+    move |renamed: &[RenamedColumn<'_>]| {
+        let mut msg = match &node_id {
+            Some(id) => format!(
+                "Query for node '{}' returned duplicate column names. \
+                 Columns were renamed to ensure uniqueness: ",
+                id
+            ),
+            None => "Query returned duplicate column names. \
+                     Columns were renamed to ensure uniqueness: "
+                .to_string(),
+        };
+
+        for (i, r) in renamed.iter().enumerate() {
+            if i > 0 {
+                msg.push_str(", ");
+            }
+            write!(msg, "'{}' -> '{}'", r.original, r.renamed).unwrap();
+        }
+
+        emit_warn_log_message(ErrorCode::DuplicateColumns, msg, None);
+    }
+}
 
 /// Adapter with typed functions.
 pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
@@ -128,6 +157,40 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         Ok(())
     }
 
+    fn cache_added(
+        &self,
+        _state: &State,
+        relation: Arc<dyn BaseRelation>,
+    ) -> Result<Value, minijinja::Error> {
+        let _ = self
+            .engine()
+            .relation_cache()
+            .insert_relation(relation, None);
+        Ok(none_value())
+    }
+
+    fn cache_dropped(
+        &self,
+        _state: &State,
+        relation: Arc<dyn BaseRelation>,
+    ) -> Result<Value, minijinja::Error> {
+        let _ = self.engine().relation_cache().evict_relation(&relation);
+        Ok(none_value())
+    }
+
+    fn cache_renamed(
+        &self,
+        _state: &State,
+        from_relation: Arc<dyn BaseRelation>,
+        to_relation: Arc<dyn BaseRelation>,
+    ) -> Result<Value, minijinja::Error> {
+        let _ = self
+            .engine()
+            .relation_cache()
+            .rename_relation(&from_relation, to_relation);
+        Ok(none_value())
+    }
+
     /// Get DB config by key
     fn get_db_config(&self, key: &str) -> Option<Cow<'_, str>> {
         self.engine().config(key)
@@ -151,13 +214,13 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         static REDSHIFT: [DbtIncrementalStrategy; 4] = [Append, DeleteInsert, Merge, Microbatch];
 
         match self.adapter_type() {
-            AdapterType::Postgres => &POSTGRES,
+            AdapterType::Postgres | AdapterType::Sidecar => &POSTGRES,
             AdapterType::Snowflake => &SNOWFLAKE,
             AdapterType::Bigquery => &BIGQUERY,
             AdapterType::Databricks => &DATABRICKS,
             AdapterType::Redshift => &REDSHIFT,
-            AdapterType::Salesforce => {
-                unimplemented!("Salesforce valid_incremental_strategies not implemented")
+            AdapterType::Salesforce | AdapterType::Spark => {
+                unimplemented!("valid_incremental_strategies not implemented")
             }
         }
     }
@@ -195,6 +258,14 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         let redacted_sql = sql.replacen(full_parens, &format!("({redacted_pairs})"), 1);
 
         Ok(redacted_sql)
+    }
+
+    fn get_partitions_metadata(
+        &self,
+        _state: &State,
+        _relation: Arc<dyn BaseRelation>,
+    ) -> Result<Value, minijinja::Error> {
+        unimplemented!("get_partitions_metadata")
     }
 
     /// Create a new connection
@@ -292,7 +363,8 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         // duplicate columns to `col_2`, `col_3`, etc.
         // BigQuery is the exception to this deduping
         let last_batch = if self.adapter_type() != AdapterType::Bigquery {
-            crate::record_batch_utils::disambiguate_column_names(last_batch)
+            let node_id = state.and_then(node_id_from_state);
+            disambiguate_column_names(last_batch, Some(warn_duplicate_columns(node_id)))
         } else {
             last_batch
         };
@@ -426,7 +498,9 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
             | AdapterType::Snowflake
             | AdapterType::Databricks
             | AdapterType::Redshift
-            | AdapterType::Salesforce => {
+            | AdapterType::Salesforce
+            | AdapterType::Sidecar
+            | AdapterType::Spark => {
                 self.execute_inner(
                     self.adapter_type().into(),
                     Arc::clone(self.engine()),
@@ -530,15 +604,17 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
                     compiled_code,
                 )
             }
-            AdapterType::Postgres | AdapterType::Redshift | AdapterType::Salesforce => {
-                Err(AdapterError::new(
-                    AdapterErrorKind::Internal,
-                    format!(
-                        "Python models are not supported for {} adapter",
-                        self.adapter_type()
-                    ),
-                ))
-            }
+            AdapterType::Postgres
+            | AdapterType::Redshift
+            | AdapterType::Salesforce
+            | AdapterType::Sidecar
+            | AdapterType::Spark => Err(AdapterError::new(
+                AdapterErrorKind::Internal,
+                format!(
+                    "Python models are not supported for {} adapter",
+                    self.adapter_type()
+                ),
+            )),
         }
     }
 
@@ -548,8 +624,11 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
             AdapterType::Snowflake
             | AdapterType::Redshift
             | AdapterType::Postgres
+            | AdapterType::Sidecar
             | AdapterType::Salesforce => format!("\"{identifier}\""),
-            AdapterType::Bigquery | AdapterType::Databricks => format!("`{identifier}`"),
+            AdapterType::Bigquery | AdapterType::Databricks | AdapterType::Spark => {
+                format!("`{identifier}`")
+            }
         }
     }
 
@@ -557,11 +636,10 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
     fn list_schemas(&self, result_set: Arc<RecordBatch>) -> AdapterResult<Vec<String>> {
         let schema_column_values = {
             let col_name = match self.adapter_type() {
-                AdapterType::Snowflake => "name",
-                AdapterType::Databricks => "databaseName",
+                AdapterType::Snowflake | AdapterType::Salesforce => "name",
+                AdapterType::Databricks | AdapterType::Spark => "databaseName",
                 AdapterType::Bigquery => "schema_name",
-                AdapterType::Postgres | AdapterType::Redshift => "nspname",
-                AdapterType::Salesforce => "name",
+                AdapterType::Postgres | AdapterType::Redshift | AdapterType::Sidecar => "nspname",
             };
             get_column_values::<StringArray>(&result_set, col_name)?
         };
@@ -573,6 +651,68 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
             schemas.push(name.to_string());
         }
         Ok(schemas)
+    }
+
+    fn create_schema(
+        &self,
+        state: &State,
+        relation: Arc<dyn BaseRelation>,
+    ) -> Result<Value, minijinja::Error> {
+        let args = [RelationObject::new(relation).into_value()];
+        execute_macro(state, &args, "create_schema")?;
+        Ok(none_value())
+    }
+
+    fn drop_schema(
+        &self,
+        state: &State,
+        relation: Arc<dyn BaseRelation>,
+    ) -> Result<Value, minijinja::Error> {
+        self.engine()
+            .relation_cache()
+            .evict_schema_for_relation(&relation);
+        let args = [RelationObject::new(relation).into_value()];
+        execute_macro(state, &args, "drop_schema")?;
+        Ok(none_value())
+    }
+
+    fn valid_snapshot_target(
+        &self,
+        _state: &State,
+        _relation: Arc<dyn BaseRelation>,
+    ) -> Result<Value, minijinja::Error> {
+        unimplemented!("valid_snapshot_target")
+    }
+
+    fn get_incremental_strategy_macro(
+        &self,
+        state: &State,
+        strategy: &str,
+    ) -> Result<Value, minijinja::Error> {
+        if strategy != "default" {
+            let strategy_ = DbtIncrementalStrategy::from_str(strategy)
+                .map_err(|e| invalid_argument_inner!("Invalid strategy value {}", e))?;
+            if !self.valid_incremental_strategies().contains(&strategy_)
+                && builtin_incremental_strategies(false).contains(&strategy_)
+            {
+                return invalid_argument!(
+                    "The incremental strategy '{}' is not valid for this adapter",
+                    strategy
+                );
+            }
+        }
+
+        let strategy = strategy.replace("+", "_");
+        let macro_name = format!("get_incremental_{strategy}_sql");
+
+        // Return the macro
+        Ok(Value::from_object(DispatchObject {
+            macro_name,
+            package_name: None,
+            strict: false,
+            auto_execute: false,
+            context: Some(state.get_base_context()),
+        }))
     }
 
     /// Get relation that represents (database, schema, identifier)
@@ -672,7 +812,9 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
             | AdapterType::Bigquery
             | AdapterType::Databricks
             | AdapterType::Redshift
-            | AdapterType::Salesforce => {
+            | AdapterType::Salesforce
+            | AdapterType::Sidecar
+            | AdapterType::Spark => {
                 let err = format!(
                     "describe_dynamic_table is not supported by the {} adapter",
                     self.adapter_type()
@@ -741,6 +883,60 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn get_relations_by_pattern(
+        &self,
+        state: &State,
+        schema_pattern: &str,
+        table_pattern: &str,
+        exclude: Option<&str>,
+        database: Option<&str>,
+        quote_table: Option<bool>,
+        excluded_schemas: Option<Value>,
+    ) -> Result<Value, minijinja::Error> {
+        // Validate excluded_schemas if provided
+        if let Some(ref schemas) = excluded_schemas {
+            let _ =
+                minijinja_value_to_typed_struct::<Vec<String>>(schemas.clone()).map_err(|e| {
+                    minijinja::Error::new(
+                        minijinja::ErrorKind::SerdeDeserializeError,
+                        e.to_string(),
+                    )
+                })?;
+        }
+
+        // Get default database from state if not provided
+        let database_str = if let Some(db) = database {
+            db.to_string()
+        } else {
+            let target = state.lookup("target").ok_or_else(|| {
+                minijinja::Error::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    "target is not set in state",
+                )
+            })?;
+            let db_value = target.get_attr("database").unwrap_or_default();
+            db_value.as_str().unwrap_or_default().to_string()
+        };
+
+        // Build args array for macro call
+        // Note: For optional string parameters like 'exclude', we pass empty string instead of None
+        // because the macro expects a string and None gets converted to "none" string
+        let args = vec![
+            Value::from(schema_pattern),
+            Value::from(table_pattern),
+            exclude.map(Value::from).unwrap_or_else(|| Value::from("")),
+            Value::from(database_str.as_str()),
+            quote_table
+                .map(Value::from)
+                .unwrap_or_else(|| Value::from(false)),
+            excluded_schemas.unwrap_or_else(|| Value::from_iter::<Vec<String>>(vec![])),
+        ];
+
+        let result = execute_macro(state, &args, "get_relations_by_pattern_internal")?;
+        Ok(result)
+    }
+
     /// Get the full macro name for check_schema_exists
     ///
     /// # Returns
@@ -751,7 +947,10 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         _state: &State,
         _args: &[Value],
     ) -> AdapterResult<(String, String)> {
-        if self.adapter_type() == AdapterType::Databricks {
+        if matches!(
+            self.adapter_type(),
+            AdapterType::Databricks | AdapterType::Spark
+        ) {
             Ok((
                 "dbt_spark".to_string(),
                 "spark__check_schema_exists".to_string(),
@@ -764,33 +963,33 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
     /// Determine if the current Databricks connection points to a classic
     /// cluster (as opposed to a SQL warehouse).
     fn is_cluster(&self) -> AdapterResult<bool> {
-        if self.adapter_type() == AdapterType::Databricks {
-            // https://github.com/databricks/dbt-databricks/blob/main/dbt/adapters/databricks/utils.py#L94
-            let http_path = self
-                .engine()
-                .get_config()
-                .get_string("http_path")
-                .ok_or_else(|| {
-                    AdapterError::new(
-                        AdapterErrorKind::Configuration,
-                        "http_path is required to determine Databricks compute type",
-                    )
-                })?;
-
-            let normalized = http_path.trim().to_ascii_lowercase();
-            if normalized.contains("/warehouses/") {
-                return Ok(false);
-            }
-            if normalized.contains("/protocolv1/") {
-                return Ok(true);
-            }
-            Ok(false)
-        } else {
-            Err(AdapterError::new(
+        if self.adapter_type() != AdapterType::Databricks {
+            return Err(AdapterError::new(
                 AdapterErrorKind::NotSupported,
                 "is_cluster is only available for the Databricks adapter",
-            ))
+            ));
         }
+
+        // https://github.com/databricks/dbt-databricks/blob/main/dbt/adapters/databricks/utils.py#L94
+        let http_path = self
+            .engine()
+            .get_config()
+            .get_string("http_path")
+            .ok_or_else(|| {
+                AdapterError::new(
+                    AdapterErrorKind::Configuration,
+                    "http_path is required to determine Databricks compute type",
+                )
+            })?;
+
+        let normalized = http_path.trim().to_ascii_lowercase();
+        if normalized.contains("/warehouses/") {
+            return Ok(false);
+        }
+        if normalized.contains("/protocolv1/") {
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// Rename relation
@@ -872,18 +1071,20 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
             AdapterType::Postgres
             | AdapterType::Snowflake
             | AdapterType::Bigquery
+            | AdapterType::Sidecar
             | AdapterType::Redshift => execute_macro(
                 state,
                 &[RelationObject::new(relation).as_value()],
                 "get_columns_in_relation",
             ),
-            AdapterType::Salesforce => {
-                unimplemented!("Salesforce get_columns_in_relation not implemented")
+            // TODO(serramatutu): get back to this later
+            AdapterType::Salesforce | AdapterType::Spark => {
+                unimplemented!("get_columns_in_relation not implemented")
             }
         };
 
         match self.adapter_type() {
-            AdapterType::Postgres | AdapterType::Redshift => {
+            AdapterType::Postgres | AdapterType::Redshift | AdapterType::Sidecar => {
                 let result = macro_execution_result?;
                 Ok(Column::vec_from_jinja_value(self.adapter_type(), result)?)
             }
@@ -915,9 +1116,9 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
                     Ok(result) => result,
                     Err(err) => {
                         // Handle NotFound errors
+                        // XXX(anna): since execute_macro passes up the original error kind, we can't rely on it being an UnexpectedResult anymore
                         if err.kind() == AdapterErrorKind::NotFound
-                            || (err.kind() == AdapterErrorKind::UnexpectedResult
-                                && err.message().contains("Error 404: Not found"))
+                            || err.message().contains("Error 404: Not found")
                         {
                             return Ok(Vec::new());
                         }
@@ -929,10 +1130,12 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
             AdapterType::Databricks => {
                 // Databricks inherits the implementation from the Spark adapter.
                 //
-                // Spark implementation also implicitly filters out known HUDI metadata columns,
-                // which we currently do not.
+                // The DESCRIBE TABLE output includes metadata sections (e.g. "# Partition Information",
+                // "# Clustering Information") that must be filtered out. This matches the Python
+                // Spark adapter behavior which filters rows where col_name starts with '#'.
                 //
                 // https://github.com/dbt-labs/dbt-adapters/blob/main/dbt-spark/src/dbt/adapters/spark/impl.py#L317-L336
+                // https://github.com/dbt-labs/dbt-fusion/issues/1230
                 let result = match macro_execution_result
                     .and_then(|r| convert_macro_result_to_record_batch(&r))
                 {
@@ -952,7 +1155,10 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
                 let name_string_array = get_column_values::<StringArray>(&result, "col_name")?;
                 let dtype_string_array = get_column_values::<StringArray>(&result, "data_type")?;
 
+                // Filter out metadata rows (like "# Partition Information", "# Clustering Information")
+                // These are section headers in DESCRIBE TABLE output, not actual columns.
                 let columns = (0..name_string_array.len())
+                    .filter(|&i| !name_string_array.value(i).starts_with('#'))
                     .map(|i| {
                         Column::new(
                             AdapterType::Databricks,
@@ -966,8 +1172,8 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
                     .collect::<Vec<_>>();
                 Ok(columns)
             }
-            AdapterType::Salesforce => {
-                unimplemented!("Salesforce get_columns_in_relation not implemented")
+            AdapterType::Salesforce | AdapterType::Spark => {
+                unimplemented!("get_columns_in_relation not implemented")
             }
         }
     }
@@ -997,7 +1203,9 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
             | AdapterType::Databricks
             | AdapterType::Redshift
             | AdapterType::Salesforce
-            | AdapterType::Postgres => {
+            | AdapterType::Postgres
+            | AdapterType::Sidecar
+            | AdapterType::Spark => {
                 // downcast relation
                 let relation = RelationObject::new(relation).as_value();
                 execute_macro(state, &[relation], "truncate_relation")?;
@@ -1042,7 +1250,9 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
             AdapterType::Postgres
             | AdapterType::Bigquery
             | AdapterType::Databricks
-            | AdapterType::Redshift => {
+            | AdapterType::Redshift
+            | AdapterType::Sidecar
+            | AdapterType::Spark => {
                 // https://github.com/dbt-labs/dbt-adapters/blob/main/dbt-adapters/src/dbt/adapters/base/impl.py#L1072
                 if quote_config.unwrap_or(true) {
                     Ok(self.quote(column))
@@ -1096,17 +1306,17 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         from_relation: Arc<dyn BaseRelation>,
         to_relation: Arc<dyn BaseRelation>,
     ) -> AdapterResult<Value> {
-        if self.adapter_type() == AdapterType::Bigquery {
-            // This method is a noop for BigQuery
-            // https://github.com/dbt-labs/dbt-adapters/blob/main/dbt-bigquery/src/dbt/adapters/bigquery/impl.py#L260-L261
-            return Ok(none_value());
-        }
         if let Some(replay_adapter) = self.as_replay() {
             return replay_adapter.replay_expand_target_column_types(
                 state,
                 from_relation,
                 to_relation,
             );
+        }
+        if self.adapter_type() == AdapterType::Bigquery {
+            // This method is a noop for BigQuery
+            // https://github.com/dbt-labs/dbt-adapters/blob/main/dbt-bigquery/src/dbt/adapters/bigquery/impl.py#L260-L261
+            return Ok(none_value());
         }
         let from_columns = self.get_columns_in_relation(state, from_relation)?;
         let to_columns = self.get_columns_in_relation(state, to_relation.clone())?;
@@ -1168,7 +1378,7 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
                 let table = relation.identifier_as_str()?;
                 let schema = relation.schema_as_str()?;
 
-                let columns = self.nest_column_data_types(columns, None)?;
+                let columns = self.do_nest_column_data_types(columns, None)?;
 
                 let column_to_description = columns
                     .iter()
@@ -1206,7 +1416,9 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
             | AdapterType::Snowflake
             | AdapterType::Databricks
             | AdapterType::Redshift
-            | AdapterType::Salesforce => {
+            | AdapterType::Salesforce
+            | AdapterType::Sidecar
+            | AdapterType::Spark => {
                 unimplemented!("only available with BigQuery adapter")
             }
         }
@@ -1222,7 +1434,9 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
             | AdapterType::Snowflake
             | AdapterType::Databricks
             | AdapterType::Redshift
-            | AdapterType::Salesforce => {
+            | AdapterType::Salesforce
+            | AdapterType::Sidecar
+            | AdapterType::Spark => {
                 // https://github.com/dbt-labs/dbt-adapters/blob/main/dbt-adapters/src/dbt/adapters/base/impl.py#L1783
                 let mut result = vec![];
                 for (_, column) in columns_map {
@@ -1263,7 +1477,7 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
                     }
                 }
                 let nested_columns =
-                    self.nest_column_data_types(columns_map, Some(rendered_constraints))?;
+                    self.do_nest_column_data_types(columns_map, Some(rendered_constraints))?;
                 let result = nested_columns
                     .into_values()
                     .map(|column| {
@@ -1380,14 +1594,22 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
             (Redshift, Check) => NotSupported,
             (Redshift, Custom) => NotSupported,
 
+            // Sidecar - follows Postgres
+            (Sidecar, NotNull) => Enforced,
+            (Sidecar, ForeignKey) => Enforced,
+            (Sidecar, Unique) => NotEnforced,
+            (Sidecar, PrimaryKey) => NotEnforced,
+            (Sidecar, Check) => NotSupported,
+            (Sidecar, Custom) => NotSupported,
+
             // Salesforce
-            (Salesforce, _) => unimplemented!("Salesforce constraint support not implemented"),
+            (Salesforce | Spark, _) => unimplemented!("constraint support not implemented"),
         }
     }
 
     /// Given existing columns and columns from our model
     /// we determine which columns to update and persist docs for
-    fn get_persist_doc_columns(
+    fn do_get_persist_doc_columns(
         &self,
         existing_columns: Vec<Column>,
         model_columns: IndexMap<String, DbtColumnRef>,
@@ -1411,6 +1633,39 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         Ok(result)
     }
 
+    fn get_persist_doc_columns(
+        &self,
+        _state: &State,
+        existing_columns: &Value,
+        model_columns: &Value,
+    ) -> Result<Value, minijinja::Error> {
+        let existing_columns =
+            Column::vec_from_jinja_value(AdapterType::Databricks, existing_columns.clone())
+                .map_err(|e| {
+                    minijinja::Error::new(
+                        minijinja::ErrorKind::SerdeDeserializeError,
+                        e.to_string(),
+                    )
+                })?;
+        let model_columns = minijinja_value_to_typed_struct::<IndexMap<String, DbtColumnRef>>(
+            model_columns.clone(),
+        )
+        .map_err(|e| {
+            minijinja::Error::new(minijinja::ErrorKind::SerdeDeserializeError, e.to_string())
+        })?;
+
+        let persist_doc_columns =
+            self.do_get_persist_doc_columns(existing_columns, model_columns)?;
+
+        let result = IndexMap::from_iter(
+            persist_doc_columns
+                .into_iter()
+                .map(|(col_name, col)| (col_name, Value::from_serialize(col))),
+        );
+
+        Ok(Value::from_object(result))
+    }
+
     /// Translate the result of `show grants` (or equivalent) to match the
     /// grants which a user would configure in their project.
     /// Ideally, the SQL to show grants should also be filtering:
@@ -1424,7 +1679,10 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         let record_batch = grants_table.original_record_batch();
 
         match self.adapter_type() {
-            AdapterType::Postgres | AdapterType::Bigquery | AdapterType::Redshift => {
+            AdapterType::Postgres
+            | AdapterType::Bigquery
+            | AdapterType::Redshift
+            | AdapterType::Sidecar => {
                 let grantee_cols = get_column_values::<StringArray>(&record_batch, "grantee")?;
                 let privilege_cols =
                     get_column_values::<StringArray>(&record_batch, "privilege_type")?;
@@ -1485,11 +1743,13 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
 
                 Ok(result)
             }
-            AdapterType::Salesforce => unimplemented!("Salesforce grants not implemented"),
+            AdapterType::Salesforce | AdapterType::Spark => {
+                unimplemented!("grants not implemented")
+            }
         }
     }
 
-    fn nest_column_data_types(
+    fn do_nest_column_data_types(
         &self,
         columns: IndexMap<String, DbtColumn>,
         constraints: Option<BTreeMap<String, String>>,
@@ -1500,10 +1760,45 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
             | AdapterType::Snowflake
             | AdapterType::Databricks
             | AdapterType::Redshift
-            | AdapterType::Salesforce => {
+            | AdapterType::Salesforce
+            | AdapterType::Sidecar
+            | AdapterType::Spark => {
                 unimplemented!("only available with BigQuery adapter")
             }
         }
+    }
+
+    fn nest_column_data_types(
+        &self,
+        _state: &State,
+        columns: &Value,
+    ) -> Result<Value, minijinja::Error> {
+        // TODO: 'constraints' arg are ignored; didn't find an usage example, implement later
+        let columns =
+            minijinja_value_to_typed_struct::<IndexMap<String, DbtColumn>>(columns.clone())
+                .map_err(|e| {
+                    minijinja::Error::new(
+                        minijinja::ErrorKind::SerdeDeserializeError,
+                        e.to_string(),
+                    )
+                })?;
+
+        let nested_columns = self.do_nest_column_data_types(columns, None)?;
+        let result = IndexMap::<String, Value>::from_iter(
+            nested_columns
+                .into_iter()
+                .map(|(col_name, col)| (col_name, Value::from_serialize(col))),
+        );
+
+        Ok(Value::from_object(result))
+    }
+
+    fn get_bq_table(
+        &self,
+        _state: &State,
+        _relation: Arc<dyn BaseRelation>,
+    ) -> Result<Value, minijinja::Error> {
+        unimplemented!("get_bq_table")
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1573,7 +1868,9 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
             | AdapterType::Snowflake
             | AdapterType::Databricks
             | AdapterType::Redshift
-            | AdapterType::Salesforce => {
+            | AdapterType::Salesforce
+            | AdapterType::Sidecar
+            | AdapterType::Spark => {
                 unimplemented!("only available with BigQuery adapter")
             }
         }
@@ -1614,7 +1911,9 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
             | AdapterType::Snowflake
             | AdapterType::Databricks
             | AdapterType::Redshift
-            | AdapterType::Salesforce => {
+            | AdapterType::Salesforce
+            | AdapterType::Sidecar
+            | AdapterType::Spark => {
                 unimplemented!("only available with BigQuery adapter")
             }
         }
@@ -1654,7 +1953,9 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
             | AdapterType::Snowflake
             | AdapterType::Databricks
             | AdapterType::Redshift
-            | AdapterType::Salesforce => {
+            | AdapterType::Salesforce
+            | AdapterType::Sidecar
+            | AdapterType::Spark => {
                 unimplemented!("only available with BigQuery adapter")
             }
         }
@@ -1725,7 +2026,9 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
             AdapterType::Postgres
             | AdapterType::Snowflake
             | AdapterType::Databricks
-            | AdapterType::Redshift => {
+            | AdapterType::Redshift
+            | AdapterType::Sidecar
+            | AdapterType::Spark => {
                 unimplemented!("only available with BigQuery or Salesforce adapter")
             }
         }
@@ -1784,7 +2087,9 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
             | AdapterType::Snowflake
             | AdapterType::Databricks
             | AdapterType::Redshift
-            | AdapterType::Salesforce => {
+            | AdapterType::Salesforce
+            | AdapterType::Sidecar
+            | AdapterType::Spark => {
                 unimplemented!("only available with BigQuery adapter")
             }
         }
@@ -1911,7 +2216,7 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         }
 
         match self.adapter_type() {
-            AdapterType::Postgres => {
+            AdapterType::Postgres | AdapterType::Sidecar => {
                 if let Some(configured_database) = self.engine().get_configured_database_name() {
                     if database == configured_database {
                         Ok(Value::from(()))
@@ -1963,7 +2268,8 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
             AdapterType::Snowflake
             | AdapterType::Bigquery
             | AdapterType::Databricks
-            | AdapterType::Salesforce => {
+            | AdapterType::Salesforce
+            | AdapterType::Spark => {
                 unimplemented!("only available with either Postgres or Redshift adapter")
             }
         }
@@ -1981,7 +2287,7 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         conn: &'_ mut dyn Connection,
         relation: Arc<dyn BaseRelation>,
         local_partition_by: Option<BigqueryPartitionConfig>,
-        local_cluster_by: Option<BigqueryClusterConfig>,
+        local_cluster_by: Option<ClusterConfig>,
         state: Option<&State>,
     ) -> AdapterResult<bool> {
         match self.adapter_type() {
@@ -2034,7 +2340,9 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
             | AdapterType::Snowflake
             | AdapterType::Databricks
             | AdapterType::Redshift
-            | AdapterType::Salesforce => {
+            | AdapterType::Salesforce
+            | AdapterType::Sidecar
+            | AdapterType::Spark => {
                 unimplemented!(
                     "is_replaceable is only available with BigQuery adapter, not {}",
                     self.adapter_type()
@@ -2043,36 +2351,48 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         }
     }
 
+    fn upload_file(&self, _state: &State, _args: &[Value]) -> Result<Value, minijinja::Error> {
+        unimplemented!("upload_file")
+    }
+
     fn parse_partition_by(&self, partition_by: Value) -> AdapterResult<Value> {
-        if self.adapter_type() == AdapterType::Bigquery {
-            // https://github.com/dbt-labs/dbt-adapters/blob/main/dbt-bigquery/src/dbt/adapters/bigquery/impl.py#L579-L586
-            // Pure config parse; safe for both BigQuery and Replay (when adapter type is BigQuery)
-            let raw_partition_by = partition_by;
-            if raw_partition_by.is_none() {
-                return Ok(none_value());
+        match self.adapter_type() {
+            AdapterType::Bigquery => {
+                // https://github.com/dbt-labs/dbt-adapters/blob/main/dbt-bigquery/src/dbt/adapters/bigquery/impl.py#L579-L586
+                // Pure config parse; safe for both BigQuery and Replay (when adapter type is BigQuery)
+                let raw_partition_by = partition_by;
+                if raw_partition_by.is_none() {
+                    return Ok(none_value());
+                }
+
+                let partition_by =
+                    minijinja_value_to_typed_struct::<PartitionConfig>(raw_partition_by.clone())
+                        .map_err(|e| {
+                            minijinja::Error::new(
+                                minijinja::ErrorKind::SerdeDeserializeError,
+                                format!(
+                                    "adapter.parse_partition_by failed on {raw_partition_by:?}: {e}"
+                                ),
+                            )
+                        })?;
+
+                let validated_config = partition_by.into_bigquery().ok_or_else(|| {
+                    minijinja::Error::new(
+                        minijinja::ErrorKind::InvalidArgument,
+                        "Expect a BigqueryPartitionConfigStruct",
+                    )
+                })?;
+
+                Ok(Value::from_object(validated_config))
             }
-
-            let partition_by =
-                minijinja_value_to_typed_struct::<PartitionConfig>(raw_partition_by.clone())
-                    .map_err(|e| {
-                        minijinja::Error::new(
-                            minijinja::ErrorKind::SerdeDeserializeError,
-                            format!(
-                                "adapter.parse_partition_by failed on {raw_partition_by:?}: {e}"
-                            ),
-                        )
-                    })?;
-
-            let validated_config = partition_by.into_bigquery().ok_or_else(|| {
-                minijinja::Error::new(
-                    minijinja::ErrorKind::InvalidArgument,
-                    "Expect a BigqueryPartitionConfigStruct",
-                )
-            })?;
-
-            return Ok(Value::from_object(validated_config));
+            AdapterType::Postgres
+            | AdapterType::Snowflake
+            | AdapterType::Databricks
+            | AdapterType::Redshift
+            | AdapterType::Salesforce
+            | AdapterType::Sidecar
+            | AdapterType::Spark => unimplemented!("only available with BigQuery adapter"),
         }
-        unimplemented!("only available with BigQuery adapter")
     }
 
     fn get_table_options(
@@ -2082,16 +2402,22 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         node: &InternalDbtNodeWrapper,
         temporary: bool,
     ) -> AdapterResult<BTreeMap<String, Value>> {
-        if self.adapter_type() == AdapterType::Bigquery {
-            return metadata::bigquery::object_options::get_table_options_value(
+        match self.adapter_type() {
+            AdapterType::Bigquery => metadata::bigquery::object_options::get_table_options_value(
                 state,
                 config,
                 node,
                 temporary,
                 self.adapter_type(),
-            );
+            ),
+            AdapterType::Postgres
+            | AdapterType::Snowflake
+            | AdapterType::Databricks
+            | AdapterType::Redshift
+            | AdapterType::Salesforce
+            | AdapterType::Sidecar
+            | AdapterType::Spark => unimplemented!("only available with BigQuery adapter"),
         }
-        unimplemented!("only available with BigQuery adapter")
     }
 
     fn get_view_options(
@@ -2100,16 +2426,22 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         config: ModelConfig,
         common_attr: &CommonAttributes,
     ) -> AdapterResult<BTreeMap<String, Value>> {
-        if self.adapter_type() == AdapterType::Bigquery {
-            let result = metadata::bigquery::object_options::get_common_table_options_value(
-                state,
-                config,
-                common_attr,
-                false,
-            );
-            Ok(result)
-        } else {
-            unimplemented!("only available with BigQuery adapter")
+        match self.adapter_type() {
+            AdapterType::Bigquery => Ok(
+                metadata::bigquery::object_options::get_common_table_options_value(
+                    state,
+                    config,
+                    common_attr,
+                    false,
+                ),
+            ),
+            AdapterType::Postgres
+            | AdapterType::Snowflake
+            | AdapterType::Databricks
+            | AdapterType::Redshift
+            | AdapterType::Salesforce
+            | AdapterType::Sidecar
+            | AdapterType::Spark => unimplemented!("only available with BigQuery adapter"),
         }
     }
 
@@ -2120,20 +2452,27 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         node: &InternalDbtNodeWrapper,
         temporary: bool,
     ) -> Result<Value, minijinja::Error> {
-        if self.adapter_type() == AdapterType::Bigquery {
-            let node = node.as_internal_node();
-            let options = metadata::bigquery::object_options::get_common_table_options_value(
-                state,
-                config,
-                node.common(),
-                temporary,
-            );
-            Ok(Value::from_serialize(options))
-        } else {
-            Err(minijinja::Error::new(
+        match self.adapter_type() {
+            AdapterType::Bigquery => {
+                let node = node.as_internal_node();
+                let options = metadata::bigquery::object_options::get_common_table_options_value(
+                    state,
+                    config,
+                    node.common(),
+                    temporary,
+                );
+                Ok(Value::from_serialize(options))
+            }
+            AdapterType::Postgres
+            | AdapterType::Snowflake
+            | AdapterType::Databricks
+            | AdapterType::Redshift
+            | AdapterType::Salesforce
+            | AdapterType::Sidecar
+            | AdapterType::Spark => Err(minijinja::Error::new(
                 minijinja::ErrorKind::InvalidOperation,
                 "get_common_options is only available with BigQuery adapter",
-            ))
+            )),
         }
     }
 
@@ -2143,31 +2482,40 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         columns: Value,
         partition_config: BigqueryPartitionConfig,
     ) -> AdapterResult<Value> {
-        if self.adapter_type() == AdapterType::Bigquery {
-            let mut result = Column::vec_from_jinja_value(AdapterType::Bigquery, columns.clone())?;
+        match self.adapter_type() {
+            AdapterType::Bigquery => {
+                let mut result =
+                    Column::vec_from_jinja_value(AdapterType::Bigquery, columns.clone())?;
 
-            if result
-                .iter()
-                .any(|c| c.name() == BigqueryPartitionConfig::PARTITION_TIME)
-            {
-                return Ok(columns);
+                if result
+                    .iter()
+                    .any(|c| c.name() == BigqueryPartitionConfig::PARTITION_TIME)
+                {
+                    return Ok(columns);
+                }
+
+                result.push(Column::new_bigquery(
+                    partition_config
+                        .insertable_time_partitioning_field()?
+                        .as_str()
+                        .expect("must be a str")
+                        .to_owned(),
+                    partition_config.data_type,
+                    &[],
+                    // TODO(serramatutu): proper mode
+                    BigqueryColumnMode::Nullable,
+                ));
+
+                Ok(Value::from(result))
             }
-
-            result.push(Column::new_bigquery(
-                partition_config
-                    .insertable_time_partitioning_field()?
-                    .as_str()
-                    .expect("must be a str")
-                    .to_owned(),
-                partition_config.data_type,
-                &[],
-                // TODO(serramatutu): proper mode
-                BigqueryColumnMode::Nullable,
-            ));
-
-            return Ok(Value::from(result));
+            AdapterType::Postgres
+            | AdapterType::Snowflake
+            | AdapterType::Databricks
+            | AdapterType::Redshift
+            | AdapterType::Salesforce
+            | AdapterType::Sidecar
+            | AdapterType::Spark => unimplemented!("only available with BigQuery adapter"),
         }
-        unimplemented!("only available with BigQuery adapter")
     }
 
     /// Lists all relations in the provided [CatalogAndSchema]
@@ -2188,9 +2536,10 @@ pub trait TypedBaseAdapter: fmt::Debug + Send + Sync + AdapterTyping {
         match self.adapter_type() {
             Snowflake => snowflake::list_relations(adapter, query_ctx, conn, db_schema),
             Bigquery => bigquery::list_relations(adapter, query_ctx, conn, db_schema),
-            Databricks => databricks::list_relations(adapter, query_ctx, conn, db_schema),
+            // TODO(serramatutu/spark): Spark list_relations breaks with Databricks implementation
+            Databricks | Spark => databricks::list_relations(adapter, query_ctx, conn, db_schema),
             Redshift => redshift::list_relations(adapter, query_ctx, conn, db_schema),
-            Postgres | Salesforce => {
+            Postgres | Salesforce | Sidecar => {
                 let err = AdapterError::new(
                     AdapterErrorKind::Internal,
                     format!(
@@ -2267,7 +2616,9 @@ prevent unnecessary latency for other users."#,
             AdapterType::Bigquery
             | AdapterType::Postgres
             | AdapterType::Redshift
-            | AdapterType::Salesforce => vec![],
+            | AdapterType::Salesforce
+            | AdapterType::Sidecar
+            | AdapterType::Spark => vec![],
         }
     }
 
@@ -2279,26 +2630,33 @@ prevent unnecessary latency for other users."#,
         major: i64,
         minor: i64,
     ) -> AdapterResult<Value> {
-        if self.adapter_type() == AdapterType::Databricks {
-            let query_ctx =
-                query_ctx_from_state(state)?.with_desc("compare_dbr_version adapter call");
+        match self.adapter_type() {
+            AdapterType::Databricks => {
+                let query_ctx =
+                    query_ctx_from_state(state)?.with_desc("compare_dbr_version adapter call");
 
-            let current_version = DatabricksMetadataAdapter::get_dbr_version(
-                self.as_typed_base_adapter(),
-                &query_ctx,
-                conn,
-            )?;
-            let expected_version = DbrVersion::Full(major, minor);
+                let current_version = DatabricksMetadataAdapter::get_dbr_version(
+                    self.as_typed_base_adapter(),
+                    &query_ctx,
+                    conn,
+                )?;
+                let expected_version = DbrVersion::Full(major, minor);
 
-            let result = match current_version.cmp(&expected_version) {
-                std::cmp::Ordering::Greater => 1,
-                std::cmp::Ordering::Equal => 0,
-                std::cmp::Ordering::Less => -1,
-            };
+                let result = match current_version.cmp(&expected_version) {
+                    std::cmp::Ordering::Greater => 1,
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Less => -1,
+                };
 
-            Ok(Value::from(result))
-        } else {
-            unimplemented!("only available with Databricks adapter")
+                Ok(Value::from(result))
+            }
+            AdapterType::Postgres
+            | AdapterType::Snowflake
+            | AdapterType::Bigquery
+            | AdapterType::Redshift
+            | AdapterType::Salesforce
+            | AdapterType::Sidecar
+            | AdapterType::Spark => unimplemented!("only available with Databricksadapter"),
         }
     }
 
@@ -2309,50 +2667,58 @@ prevent unnecessary latency for other users."#,
         node: &dyn InternalDbtNodeAttributes,
         is_incremental: bool,
     ) -> AdapterResult<String> {
-        if self.adapter_type() == AdapterType::Databricks {
-            // TODO: dbt seems to allow optional database and schema
-            // https://github.com/databricks/dbt-databricks/blob/main/dbt/adapters/databricks/impl.py#L212-L213
-            let location_root = config
-                .__warehouse_specific_config__
-                .location_root
-                .ok_or_else(|| {
-                    AdapterError::new(
-                        AdapterErrorKind::Configuration,
-                        "location_root is required for external tables.",
+        match self.adapter_type() {
+            AdapterType::Databricks => {
+                // TODO: dbt seems to allow optional database and schema
+                // https://github.com/databricks/dbt-databricks/blob/main/dbt/adapters/databricks/impl.py#L212-L213
+                let location_root = config
+                    .__warehouse_specific_config__
+                    .location_root
+                    .ok_or_else(|| {
+                        AdapterError::new(
+                            AdapterErrorKind::Configuration,
+                            "location_root is required for external tables.",
+                        )
+                    })?;
+
+                let include_full_name_in_path = config
+                    .__warehouse_specific_config__
+                    .include_full_name_in_path
+                    .unwrap_or_default();
+
+                // Build path using the same logic as posixpath.join
+                let path = if include_full_name_in_path {
+                    format!(
+                        "{}/{}/{}/{}",
+                        location_root.trim_end_matches('/'),
+                        node.database().trim_end_matches('/'),
+                        node.schema().trim_end_matches('/'),
+                        node.name()
                     )
-                })?;
+                } else {
+                    format!(
+                        "{}/{}/{}",
+                        location_root.trim_end_matches('/'),
+                        node.database().trim_end_matches('/'),
+                        node.name()
+                    )
+                };
 
-            let include_full_name_in_path = config
-                .__warehouse_specific_config__
-                .include_full_name_in_path
-                .unwrap_or_default();
+                let path = if is_incremental {
+                    format!("{path}_tmp")
+                } else {
+                    path
+                };
+                Ok(path)
+            }
 
-            // Build path using the same logic as posixpath.join
-            let path = if include_full_name_in_path {
-                format!(
-                    "{}/{}/{}/{}",
-                    location_root.trim_end_matches('/'),
-                    node.database().trim_end_matches('/'),
-                    node.schema().trim_end_matches('/'),
-                    node.name()
-                )
-            } else {
-                format!(
-                    "{}/{}/{}",
-                    location_root.trim_end_matches('/'),
-                    node.database().trim_end_matches('/'),
-                    node.name()
-                )
-            };
-
-            let path = if is_incremental {
-                format!("{path}_tmp")
-            } else {
-                path
-            };
-            Ok(path)
-        } else {
-            unimplemented!("only available with Databricks adapter")
+            AdapterType::Postgres
+            | AdapterType::Snowflake
+            | AdapterType::Bigquery
+            | AdapterType::Redshift
+            | AdapterType::Salesforce
+            | AdapterType::Sidecar
+            | AdapterType::Spark => unimplemented!("only available with Databricksadapter"),
         }
     }
 
@@ -2368,16 +2734,100 @@ prevent unnecessary latency for other users."#,
         node: &InternalDbtNodeWrapper,
         tblproperties: &mut BTreeMap<String, Value>,
     ) -> AdapterResult<()> {
-        if self.adapter_type() == AdapterType::Databricks {
-            // TODO(anna): Ideally from_model_config_and_catalogs would just take in an InternalDbtNodeWrapper instead of a Value. This is blocked by a Snowflake hack in `snowflake__drop_table`.
-            let node_yml = node.as_internal_node().serialize();
-            let catalog_relation = CatalogRelation::from_model_config_and_catalogs(
-                &self.adapter_type(),
-                &Value::from_object(dbt_common::serde_utils::convert_yml_to_value_map(node_yml)),
-                load_catalogs::fetch_catalogs(),
-            )?;
-            // We only have to update tblproperties if using a UniForm Iceberg table
-            if catalog_relation.table_format == "iceberg" {
+        match self.adapter_type() {
+            AdapterType::Databricks => {
+                // TODO(anna): Ideally from_model_config_and_catalogs would just take in an InternalDbtNodeWrapper instead of a Value. This is blocked by a Snowflake hack in `snowflake__drop_table`.
+                let node_yml = node.as_internal_node().serialize();
+                let catalog_relation = CatalogRelation::from_model_config_and_catalogs(
+                    &self.adapter_type(),
+                    &Value::from_object(dbt_common::serde_utils::convert_yml_to_value_map(
+                        node_yml,
+                    )),
+                    load_catalogs::fetch_catalogs(),
+                )?;
+                // We only have to update tblproperties if using a UniForm Iceberg table
+                if catalog_relation.table_format == "iceberg" {
+                    if self
+                        .compare_dbr_version(state, conn, 14, 3)?
+                        .as_i64()
+                        .expect("dbr_version is a number")
+                        < 0
+                    {
+                        return Err(AdapterError::new(
+                            AdapterErrorKind::Configuration,
+                            "Iceberg support requires Databricks Runtime 14.3 or later.",
+                        ));
+                    }
+
+                    if catalog_relation.file_format != Some("delta".to_string()) {
+                        return Err(AdapterError::new(
+                            AdapterErrorKind::Configuration,
+                            "When table_format is 'iceberg', file_format must be 'delta'.",
+                        ));
+                    }
+
+                    let materialized = config.materialized.ok_or_else(|| {
+                        AdapterError::new(
+                            AdapterErrorKind::Configuration,
+                            "materialized is required for iceberg tables.",
+                        )
+                    })?;
+
+                    // TODO(versusfacit): support snapshot
+                    if materialized != DbtMaterialization::Incremental
+                        && materialized != DbtMaterialization::Table
+                        && materialized != DbtMaterialization::Seed
+                    {
+                        return Err(AdapterError::new(
+                            AdapterErrorKind::Configuration,
+                            "When table_format is 'iceberg', materialized must be 'incremental', 'table', or 'seed'.",
+                        ));
+                    }
+
+                    tblproperties
+                        .entry("delta.enableIcebergCompatV2".to_string())
+                        .or_insert_with(|| Value::from(true));
+
+                    tblproperties
+                        .entry("delta.universalFormat.enabledFormats".to_string())
+                        .or_insert_with(|| Value::from("iceberg"));
+                }
+                Ok(())
+            }
+            AdapterType::Postgres
+            | AdapterType::Snowflake
+            | AdapterType::Bigquery
+            | AdapterType::Redshift
+            | AdapterType::Salesforce
+            | AdapterType::Sidecar
+            | AdapterType::Spark => unimplemented!("only available with Databricks adapter"),
+        }
+    }
+
+    /// https://github.com/databricks/dbt-databricks/blob/8cda62ee19d01e0670e3156e652841e3ffd3ed41/dbt/adapters/databricks/impl.py#L253
+    fn is_uniform(
+        &self,
+        state: &State,
+        conn: &mut dyn Connection,
+        config: ModelConfig,
+        node: &InternalDbtNodeWrapper,
+    ) -> AdapterResult<bool> {
+        match self.adapter_type() {
+            AdapterType::Databricks => {
+                // TODO(anna): Ideally from_model_config_and_catalogs would just take in an InternalDbtNodeWrapper instead of a Value. This is blocked by a Snowflake hack in `snowflake__drop_table`.
+                let node_yml = node.as_internal_node().serialize();
+                let catalog_relation = CatalogRelation::from_model_config_and_catalogs(
+                    &self.adapter_type(),
+                    &Value::from_object(dbt_common::serde_utils::convert_yml_to_value_map(
+                        node_yml,
+                    )),
+                    load_catalogs::fetch_catalogs(),
+                )?;
+
+                if catalog_relation.table_format != "iceberg" {
+                    return Ok(false);
+                }
+
                 if self
                     .compare_dbr_version(state, conn, 14, 3)?
                     .as_i64()
@@ -2387,13 +2837,6 @@ prevent unnecessary latency for other users."#,
                     return Err(AdapterError::new(
                         AdapterErrorKind::Configuration,
                         "Iceberg support requires Databricks Runtime 14.3 or later.",
-                    ));
-                }
-
-                if catalog_relation.file_format != Some("delta".to_string()) {
-                    return Err(AdapterError::new(
-                        AdapterErrorKind::Configuration,
-                        "When table_format is 'iceberg', file_format must be 'delta'.",
                     ));
                 }
 
@@ -2415,88 +2858,29 @@ prevent unnecessary latency for other users."#,
                     ));
                 }
 
-                tblproperties
-                    .entry("delta.enableIcebergCompatV2".to_string())
-                    .or_insert_with(|| Value::from(true));
+                let use_uniform =
+                    if let Some(val) = catalog_relation.adapter_properties.get("use_uniform") {
+                        val.eq_ignore_ascii_case("true")
+                    } else {
+                        false
+                    };
 
-                tblproperties
-                    .entry("delta.universalFormat.enabledFormats".to_string())
-                    .or_insert_with(|| Value::from("iceberg"));
+                if use_uniform && catalog_relation.catalog_type != "unity" {
+                    return Err(AdapterError::new(
+                        AdapterErrorKind::Configuration,
+                        "Managed Iceberg tables are only supported in Unity Catalog. Set 'use_uniform' adapter property to true for Hive Metastore.",
+                    ));
+                }
+
+                Ok(use_uniform)
             }
-            Ok(())
-        } else {
-            unimplemented!("only available with Databricks adapter")
-        }
-    }
-
-    /// https://github.com/databricks/dbt-databricks/blob/8cda62ee19d01e0670e3156e652841e3ffd3ed41/dbt/adapters/databricks/impl.py#L253
-    fn is_uniform(
-        &self,
-        state: &State,
-        conn: &mut dyn Connection,
-        config: ModelConfig,
-        node: &InternalDbtNodeWrapper,
-    ) -> AdapterResult<bool> {
-        if self.adapter_type() == AdapterType::Databricks {
-            // TODO(anna): Ideally from_model_config_and_catalogs would just take in an InternalDbtNodeWrapper instead of a Value. This is blocked by a Snowflake hack in `snowflake__drop_table`.
-            let node_yml = node.as_internal_node().serialize();
-            let catalog_relation = CatalogRelation::from_model_config_and_catalogs(
-                &self.adapter_type(),
-                &Value::from_object(dbt_common::serde_utils::convert_yml_to_value_map(node_yml)),
-                load_catalogs::fetch_catalogs(),
-            )?;
-
-            if catalog_relation.table_format != "iceberg" {
-                return Ok(false);
-            }
-
-            if self
-                .compare_dbr_version(state, conn, 14, 3)?
-                .as_i64()
-                .expect("dbr_version is a number")
-                < 0
-            {
-                return Err(AdapterError::new(
-                    AdapterErrorKind::Configuration,
-                    "Iceberg support requires Databricks Runtime 14.3 or later.",
-                ));
-            }
-
-            let materialized = config.materialized.ok_or_else(|| {
-                AdapterError::new(
-                    AdapterErrorKind::Configuration,
-                    "materialized is required for iceberg tables.",
-                )
-            })?;
-
-            // TODO(versusfacit): support snapshot
-            if materialized != DbtMaterialization::Incremental
-                && materialized != DbtMaterialization::Table
-                && materialized != DbtMaterialization::Seed
-            {
-                return Err(AdapterError::new(
-                    AdapterErrorKind::Configuration,
-                    "When table_format is 'iceberg', materialized must be 'incremental', 'table', or 'seed'.",
-                ));
-            }
-
-            let use_uniform =
-                if let Some(val) = catalog_relation.adapter_properties.get("use_uniform") {
-                    val.eq_ignore_ascii_case("true")
-                } else {
-                    false
-                };
-
-            if use_uniform && catalog_relation.catalog_type != "unity" {
-                return Err(AdapterError::new(
-                    AdapterErrorKind::Configuration,
-                    "Managed Iceberg tables are only supported in Unity Catalog. Set 'use_uniform' adapter property to true for Hive Metastore.",
-                ));
-            }
-
-            Ok(use_uniform)
-        } else {
-            unimplemented!("only available with Databricks adapter")
+            AdapterType::Postgres
+            | AdapterType::Snowflake
+            | AdapterType::Bigquery
+            | AdapterType::Redshift
+            | AdapterType::Salesforce
+            | AdapterType::Sidecar
+            | AdapterType::Spark => unimplemented!("only available with Databricks adapter"),
         }
     }
 
@@ -2508,7 +2892,7 @@ prevent unnecessary latency for other users."#,
         conn: &mut dyn Connection,
         relation: Arc<dyn BaseRelation>,
     ) -> AdapterResult<RelationConfig> {
-        use crate::relation::databricks::config_v2::relation_types;
+        use crate::relation::databricks::config::relation_types;
 
         let (relation_type, remote_state) = {
             let metadata_adapter = DatabricksMetadataAdapter::new(self.engine().clone());
@@ -2535,8 +2919,10 @@ prevent unnecessary latency for other users."#,
 
     /// Given a model, parse and build its configurations
     /// reference: https://github.com/databricks/dbt-databricks/blob/13686739eb59566c7a90ee3c357d12fe52ec02ea/dbt/adapters/databricks/impl.py#L810
-    fn get_config_from_model(&self, model: &dyn InternalDbtNodeAttributes) -> AdapterResult<Value> {
-        use crate::relation::databricks::config_v2::relation_types;
+    fn get_config_from_model(&self, model: &InternalDbtNodeWrapper) -> AdapterResult<Value> {
+        use crate::relation::databricks::config::relation_types;
+
+        let model = model.as_internal_node();
 
         let config_loader = match model.materialized() {
             DbtMaterialization::Incremental => relation_types::incremental_table::new_loader(),
@@ -2557,11 +2943,23 @@ prevent unnecessary latency for other users."#,
         Ok(Value::from_object(config))
     }
 
+    fn get_relations_without_caching(
+        &self,
+        _state: &State,
+        _relation: Arc<dyn BaseRelation>,
+    ) -> Result<Value, minijinja::Error> {
+        unimplemented!("get_relations_without_caching")
+    }
+
+    fn parse_index(&self, _state: &State, _raw_index: &Value) -> Result<Value, minijinja::Error> {
+        unimplemented!("parse_index")
+    }
+
     fn get_column_tags_from_model(
         &self,
         model: &dyn InternalDbtNodeAttributes,
     ) -> AdapterResult<Value> {
-        use crate::relation::databricks::config_v2::components::ColumnTagsLoader;
+        use crate::relation::databricks::config::components::ColumnTagsLoader;
 
         if self.adapter_type() != AdapterType::Databricks {
             return Err(AdapterError::new(
@@ -2603,61 +3001,69 @@ prevent unnecessary latency for other users."#,
         dest: Arc<dyn BaseRelation>,
         materialization: String,
     ) -> AdapterResult<()> {
-        if self.adapter_type() == AdapterType::Bigquery {
-            let append = materialization == "incremental";
-            let truncate = materialization == "table";
-            if !append && !truncate {
-                return Err(AdapterError::new(
-                    AdapterErrorKind::Configuration,
-                    "copy_table 'materialization' must be either 'table' or 'incremental'"
-                        .to_string(),
-                ));
+        match self.adapter_type() {
+            AdapterType::Bigquery => {
+                let append = materialization == "incremental";
+                let truncate = materialization == "table";
+                if !append && !truncate {
+                    return Err(AdapterError::new(
+                        AdapterErrorKind::Configuration,
+                        "copy_table 'materialization' must be either 'table' or 'incremental'"
+                            .to_string(),
+                    ));
+                }
+
+                let source_fqn = format!(
+                    "{}.{}.{}",
+                    source.database_as_str()?,
+                    source.schema_as_str()?,
+                    source.identifier_as_str()?
+                );
+                let dest_fqn = format!(
+                    "{}.{}.{}",
+                    dest.database_as_str()?,
+                    dest.schema_as_str()?,
+                    dest.identifier_as_str()?
+                );
+
+                // Determine write disposition based on materialization
+                // WRITE_TRUNCATE for table materialization, WRITE_APPEND for incremental
+                let write_disposition = if truncate {
+                    "WRITE_TRUNCATE"
+                } else {
+                    "WRITE_APPEND"
+                };
+
+                let mut options = self.get_adbc_execute_options(state);
+                options.extend(vec![
+                    (
+                        COPY_TABLE_SOURCE.to_string(),
+                        OptionValue::String(source_fqn),
+                    ),
+                    (
+                        COPY_TABLE_DESTINATION.to_string(),
+                        OptionValue::String(dest_fqn),
+                    ),
+                    (
+                        COPY_TABLE_WRITE_DISPOSITION.to_string(),
+                        OptionValue::String(write_disposition.to_string()),
+                    ),
+                ]);
+
+                let ctx = query_ctx_from_state(state)?.with_desc("copy_table adapter call");
+                self.engine()
+                    .execute_with_options(Some(state), &ctx, conn, "", options, false)?;
+
+                Ok(())
             }
-
-            let source_fqn = format!(
-                "{}.{}.{}",
-                source.database_as_str()?,
-                source.schema_as_str()?,
-                source.identifier_as_str()?
-            );
-            let dest_fqn = format!(
-                "{}.{}.{}",
-                dest.database_as_str()?,
-                dest.schema_as_str()?,
-                dest.identifier_as_str()?
-            );
-
-            // Determine write disposition based on materialization
-            // WRITE_TRUNCATE for table materialization, WRITE_APPEND for incremental
-            let write_disposition = if truncate {
-                "WRITE_TRUNCATE"
-            } else {
-                "WRITE_APPEND"
-            };
-
-            let mut options = self.get_adbc_execute_options(state);
-            options.extend(vec![
-                (
-                    COPY_TABLE_SOURCE.to_string(),
-                    OptionValue::String(source_fqn),
-                ),
-                (
-                    COPY_TABLE_DESTINATION.to_string(),
-                    OptionValue::String(dest_fqn),
-                ),
-                (
-                    COPY_TABLE_WRITE_DISPOSITION.to_string(),
-                    OptionValue::String(write_disposition.to_string()),
-                ),
-            ]);
-
-            let ctx = query_ctx_from_state(state)?.with_desc("copy_table adapter call");
-            self.engine()
-                .execute_with_options(Some(state), &ctx, conn, "", options, false)?;
-
-            return Ok(());
+            AdapterType::Postgres
+            | AdapterType::Snowflake
+            | AdapterType::Databricks
+            | AdapterType::Redshift
+            | AdapterType::Salesforce
+            | AdapterType::Sidecar
+            | AdapterType::Spark => unimplemented!("only available with BigQuery adapter"),
         }
-        unimplemented!("only available with BigQuery adapter")
     }
 
     /// https://github.com/dbt-labs/dbt-adapters/blob/4a00354a497214d9043bf4122810fe2d04de17bb/dbt-bigquery/src/dbt/adapters/bigquery/impl.py#L818
@@ -2667,44 +3073,52 @@ prevent unnecessary latency for other users."#,
         relation: Arc<dyn BaseRelation>,
         state: Option<&State>,
     ) -> AdapterResult<Option<Value>> {
-        if self.adapter_type() == AdapterType::Bigquery {
-            if let (Some(replay_adapter), Some(state)) = (self.as_replay(), state) {
-                return replay_adapter.replay_describe_relation(state);
-            }
-
-            let adbc_schema = conn
-                .get_table_schema(
-                    Some(&relation.database_as_str()?),
-                    Some(&relation.schema_as_str()?),
-                    &relation.identifier_as_str()?,
-                )
-                .map_err(adbc_error_to_adapter_error)?;
-            if let Some(relation_type) = relation.relation_type() {
-                if relation_type == RelationType::MaterializedView {
-                    return Ok(Some(Value::from_object(
-                        BigqueryMaterializedViewConfigObject::new(
-                            <dyn BigqueryMaterializedViewConfig>::try_from_schema(
-                                &adbc_schema,
-                                self.engine().type_ops(),
-                            )
-                            .map_err(|err| {
-                                AdapterError::new(AdapterErrorKind::UnexpectedResult, err)
-                            })?,
-                        ),
-                    )));
-                } else {
-                    return Err(AdapterError::new(
-                        AdapterErrorKind::Configuration,
-                        format!(
-                            "The method `BigQueryAdapter.describe_relation` is not implemented for this relation type: {relation_type}"
-                        ),
-                    ));
+        match self.adapter_type() {
+            AdapterType::Bigquery => {
+                if let (Some(replay_adapter), Some(state)) = (self.as_replay(), state) {
+                    return replay_adapter.replay_describe_relation(state);
                 }
-            }
 
-            return Ok(None);
+                let adbc_schema = conn
+                    .get_table_schema(
+                        Some(&relation.database_as_str()?),
+                        Some(&relation.schema_as_str()?),
+                        &relation.identifier_as_str()?,
+                    )
+                    .map_err(adbc_error_to_adapter_error)?;
+                if let Some(relation_type) = relation.relation_type() {
+                    if relation_type == RelationType::MaterializedView {
+                        return Ok(Some(Value::from_object(
+                            BigqueryMaterializedViewConfigObject::new(
+                                <dyn BigqueryMaterializedViewConfig>::try_from_schema(
+                                    &adbc_schema,
+                                    self.engine().type_ops(),
+                                )
+                                .map_err(|err| {
+                                    AdapterError::new(AdapterErrorKind::UnexpectedResult, err)
+                                })?,
+                            ),
+                        )));
+                    } else {
+                        return Err(AdapterError::new(
+                            AdapterErrorKind::Configuration,
+                            format!(
+                                "The method `BigQueryAdapter.describe_relation` is not implemented for this relation type: {relation_type}"
+                            ),
+                        ));
+                    }
+                }
+
+                Ok(None)
+            }
+            AdapterType::Postgres
+            | AdapterType::Snowflake
+            | AdapterType::Databricks
+            | AdapterType::Redshift
+            | AdapterType::Salesforce
+            | AdapterType::Sidecar
+            | AdapterType::Spark => unimplemented!("only available with BigQuery adapter"),
         }
-        unimplemented!("only available with BigQuery adapter")
     }
 
     /// Ensure that the target relation is valid, by making sure it
@@ -2840,6 +3254,26 @@ prevent unnecessary latency for other users."#,
     }
 }
 
+/// List of possible builtin strategies for adapters
+/// Microbatch is added by _default_. It is only not added when the behavior flag
+/// `require_batched_execution_for_custom_microbatch_strategy` is True.
+/// TODO: come back when Behavior is implemented
+/// https://github.com/dbt-labs/dbt-adapters/blob/main/dbt-adapters/src/dbt/adapters/base/impl.py#L1690-L1691
+fn builtin_incremental_strategies(
+    require_batched_execution_for_custom_microbatch_strategy: bool,
+) -> Vec<DbtIncrementalStrategy> {
+    let mut result = vec![
+        DbtIncrementalStrategy::Append,
+        DbtIncrementalStrategy::DeleteInsert,
+        DbtIncrementalStrategy::Merge,
+        DbtIncrementalStrategy::InsertOverwrite,
+    ];
+    if require_batched_execution_for_custom_microbatch_strategy {
+        result.push(DbtIncrementalStrategy::Microbatch)
+    }
+    result
+}
+
 /// Temporary before the [TypedBaseAdapter] trait becomes *the* adapter implementation struct.
 ///
 /// Which will be possible when all the implementations of the trait
@@ -2867,7 +3301,7 @@ impl AdapterTyping for ConcreteAdapter {
             AdapterType::Bigquery => {
                 Box::new(BigqueryMetadataAdapter::new(engine)) as Box<dyn MetadataAdapter>
             }
-            AdapterType::Databricks => {
+            AdapterType::Databricks | AdapterType::Spark => {
                 Box::new(DatabricksMetadataAdapter::new(engine)) as Box<dyn MetadataAdapter>
             }
             AdapterType::Redshift => {
@@ -2876,7 +3310,7 @@ impl AdapterTyping for ConcreteAdapter {
             AdapterType::Salesforce => {
                 Box::new(SalesforceMetadataAdapter::new(engine)) as Box<dyn MetadataAdapter>
             }
-            AdapterType::Postgres => {
+            AdapterType::Postgres | AdapterType::Sidecar => {
                 Box::new(PostgresMetadataAdapter::new(engine)) as Box<dyn MetadataAdapter>
             }
         };
@@ -3036,6 +3470,7 @@ pub trait ReplayAdapter: TypedBaseAdapter {
 mod tests {
     use super::*;
     use crate::base_adapter::backend_of;
+    use crate::cache::RelationCache;
     use crate::config::AdapterConfig;
     use crate::query_comment::QueryCommentConfig;
     use crate::sql_types::NaiveTypeOpsImpl;
@@ -3082,6 +3517,7 @@ mod tests {
             None,
             QueryCommentConfig::from_query_comment(None, adapter_type, false),
             Box::new(NaiveTypeOpsImpl::new(adapter_type)), // XXX: NaiveTypeOpsImpl
+            Arc::new(RelationCache::default()),
             never_cancels(),
         )
     }

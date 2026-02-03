@@ -1,5 +1,5 @@
 use dbt_adapter::relation::create_relation;
-use dbt_adapter::{AdapterTyping, ParseAdapter};
+use dbt_adapter::{AdapterTyping, BridgeAdapter};
 use dbt_common::io_utils::StatusReporter;
 use dbt_common::{ErrorCode, FsError, fs_err, stdfs};
 use dbt_common::{FsResult, constants::DBT_CTE_PREFIX, error::MacroSpan, tokiofs};
@@ -16,7 +16,7 @@ use minijinja::constants::{ROOT_PACKAGE_NAME, TARGET_PACKAGE_NAME, TARGET_UNIQUE
 use minijinja::{
     Error, ErrorKind, MacroSpans, State, Value,
     functions::debug,
-    value::{Rest, Value as MinijinjaValue},
+    value::{Rest, Value as MinijinjaValue, ValueKind},
 };
 use serde::Deserialize;
 use std::any::Any;
@@ -424,17 +424,20 @@ pub fn generate_component_name(
     if let Some(node) = node {
         args.push(Value::from_serialize(node.serialize()));
     }
+
     // Call the macro
     let result = new_state
-        .call_macro(macro_name.as_str(), &args, &[])
+        .call_macro_raw(macro_name.as_str(), &args, &[])
+        .map(|v| match v.kind() {
+            ValueKind::None => "".to_string(),
+            _ => v.to_string().trim().to_string(),
+        })
         .map_err(|err| {
             Box::new(FsError::from_jinja_err(
                 err,
                 format!("Failed to run macro {macro_name} for component {component}"),
             ))
-        })?
-        .trim()
-        .to_string();
+        })?;
     // Return the result
     Ok(result)
 }
@@ -448,7 +451,7 @@ pub fn clear_template_cache() {
 
 /// Generate a relation name from database, schema, alias
 pub fn generate_relation_name(
-    parse_adapter: Arc<ParseAdapter>,
+    parse_adapter: Arc<BridgeAdapter>,
     database: &str,
     schema: &str,
     identifier: &str,
