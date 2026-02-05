@@ -46,6 +46,7 @@ pub enum Backend {
     Spark,
     /// DuckDB driver implementation (ADBC).
     DuckDB,
+    ClickHouse,
     /// Databricks driver implementation (ODBC).
     DatabricksODBC,
     /// Redshift driver implementation (ODBC).
@@ -75,6 +76,7 @@ impl Display for Backend {
             Backend::Databricks => write!(f, "Databricks"),
             Backend::Redshift => write!(f, "Redshift"),
             Backend::DuckDB => write!(f, "DuckDB"),
+            Backend::ClickHouse => write!(f, "ClickHouse"),
             Backend::DatabricksODBC => write!(f, "Databricks"),
             Backend::RedshiftODBC => write!(f, "Redshift"),
             Backend::Salesforce => write!(f, "Salesforce"),
@@ -95,6 +97,7 @@ impl Backend {
             Backend::Spark => Some("adbc_driver_spark"),
             Backend::Redshift => Some("adbc_driver_redshift"),
             Backend::DuckDB => Some("duckdb"),
+            Backend::ClickHouse => Some("adbc_clickhouse"),
             Backend::DatabricksODBC | Backend::RedshiftODBC => None, // these use ODBC
             Backend::Generic { library_name, .. } => Some(library_name),
         }
@@ -122,6 +125,7 @@ impl Backend {
             | Backend::Salesforce
             | Backend::Spark
             | Backend::DuckDB
+            | Backend::ClickHouse
             | Backend::Generic { .. } => FFIProtocol::Adbc,
             Backend::DatabricksODBC | Backend::RedshiftODBC => FFIProtocol::Odbc,
         }
@@ -331,6 +335,7 @@ impl AdbcDriver {
             | Backend::Redshift
             | Backend::Spark
             | Backend::DuckDB
+            | Backend::ClickHouse
             | Backend::Salesforce => {
                 debug_assert!(backend.ffi_protocol() == FFIProtocol::Adbc);
                 debug_assert!(install::is_installable_driver(backend));
