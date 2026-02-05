@@ -167,6 +167,11 @@ mod tests {
                 builder.with_named_option("path", database_path)?;
                 Ok(builder)
             }
+            Backend::ClickHouse => {
+                // TODO: add connection setup
+                let builder = database::Builder::new(backend);
+                Ok(builder)
+            }
             Backend::Generic { .. } => unimplemented!("generic backend database builder in tests"),
         }?;
         if backend == Backend::Snowflake {

@@ -203,6 +203,7 @@ pub fn default_time_unit(backend: Backend) -> TimeUnit {
         BigQuery | Redshift | RedshiftODBC => Microsecond,
         Postgres | Salesforce | DuckDB => Microsecond,
         SQLServer => Microsecond,
+        ClickHouse => Second,
         Generic { .. } => Microsecond, // a reasonable default
     }
 }
@@ -703,7 +704,7 @@ impl SqlType {
                 match backend {
                     Snowflake => write!(out, "OBJECT(")?,
                     BigQuery | Databricks | DatabricksODBC | Spark => write!(out, "STRUCT<")?,
-                    Postgres | Salesforce | DuckDB => write!(out, "(")?,
+                    Postgres | Salesforce | DuckDB | ClickHouse => write!(out, "(")?,
                     // Redshift doesn't support object/struct types
                     Redshift | RedshiftODBC => write!(out, "(")?,
                     SQLServer => unimplemented!("SQL Server does't have a struct type"),
@@ -742,7 +743,7 @@ impl SqlType {
                 match backend {
                     Snowflake => write!(out, ")"),
                     BigQuery | Databricks | DatabricksODBC | Spark => write!(out, ">"),
-                    Postgres | Salesforce | DuckDB => write!(out, ")"),
+                    Postgres | Salesforce | DuckDB | ClickHouse => write!(out, ")"),
                     Redshift | RedshiftODBC => write!(out, ")"),
                     SQLServer => unimplemented!("SQL Server does't have a struct type"),
                     Generic { .. } => write!(out, ">"),
@@ -1146,6 +1147,11 @@ impl SqlType {
             }
             // }}}
 
+            (ClickHouse, Numeric(None) | BigNumeric(None)) => {
+                // https://clickhouse.com/docs/sql-reference/data-types/decimal#parameters
+                DataType::Decimal128(10, 0)
+            }
+
             // PostgreSQL {{{
             (Postgres | Salesforce | Generic { .. }, Numeric(None) | BigNumeric(None)) => {
                 // PostgreSQL's NUMERIC type is truly arbitrary (precision can go to a 1000!). When
@@ -1232,6 +1238,11 @@ impl SqlType {
                         // TODO: fs#8086
                         TimeUnit::Nanosecond
                     }
+                    // ClickHouse's `Time` type has a precision of 1 second:
+                    // https://clickhouse.com/docs/sql-reference/data-types/time
+                    // `Time64` has adjustable precision:
+                    // https://clickhouse.com/docs/sql-reference/data-types/time64
+                    (ClickHouse, None) => TimeUnit::Second,
                     (Generic { .. }, None) => {
                         // we pick microseconds as a reasonable default
                         TimeUnit::Microsecond
@@ -1365,6 +1376,8 @@ impl SqlType {
                             )
                     }
                     BigQuery | Postgres | DuckDB => MonthDayNano, // MonthDayNano is exactly what BQ and PG use internally
+                    // FIXME: ClickHouse doesn't actually seem to support Arrow's Interval
+                    ClickHouse => MonthDayNano,
                     Salesforce => MonthDayNano, // Salesforce seems to follow PostgreSQL
                     SQLServer => MonthDayNano, // SQL Server doesn't appear to have an INTERVAL type
                     Generic { .. } => MonthDayNano, // Reasonable default
@@ -1506,6 +1519,7 @@ const BIGQUERY_KEYS: [&str; 2] = ["BIGQUERY:type", "type_text"];
 const DATABRICKS_KEYS: [&str; 2] = ["DBX:type", "type_text"];
 const REDSHIFT_KEYS: [&str; 2] = ["REDSHIFT:type", "type_text"];
 const DUCKDB_KEYS: [&str; 2] = ["DUCKDB:type", "type_text"];
+const CLICKHOUSE_KEYS: [&str; 2] = ["CLICKHOUSE:type", "type_text"];
 const SPARK_KEYS: [&str; 2] = ["SPARK:type", "type_text"];
 const SQLSERVER_KEYS: [&str; 2] = ["SQLSERVER:type", "type_text"];
 const GENERIC_KEYS: [&str; 2] = ["SQL:type", "type_text"];
@@ -1521,6 +1535,7 @@ fn metadata_type_candidate_keys(backend: Backend) -> &'static [&'static str] {
         Backend::DatabricksODBC => &DATABRICKS_KEYS,
         Backend::DuckDB => &DUCKDB_KEYS,
         Backend::SQLServer => &SQLSERVER_KEYS, // TODO
+        Backend::ClickHouse => &CLICKHOUSE_KEYS,
         Backend::Generic { .. } => &GENERIC_KEYS,
     }
 }
