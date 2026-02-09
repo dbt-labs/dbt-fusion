@@ -94,12 +94,28 @@ pub fn resolve_final_selectors(
 
         // Use selector's include and apply CLI indirect selection as fallback
         let mut include = entry.include.clone();
+
+        // Extract excludes that may be embedded in the include expression
+        // (e.g., from parse_composite creating And([include, Exclude(...)]))
+        let (cleaned_include, extracted_exclude) = include.extract_exclude();
+        include = cleaned_include;
+
         if let Some(cli_mode) = arg.indirect_selection {
             include.set_indirect_selection(cli_mode);
         }
 
-        // Set exclude to CLI exclude and apply CLI indirect selection as fallback
-        let mut exclude = arg.exclude.clone();
+        // Merge extracted exclude with CLI exclude
+        let mut exclude = if let Some(extracted) = extracted_exclude {
+            // If both exist, combine them with OR (exclude if matches either)
+            if let Some(cli_exclude) = arg.exclude.clone() {
+                Some(SelectExpression::Or(vec![extracted, cli_exclude]))
+            } else {
+                Some(extracted)
+            }
+        } else {
+            arg.exclude.clone()
+        };
+
         if let (Some(cli_mode), Some(exc)) = (arg.indirect_selection, exclude.as_mut()) {
             exc.set_indirect_selection(cli_mode);
         }
@@ -303,4 +319,101 @@ fn validate_default_selectors(resolved_selectors: &HashMap<String, SelectorEntry
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dbt_common::node_selector::parse_single_selector;
+    use dbt_common::io_args::IoArgs;
+
+    #[test]
+    fn test_resolve_final_selectors_with_embedded_exclude() -> FsResult<()> {
+        let mut resolved_selectors = HashMap::new();
+
+        // Create an include expression with embedded exclude
+        // And([include, Exclude(exclude)])
+        let include = SelectExpression::Atom(parse_single_selector("model_a")?);
+        let exclude = SelectExpression::Atom(parse_single_selector("model_b")?);
+        let embedded_expr = SelectExpression::And(vec![
+            include.clone(),
+            SelectExpression::Exclude(Box::new(exclude.clone())),
+        ]);
+
+        resolved_selectors.insert(
+            "test_selector".to_string(),
+            SelectorEntry {
+                include: embedded_expr,
+                is_default: false,
+                description: None,
+            },
+        );
+
+        let arg = ResolveArgs {
+            selector: Some("test_selector".to_string()),
+            select: None,
+            exclude: None,
+            indirect_selection: None,
+            io: IoArgs::default(),
+            ..Default::default()
+        };
+
+        let result = resolve_final_selectors(resolved_selectors, &arg)?;
+
+        // Verify exclude is extracted and placed in ResolvedSelector.exclude
+        assert_eq!(result.include, Some(include));
+        assert_eq!(result.exclude, Some(exclude));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_resolve_final_selectors_merge_excludes() -> FsResult<()> {
+        let mut resolved_selectors = HashMap::new();
+
+        // Create an include expression with embedded exclude
+        let include = SelectExpression::Atom(parse_single_selector("model_a")?);
+        let exclude_embedded = SelectExpression::Atom(parse_single_selector("model_b")?);
+        let embedded_expr = SelectExpression::And(vec![
+            include.clone(),
+            SelectExpression::Exclude(Box::new(exclude_embedded.clone())),
+        ]);
+
+        resolved_selectors.insert(
+            "test_selector".to_string(),
+            SelectorEntry {
+                include: embedded_expr,
+                is_default: false,
+                description: None,
+            },
+        );
+
+        // CLI exclude
+        let exclude_cli = SelectExpression::Atom(parse_single_selector("model_c")?);
+
+        let arg = ResolveArgs {
+            selector: Some("test_selector".to_string()),
+            select: None,
+            exclude: Some(exclude_cli.clone()),
+            indirect_selection: None,
+            io: IoArgs::default(),
+            ..Default::default()
+        };
+
+        let result = resolve_final_selectors(resolved_selectors, &arg)?;
+
+        // Verify include is cleaned
+        assert_eq!(result.include, Some(include));
+
+        // Verify excludes are merged with OR
+        if let Some(SelectExpression::Or(exprs)) = result.exclude {
+            assert_eq!(exprs.len(), 2);
+            assert_eq!(exprs[0], exclude_embedded);
+            assert_eq!(exprs[1], exclude_cli);
+        } else {
+            panic!("Expected Or expression for merged excludes");
+        }
+
+        Ok(())
+    }
 }
