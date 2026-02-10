@@ -91,9 +91,10 @@ impl<'a> SelectorParser<'a> {
         }
 
         // Build the boolean operator over includes
-        let include_expr = match op_kind {
-            CompositeKind::Union(_) => SelectExpression::Or(includes),
-            CompositeKind::Intersection(_) => SelectExpression::And(includes),
+        let include_expr = match (op_kind, includes.len()) {
+            (_, 1) => includes.pop().unwrap(),
+            (CompositeKind::Union(_), _) => SelectExpression::Or(includes),
+            (CompositeKind::Intersection(_), _) => SelectExpression::And(includes),
         };
 
         // If we have an exclude expression, we need to handle this specially
@@ -857,6 +858,87 @@ mod tests {
         } else {
             panic!("Expected And expression");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_intersection_with_exclude_extraction() -> FsResult<()> {
+        let defs = BTreeMap::new();
+        let io_args = IoArgs::default();
+        let parser = SelectorParser::new(defs, &io_args);
+
+        // Test the scenario from the user's report:
+        // intersection:
+        //   - "path:models/test_exclude/bronze/bronze_*"
+        //   - exclude:
+        //     - "path:models/test_exclude/bronse/no_such_model_*"
+
+        let composite = CompositeExpr {
+            kind: {
+                let mut m = BTreeMap::new();
+                m.insert(
+                    "intersection".to_string(),
+                    CompositeKind::Intersection(vec![
+                        SelectorDefinitionValue::String("path:models/test_exclude/bronze/bronze_*".to_string()),
+                        SelectorDefinitionValue::Full(SelectorExpr::Atom(AtomExpr::Exclude(ExcludeAtomExpr {
+                            exclude: vec![SelectorDefinitionValue::String(
+                                "path:models/test_exclude/bronse/no_such_model_*".to_string(),
+                            )],
+                        }))),
+                    ]),
+                );
+                m
+            },
+        };
+
+        let result = parser.parse_composite(&composite)?;
+
+        // The result should be And([include, Exclude(...)])
+        if let SelectExpression::And(exprs) = &result {
+            assert_eq!(exprs.len(), 2);
+
+            // First is include
+            if let SelectExpression::Atom(criteria) = &exprs[0] {
+                assert_eq!(criteria.method, MethodName::Path);
+                assert_eq!(criteria.value, "models/test_exclude/bronze/bronze_*");
+            } else {
+                panic!("Expected first expression to be Atom");
+            }
+
+            // Second is Exclude
+            if let SelectExpression::Exclude(exclude_expr) = &exprs[1] {
+                if let SelectExpression::Atom(exclude_criteria) = &**exclude_expr {
+                    assert_eq!(exclude_criteria.method, MethodName::Path);
+                    assert_eq!(exclude_criteria.value, "models/test_exclude/bronse/no_such_model_*");
+                } else {
+                    panic!("Expected Atom inside exclude");
+                }
+            } else {
+                panic!("Expected second expression to be Exclude");
+            }
+        } else {
+            panic!("Expected And expression");
+        }
+
+        // Now verify extraction
+        let (cleaned, extracted) = result.extract_exclude();
+
+        // Cleaned include should be the path pattern
+        if let SelectExpression::Atom(criteria) = cleaned {
+            assert_eq!(criteria.method, MethodName::Path);
+            assert_eq!(criteria.value, "models/test_exclude/bronze/bronze_*");
+        } else {
+            panic!("Expected cleaned include to be Atom");
+        }
+
+        // Extracted exclude should be the typo path pattern
+        if let Some(SelectExpression::Atom(criteria)) = extracted {
+            assert_eq!(criteria.method, MethodName::Path);
+            assert_eq!(criteria.value, "models/test_exclude/bronse/no_such_model_*");
+        } else {
+            panic!("Expected extracted exclude to be Atom");
+        }
+
         Ok(())
     }
 }

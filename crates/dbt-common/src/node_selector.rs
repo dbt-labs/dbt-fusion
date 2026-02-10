@@ -257,6 +257,112 @@ impl SelectExpression {
             }
         }
     }
+
+    /// Extract excludes from an expression that may have them embedded.
+    /// Specifically handles the pattern `And([include, Exclude(...)])` created by parse_composite.
+    /// Returns (cleaned_include_expression, extracted_exclude_expression)
+    pub fn extract_exclude(self) -> (SelectExpression, Option<SelectExpression>) {
+        match self {
+            // Handle the specific pattern: And([include, Exclude(...)])
+            SelectExpression::And(mut exprs) if exprs.len() == 2 => {
+                // Check if either element is an Exclude
+                let mut exclude_idx = None;
+                for (i, expr) in exprs.iter().enumerate() {
+                    if matches!(expr, SelectExpression::Exclude(_)) {
+                        exclude_idx = Some(i);
+                        break;
+                    }
+                }
+
+                if let Some(idx) = exclude_idx {
+                    let exclude_expr = exprs.remove(idx);
+                    let include_expr = exprs.pop().unwrap();
+
+                    // Recursively extract from the include side
+                    let (cleaned_include, nested_exclude) = include_expr.extract_exclude();
+
+                    let current_exclude = if let SelectExpression::Exclude(inner) = exclude_expr {
+                        Some(*inner)
+                    } else {
+                        None
+                    };
+
+                    let combined_exclude = match (nested_exclude, current_exclude) {
+                        (Some(n), Some(c)) => Some(SelectExpression::Or(vec![n, c])),
+                        (Some(e), None) | (None, Some(e)) => Some(e),
+                        (None, None) => None,
+                    };
+
+                    (cleaned_include, combined_exclude)
+                } else {
+                    // No Exclude found at this level, but maybe nested?
+                    let mut extracted_excludes = Vec::new();
+                    let mut cleaned_exprs = Vec::new();
+
+                    for expr in exprs {
+                        let (cleaned, exclude) = expr.extract_exclude();
+                        cleaned_exprs.push(cleaned);
+                        if let Some(exc) = exclude {
+                            extracted_excludes.push(exc);
+                        }
+                    }
+
+                    let cleaned = if cleaned_exprs.len() == 1 {
+                        cleaned_exprs.pop().unwrap()
+                    } else {
+                        SelectExpression::And(cleaned_exprs)
+                    };
+
+                    let exclude = if extracted_excludes.is_empty() {
+                        None
+                    } else if extracted_excludes.len() == 1 {
+                        Some(extracted_excludes.pop().unwrap())
+                    } else {
+                        Some(SelectExpression::Or(extracted_excludes))
+                    };
+
+                    (cleaned, exclude)
+                }
+            }
+            // Recursively extract excludes from nested And expressions
+            SelectExpression::And(exprs) => {
+                let mut extracted_excludes = Vec::new();
+                let mut cleaned_exprs = Vec::new();
+
+                for expr in exprs {
+                    let (cleaned, exclude) = expr.extract_exclude();
+                    cleaned_exprs.push(cleaned);
+                    if let Some(exc) = exclude {
+                        extracted_excludes.push(exc);
+                    }
+                }
+
+                let cleaned = if cleaned_exprs.len() == 1 {
+                    cleaned_exprs.pop().unwrap()
+                } else {
+                    SelectExpression::And(cleaned_exprs)
+                };
+
+                let exclude = if extracted_excludes.is_empty() {
+                    None
+                } else if extracted_excludes.len() == 1 {
+                    Some(extracted_excludes.pop().unwrap())
+                } else {
+                    Some(SelectExpression::Or(extracted_excludes))
+                };
+
+                (cleaned, exclude)
+            }
+            // Recursively extract excludes from Or expressions
+            SelectExpression::Or(exprs) => {
+                // STOP RECURSION: Returning (self, None) preserves the structure
+                // and prevents branch-local excludes from becoming global.
+                (SelectExpression::Or(exprs), None)
+            }
+            // Atom and Exclude expressions don't need extraction
+            other => (other, None),
+        }
+    }
 }
 
 /// Converts every `column:` selector in the expression into an equivalent `fqn:` selector.
@@ -1092,6 +1198,128 @@ mod tests {
         };
         assert_eq!(criteria_both.to_string(), "+fqn:model_a+");
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_extract_exclude_basic() -> FsResult<()> {
+        // Test And([include, Exclude(...)]) pattern
+        let include = SelectExpression::Atom(parse_single_selector("model_a")?);
+        let exclude = SelectExpression::Atom(parse_single_selector("model_b")?);
+        let expr = SelectExpression::And(vec![
+            include.clone(),
+            SelectExpression::Exclude(Box::new(exclude.clone())),
+        ]);
+
+        let (cleaned, extracted) = expr.extract_exclude();
+        assert_eq!(cleaned, include);
+        assert_eq!(extracted, Some(exclude));
+        Ok(())
+    }
+
+    #[test]
+    fn test_extract_exclude_no_exclude() -> FsResult<()> {
+        // Test And([include1, include2]) - no exclude
+        let include1 = SelectExpression::Atom(parse_single_selector("model_a")?);
+        let include2 = SelectExpression::Atom(parse_single_selector("model_b")?);
+        let expr = SelectExpression::And(vec![include1.clone(), include2.clone()]);
+        let (cleaned, extracted) = expr.clone().extract_exclude();
+        assert_eq!(cleaned, expr);
+        assert_eq!(extracted, None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_extract_exclude_nested() -> FsResult<()> {
+        // Test nested And expressions with excludes
+        let include1 = SelectExpression::Atom(parse_single_selector("model_a")?);
+        let include2 = SelectExpression::Atom(parse_single_selector("model_b")?);
+        let exclude1 = SelectExpression::Atom(parse_single_selector("model_c")?);
+
+        // inner = And([include1, Exclude(exclude1)])
+        let inner = SelectExpression::And(vec![
+            include1.clone(),
+            SelectExpression::Exclude(Box::new(exclude1.clone())),
+        ]);
+
+        // expr = And([inner, include2])
+        let expr = SelectExpression::And(vec![inner, include2.clone()]);
+
+        let (cleaned, extracted) = expr.extract_exclude();
+
+        // Expected cleaned: And([include1, include2])
+        if let SelectExpression::And(exprs) = cleaned {
+            assert_eq!(exprs.len(), 2);
+            assert_eq!(exprs[0], include1);
+            assert_eq!(exprs[1], include2);
+        } else {
+            panic!("Expected And expression");
+        }
+
+        // Expected extracted: exclude1
+        assert_eq!(extracted, Some(exclude1));
+        Ok(())
+    }
+
+    #[test]
+    fn test_extract_exclude_multiple() -> FsResult<()> {
+        // Test multiple excludes in nested structures
+        let include1 = SelectExpression::Atom(parse_single_selector("model_a")?);
+        let exclude1 = SelectExpression::Atom(parse_single_selector("model_b")?);
+        let exclude2 = SelectExpression::Atom(parse_single_selector("model_c")?);
+
+        // inner1 = And([include1, Exclude(exclude1)])
+        let inner1 = SelectExpression::And(vec![
+            include1.clone(),
+            SelectExpression::Exclude(Box::new(exclude1.clone())),
+        ]);
+
+        // expr = And([inner1, Exclude(exclude2)])
+        // This pattern might not be common but should be handled
+        let expr = SelectExpression::And(vec![
+            inner1,
+            SelectExpression::Exclude(Box::new(exclude2.clone())),
+        ]);
+
+        let (cleaned, extracted) = expr.extract_exclude();
+
+        // Expected cleaned: include1
+        assert_eq!(cleaned, include1);
+
+        // Expected extracted: Or([exclude1, exclude2])
+        if let Some(SelectExpression::Or(exprs)) = extracted {
+            assert_eq!(exprs.len(), 2);
+            assert_eq!(exprs[0], exclude1);
+            assert_eq!(exprs[1], exclude2);
+        } else {
+            panic!("Expected Or expression for multiple excludes");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_extract_exclude_or_preserves_nested() -> FsResult<()> {
+        // Test that Or expressions containing Exclude branches are preserved
+        // (A OR (B AND NOT C)) should remain (A OR (B AND NOT C))
+        // and NOT be extracted as ((A OR B) AND NOT C)
+        let include_a = SelectExpression::Atom(parse_single_selector("model_a")?);
+        let include_b = SelectExpression::Atom(parse_single_selector("model_b")?);
+        let exclude_c = SelectExpression::Atom(parse_single_selector("model_c")?);
+
+        // inner = And([include_b, Exclude(exclude_c)])
+        let inner = SelectExpression::And(vec![
+            include_b.clone(),
+            SelectExpression::Exclude(Box::new(exclude_c.clone())),
+        ]);
+
+        // expr = Or([include_a, inner])
+        let expr = SelectExpression::Or(vec![include_a.clone(), inner.clone()]);
+
+        let (cleaned, extracted) = expr.clone().extract_exclude();
+
+        // Expected: Cleaned is identical to original expr, and extracted is None
+        assert_eq!(cleaned, expr);
+        assert_eq!(extracted, None);
         Ok(())
     }
 }
