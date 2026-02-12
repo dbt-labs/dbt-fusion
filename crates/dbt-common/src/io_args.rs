@@ -1127,6 +1127,14 @@ pub fn check_var(vars: &str) -> Result<BTreeMap<String, Value>, String> {
 
     // Strip outer quotes if present
     let vars = vars.trim().trim_matches('\'');
+    let path = Path::new(vars);
+
+    // If a file path is provided, read and parse its contents as YAML/JSON
+    if path.is_file() {
+        let contents = fs::read_to_string(path)
+            .map_err(|err| format!("Failed to read vars file '{}': {}", vars, err))?;
+        return parse_vars(&contents);
+    }
 
     // Check if the input is already wrapped in curly braces
     let yaml_str = if vars.trim().starts_with('{') {
@@ -1141,8 +1149,17 @@ pub fn check_var(vars: &str) -> Result<BTreeMap<String, Value>, String> {
         vars.to_string()
     };
 
+    parse_vars(&yaml_str)
+}
+
+fn parse_vars(content: &str) -> Result<BTreeMap<String, Value>, String> {
+    // Handle empty input
+    if content.trim().is_empty() {
+        return Err("Empty vars input is not valid".into());
+    }
+
     // Try parsing as YAML first
-    match dbt_serde_yaml::from_str::<BTreeMap<String, Value>>(&yaml_str) {
+    match dbt_serde_yaml::from_str::<BTreeMap<String, Value>>(content) {
         Ok(btree) => {
             // Disallow the '{key:value}' format for flow-style YAML syntax
             // to prevent key:value: None interpretation: https://stackoverflow.com/a/70909331
@@ -1157,7 +1174,7 @@ pub fn check_var(vars: &str) -> Result<BTreeMap<String, Value>, String> {
         }
         Err(_) => {
             // If YAML parsing fails, try JSON
-            match serde_json::from_str(&yaml_str) {
+            match serde_json::from_str(content) {
                 Ok(btree) => Ok(btree),
                 Err(_) => Err(
                     "Invalid YAML/JSON format. Expected format: 'key: value' or '{key: value, ..}'. Note both argument forms must be just one shell token"
@@ -1217,6 +1234,8 @@ pub fn validate_project_name(name: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::NamedTempFile;
 
     #[test]
     fn test_check_single_var() {
@@ -1269,6 +1288,243 @@ mod tests {
         for var in invalid_vars {
             assert!(check_var(var).is_err(), "Should have failed: {var}");
         }
+    }
+
+    #[test]
+    fn test_check_var_from_yaml_file() {
+        // Test 1: Basic string key-value pairs (original test)
+        let tmp1 = NamedTempFile::new().unwrap();
+        fs::write(tmp1.path(), "key1: value1\nkey2: value2").unwrap();
+
+        let result1 = check_var(tmp1.path().to_str().unwrap()).unwrap();
+        let expected_result1 = BTreeMap::from([
+            (
+                "key1".to_string(),
+                dbt_serde_yaml::from_str("value1").unwrap(),
+            ),
+            (
+                "key2".to_string(),
+                dbt_serde_yaml::from_str("value2").unwrap(),
+            ),
+        ]);
+
+        assert_eq!(result1, expected_result1);
+
+        // Test 2: Different value types (numbers, booleans, null)
+        let tmp2 = NamedTempFile::new().unwrap();
+        fs::write(tmp2.path(), "int_val: 42\nfloat_val: 3.14\nbool_true: true\nbool_false: false\nnull_val: null").unwrap();
+
+        let result2 = check_var(tmp2.path().to_str().unwrap()).unwrap();
+        let expected_result2 = BTreeMap::from([
+            ("int_val".to_string(), dbt_serde_yaml::from_str("42").unwrap()),
+            ("float_val".to_string(), dbt_serde_yaml::from_str("3.14").unwrap()),
+            ("bool_true".to_string(), dbt_serde_yaml::from_str("true").unwrap()),
+            ("bool_false".to_string(), dbt_serde_yaml::from_str("false").unwrap()),
+            ("null_val".to_string(), dbt_serde_yaml::from_str("null").unwrap()),
+        ]);
+
+        assert_eq!(result2, expected_result2);
+
+        // Test 3: Nested structures
+        let tmp3 = NamedTempFile::new().unwrap();
+        fs::write(tmp3.path(), "config:\n  database: postgres\n  host: localhost\n  port: 5432\nnested:\n  level1:\n    level2:\n      value: deep").unwrap();
+
+        let result3 = check_var(tmp3.path().to_str().unwrap()).unwrap();
+        let expected_result3 = BTreeMap::from([
+            ("config".to_string(), dbt_serde_yaml::from_str("{database: postgres, host: localhost, port: 5432}").unwrap()),
+            ("nested".to_string(), dbt_serde_yaml::from_str("{level1: {level2: {value: deep}}}").unwrap()),
+        ]);
+
+        assert_eq!(result3, expected_result3);
+
+        // Test 4: Arrays
+        let tmp4 = NamedTempFile::new().unwrap();
+        fs::write(tmp4.path(), "simple_array: [1, 2, 3]\nstring_array: [a, b, c]\nmixed_array: [1, 'string', true, null]\nobject_array:\n  - name: item1\n    value: 10\n  - name: item2\n    value: 20").unwrap();
+
+        let result4 = check_var(tmp4.path().to_str().unwrap()).unwrap();
+        let expected_result4 = BTreeMap::from([
+            ("simple_array".to_string(), dbt_serde_yaml::from_str("[1, 2, 3]").unwrap()),
+            ("string_array".to_string(), dbt_serde_yaml::from_str("[a, b, c]").unwrap()),
+            ("mixed_array".to_string(), dbt_serde_yaml::from_str("[1, 'string', true, null]").unwrap()),
+            ("object_array".to_string(), dbt_serde_yaml::from_str("[\n  {name: item1, value: 10},\n  {name: item2, value: 20}\n]").unwrap()),
+        ]);
+
+        assert_eq!(result4, expected_result4);
+
+        // Test 5: YAML with comments (should parse correctly, comments ignored)
+        let tmp5 = NamedTempFile::new().unwrap();
+        fs::write(tmp5.path(), "# This is a comment\nkey1: value1\n# Another comment\nkey2: value2\n# Final comment").unwrap();
+
+        let result5 = check_var(tmp5.path().to_str().unwrap()).unwrap();
+        let expected_result5 = BTreeMap::from([
+            (
+                "key1".to_string(),
+                dbt_serde_yaml::from_str("value1").unwrap(),
+            ),
+            (
+                "key2".to_string(),
+                dbt_serde_yaml::from_str("value2").unwrap(),
+            ),
+        ]);
+
+        assert_eq!(result5, expected_result5);
+
+        // Test 6: Single key-value pair (edge case)
+        let tmp6 = NamedTempFile::new().unwrap();
+        fs::write(tmp6.path(), "single_key: single_value").unwrap();
+
+        let result6 = check_var(tmp6.path().to_str().unwrap()).unwrap();
+        let expected_result6 = BTreeMap::from([
+            (
+                "single_key".to_string(),
+                dbt_serde_yaml::from_str("single_value").unwrap(),
+            ),
+        ]);
+
+        assert_eq!(result6, expected_result6);
+
+        // Test 7: Empty file (should error)
+        let tmp7 = NamedTempFile::new().unwrap();
+        fs::write(tmp7.path(), "").unwrap();
+
+        let result7 = check_var(tmp7.path().to_str().unwrap());
+        assert!(result7.is_err());
+        assert_eq!(result7.unwrap_err(), "Empty vars input is not valid");
+
+        // Test 8: Invalid YAML syntax (should error)
+        let tmp8 = NamedTempFile::new().unwrap();
+        fs::write(tmp8.path(), "invalid: yaml: syntax: : broken").unwrap();
+
+        let result8 = check_var(tmp8.path().to_str().unwrap());
+        assert!(result8.is_err());
+        // Should contain error about invalid YAML/JSON format
+        assert!(result8.unwrap_err().contains("Invalid YAML/JSON format"));
+    }
+
+    #[test]
+    fn test_check_var_from_json_file() {
+        // Test 1: Basic nested structure (original test)
+        let tmp1 = NamedTempFile::new().unwrap();
+        fs::write(
+            tmp1.path(),
+            r#"{"key1": "value1", "key2": {"nested": "value2"}}"#,
+        )
+        .unwrap();
+
+        let result1 = check_var(tmp1.path().to_str().unwrap()).unwrap();
+        let expected_result1 = BTreeMap::from([
+            (
+                "key1".to_string(),
+                dbt_serde_yaml::from_str("value1").unwrap(),
+            ),
+            (
+                "key2".to_string(),
+                dbt_serde_yaml::from_str("{nested: value2}").unwrap(),
+            ),
+        ]);
+
+        assert_eq!(result1, expected_result1);
+
+        // Test 2: Different value types (numbers, booleans, null)
+        let tmp2 = NamedTempFile::new().unwrap();
+        fs::write(
+            tmp2.path(),
+            r#"{"int_val": 42, "float_val": 3.14, "bool_true": true, "bool_false": false, "null_val": null}"#,
+        )
+        .unwrap();
+
+        let result2 = check_var(tmp2.path().to_str().unwrap()).unwrap();
+        let expected_result2 = BTreeMap::from([
+            ("int_val".to_string(), dbt_serde_yaml::from_str("42").unwrap()),
+            ("float_val".to_string(), dbt_serde_yaml::from_str("3.14").unwrap()),
+            ("bool_true".to_string(), dbt_serde_yaml::from_str("true").unwrap()),
+            ("bool_false".to_string(), dbt_serde_yaml::from_str("false").unwrap()),
+            ("null_val".to_string(), dbt_serde_yaml::from_str("null").unwrap()),
+        ]);
+
+        assert_eq!(result2, expected_result2);
+
+        // Test 3: Arrays
+        let tmp3 = NamedTempFile::new().unwrap();
+        fs::write(
+            tmp3.path(),
+            r#"{"simple_array": [1, 2, 3], "string_array": ["a", "b", "c"], "mixed_array": [1, "string", true, null], "object_array": [{"name": "item1", "value": 10}, {"name": "item2", "value": 20}]}"#,
+        )
+        .unwrap();
+
+        let result3 = check_var(tmp3.path().to_str().unwrap()).unwrap();
+        let expected_result3 = BTreeMap::from([
+            ("simple_array".to_string(), dbt_serde_yaml::from_str("[1, 2, 3]").unwrap()),
+            ("string_array".to_string(), dbt_serde_yaml::from_str("['a', 'b', 'c']").unwrap()),
+            ("mixed_array".to_string(), dbt_serde_yaml::from_str("[1, 'string', true, null]").unwrap()),
+            ("object_array".to_string(), dbt_serde_yaml::from_str("[\n  {name: item1, value: 10},\n  {name: item2, value: 20}\n]").unwrap()),
+        ]);
+
+        assert_eq!(result3, expected_result3);
+
+        // Test 4: Deeply nested structures
+        let tmp4 = NamedTempFile::new().unwrap();
+        fs::write(
+            tmp4.path(),
+            r#"{"config": {"database": {"host": "localhost", "port": 5432, "credentials": {"user": "admin", "pass": "secret"}}, "features": ["ssl", "pooling"]}, "metadata": {"version": "1.0", "nested": {"deeply": {"value": "found"}}}}"#,
+        )
+        .unwrap();
+
+        let result4 = check_var(tmp4.path().to_str().unwrap()).unwrap();
+        let expected_result4 = BTreeMap::from([
+            ("config".to_string(), dbt_serde_yaml::from_str("{database: {host: localhost, port: 5432, credentials: {user: admin, pass: secret}}, features: [ssl, pooling]}").unwrap()),
+            ("metadata".to_string(), dbt_serde_yaml::from_str("{version: '1.0', nested: {deeply: {value: found}}}").unwrap()),
+        ]);
+
+        assert_eq!(result4, expected_result4);
+
+        // Test 5: Nested arrays
+        let tmp5 = NamedTempFile::new().unwrap();
+        fs::write(
+            tmp5.path(),
+            r#"{"matrix": [[1, 2], [3, 4]], "nested_objects": [{"items": ["a", "b"]}, {"items": ["c", "d"]}], "complex": [{"data": [1, 2, 3], "meta": {"type": "array"}}]}"#,
+        )
+        .unwrap();
+
+        let result5 = check_var(tmp5.path().to_str().unwrap()).unwrap();
+        let expected_result5 = BTreeMap::from([
+            ("matrix".to_string(), dbt_serde_yaml::from_str("[[1, 2], [3, 4]]").unwrap()),
+            ("nested_objects".to_string(), dbt_serde_yaml::from_str("[\n  {items: [a, b]},\n  {items: [c, d]}\n]").unwrap()),
+            ("complex".to_string(), dbt_serde_yaml::from_str("[\n  {data: [1, 2, 3], meta: {type: array}}\n]").unwrap()),
+        ]);
+
+        assert_eq!(result5, expected_result5);
+
+        // Test 6: Single key-value pair (edge case)
+        let tmp6 = NamedTempFile::new().unwrap();
+        fs::write(tmp6.path(), r#"{"single_key": "single_value"}"#).unwrap();
+
+        let result6 = check_var(tmp6.path().to_str().unwrap()).unwrap();
+        let expected_result6 = BTreeMap::from([
+            (
+                "single_key".to_string(),
+                dbt_serde_yaml::from_str("single_value").unwrap(),
+            ),
+        ]);
+
+        assert_eq!(result6, expected_result6);
+
+        // Test 7: Empty file (should error)
+        let tmp7 = NamedTempFile::new().unwrap();
+        fs::write(tmp7.path(), "").unwrap();
+
+        let result7 = check_var(tmp7.path().to_str().unwrap());
+        assert!(result7.is_err());
+        assert_eq!(result7.unwrap_err(), "Empty vars input is not valid");
+
+        // Test 8: Invalid JSON syntax (should error)
+        let tmp8 = NamedTempFile::new().unwrap();
+        fs::write(tmp8.path(), r#"{"invalid": json": "syntax": broken}"#).unwrap();
+
+        let result8 = check_var(tmp8.path().to_str().unwrap());
+        assert!(result8.is_err());
+        // Should contain error about invalid YAML/JSON format
+        assert!(result8.unwrap_err().contains("Invalid YAML/JSON format"));
     }
 
     #[test]
