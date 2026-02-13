@@ -589,4 +589,98 @@ mod tests {
         let result = evaluate_selector(&expr, &nodes).expect("evaluate_selector should not error");
         assert_eq!(result.len(), 3);
     }
+
+    #[test]
+    fn test_package_exclude_empty() {
+        let nodes = make_test_nodes_with_bronze_models();
+        let package_include = SelectionCriteria::new(
+            MethodName::Package,
+            vec![],
+            "test".to_string(),
+            false,
+            None,
+            None,
+            None,
+            None,
+        );
+        let package_exclude_no_match = SelectionCriteria::new(
+            MethodName::Package,
+            vec![],
+            "other_package".to_string(),
+            false,
+            None,
+            None,
+            None,
+            None,
+        );
+        let expr = SelectExpression::And(vec![
+            SelectExpression::Atom(package_include),
+            SelectExpression::Exclude(Box::new(SelectExpression::Atom(package_exclude_no_match))),
+        ]);
+
+        let result = evaluate_selector(&expr, &nodes).expect("evaluate_selector should not error");
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn test_resource_type_exclude_empty() {
+        let nodes = make_test_nodes_with_bronze_models();
+        let rt_include = SelectionCriteria::new(
+            MethodName::ResourceType,
+            vec![],
+            "model".to_string(),
+            false,
+            None,
+            None,
+            None,
+            None,
+        );
+        let rt_exclude_no_match = SelectionCriteria::new(
+            MethodName::ResourceType,
+            vec![],
+            "seed".to_string(),
+            false,
+            None,
+            None,
+            None,
+            None,
+        );
+        let expr = SelectExpression::And(vec![
+            SelectExpression::Atom(rt_include),
+            SelectExpression::Exclude(Box::new(SelectExpression::Atom(rt_exclude_no_match))),
+        ]);
+
+        let result = evaluate_selector(&expr, &nodes).expect("evaluate_selector should not error");
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn test_atom_level_exclude_empty() {
+        let nodes = make_test_nodes_with_bronze_models();
+        let mut path_criteria = SelectionCriteria::new(
+            MethodName::Path,
+            vec![],
+            "models/test_exclude/bronze/bronze_*".to_string(),
+            false,
+            None,
+            None,
+            None,
+            None,
+        );
+        let exclude_criteria = SelectionCriteria::new(
+            MethodName::Path,
+            vec![],
+            "nonexistent/*".to_string(),
+            false,
+            None,
+            None,
+            None,
+            None,
+        );
+        path_criteria.exclude = Some(Box::new(SelectExpression::Atom(exclude_criteria)));
+        let expr = SelectExpression::Atom(path_criteria);
+
+        let result = evaluate_selector(&expr, &nodes).expect("evaluate_selector should not error");
+        assert_eq!(result.len(), 3);
+    }
 }
