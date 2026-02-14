@@ -1,0 +1,7 @@
+---
+source: crates/dbt-jinja/minijinja/tests/test_typecheck.rs
+expression: warnings
+---
+- "Type mismatch: expected return type Integer, got String(hello)"
+- "Type mismatch: expected return type Integer, got String(hello)"
+- "Type mismatch: expected return type Integer, got String"

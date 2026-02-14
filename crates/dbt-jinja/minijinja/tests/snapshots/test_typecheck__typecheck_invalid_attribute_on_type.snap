@@ -1,0 +1,5 @@
+---
+source: crates/dbt-jinja/minijinja/tests/test_typecheck.rs
+expression: warnings
+---
+- Integer.nonexistent is not supported

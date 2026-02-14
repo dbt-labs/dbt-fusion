@@ -1,0 +1,5 @@
+---
+source: crates/dbt-jinja/minijinja/tests/test_typecheck.rs
+expression: warnings
+---
+- "Potential TypeError: Unknown local variable 'x'"
