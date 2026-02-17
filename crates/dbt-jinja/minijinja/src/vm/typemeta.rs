@@ -834,7 +834,7 @@ impl<'src> TypeChecker<'src> {
                             ))
                         }
                     };
-                    let _ = match typestate.stack.pop() {
+                    let start = match typestate.stack.pop() {
                         Some(val) => val,
                         None => {
                             return Err(crate::Error::new(
@@ -843,7 +843,7 @@ impl<'src> TypeChecker<'src> {
                             ))
                         }
                     };
-                    let b = match typestate.stack.pop() {
+                    let _base = match typestate.stack.pop() {
                         Some(val) => val,
                         None => {
                             return Err(crate::Error::new(
@@ -853,7 +853,7 @@ impl<'src> TypeChecker<'src> {
                         }
                     };
 
-                    for (name, slice_type) in [("b", &b), ("stop", &stop), ("step", &step)] {
+                    for (name, slice_type) in [("start", &start), ("stop", &stop), ("step", &step)] {
                         if !slice_type.is_subtype_of(&Type::Integer(None).into()) {
                             listener.warn(&format!(
                                 "Type mismatch for slice {name}: type = {slice_type}"

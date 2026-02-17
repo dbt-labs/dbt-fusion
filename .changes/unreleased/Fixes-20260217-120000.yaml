@@ -1,0 +1,7 @@
+kind: Fixes
+body: "Fix slice type check examining base object instead of start index (#1312)"
+time: 2026-02-17T12:00:00.000000-05:00
+custom:
+  author: leochen4891
+  issue: "1312"
+  project: dbt-fusion
