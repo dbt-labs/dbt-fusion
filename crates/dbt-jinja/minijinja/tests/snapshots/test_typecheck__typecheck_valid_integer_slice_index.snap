@@ -2,4 +2,4 @@
 source: crates/dbt-jinja/minijinja/tests/test_typecheck.rs
 expression: warnings
 ---
-- "Type mismatch for slice b: type = List(Integer)"
+[]
