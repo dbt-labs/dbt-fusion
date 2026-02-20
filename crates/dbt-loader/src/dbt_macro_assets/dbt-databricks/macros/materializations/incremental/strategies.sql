@@ -34,7 +34,6 @@
 
     {%- for col in dest_columns -%}
         {%- set col_name_low = col.name | lower -%}
-
         {%- if col_name_low not in seen_cols -%}
             {%- do final_cols.append(col.quoted) -%}
             {%- do seen_cols.append(col_name_low) -%}
