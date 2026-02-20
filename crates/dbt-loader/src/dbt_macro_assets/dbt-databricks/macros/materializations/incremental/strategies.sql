@@ -27,13 +27,25 @@
 
 
 {% macro get_insert_overwrite_sql(source_relation, target_relation) %}
-
     {%- set dest_columns = adapter.get_columns_in_relation(target_relation) -%}
-    {%- set dest_cols_csv = dest_columns | map(attribute='quoted') | join(', ') -%}
+    {%- set partition_by = config.get('partition_by', []) -%}
+    {%- set final_cols = [] -%}
+    {%- set seen_cols = [] -%}
+
+    {%- for col in dest_columns -%}
+        {%- set col_name_low = col.name | lower -%}
+
+        {%- if col_name_low not in seen_cols -%}
+            {%- do final_cols.append(col.quoted) -%}
+            {%- do seen_cols.append(col_name_low) -%}
+        {%- endif -%}
+    {%- endfor -%}
+
+    {%- set dest_cols_csv = final_cols | join(', ') -%}
+
     insert overwrite table {{ target_relation }}
     {{ partition_cols(label="partition") }}
-    select {{dest_cols_csv}} from {{ source_relation }}
-
+    select {{ dest_cols_csv }} from {{ source_relation }}
 {% endmacro %}
 
 {% macro get_replace_where_sql(args_dict) -%}
