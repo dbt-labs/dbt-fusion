@@ -1,0 +1,7 @@
+kind: Under the Hood
+body: "Add 26 snapshot tests for the TypeJinja static type checker in minijinja"
+time: 2026-02-14T12:00:00.000000-05:00
+custom:
+  author: leochen4891
+  issue: ""
+  project: dbt-fusion
