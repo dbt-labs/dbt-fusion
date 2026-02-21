@@ -867,6 +867,30 @@ pub trait BaseAdapter: fmt::Debug + AdapterTyping + Send + Sync {
         materialization: &str,
     ) -> Result<Value, minijinja::Error>;
 
+    /// copy_partitions
+    fn copy_partitions(
+        &self,
+        state: &State,
+        source_relations: &[Arc<dyn BaseRelation>],
+        target_relations: &[Arc<dyn BaseRelation>],
+        materialization: &str,
+    ) -> Result<Value, minijinja::Error> {
+        if source_relations.len() != target_relations.len() {
+            return Err(minijinja::Error::new(
+                minijinja::ErrorKind::InvalidOperation,
+                format!(
+                    "copy_partitions source/target length mismatch: {} vs {}",
+                    source_relations.len(),
+                    target_relations.len()
+                ),
+            ));
+        }
+        for (source_relation, target_relation) in source_relations.iter().zip(target_relations) {
+            self.copy_table(state, source_relation, target_relation, materialization)?;
+        }
+        Ok(Value::from(()))
+    }
+
     /// update_columns
     fn update_columns(
         &self,

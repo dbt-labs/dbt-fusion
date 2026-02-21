@@ -21,10 +21,12 @@ use crate::time_machine::TimeMachine;
 use crate::typed_adapter::{ReplayAdapter, TypedBaseAdapter};
 use crate::{AdapterResponse, AdapterResult, BaseAdapter};
 
+use adbc_core::options::OptionValue;
 use dbt_agate::AgateTable;
 use dbt_auth::{AdapterConfig, Auth, auth_for_backend};
 use dbt_common::behavior_flags::Behavior;
-use dbt_common::cancellation::CancellationToken;
+use dbt_common::cancellation::{Cancellable, CancellationToken};
+use dbt_common::tracing::run_traced_async_blocking;
 use dbt_common::{AdapterError, AdapterErrorKind, FsError, FsResult};
 use dbt_schema_store::{SchemaEntry, SchemaStoreTrait};
 use dbt_schemas::schemas::common::{ClusterConfig, DbtQuoting, ResolvedQuoting};
@@ -36,7 +38,10 @@ use dbt_schemas::schemas::properties::ModelConstraint;
 use dbt_schemas::schemas::relations::base::{BaseRelation, ComponentName};
 use dbt_schemas::schemas::serde::{minijinja_value_to_typed_struct, yml_value_to_minijinja};
 use dbt_schemas::schemas::{InternalDbtNodeAttributes, InternalDbtNodeWrapper};
-use dbt_xdbc::Connection;
+use dbt_xdbc::bigquery::{
+    COPY_TABLE_DESTINATION, COPY_TABLE_SOURCE, COPY_TABLE_WRITE_DISPOSITION, QUERY_LABELS,
+};
+use dbt_xdbc::{Connection, MapReduce};
 use indexmap::IndexMap;
 use minijinja::constants::TARGET_UNIQUE_ID;
 use minijinja::listener::RenderingEventListener;
@@ -1658,6 +1663,178 @@ impl BaseAdapter for BridgeAdapter {
         }
     }
 
+    #[tracing::instrument(skip(self, state, source_relations, target_relations), level = "trace")]
+    fn copy_partitions(
+        &self,
+        state: &State,
+        source_relations: &[Arc<dyn BaseRelation>],
+        target_relations: &[Arc<dyn BaseRelation>],
+        materialization: &str,
+    ) -> Result<Value, minijinja::Error> {
+        if source_relations.len() != target_relations.len() {
+            return Err(AdapterError::new(
+                AdapterErrorKind::Configuration,
+                format!(
+                    "copy_partitions source/target length mismatch: {} vs {}",
+                    source_relations.len(),
+                    target_relations.len()
+                ),
+            )
+            .into());
+        }
+        if source_relations.is_empty() {
+            return Ok(none_value());
+        }
+
+        match &self.inner {
+            Typed { adapter, .. } => {
+                // This method is BigQuery-specific.
+                if self.adapter_type() != AdapterType::Bigquery {
+                    return Err(AdapterError::new(
+                        AdapterErrorKind::NotSupported,
+                        "copy_partitions is only supported for BigQuery adapter",
+                    )
+                    .into());
+                }
+
+                let write_disposition = match materialization {
+                    "table" => "WRITE_TRUNCATE",
+                    "incremental" => "WRITE_APPEND",
+                    _ => {
+                        return Err(AdapterError::new(
+                            AdapterErrorKind::Configuration,
+                            "copy_partitions 'materialization' must be either 'table' or 'incremental'",
+                        )
+                        .into());
+                    }
+                };
+
+                let mut copy_jobs = Vec::with_capacity(source_relations.len());
+                for (source_relation, target_relation) in
+                    source_relations.iter().zip(target_relations)
+                {
+                    let source_fqn = format!(
+                        "{}.{}.{}",
+                        source_relation.database_as_str()?,
+                        source_relation.schema_as_str()?,
+                        source_relation.identifier_as_str()?
+                    );
+                    let target_fqn = format!(
+                        "{}.{}.{}",
+                        target_relation.database_as_str()?,
+                        target_relation.schema_as_str()?,
+                        target_relation.identifier_as_str()?
+                    );
+                    copy_jobs.push((source_fqn, target_fqn));
+                }
+
+                let max_connections = self
+                    .engine()
+                    .config("threads")
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .filter(|v| *v > 0)
+                    .unwrap_or(MAX_CONNECTIONS);
+
+                let base_query_ctx = query_ctx_from_state(state)?;
+                let mut base_options = adapter.get_adbc_execute_options(state);
+                let query_comment = self.engine().query_comment().resolve_comment(state)?;
+                let mut job_labels = self
+                    .engine()
+                    .query_comment()
+                    .get_job_labels_from_query_comment(&query_comment);
+                if let Some(invocation_id_label) = state
+                    .lookup("invocation_id")
+                    .and_then(|value| value.as_str().map(|label| label.to_owned()))
+                {
+                    job_labels.insert("dbt_invocation_id".to_string(), invocation_id_label);
+                }
+                let job_labels_json =
+                    serde_json::to_string(&job_labels).expect("Should serialize job labels");
+                base_options.push((
+                    QUERY_LABELS.to_owned(),
+                    OptionValue::String(job_labels_json),
+                ));
+
+                type Acc = ();
+                let adapter = adapter.clone();
+                let new_connection_f = move || {
+                    adapter
+                        .new_connection(None, None)
+                        .map_err(Cancellable::Error)
+                };
+
+                let engine = self.engine().clone();
+                let write_disposition = write_disposition.to_string();
+                let map_f = move |conn: &'_ mut dyn Connection,
+                                  copy_job: &(String, String)|
+                      -> Result<(), Cancellable<AdapterError>> {
+                    let (source_fqn, target_fqn) = copy_job;
+                    let mut options = base_options.clone();
+                    options.extend(vec![
+                        (
+                            COPY_TABLE_SOURCE.to_string(),
+                            OptionValue::String(source_fqn.clone()),
+                        ),
+                        (
+                            COPY_TABLE_DESTINATION.to_string(),
+                            OptionValue::String(target_fqn.clone()),
+                        ),
+                        (
+                            COPY_TABLE_WRITE_DISPOSITION.to_string(),
+                            OptionValue::String(write_disposition.clone()),
+                        ),
+                    ]);
+
+                    let ctx = base_query_ctx
+                        .clone()
+                        .with_desc("copy_partitions adapter call");
+                    engine.execute_with_options(None, &ctx, conn, "", options, false)?;
+                    Ok(())
+                };
+
+                let reduce_f = move |_acc: &mut Acc,
+                                     _copy_job: (String, String),
+                                     copy_res: Result<(), Cancellable<AdapterError>>|
+                      -> Result<(), Cancellable<AdapterError>> {
+                    copy_res?;
+                    Ok(())
+                };
+
+                for target_relation in target_relations {
+                    self.engine()
+                        .relation_cache()
+                        .insert_relation(target_relation.clone(), None);
+                }
+
+                let map_reduce = MapReduce::new(
+                    Box::new(new_connection_f),
+                    Box::new(map_f),
+                    Box::new(reduce_f),
+                    max_connections,
+                );
+
+                let token = self.cancellation_token();
+                let run_result = run_traced_async_blocking(async move {
+                    map_reduce.run(Arc::new(copy_jobs), token).await
+                });
+
+                if let Err(err) = run_result {
+                    return match err {
+                        Cancellable::Error(err) => Err(err.into()),
+                        Cancellable::Cancelled => Err(AdapterError::new(
+                            AdapterErrorKind::Cancelled,
+                            "copy_partitions operation cancelled",
+                        )
+                        .into()),
+                    };
+                }
+
+                Ok(none_value())
+            }
+            Parse(_) => Ok(none_value()),
+        }
+    }
+
     #[tracing::instrument(skip(self), level = "trace")]
     fn describe_relation(
         &self,
@@ -2065,6 +2242,128 @@ fn debug_compare_column_types(
                 println!("Error getting columns in relation from remote: {e}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::base_adapter::BaseAdapter;
+    use crate::mock::adapter::MockAdapter;
+    use crate::relation::bigquery::BigqueryRelation;
+    use crate::sql_types::NaiveTypeOpsImpl;
+    use dbt_common::cancellation::never_cancels;
+    use dbt_schemas::schemas::relations::{DEFAULT_RESOLVED_QUOTING, SNOWFLAKE_RESOLVED_QUOTING};
+    use minijinja::Environment;
+    use std::collections::BTreeMap;
+
+    fn bigquery_relation(identifier: &str) -> Arc<dyn BaseRelation> {
+        Arc::new(BigqueryRelation::new(
+            Some("db".to_string()),
+            Some("schema".to_string()),
+            Some(identifier.to_string()),
+            None,
+            None,
+            DEFAULT_RESOLVED_QUOTING,
+        )) as Arc<dyn BaseRelation>
+    }
+
+    fn snowflake_bridge_adapter() -> BridgeAdapter {
+        let mock = MockAdapter::new(
+            AdapterType::Snowflake,
+            BTreeMap::new(),
+            SNOWFLAKE_RESOLVED_QUOTING,
+            Box::new(NaiveTypeOpsImpl::new(AdapterType::Snowflake)),
+            Arc::new(NaiveStmtSplitter),
+            never_cancels(),
+        );
+        BridgeAdapter::new(Arc::new(mock), None, None)
+    }
+
+    fn bigquery_bridge_adapter() -> BridgeAdapter {
+        let mock = MockAdapter::new(
+            AdapterType::Bigquery,
+            BTreeMap::new(),
+            DEFAULT_RESOLVED_QUOTING,
+            Box::new(NaiveTypeOpsImpl::new(AdapterType::Bigquery)),
+            Arc::new(NaiveStmtSplitter),
+            never_cancels(),
+        );
+        BridgeAdapter::new(Arc::new(mock), None, None)
+    }
+
+    #[test]
+    fn test_copy_partitions_validates_source_target_lengths() {
+        let adapter = snowflake_bridge_adapter();
+        let env = Environment::new();
+        let state = State::new_for_env(&env);
+
+        let source_relations = vec![bigquery_relation("src_a"), bigquery_relation("src_b")];
+        let target_relations = vec![bigquery_relation("dst_a")];
+
+        let err = BaseAdapter::copy_partitions(
+            &adapter,
+            &state,
+            &source_relations,
+            &target_relations,
+            "table",
+        )
+        .expect_err("expected source/target length mismatch");
+        let adapter_err: AdapterError = err.into();
+        assert_eq!(adapter_err.kind(), AdapterErrorKind::Configuration);
+    }
+
+    #[test]
+    fn test_copy_partitions_non_bigquery_returns_not_supported() {
+        let adapter = snowflake_bridge_adapter();
+        let env = Environment::new();
+        let state = State::new_for_env(&env);
+
+        let source_relations = vec![bigquery_relation("src_a")];
+        let target_relations = vec![bigquery_relation("dst_a")];
+
+        let err = BaseAdapter::copy_partitions(
+            &adapter,
+            &state,
+            &source_relations,
+            &target_relations,
+            "table",
+        )
+        .expect_err("expected non-bigquery copy_partitions to be not supported");
+        let adapter_err: AdapterError = err.into();
+        // BridgeAdapter surfaces AdapterError through minijinja::Error; converting back wraps the
+        // kind as Configuration while preserving the message payload.
+        assert_eq!(adapter_err.kind(), AdapterErrorKind::Configuration);
+        assert!(
+            adapter_err.message().contains("Not Supported:")
+                && adapter_err
+                    .message()
+                    .contains("copy_partitions is only supported for BigQuery adapter"),
+            "unexpected wrapped error message: {}",
+            adapter_err.message()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_copy_partitions_bigquery_success_path() {
+        let adapter = bigquery_bridge_adapter();
+        let env = Environment::new();
+        let state = State::new_for_env(&env);
+
+        let source_relations = vec![bigquery_relation("src_a"), bigquery_relation("src_b")];
+        let target_relations = vec![bigquery_relation("dst_a"), bigquery_relation("dst_b")];
+
+        let result = BaseAdapter::copy_partitions(
+            &adapter,
+            &state,
+            &source_relations,
+            &target_relations,
+            "table",
+        );
+        assert!(
+            result.is_ok(),
+            "expected bigquery copy_partitions success path to pass with mock engine"
+        );
     }
 }
 

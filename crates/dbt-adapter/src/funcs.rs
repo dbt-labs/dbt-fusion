@@ -15,6 +15,7 @@ use dbt_schemas::schemas::common::{ClusterConfig, PartitionConfig};
 use dbt_schemas::schemas::dbt_column::DbtColumn;
 use dbt_schemas::schemas::manifest::{BigqueryPartitionConfig, GrantAccessToTarget};
 use dbt_schemas::schemas::properties::ModelConstraint;
+use dbt_schemas::schemas::relations::base::BaseRelation;
 use dbt_schemas::schemas::serde::minijinja_value_to_typed_struct;
 use indexmap::IndexMap;
 use minijinja::arg_utils::ArgsIter;
@@ -654,6 +655,42 @@ pub fn dispatch_adapter_calls(
                 &target_relation_partitioned,
                 materialization,
             )
+        }
+        "copy_partitions" => {
+            // source_relations: List[BaseRelation], target_relations: List[BaseRelation], materialization: str
+            let iter = ArgsIter::new(
+                name,
+                &["source_relations", "target_relations", "materialization"],
+                args,
+            );
+            let source_relations_val = iter.next_arg::<&Value>()?;
+            let target_relations_val = iter.next_arg::<&Value>()?;
+            let materialization = iter.next_arg::<&str>()?;
+            iter.finish()?;
+
+            let source_relations = source_relations_val
+                .try_iter()
+                .map_err(|_| {
+                    minijinja::Error::new(
+                        minijinja::ErrorKind::InvalidOperation,
+                        "source_relations must be a list of BaseRelation objects",
+                    )
+                })?
+                .map(|v| downcast_value_to_dyn_base_relation(&v))
+                .collect::<Result<Vec<Arc<dyn BaseRelation>>, minijinja::Error>>()?;
+
+            let target_relations = target_relations_val
+                .try_iter()
+                .map_err(|_| {
+                    minijinja::Error::new(
+                        minijinja::ErrorKind::InvalidOperation,
+                        "target_relations must be a list of BaseRelation objects",
+                    )
+                })?
+                .map(|v| downcast_value_to_dyn_base_relation(&v))
+                .collect::<Result<Vec<Arc<dyn BaseRelation>>, minijinja::Error>>()?;
+
+            adapter.copy_partitions(state, &source_relations, &target_relations, materialization)
         }
         "update_columns" => {
             // relation: BaseRelation, columns: Dict[str, DbtColumn]
