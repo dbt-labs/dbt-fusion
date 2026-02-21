@@ -3,5 +3,5 @@ body: Add BigQuery-only parallel execution path for copy_partitions and supporti
 time: 2026-02-21T17:29:00-08:00
 custom:
     author: leohoare
-    issue: ""
+    issue: "1335"
     project: dbt-fusion
