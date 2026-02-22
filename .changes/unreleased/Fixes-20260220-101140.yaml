@@ -1,0 +1,7 @@
+kind: Fixes
+body: 'Databricks adapter adds the partition columns to projection on insert_overwrite incremental strategy'
+time: 2026-02-20T10:11:40.194993Z
+custom:
+    author: Guilherme-B
+    issue: ecause the adapter's internal logic for generating the INSERT OVERWRITE statement is additive rather than unique. It takes the full list of columns from the
+    project: dbt-fusion
