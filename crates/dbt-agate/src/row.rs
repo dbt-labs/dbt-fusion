@@ -1,4 +1,3 @@
-use crate::columns::ColumnNamesAsTuple;
 use crate::table::TableRepr;
 use crate::{MappedSequence, Tuple, TupleRepr};
 use minijinja::listener::RenderingEventListener;
@@ -17,21 +16,46 @@ pub struct RowAsTuple {
 
 impl TupleRepr for RowAsTuple {
     fn get_item_by_index(&self, col_idx: isize) -> Option<Value> {
-        self.of_table.cell(self.index as isize, col_idx)
+        let ncols = self.of_table.row_num_columns();
+        let col_idx = if col_idx < 0 {
+            let adjusted = col_idx + ncols as isize;
+            if adjusted < 0 {
+                return None;
+            }
+            adjusted as usize
+        } else {
+            col_idx as usize
+        };
+        self.of_table.row_cell(self.index, col_idx)
     }
 
     fn len(&self) -> usize {
-        self.of_table.num_columns()
+        self.of_table.row_num_columns()
     }
 
     fn count_occurrences_of(&self, value: &Value) -> usize {
-        self.of_table
-            .count_occurrences_of_value_in_row(value, self.index as isize)
+        let ncols = self.of_table.row_num_columns();
+        let mut count = 0;
+        for col_idx in 0..ncols {
+            if let Some(cell) = self.of_table.row_cell(self.index, col_idx) {
+                if cell == *value {
+                    count += 1;
+                }
+            }
+        }
+        count
     }
 
     fn index_of(&self, value: &Value) -> Option<usize> {
-        self.of_table
-            .index_of_value_in_row(value, self.index as isize)
+        let ncols = self.of_table.row_num_columns();
+        for col_idx in 0..ncols {
+            if let Some(cell) = self.of_table.row_cell(self.index, col_idx) {
+                if cell == *value {
+                    return Some(col_idx);
+                }
+            }
+        }
+        None
     }
 
     fn clone_repr(&self) -> Box<dyn TupleRepr> {
@@ -60,6 +84,66 @@ impl Row {
     }
 }
 
+/// A tuple of column names from the original (unflattened) schema.
+///
+/// Used by `Row::keys()` so that row key iteration matches the
+/// original column count rather than the flattened column count.
+#[derive(Debug)]
+struct OriginalColumnNamesAsTuple {
+    of_table: Arc<TableRepr>,
+}
+
+impl TupleRepr for OriginalColumnNamesAsTuple {
+    fn get_item_by_index(&self, idx: isize) -> Option<Value> {
+        let ncols = self.of_table.row_num_columns();
+        let idx = if idx < 0 {
+            let adjusted = idx + ncols as isize;
+            if adjusted < 0 {
+                return None;
+            }
+            adjusted as usize
+        } else {
+            idx as usize
+        };
+        if idx >= ncols {
+            return None;
+        }
+        self.of_table
+            .original_column_name(idx)
+            .map(Value::from)
+    }
+
+    fn len(&self) -> usize {
+        self.of_table.row_num_columns()
+    }
+
+    fn count_occurrences_of(&self, needle: &Value) -> usize {
+        if let Some(name) = needle.as_str() {
+            let ncols = self.of_table.row_num_columns();
+            (0..ncols)
+                .filter(|&i| self.of_table.original_column_name(i) == Some(name))
+                .count()
+        } else {
+            0
+        }
+    }
+
+    fn index_of(&self, needle: &Value) -> Option<usize> {
+        if let Some(name) = needle.as_str() {
+            let ncols = self.of_table.row_num_columns();
+            (0..ncols).find(|&i| self.of_table.original_column_name(i) == Some(name))
+        } else {
+            None
+        }
+    }
+
+    fn clone_repr(&self) -> Box<dyn TupleRepr> {
+        Box::new(OriginalColumnNamesAsTuple {
+            of_table: Arc::clone(&self.of_table),
+        })
+    }
+}
+
 impl MappedSequence for Row {
     fn type_name(&self) -> &str {
         "Row"
@@ -75,8 +159,10 @@ impl MappedSequence for Row {
     }
 
     fn keys(&self) -> Option<Tuple> {
-        let column_names = ColumnNamesAsTuple::of_table(&self.of_table).into_tuple();
-        Some(column_names)
+        let repr = OriginalColumnNamesAsTuple {
+            of_table: Arc::clone(&self.of_table),
+        };
+        Some(Tuple(Box::new(repr)))
     }
 }
 
