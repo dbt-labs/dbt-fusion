@@ -1,5 +1,6 @@
 use dbt_common::{ErrorCode, FsResult, err};
 use dbt_schemas::schemas::packages::PrivatePackage;
+use vortex_events::private_package_usage_event;
 use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
 use serde_json;
@@ -222,11 +223,23 @@ pub fn get_resolved_url(private_package: &PrivatePackage) -> FsResult<String> {
     // Iterate over all providers and try to match each one
     for provider in provider_info {
         if provider.matches_private_definition(&private_def, private_package.provider.as_deref()) {
+            private_package_usage_event(
+                private_package.private.deref(),
+                private_package.provider.as_deref(),
+                true,
+                provider.provider.as_deref(),
+            );
             return Ok(provider.resolved_url(&private_def.repo_name));
         }
     }
 
     // No matching provider found
+    private_package_usage_event(
+        private_package.private.deref(),
+        private_package.provider.as_deref(),
+        false,
+        None,
+    );
     err!(
         ErrorCode::InvalidConfig,
         "No matching provider found for private definition '{}' with provider {:?}",
@@ -258,5 +271,51 @@ fn get_local_resolved_url(private_package: &PrivatePackage) -> FsResult<String> 
                 private_package.provider.as_deref().unwrap_or_default()
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dbt_schemas::schemas::packages::PrivatePackage;
+    use dbt_yaml::Verbatim;
+    use std::collections::HashMap;
+
+    fn private_package(private: &str, provider: Option<&str>) -> PrivatePackage {
+        PrivatePackage {
+            private: Verbatim::from(private.to_string()),
+            provider: provider.map(str::to_string),
+            revision: None,
+            warn_unpinned: None,
+            subdirectory: None,
+            __unrendered__: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_get_resolved_url_emits_private_package_usage_on_success() {
+        let provider_info = r#"[{"org": "dbt-labs", "url": "https://{token}@github.com/dbt-labs/{repo}.git", "token": "a_token", "provider": "github"}]"#;
+        std::env::set_var("DBT_ENV_PRIVATE_GIT_PROVIDER_INFO", provider_info);
+
+        let pkg = private_package("dbt-labs/test", Some("github"));
+        let result = get_resolved_url(&pkg);
+
+        std::env::remove_var("DBT_ENV_PRIVATE_GIT_PROVIDER_INFO");
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "https://a_token@github.com/dbt-labs/test.git");
+    }
+
+    #[test]
+    fn test_get_resolved_url_emits_private_package_usage_on_failure() {
+        let provider_info = r#"[{"org": "dbt-labs", "url": "https://{token}@github.com/dbt-labs/{repo}.git", "token": "a_token", "provider": "github"}]"#;
+        std::env::set_var("DBT_ENV_PRIVATE_GIT_PROVIDER_INFO", provider_info);
+
+        let pkg = private_package("invalid-org/test", None);
+        let result = get_resolved_url(&pkg);
+
+        std::env::remove_var("DBT_ENV_PRIVATE_GIT_PROVIDER_INFO");
+
+        assert!(result.is_err());
     }
 }
