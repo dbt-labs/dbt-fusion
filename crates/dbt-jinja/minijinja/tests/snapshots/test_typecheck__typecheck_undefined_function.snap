@@ -1,5 +1,0 @@
----
-source: crates/dbt-jinja/minijinja/tests/test_typecheck.rs
-expression: warnings
----
-- "Potential TypeError: Function 'not_a_function' is not defined."

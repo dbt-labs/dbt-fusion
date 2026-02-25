@@ -2,7 +2,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -45,13 +45,7 @@ impl TypecheckingEventListener for WarningCollector {
     fn set_span(&self, _span: &Span) {}
     fn new_block(&self, _block_id: usize) {}
     fn flush(&self) {}
-    fn on_lookup(
-        &self,
-        _span: &Span,
-        _simple_name: &str,
-        _full_name: &str,
-        _def_spans: Vec<Span>,
-    ) {
+    fn on_lookup(&self, _span: &Span, _simple_name: &str, _full_name: &str, _def_spans: Vec<Span>) {
     }
 }
 
@@ -72,10 +66,7 @@ fn minimal_typecheck_context() -> BTreeMap<String, Value> {
 }
 
 /// Helper to run typecheck on a template source with a given function registry.
-fn typecheck_template(
-    source: &str,
-    funcsigns: BTreeMap<String, DynTypeObject>,
-) -> Vec<String> {
+fn typecheck_template(source: &str, funcsigns: BTreeMap<String, DynTypeObject>) -> Vec<String> {
     let context = minimal_typecheck_context();
     let funcsigns = Arc::new(funcsigns);
     let builtins = load_builtins_with_namespace(None).unwrap();
@@ -147,493 +138,101 @@ fn register_udf_with_bare_name(
     funcsigns.insert(name.to_string(), udf);
 }
 
-#[test]
-fn test_typecheck_funcsign_with_is_not_none_narrowing() {
-    let source = r#"{%- macro my_macro(a) -%}
-{#-- funcsign: (optional[integer]) -> string --#}
-{% if a is not none %}
-  {{ a + 1 }}
-{% else %}
-  {{ a }}
-{% endif %}
-{%- endmacro -%}"#;
+/// Parse macro name, parameter names, and funcsign from a SQL template.
+///
+/// Expects the template to contain:
+///   `{% macro NAME(param1, param2, ...) %}`
+///   `{#-- funcsign: SIGNATURE --#}`
+fn parse_macro_metadata(source: &str) -> (&str, Vec<&str>, &str) {
+    let macro_start = source
+        .find("macro ")
+        .expect("SQL file must contain a macro definition");
+    let after_macro = &source[macro_start + 6..];
+    let paren_start = after_macro.find('(').expect("macro must have parameters");
+    let name = after_macro[..paren_start].trim();
+    let paren_end = after_macro
+        .find(')')
+        .expect("macro must have closing paren");
+    let params_str = &after_macro[paren_start + 1..paren_end];
+    let params: Vec<&str> = params_str
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
 
-    let mut funcsigns = BTreeMap::new();
-    register_udf(&mut funcsigns, "my_macro", "(optional[integer]) -> string", &["a"]);
+    let funcsign_marker = "funcsign:";
+    let fs_start = source
+        .find(funcsign_marker)
+        .expect("SQL file must contain a funcsign comment");
+    let after_fs = &source[fs_start + funcsign_marker.len()..];
+    let fs_end = after_fs
+        .find("--#")
+        .expect("funcsign comment must end with --#");
+    let funcsign = after_fs[..fs_end].trim();
 
-    let warnings = typecheck_template(source, funcsigns);
-    insta::assert_yaml_snapshot!(warnings);
+    (name, params, funcsign)
+}
+
+/// Collect all .sql files from a directory, sorted by name for deterministic ordering.
+fn collect_sql_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "sql"))
+        .collect();
+    files.sort();
+    files
+}
+
+/// Run typecheck on each .sql file in a directory, using the given registration function,
+/// and assert the warnings match the snapshot stored next to the .sql file.
+fn run_typecheck_dir(
+    dir: &Path,
+    register_fn: fn(&mut BTreeMap<String, DynTypeObject>, &str, &str, &[&str]),
+) {
+    let files = collect_sql_files(dir);
+    assert!(
+        !files.is_empty(),
+        "No .sql files found in {}",
+        dir.display()
+    );
+
+    for sql_path in files {
+        let source = std::fs::read_to_string(&sql_path).unwrap();
+        let (name, params, funcsign) = parse_macro_metadata(&source);
+        let param_refs: Vec<&str> = params.into_iter().collect();
+
+        let mut funcsigns_map = BTreeMap::new();
+        register_fn(&mut funcsigns_map, name, funcsign, &param_refs);
+
+        let warnings = typecheck_template(&source, funcsigns_map);
+        let snap_name = sql_path.file_stem().unwrap().to_str().unwrap();
+        insta::with_settings!({
+            snapshot_path => dir,
+            prepend_module_to_snapshot => false,
+            omit_expression => true,
+        }, {
+            insta::assert_yaml_snapshot!(snap_name, warnings);
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Unknown local variable
+// General typecheck tests (register UDF under qualified name only)
 // ---------------------------------------------------------------------------
 #[test]
-fn test_typecheck_unknown_local_variable() {
-    let source = r#"{%- macro my_macro(a) -%}
-{#-- funcsign: (integer) -> string --#}
-{{ unknown_var }}
-{%- endmacro -%}"#;
-
-    let mut funcsigns = BTreeMap::new();
-    register_udf(&mut funcsigns, "my_macro", "(integer) -> string", &["a"]);
-
-    let warnings = typecheck_template(source, funcsigns);
-    insta::assert_yaml_snapshot!(warnings);
+fn test_typecheck() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/typecheck-inputs/udf");
+    run_typecheck_dir(&dir, register_udf);
 }
 
 // ---------------------------------------------------------------------------
-// Arithmetic type mismatch (string + integer)
+// Return-type typecheck tests (register UDF under both qualified and bare name)
 // ---------------------------------------------------------------------------
 #[test]
-fn test_typecheck_arithmetic_type_mismatch() {
-    let source = r#"{%- macro my_macro(a, b) -%}
-{#-- funcsign: (string, integer) -> string --#}
-{{ a + b }}
-{%- endmacro -%}"#;
-
-    let mut funcsigns = BTreeMap::new();
-    register_udf(&mut funcsigns, "my_macro", "(string, integer) -> string", &["a", "b"]);
-
-    let warnings = typecheck_template(source, funcsigns);
-    insta::assert_yaml_snapshot!(warnings);
-}
-
-// ---------------------------------------------------------------------------
-// Undefined function
-// ---------------------------------------------------------------------------
-#[test]
-fn test_typecheck_undefined_function() {
-    let source = r#"{%- macro my_macro(a) -%}
-{#-- funcsign: (integer) -> string --#}
-{{ not_a_function() }}
-{%- endmacro -%}"#;
-
-    let mut funcsigns = BTreeMap::new();
-    register_udf(&mut funcsigns, "my_macro", "(integer) -> string", &["a"]);
-
-    let warnings = typecheck_template(source, funcsigns);
-    insta::assert_yaml_snapshot!(warnings);
-}
-
-// ---------------------------------------------------------------------------
-// Undefined filter
-// ---------------------------------------------------------------------------
-#[test]
-fn test_typecheck_undefined_filter() {
-    let source = r#"{%- macro my_macro(a) -%}
-{#-- funcsign: (integer) -> string --#}
-{{ a | not_a_filter }}
-{%- endmacro -%}"#;
-
-    let mut funcsigns = BTreeMap::new();
-    register_udf(&mut funcsigns, "my_macro", "(integer) -> string", &["a"]);
-
-    let warnings = typecheck_template(source, funcsigns);
-    insta::assert_yaml_snapshot!(warnings);
-}
-
-// ---------------------------------------------------------------------------
-// Single-branch variable definition
-// ---------------------------------------------------------------------------
-#[test]
-fn test_typecheck_single_branch_variable_definition() {
-    // Variable `x` is only set in the truthy branch; using it after the if
-    // should warn that it's not defined in one predecessor block.
-    // We use an if/else to ensure the merge creates two distinct paths.
-    let source = r#"{%- macro my_macro(cond) -%}
-{#-- funcsign: (boolean) -> string --#}
-{% if cond %}{% set x = 1 %}{% else %}nope{% endif %}
-{{ x }}
-{%- endmacro -%}"#;
-
-    let mut funcsigns = BTreeMap::new();
-    register_udf(&mut funcsigns, "my_macro", "(boolean) -> string", &["cond"]);
-
-    let warnings = typecheck_template(source, funcsigns);
-    insta::assert_yaml_snapshot!(warnings);
-}
-
-// ---------------------------------------------------------------------------
-// Both-branch variable definition (control for single-branch test)
-// ---------------------------------------------------------------------------
-#[test]
-fn test_typecheck_both_branch_variable_definition() {
-    // Variable `x` is set in both branches; no warning expected.
-    let source = r#"{%- macro my_macro(cond) -%}
-{#-- funcsign: (boolean) -> string --#}
-{% if cond %}{% set x = 1 %}{% else %}{% set x = 2 %}{% endif %}
-{{ x }}
-{%- endmacro -%}"#;
-
-    let mut funcsigns = BTreeMap::new();
-    register_udf(&mut funcsigns, "my_macro", "(boolean) -> string", &["cond"]);
-
-    let warnings = typecheck_template(source, funcsigns);
-    insta::assert_yaml_snapshot!(warnings);
-}
-
-// ---------------------------------------------------------------------------
-// Nested if/else with variable defined in all leaf branches (control)
-// ---------------------------------------------------------------------------
-#[test]
-fn test_typecheck_nested_if_all_branches_define_var() {
-    // Variable `x` is set in every leaf branch of a nested if/else;
-    // no single-branch warning expected.
-    let source = r#"{%- macro my_macro(a, b) -%}
-{#-- funcsign: (boolean, boolean) -> string --#}
-{% if a %}
-  {% if b %}{% set x = 1 %}{% else %}{% set x = 2 %}{% endif %}
-{% else %}
-  {% set x = 3 %}
-{% endif %}
-{{ x }}
-{%- endmacro -%}"#;
-
-    let mut funcsigns = BTreeMap::new();
-    register_udf(&mut funcsigns, "my_macro", "(boolean, boolean) -> string", &["a", "b"]);
-
-    let warnings = typecheck_template(source, funcsigns);
-    insta::assert_yaml_snapshot!(warnings);
-}
-
-// ---------------------------------------------------------------------------
-// Comparison type mismatch
-// ---------------------------------------------------------------------------
-#[test]
-fn test_typecheck_comparison_type_mismatch() {
-    let source = r#"{%- macro my_macro(a, b) -%}
-{#-- funcsign: (string, integer) -> string --#}
-{% if a > b %}yes{% endif %}
-{%- endmacro -%}"#;
-
-    let mut funcsigns = BTreeMap::new();
-    register_udf(&mut funcsigns, "my_macro", "(string, integer) -> string", &["a", "b"]);
-
-    let warnings = typecheck_template(source, funcsigns);
-    insta::assert_yaml_snapshot!(warnings);
-}
-
-// ---------------------------------------------------------------------------
-// Explicit return type mismatch
-// The per-block return type check uses the bare macro name from the CFG to
-// look up the function registry. We register under the bare name to exercise
-// this code path.
-// ---------------------------------------------------------------------------
-#[test]
-fn test_typecheck_explicit_return_type_mismatch() {
-    let source = r#"{%- macro my_macro(a) -%}
-{#-- funcsign: (integer) -> integer --#}
-{{ return("hello") }}
-{%- endmacro -%}"#;
-
-    let mut funcsigns = BTreeMap::new();
-    register_udf_with_bare_name(&mut funcsigns, "my_macro", "(integer) -> integer", &["a"]);
-
-    let warnings = typecheck_template(source, funcsigns);
-    insta::assert_yaml_snapshot!(warnings);
-}
-
-// ---------------------------------------------------------------------------
-// Implicit return type mismatch
-// The last-block return type check fires when a macro's declared return type
-// is not compatible with String (the implicit return).
-// ---------------------------------------------------------------------------
-#[test]
-fn test_typecheck_implicit_return_type_mismatch() {
-    let source = r#"{%- macro my_macro(a) -%}
-{#-- funcsign: (integer) -> integer --#}
-hello world
-{%- endmacro -%}"#;
-
-    let mut funcsigns = BTreeMap::new();
-    register_udf_with_bare_name(&mut funcsigns, "my_macro", "(integer) -> integer", &["a"]);
-
-    let warnings = typecheck_template(source, funcsigns);
-    insta::assert_yaml_snapshot!(warnings);
-}
-
-// ---------------------------------------------------------------------------
-// Correct return type (control for return type mismatch tests)
-// ---------------------------------------------------------------------------
-#[test]
-fn test_typecheck_correct_return_type() {
-    // Explicit return matches declared type; no warning expected.
-    // The macro declares -> string, and both the explicit return("hello")
-    // and the implicit return (rendered text) are strings.
-    let source = r#"{%- macro my_macro(a) -%}
-{#-- funcsign: (integer) -> string --#}
-{{ return("hello") }}
-{%- endmacro -%}"#;
-
-    let mut funcsigns = BTreeMap::new();
-    register_udf_with_bare_name(&mut funcsigns, "my_macro", "(integer) -> string", &["a"]);
-
-    let warnings = typecheck_template(source, funcsigns);
-    insta::assert_yaml_snapshot!(warnings);
-}
-
-// ---------------------------------------------------------------------------
-// `is string` type narrowing
-// ---------------------------------------------------------------------------
-#[test]
-fn test_typecheck_is_string_narrowing() {
-    // `a` has union type string|integer. After `is string`, the truthy branch
-    // should narrow to string, allowing `a.upper()` without warnings.
-    let source = r#"{%- macro my_macro(a) -%}
-{#-- funcsign: (string | integer) -> string --#}
-{% if a is string %}{{ a.upper() }}{% endif %}
-{%- endmacro -%}"#;
-
-    let mut funcsigns = BTreeMap::new();
-    register_udf(&mut funcsigns, "my_macro", "(string | integer) -> string", &["a"]);
-
-    let warnings = typecheck_template(source, funcsigns);
-    insta::assert_yaml_snapshot!(warnings);
-}
-
-// ---------------------------------------------------------------------------
-// `is integer` negative narrowing / type exclusion
-// ---------------------------------------------------------------------------
-#[test]
-fn test_typecheck_is_integer_else_narrowing() {
-    // `a` has union type string|integer. `is integer` narrows truthy to integer;
-    // the else branch should narrow to string, allowing `a.upper()`.
-    let source = r#"{%- macro my_macro(a) -%}
-{#-- funcsign: (string | integer) -> string --#}
-{% if a is integer %}{{ a + 1 }}{% else %}{{ a.upper() }}{% endif %}
-{%- endmacro -%}"#;
-
-    let mut funcsigns = BTreeMap::new();
-    register_udf(&mut funcsigns, "my_macro", "(string | integer) -> string", &["a"]);
-
-    let warnings = typecheck_template(source, funcsigns);
-    insta::assert_yaml_snapshot!(warnings);
-}
-
-// ---------------------------------------------------------------------------
-// For loop element type inference
-// ---------------------------------------------------------------------------
-#[test]
-fn test_typecheck_for_loop_element_type_inference() {
-    // Iterate over a list[integer] parameter; element should be inferred as
-    // integer, so `item + 1` should produce no type errors.
-    let source = r#"{%- macro my_macro(items) -%}
-{#-- funcsign: (list[integer]) -> string --#}
-{% for item in items %}{{ item + 1 }}{% endfor %}
-{%- endmacro -%}"#;
-
-    let mut funcsigns = BTreeMap::new();
-    register_udf(&mut funcsigns, "my_macro", "(list[integer]) -> string", &["items"]);
-
-    let warnings = typecheck_template(source, funcsigns);
-    insta::assert_yaml_snapshot!(warnings);
-}
-
-// ---------------------------------------------------------------------------
-// Undefined macro call
-// ---------------------------------------------------------------------------
-#[test]
-fn test_typecheck_undefined_macro_call() {
-    let source = r#"{%- macro my_macro(a) -%}
-{#-- funcsign: (integer) -> string --#}
-{{ unknown_macro() }}
-{%- endmacro -%}"#;
-
-    let mut funcsigns = BTreeMap::new();
-    register_udf(&mut funcsigns, "my_macro", "(integer) -> string", &["a"]);
-
-    let warnings = typecheck_template(source, funcsigns);
-    insta::assert_yaml_snapshot!(warnings);
-}
-
-// ---------------------------------------------------------------------------
-// Unpack list length mismatch
-// ---------------------------------------------------------------------------
-#[test]
-fn test_typecheck_unpack_list_length_mismatch() {
-    let source = r#"{%- macro my_macro(a) -%}
-{#-- funcsign: (integer) -> string --#}
-{% set x, y = [1, 2, 3] %}
-{{ x }}{{ y }}
-{%- endmacro -%}"#;
-
-    let mut funcsigns = BTreeMap::new();
-    register_udf(&mut funcsigns, "my_macro", "(integer) -> string", &["a"]);
-
-    let warnings = typecheck_template(source, funcsigns);
-    insta::assert_yaml_snapshot!(warnings);
-}
-
-// ---------------------------------------------------------------------------
-// Non-integer slice index
-// ---------------------------------------------------------------------------
-#[test]
-fn test_typecheck_non_integer_slice_index() {
-    let source = r#"{%- macro my_macro(items) -%}
-{#-- funcsign: (list[integer]) -> string --#}
-{{ items["a":"b"] }}
-{%- endmacro -%}"#;
-
-    let mut funcsigns = BTreeMap::new();
-    register_udf(&mut funcsigns, "my_macro", "(list[integer]) -> string", &["items"]);
-
-    let warnings = typecheck_template(source, funcsigns);
-    insta::assert_yaml_snapshot!(warnings);
-}
-
-// ---------------------------------------------------------------------------
-// Valid integer slice index (control for non-integer slice test)
-// ---------------------------------------------------------------------------
-#[test]
-fn test_typecheck_valid_integer_slice_index() {
-    // Slice indices are integers; no warning expected.
-    let source = r#"{%- macro my_macro(items) -%}
-{#-- funcsign: (list[integer]) -> string --#}
-{{ items[0:2] }}
-{%- endmacro -%}"#;
-
-    let mut funcsigns = BTreeMap::new();
-    register_udf(&mut funcsigns, "my_macro", "(list[integer]) -> string", &["items"]);
-
-    let warnings = typecheck_template(source, funcsigns);
-    insta::assert_yaml_snapshot!(warnings);
-}
-
-// ---------------------------------------------------------------------------
-// Valid string method (no warning expected)
-// ---------------------------------------------------------------------------
-#[test]
-fn test_typecheck_valid_string_method() {
-    let source = r#"{%- macro my_macro(a) -%}
-{#-- funcsign: (string) -> string --#}
-{{ a.upper() }}
-{%- endmacro -%}"#;
-
-    let mut funcsigns = BTreeMap::new();
-    register_udf(&mut funcsigns, "my_macro", "(string) -> string", &["a"]);
-
-    let warnings = typecheck_template(source, funcsigns);
-    insta::assert_yaml_snapshot!(warnings);
-}
-
-// ---------------------------------------------------------------------------
-// Invalid attribute on type
-// ---------------------------------------------------------------------------
-#[test]
-fn test_typecheck_invalid_attribute_on_type() {
-    let source = r#"{%- macro my_macro(a) -%}
-{#-- funcsign: (integer) -> string --#}
-{{ a.nonexistent() }}
-{%- endmacro -%}"#;
-
-    let mut funcsigns = BTreeMap::new();
-    register_udf(&mut funcsigns, "my_macro", "(integer) -> string", &["a"]);
-
-    let warnings = typecheck_template(source, funcsigns);
-    insta::assert_yaml_snapshot!(warnings);
-}
-
-// ===========================================================================
-// Additional coverage: null dereference, nested control flow, loop edge cases
-// ===========================================================================
-
-// ---------------------------------------------------------------------------
-// Attribute access on optional type without guard (null dereference)
-// Paper's most common bug pattern (17/30 in evaluation).
-// ---------------------------------------------------------------------------
-#[test]
-fn test_typecheck_optional_attribute_access_no_guard() {
-    // `a` is optional[string], accessing `.upper()` without an `is not none`
-    // guard should warn about potential None dereference.
-    let source = r#"{%- macro my_macro(a) -%}
-{#-- funcsign: (optional[string]) -> string --#}
-{{ a.upper() }}
-{%- endmacro -%}"#;
-
-    let mut funcsigns = BTreeMap::new();
-    register_udf(&mut funcsigns, "my_macro", "(optional[string]) -> string", &["a"]);
-
-    let warnings = typecheck_template(source, funcsigns);
-    insta::assert_yaml_snapshot!(warnings);
-}
-
-// ---------------------------------------------------------------------------
-// Attribute access on optional type WITH `is not none` guard (control)
-// ---------------------------------------------------------------------------
-#[test]
-fn test_typecheck_optional_attribute_access_with_guard() {
-    // After `is not none`, accessing `.upper()` is safe; no warning expected.
-    let source = r#"{%- macro my_macro(a) -%}
-{#-- funcsign: (optional[string]) -> string --#}
-{% if a is not none %}{{ a.upper() }}{% endif %}
-{%- endmacro -%}"#;
-
-    let mut funcsigns = BTreeMap::new();
-    register_udf(&mut funcsigns, "my_macro", "(optional[string]) -> string", &["a"]);
-
-    let warnings = typecheck_template(source, funcsigns);
-    insta::assert_yaml_snapshot!(warnings);
-}
-
-// ---------------------------------------------------------------------------
-// Nested loop: inner loop variable used inside inner body (no false positive)
-// ---------------------------------------------------------------------------
-#[test]
-fn test_typecheck_nested_loop_variable() {
-    // `row` and `cell` are loop variables; using them inside their
-    // respective loop bodies should not produce single-branch warnings.
-    let source = r#"{%- macro my_macro(matrix) -%}
-{#-- funcsign: (list[list[integer]]) -> string --#}
-{% for row in matrix %}{% for cell in row %}{{ cell + 1 }}{% endfor %}{% endfor %}
-{%- endmacro -%}"#;
-
-    let mut funcsigns = BTreeMap::new();
-    register_udf(&mut funcsigns, "my_macro", "(list[list[integer]]) -> string", &["matrix"]);
-
-    let warnings = typecheck_template(source, funcsigns);
-    insta::assert_yaml_snapshot!(warnings);
-}
-
-// ---------------------------------------------------------------------------
-// Variable set inside loop body, used after loop (single-branch)
-// The loop may not execute, so `x` might be undefined after the loop.
-// ---------------------------------------------------------------------------
-#[test]
-fn test_typecheck_var_defined_in_loop_used_after() {
-    let source = r#"{%- macro my_macro(items) -%}
-{#-- funcsign: (list[integer]) -> string --#}
-{% for item in items %}{% set x = item %}{% endfor %}
-{{ x }}
-{%- endmacro -%}"#;
-
-    let mut funcsigns = BTreeMap::new();
-    register_udf(&mut funcsigns, "my_macro", "(list[integer]) -> string", &["items"]);
-
-    let warnings = typecheck_template(source, funcsigns);
-    insta::assert_yaml_snapshot!(warnings);
-}
-
-// ---------------------------------------------------------------------------
-// Nested if/else where only SOME leaf branches define a variable
-// ---------------------------------------------------------------------------
-#[test]
-fn test_typecheck_nested_if_partial_branch_definition() {
-    // `x` is set in the inner-if truthy branch and the outer else,
-    // but NOT in the inner-if else branch. Should warn.
-    let source = r#"{%- macro my_macro(a, b) -%}
-{#-- funcsign: (boolean, boolean) -> string --#}
-{% if a %}
-  {% if b %}{% set x = 1 %}{% else %}nope{% endif %}
-{% else %}
-  {% set x = 3 %}
-{% endif %}
-{{ x }}
-{%- endmacro -%}"#;
-
-    let mut funcsigns = BTreeMap::new();
-    register_udf(&mut funcsigns, "my_macro", "(boolean, boolean) -> string", &["a", "b"]);
-
-    let warnings = typecheck_template(source, funcsigns);
-    insta::assert_yaml_snapshot!(warnings);
+fn test_typecheck_return_type() {
+    let dir =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/typecheck-inputs/udf_and_bare_name");
+    run_typecheck_dir(&dir, register_udf_with_bare_name);
 }
