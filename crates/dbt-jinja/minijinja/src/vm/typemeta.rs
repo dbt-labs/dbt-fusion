@@ -2143,6 +2143,7 @@ impl<'src> TypeChecker<'src> {
                 .unwrap()
                 .dedup();
             match (dst.locals.get_mut(&name), src.locals.get_ref(&name)) {
+                // Both branches define the variable — union their types.
                 (Some(dst_type), Some(src_type)) => {
                     let union_type = dst_type.union(src_type);
                     if union_type.inner != dst_type.inner {
@@ -2150,7 +2151,11 @@ impl<'src> TypeChecker<'src> {
                         changed = true;
                     }
                 }
+                // Variable in dst (one branch) but not in src (other branch):
+                // should mark as single-branch-defined so Lookup warns later.
                 (Some(_), None) => {}
+                // Variable in src (one branch) but not in dst (other branch):
+                // mark as single-branch-defined and insert as Any.
                 (None, Some(_src_type)) => {
                     if !visited {
                         dst.single_branch_definition_vars.insert(name.clone());
@@ -2165,6 +2170,7 @@ impl<'src> TypeChecker<'src> {
                         .unwrap();
                     changed = true;
                 }
+                // Neither branch defines the variable — nothing to do.
                 (None, None) => {}
             }
         }
