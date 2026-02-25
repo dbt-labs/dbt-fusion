@@ -2152,8 +2152,14 @@ impl<'src> TypeChecker<'src> {
                     }
                 }
                 // Variable in dst (one branch) but not in src (other branch):
-                // should mark as single-branch-defined so Lookup warns later.
-                (Some(_), None) => {}
+                // mark as single-branch-defined so Lookup warns later.
+                // Note: no `!visited` guard here — at this point the join
+                // block is already visited (set when the first predecessor
+                // arrived via first_merge), so a visited check would always
+                // skip this.
+                (Some(_), None) => {
+                    dst.single_branch_definition_vars.insert(name.clone());
+                }
                 // Variable in src (one branch) but not in dst (other branch):
                 // mark as single-branch-defined and insert as Any.
                 (None, Some(_src_type)) => {
