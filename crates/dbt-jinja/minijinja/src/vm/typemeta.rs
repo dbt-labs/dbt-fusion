@@ -537,16 +537,22 @@ impl<'src> TypeChecker<'src> {
             let out_state =
                 self.transfer_block(bb_id, listener.clone(), typecheck_resolved_context.clone())?;
 
-            // Per-block return type check (explicit return)
+            // Per-block return type check: only fire when this block contains
+            // an explicit return() — i.e., rv_type changed during transfer_block.
+            // Without this guard, rv_type propagated from predecessor blocks
+            // through state merging would trigger duplicate warnings.
             let rv_type = out_state.rv_type.clone();
-            if let Some(expected_ret_type) = self.expected_return_type(bb_id) {
-                if !rv_type.is_compatible_with(&expected_ret_type) {
-                    listener.set_span(&out_state.return_span);
-                    listener.warn(
-                        &format!(
-                            "Type mismatch: expected return type {expected_ret_type}, got {rv_type}"
-                        ),
-                    );
+            let rv_type_changed = rv_type != self.in_states[bb_id].rv_type;
+            if rv_type_changed {
+                if let Some(expected_ret_type) = self.expected_return_type(bb_id) {
+                    if !rv_type.is_compatible_with(&expected_ret_type) {
+                        listener.set_span(&out_state.return_span);
+                        listener.warn(
+                            &format!(
+                                "Type mismatch: expected return type {expected_ret_type}, got {rv_type}"
+                            ),
+                        );
+                    }
                 }
             }
 
