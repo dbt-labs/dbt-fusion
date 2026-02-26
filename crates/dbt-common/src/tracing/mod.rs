@@ -21,7 +21,9 @@ mod shared_writer;
 pub mod shutdown;
 pub mod span_info;
 
-pub use async_tracing::{spawn_blocking_traced, spawn_traced, spawn_traced_block_in_place};
+pub use async_tracing::{
+    run_traced_async_blocking, spawn_blocking_traced, spawn_traced, spawn_traced_block_in_place,
+};
 pub use config::FsTraceConfig;
 pub use emit::{
     create_debug_span, create_debug_span_with_parent, create_info_span,
