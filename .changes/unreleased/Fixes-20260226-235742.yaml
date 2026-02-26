@@ -1,0 +1,7 @@
+kind: Fixes
+body: '[dbt-common] Update jq installation to dynamically fetch latest version during setup'
+time: 2026-02-26T23:57:42.094184018+07:00
+custom:
+    author: tlm365
+    issue: "1019"
+    project: dbt-fusion

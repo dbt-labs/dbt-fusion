@@ -55,14 +55,24 @@ need() {
     fi
 }
 
+get_latest_jq_version() {
+    _latest_version=$(curl -sL https://api.github.com/repos/jqlang/jq/releases/latest | grep '"tag_name":' | sed -E 's/.*"jq-([^"]+)".*/\1/')
+
+    if [ -z "$_latest_version" ]; then
+        echo "1.8.1" # Hardcode fallback version
+    else
+        echo "$_latest_version"
+    fi
+}
+
 # Function to install jq automatically
 install_jq() {
-    jq_version="1.7.1"
+    jq_version=$(get_latest_jq_version)
     jq_url=""
     jq_binary_name="jq"
     temp_dir=""
     
-    log_grey "jq not found, installing automatically..."
+    log_grey "jq not found, installing automatically (version $jq_version) ..."
     
     # Detect platform for jq download
     os=$(uname -s | tr '[:upper:]' '[:lower:]')
