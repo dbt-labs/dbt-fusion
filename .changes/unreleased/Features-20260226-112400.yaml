@@ -1,0 +1,7 @@
+kind: Features
+body: Add dbt-chaos crate for chaos engineering testing of Cloud Runner
+time: 2026-02-26T11:24:00.000000-07:00
+custom:
+    author: rohansanjeevindurkar-dbt
+    issue: "1373"
+    project: dbt-fusion
