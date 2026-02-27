@@ -1,0 +1,7 @@
+kind: Fixes
+body: "[internal] Eliminate production panics and hangs: convert panic!/unimplemented!/todo! to safe no-ops or error returns across dbt-schemas, dbt-parser, dbt-adapter, dbt-xdbc, and vortex-client"
+time: 2026-02-26T14:15:00.000000-07:00
+custom:
+    author: ""
+    issue: ""
+    project: dbt-fusion
