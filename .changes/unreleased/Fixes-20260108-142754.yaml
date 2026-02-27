@@ -1,0 +1,7 @@
+kind: Fixes
+body: Suppress decorative header in dbtf list output when --quiet is used
+time: 2026-01-08T14:27:54.65576+09:00
+custom:
+    author: yu-iskw
+    issue: none
+    project: dbt-fusion

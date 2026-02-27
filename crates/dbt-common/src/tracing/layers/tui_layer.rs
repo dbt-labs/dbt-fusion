@@ -1121,11 +1121,13 @@ impl TuiLayer {
 
                 // Emit header once before first list item
                 if !self.list_header_emitted.swap(true, Ordering::Relaxed) {
-                    let header =
-                        format_delimiter(SELECTED_NODES_TITLE, self.max_term_line_width, true);
-                    stdout
-                        .write_all(format!("{}\n", header).as_bytes())
-                        .expect("failed to write header to stdout");
+                    if self.show_options.contains(&ShowOptions::Nodes) {
+                        let header =
+                            format_delimiter(SELECTED_NODES_TITLE, self.max_term_line_width, true);
+                        stdout
+                            .write_all(format!("{}\n", header).as_bytes())
+                            .expect("failed to write header to stdout");
+                    }
                 }
 
                 // Print list item content

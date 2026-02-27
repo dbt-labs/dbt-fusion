@@ -476,7 +476,9 @@ impl ListArgs {
     pub fn to_eval_args(&self, arg: SystemArgs, in_dir: &Path, out_dir: &Path) -> EvalArgs {
         let mut eval_args = self.common_args.to_eval_args(arg, in_dir, out_dir);
         eval_args.phase = Phases::List;
-        eval_args.io.show.insert(ShowOptions::Nodes);
+        if !self.common_args.quiet {
+            eval_args.io.show.insert(ShowOptions::Nodes);
+        }
         eval_args.output_keys = self.output_keys.clone();
         if let Some(resource_type) = self.resource_type {
             eval_args.resource_types = vec![resource_type];
