@@ -113,23 +113,23 @@ pub trait Statement: Send {
 
     /// Set a post-init option.
     fn set_option(&mut self, _key: OptionStatement, _value: OptionValue) -> Result<()> {
-        unimplemented!("ADBC statement option setting")
+        Err(Error::with_message_and_status("ADBC statement option setting is not implemented", Status::NotImplemented))
     }
     /// Get a string option value by key.
     fn get_option_string(&self, _key: OptionStatement) -> Result<String> {
-        unimplemented!("ADBC statement string option retrieval")
+        Err(Error::with_message_and_status("ADBC statement string option retrieval is not implemented", Status::NotImplemented))
     }
     /// Get a bytes option value by key.
     fn get_option_bytes(&self, _key: OptionStatement) -> Result<Vec<u8>> {
-        unimplemented!("ADBC statement bytes option retrieval")
+        Err(Error::with_message_and_status("ADBC statement bytes option retrieval is not implemented", Status::NotImplemented))
     }
     /// Get an integer option value by key.
     fn get_option_int(&self, _key: OptionStatement) -> Result<i64> {
-        unimplemented!("ADBC statement integer option retrieval")
+        Err(Error::with_message_and_status("ADBC statement integer option retrieval is not implemented", Status::NotImplemented))
     }
     /// Get a float option value by key.
     fn get_option_double(&self, _key: OptionStatement) -> Result<f64> {
-        unimplemented!("ADBC statement float option retrieval")
+        Err(Error::with_message_and_status("ADBC statement float option retrieval is not implemented", Status::NotImplemented))
     }
 
     /// [Debug](std::fmt::Debug) implementation for Connection.
@@ -262,14 +262,14 @@ pub(crate) struct OdbcStatement(pub(crate) Backend, pub(crate) ManagedOdbcStatem
 #[cfg(feature = "odbc")]
 impl Statement for OdbcStatement {
     fn bind(&mut self, _batch: RecordBatch) -> Result<()> {
-        todo!("OdbcStatement::bind")
+        Err(Error::with_message_and_status("OdbcStatement::bind is not implemented", Status::NotImplemented))
     }
 
     fn bind_stream<'a>(
         &'a mut self,
         _reader: Box<dyn RecordBatchReader + Send + 'a>,
     ) -> Result<()> {
-        todo!("OdbcStatement::bind_stream")
+        Err(Error::with_message_and_status("OdbcStatement::bind_stream is not implemented", Status::NotImplemented))
     }
 
     fn execute<'a>(&'a mut self) -> Result<Box<dyn RecordBatchReader + Send + 'a>> {
@@ -279,19 +279,19 @@ impl Statement for OdbcStatement {
     }
 
     fn execute_update(&mut self) -> Result<Option<i64>> {
-        todo!("OdbcStatement::execute_update")
+        Err(Error::with_message_and_status("OdbcStatement::execute_update is not implemented", Status::NotImplemented))
     }
 
     fn execute_schema(&mut self) -> Result<Schema> {
-        todo!("OdbcStatement::execute_schema")
+        Err(Error::with_message_and_status("OdbcStatement::execute_schema is not implemented", Status::NotImplemented))
     }
 
     fn execute_partitions(&mut self) -> Result<PartitionedResult> {
-        todo!("OdbcStatement::execute_partitions")
+        Err(Error::with_message_and_status("OdbcStatement::execute_partitions is not implemented", Status::NotImplemented))
     }
 
     fn get_parameter_schema(&self) -> Result<Schema> {
-        todo!("OdbcStatement::get_parameter_schema")
+        Err(Error::with_message_and_status("OdbcStatement::get_parameter_schema is not implemented", Status::NotImplemented))
     }
 
     fn prepare(&mut self) -> Result<()> {
@@ -303,7 +303,7 @@ impl Statement for OdbcStatement {
     }
 
     fn set_substrait_plan(&mut self, _plan: &[u8]) -> Result<()> {
-        unimplemented!("OdbcStatement::set_substrait_plan")
+        Err(Error::with_message_and_status("OdbcStatement::set_substrait_plan is not implemented", Status::NotImplemented))
     }
 
     fn cancel(&mut self) -> Result<()> {
@@ -313,23 +313,23 @@ impl Statement for OdbcStatement {
     // adbc_core::Optionable<Option = OptionStatement> functions -----------------------------
 
     fn set_option(&mut self, _key: OptionStatement, _value: OptionValue) -> Result<()> {
-        std::unimplemented!("OdbcStatement::set_option")
+        Err(Error::with_message_and_status("OdbcStatement::set_option is not implemented", Status::NotImplemented))
     }
 
     fn get_option_string(&self, _key: OptionStatement) -> Result<String> {
-        std::unimplemented!("OdbcStatement::get_option_string")
+        Err(Error::with_message_and_status("OdbcStatement::get_option_string is not implemented", Status::NotImplemented))
     }
 
     fn get_option_bytes(&self, _key: OptionStatement) -> Result<Vec<u8>> {
-        std::unimplemented!("OdbcStatement::get_option_bytes")
+        Err(Error::with_message_and_status("OdbcStatement::get_option_bytes is not implemented", Status::NotImplemented))
     }
 
     fn get_option_int(&self, _key: OptionStatement) -> Result<i64> {
-        std::unimplemented!("OdbcStatement::set_option")
+        Err(Error::with_message_and_status("OdbcStatement::get_option_int is not implemented", Status::NotImplemented))
     }
 
     fn get_option_double(&self, _key: OptionStatement) -> Result<f64> {
-        std::unimplemented!("OdbcStatement::get_option_double")
+        Err(Error::with_message_and_status("OdbcStatement::get_option_double is not implemented", Status::NotImplemented))
     }
 
     fn debug_fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

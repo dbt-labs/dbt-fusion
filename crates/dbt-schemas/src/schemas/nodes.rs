@@ -1432,7 +1432,7 @@ impl InternalDbtNode for DbtSeed {
         }
     }
     fn set_detected_introspection(&mut self, _introspection: IntrospectionKind) {
-        panic!("DbtSeed does not support setting detected_unsafe");
+        // Seeds don't support introspection detection — no-op
     }
 }
 
@@ -1730,7 +1730,7 @@ impl InternalDbtNode for DbtUnitTest {
         }
     }
     fn set_detected_introspection(&mut self, _introspection: IntrospectionKind) {
-        panic!("DbtUnitTest does not support setting detected_unsafe");
+        // Unit tests don't support introspection detection — no-op
     }
 }
 
@@ -2043,7 +2043,7 @@ impl InternalDbtNode for DbtSource {
         }
     }
     fn set_detected_introspection(&mut self, _introspection: IntrospectionKind) {
-        panic!("DbtSource does not support setting detected_unsafe");
+        // Sources don't support introspection detection — no-op
     }
 }
 
@@ -2640,7 +2640,7 @@ impl InternalDbtNode for DbtExposure {
         }
     }
     fn set_detected_introspection(&mut self, _introspection: IntrospectionKind) {
-        panic!("DbtExposure does not support setting detected_unsafe");
+        // Exposures don't support introspection detection — no-op
     }
 }
 
@@ -2819,7 +2819,7 @@ impl InternalDbtNode for DbtSemanticModel {
         }
     }
     fn set_detected_introspection(&mut self, _introspection: IntrospectionKind) {
-        panic!("DbtSemanticModel does not support setting detected_unsafe");
+        // Semantic models don't support introspection detection — no-op
     }
 }
 
@@ -3000,7 +3000,7 @@ impl InternalDbtNode for DbtMetric {
         }
     }
     fn set_detected_introspection(&mut self, _introspection: IntrospectionKind) {
-        panic!("DbtMetric does not support setting detected_unsafe");
+        // Metrics don't support introspection detection — no-op
     }
 }
 
@@ -3218,7 +3218,7 @@ impl InternalDbtNode for DbtSavedQuery {
         }
     }
     fn set_detected_introspection(&mut self, _introspection: IntrospectionKind) {
-        panic!("DbtSavedQuery does not support setting detected_unsafe");
+        // Saved queries don't support introspection detection — no-op
     }
 }
 
@@ -3415,7 +3415,7 @@ impl InternalDbtNode for DbtMacro {
         }
     }
     fn set_detected_introspection(&mut self, _introspection: IntrospectionKind) {
-        panic!("DbtMacro does not support setting detected_unsafe");
+        // Macros don't support introspection detection — no-op
     }
 }
 
@@ -5912,7 +5912,7 @@ impl InternalDbtNode for DbtAnalysis {
     }
 
     fn set_detected_introspection(&mut self, _introspection: IntrospectionKind) {
-        panic!("DbtAnalysis does not support setting detected_unsafe");
+        // Analyses don't support introspection detection — no-op
     }
 }
 

@@ -523,7 +523,7 @@ impl OdbcDatabase {
                     }
                     OptionDatabase::Username => OptionConnection::Other("UID".to_string()),
                     OptionDatabase::Password => OptionConnection::Other("PWD".to_string()),
-                    _ => todo!("unsupported OptionDatabase variant for ODBC"),
+                    _ => return Err(Error::with_message_and_status("unsupported OptionDatabase variant for ODBC", Status::NotImplemented)),
                 };
                 (option_connection, v)
             })
@@ -601,7 +601,7 @@ try setting the {} environment variable to the correct location and try again.",
 #[cfg(feature = "odbc")]
 impl Database for OdbcDatabase {
     fn new_connection(&mut self) -> Result<Box<dyn Connection>> {
-        unimplemented!("OdbcDatabase::new_connection: use new_connection_with_opts() instead")
+        Err(Error::with_message_and_status("OdbcDatabase::new_connection: use new_connection_with_opts() instead", Status::NotImplemented))
     }
 
     fn new_connection_with_opts(
@@ -625,7 +625,7 @@ impl Database for OdbcDatabase {
                     conn_string.push_str(&format!("{k}={s};"));
                     Ok(())
                 }
-                _ => unimplemented!("non-string ODBC connection option handling"),
+                _ => return Err(Error::with_message_and_status("non-string ODBC connection option handling is not implemented", Status::NotImplemented)),
             }
         };
         for opt in self.options.iter() {
@@ -643,23 +643,23 @@ impl Database for OdbcDatabase {
     }
 
     fn set_option(&mut self, _key: OptionDatabase, _value: OptionValue) -> Result<()> {
-        todo!("ODBC database option setting")
+        Err(Error::with_message_and_status("ODBC database option setting is not implemented", Status::NotImplemented))
     }
 
     fn get_option_string(&self, _key: OptionDatabase) -> Result<String> {
-        todo!("ODBC database string option retrieval")
+        Err(Error::with_message_and_status("ODBC database string option retrieval is not implemented", Status::NotImplemented))
     }
 
     fn get_option_bytes(&self, _key: OptionDatabase) -> Result<Vec<u8>> {
-        todo!("ODBC database bytes option retrieval")
+        Err(Error::with_message_and_status("ODBC database bytes option retrieval is not implemented", Status::NotImplemented))
     }
 
     fn get_option_int(&self, _key: OptionDatabase) -> Result<i64> {
-        todo!("ODBC database integer option retrieval")
+        Err(Error::with_message_and_status("ODBC database integer option retrieval is not implemented", Status::NotImplemented))
     }
 
     fn get_option_double(&self, _key: OptionDatabase) -> Result<f64> {
-        todo!("ODBC database float option retrieval")
+        Err(Error::with_message_and_status("ODBC database float option retrieval is not implemented", Status::NotImplemented))
     }
 
     fn clone_box(&self) -> Box<dyn Database> {
@@ -670,7 +670,7 @@ impl Database for OdbcDatabase {
 #[cfg(feature = "odbc")]
 impl DatabaseInfo for OdbcDatabase {
     fn get_info(&mut self, _info_code: InfoCode) -> Result<Arc<dyn Array>> {
-        todo!("ODBC database info retrieval")
+        Err(Error::with_message_and_status("ODBC database info retrieval is not implemented", Status::NotImplemented))
     }
 }
 

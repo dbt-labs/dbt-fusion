@@ -512,13 +512,13 @@ impl XdbcEngine {
         let opts = builder.into_iter().collect::<Vec<_>>();
         let fingerprint = database::Builder::fingerprint(opts.iter());
         {
-            let read_guard = self.configured_databases.read().unwrap();
+            let read_guard = self.configured_databases.read().unwrap_or_else(|e| e.into_inner());
             if let Some(database) = read_guard.inner.get(&fingerprint) {
                 return Ok(database.clone());
             }
         }
         {
-            let mut write_guard = self.configured_databases.write().unwrap();
+            let mut write_guard = self.configured_databases.write().unwrap_or_else(|e| e.into_inner());
             if let Some(database) = write_guard.inner.get(&fingerprint) {
                 let database: Box<dyn Database> = database.clone();
                 Ok(database)

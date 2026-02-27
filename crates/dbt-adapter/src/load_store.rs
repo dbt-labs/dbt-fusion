@@ -19,7 +19,7 @@ pub struct ResultStore {
 impl ResultStore {
     /// Clear all results from the store
     pub fn clear(&self) {
-        let mut results = self.results.lock().unwrap();
+        let mut results = self.results.lock().unwrap_or_else(|e| e.into_inner());
         results.clear();
     }
 
@@ -59,7 +59,7 @@ impl ResultStore {
             let value = Value::from_object(ResultObject::new(response, table));
             iter.finish()?;
 
-            let mut results = store.results.lock().unwrap();
+            let mut results = store.results.lock().unwrap_or_else(|e| e.into_inner());
             results.insert(name, value);
 
             Ok(Value::from(""))
@@ -78,7 +78,7 @@ impl ResultStore {
             let name: String = iter.next_arg::<&str>()?.to_string();
             iter.finish()?;
 
-            let mut results = store.results.lock().unwrap();
+            let mut results = store.results.lock().unwrap_or_else(|e| e.into_inner());
 
             if let Some(value) = results.get_mut(&name) {
                 if name == "main" {
@@ -146,7 +146,7 @@ impl ResultStore {
                 query_id: None,
             };
             // Call store_result directly instead of using function
-            let mut results = store.results.lock().unwrap();
+            let mut results = store.results.lock().unwrap_or_else(|e| e.into_inner());
             let value = Value::from_object(ResultObject::new(
                 response,
                 agate_table

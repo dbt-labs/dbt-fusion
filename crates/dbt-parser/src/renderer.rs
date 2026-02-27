@@ -746,7 +746,7 @@ pub async fn collect_adapter_identifiers_detect_unsafe<T: InternalDbtNodeAttribu
 
     let parse_adapter = jinja_env
         .get_adapter()
-        .expect("Adapter should be available during parse phase");
+        .ok_or_else(|| fs_err!(ErrorCode::Unexpected, "Adapter should be available during parse phase"))?;
 
     // Use sequential processing if num_threads is 1, otherwise use parallel processing
     let mut dbt_nodes = if max_concurrency == 1 {

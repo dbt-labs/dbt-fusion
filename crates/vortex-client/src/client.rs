@@ -50,7 +50,7 @@ static PRODUCER: LazyLock<VortexProducerClient> = LazyLock::new(|| {
         client.is_in_dev_mode() || handle.is_some(),
         "Worker thread must be spawned by VortexProducerClient::new()"
     );
-    let mut lock = WORKER_THREAD.lock().unwrap();
+    let mut lock = WORKER_THREAD.lock().unwrap_or_else(|e| e.into_inner());
     *lock = handle;
     client
 });
@@ -100,7 +100,7 @@ pub fn log_proto_and_shutdown<T: Message + prost::Name + serde::Serialize>(
     // Wait for the worker thread to finish processing messages. Since a
     // shutdown message has been sent, it will NOT block indefinitely.
     let handle = {
-        let mut lock = WORKER_THREAD.lock().unwrap();
+        let mut lock = WORKER_THREAD.lock().unwrap_or_else(|e| e.into_inner());
         lock.take()
     };
     match handle {
@@ -114,7 +114,7 @@ pub fn log_proto_and_shutdown<T: Message + prost::Name + serde::Serialize>(
 }
 
 pub fn vortex_producer_is_running() -> bool {
-    let lock = WORKER_THREAD.lock().unwrap();
+    let lock = WORKER_THREAD.lock().unwrap_or_else(|e| e.into_inner());
     lock.is_some()
 }
 
@@ -423,7 +423,7 @@ impl Default for VortexProducerClient {
             let full_url = format!("{base_url}{ingest_endpoint}");
             full_url
                 .parse::<http::Uri>()
-                .expect("Failed to parse Vortex endpoint URL")
+                .unwrap_or_else(|e| panic!("Invalid Vortex endpoint URL '{}': {}", full_url, e))
         };
         let vortex_client_platform = {
             // Construct the X-Vortex-Client-Platform header with service, client, and proto library
@@ -447,7 +447,7 @@ impl Default for VortexProducerClient {
                 proto_version
             );
             HeaderValue::from_str(&header_value_string)
-                .expect("Failed to create X-Vortex-Client-Platform header value")
+                .unwrap_or_else(|e| panic!("Invalid X-Vortex-Client-Platform header value '{}': {}", header_value_string, e))
         };
         let dev_mode_output_path = {
             if vortex_config.dev_mode == "true" {
@@ -572,7 +572,7 @@ impl VortexProducerClient {
         };
         let json_payload = serde_json::to_string(&dev_mode_msg).unwrap_or_default();
 
-        let mut writer_res_lock_guard = self.dev_mode_output_writer.lock().unwrap();
+        let mut writer_res_lock_guard = self.dev_mode_output_writer.lock().unwrap_or_else(|e| e.into_inner());
         match writer_res_lock_guard.deref_mut() {
             Ok(writer) => {
                 writer.write_all(json_payload.as_bytes())?;
