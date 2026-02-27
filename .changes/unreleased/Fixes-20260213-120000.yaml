@@ -1,0 +1,6 @@
+body: Treat empty exclude as no-op in intersection selectors to match dbt Core ([#1279](https://github.com/dbt-labs/dbt-fusion/issues/1279))
+kind: Fixes
+custom:
+  issue: "1279"
+  author: yu-iskw
+time: 2026-02-13T12:00:00Z
