@@ -51,6 +51,7 @@ members = [
   "crates/dbt-sql/dbt-lexer-snowflake",
   "crates/dbt-sql/dbt-lexer-trino",
   "crates/dbt-sql/dbt-sql-utils",
+  "crates/dbt-chaos",
 ]
 
 resolver = "2"
@@ -214,6 +215,7 @@ dbt-lexer-redshift = { path = "crates/dbt-sql/dbt-lexer-redshift" }
 dbt-lexer-snowflake = { path = "crates/dbt-sql/dbt-lexer-snowflake" }
 dbt-lexer-trino = { path = "crates/dbt-sql/dbt-lexer-trino" }
 dbt-sql-utils = { path = "crates/dbt-sql/dbt-sql-utils" }
+dbt-chaos = { path = "crates/dbt-chaos" }
 
 # jinja dependencies
 minijinja-typecheck-builtins = { path = "crates/minijinja-typecheck-builtins" }

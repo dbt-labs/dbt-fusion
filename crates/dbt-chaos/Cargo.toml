@@ -1,0 +1,38 @@
+[package]
+name = "dbt-chaos"
+description = "Chaos engineering framework for dbt adapter testing"
+version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+keywords.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+dbt-adapter = { workspace = true }
+dbt-common = { workspace = true }
+dbt-schemas = { workspace = true }
+dbt-xdbc = { workspace = true }
+dbt-yaml = { workspace = true }
+
+arrow = { workspace = true }
+arrow-schema = { workspace = true }
+
+minijinja = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+dbt-test-primitives = { workspace = true }
+tokio = { workspace = true }
+
+[lib]
+name = "dbt_chaos"
+path = "src/lib.rs"
+doctest = false
