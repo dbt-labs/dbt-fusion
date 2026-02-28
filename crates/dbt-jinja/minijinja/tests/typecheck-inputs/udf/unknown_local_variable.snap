@@ -1,0 +1,4 @@
+---
+source: crates/dbt-jinja/minijinja/tests/test_typecheck.rs
+---
+- "Potential TypeError: Unknown local variable 'unknown_var'"
