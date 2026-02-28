@@ -537,25 +537,21 @@ impl<'src> TypeChecker<'src> {
             let out_state =
                 self.transfer_block(bb_id, listener.clone(), typecheck_resolved_context.clone())?;
 
+            // Per-block return type check: only fire when this block contains
+            // an explicit return() — i.e., rv_type changed during transfer_block.
+            // Without this guard, rv_type propagated from predecessor blocks
+            // through state merging would trigger duplicate warnings.
             let rv_type = out_state.rv_type.clone();
-            if let Some(macro_block) = self.cfg.get_block(bb_id) {
-                if let Some(macro_name) = macro_block.current_macro.as_ref() {
-                    if let Some(funcsign) = self.function_registry.get(macro_name) {
-                        if let Some(user_defined_func) =
-                            funcsign.downcast_ref::<UserDefinedFunctionType>()
-                        {
-                            let expected_ret_type = user_defined_func.ret_type.clone();
-                            // try match rv with registry_ret_type
-                            let span = out_state.return_span;
-                            if !rv_type.is_compatible_with(&expected_ret_type) {
-                                listener.set_span(&span);
-                                listener.warn(
-                                    &format!(
-                                        "Type mismatch: expected return type {expected_ret_type}, got {rv_type}"
-                                    ),
-                                );
-                            }
-                        }
+            let rv_type_changed = rv_type != self.in_states[bb_id].rv_type;
+            if rv_type_changed {
+                if let Some(expected_ret_type) = self.expected_return_type(bb_id) {
+                    if !rv_type.is_compatible_with(&expected_ret_type) {
+                        listener.set_span(&out_state.return_span);
+                        listener.warn(
+                            &format!(
+                                "Type mismatch: expected return type {expected_ret_type}, got {rv_type}"
+                            ),
+                        );
                     }
                 }
             }
@@ -578,28 +574,30 @@ impl<'src> TypeChecker<'src> {
                     visited[*succ] = true;
                 }
             }
+            // Last-block return type check (implicit return)
             if let Some(macro_block) = self.cfg.get_block(bb_id) {
-                // find the last block in a macro
                 if macro_block.successor.is_empty() {
-                    if let Some(macro_name) = macro_block.current_macro.as_ref() {
-                        if let Some(funcsign) = self.function_registry.get(macro_name) {
-                            if let Some(user_defined_func) =
-                                funcsign.downcast_ref::<UserDefinedFunctionType>()
-                            {
-                                let expected_ret_type = user_defined_func.ret_type.clone();
-                                if !expected_ret_type.is_compatible_with(&Type::String(None)) {
-                                    listener.set_span(&macro_block.span.unwrap_or_default());
-                                    listener.warn(
-                                        &format!("Type mismatch: expected return type {expected_ret_type}, got String"),
-                                    );
-                                }
-                            }
+                    if let Some(expected_ret_type) = self.expected_return_type(bb_id) {
+                        if !expected_ret_type.is_compatible_with(&Type::String(None)) {
+                            listener.set_span(&macro_block.span.unwrap_or_default());
+                            listener.warn(
+                                &format!("Type mismatch: expected return type {expected_ret_type}, got String"),
+                            );
                         }
                     }
                 }
             }
         }
         Ok(())
+    }
+
+    /// Look up the declared return type for the macro that owns the given block.
+    fn expected_return_type(&self, bb_id: usize) -> Option<Type> {
+        let macro_block = self.cfg.get_block(bb_id)?;
+        let macro_name = macro_block.current_macro.as_ref()?;
+        let funcsign = self.function_registry.get(macro_name)?;
+        let udf = funcsign.downcast_ref::<UserDefinedFunctionType>()?;
+        Some(udf.ret_type.clone())
     }
 
     /// The internal function typechecking a single block.
