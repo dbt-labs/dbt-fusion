@@ -1,0 +1,7 @@
+kind: Under the Hood
+body: Add comprehensive test infrastructure for MiniJinja type checker integration in dbt-jinja-utils, including test utilities for dbt function registries and snapshot tests for type checking, NoQA suppression, and warning formatting
+time: 2026-02-13T12:00:00Z
+custom:
+  issue: ""
+  author: leochen4891
+  project: dbt-fusion

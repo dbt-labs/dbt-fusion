@@ -1,0 +1,6 @@
+---
+source: crates/dbt-jinja-utils/tests/test_typechecking.rs
+assertion_line: 109
+expression: snapshot
+---
+warnings: []
