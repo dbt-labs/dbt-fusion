@@ -84,7 +84,34 @@ impl DateTimeField {
     }
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone)]
+pub enum TimeZone {
+    Named(String),
+}
+
+impl TimeZone {
+    pub fn display(&self, backend: Backend) -> TimeZoneDisplay<'_> {
+        TimeZoneDisplay(self, backend)
+    }
+}
+
+pub struct TimeZoneDisplay<'a>(&'a TimeZone, Backend);
+
+impl fmt::Display for TimeZoneDisplay<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use Backend::*;
+        use TimeZone::*;
+        match (self.1, self.0) {
+            // https://clickhouse.com/docs/use-cases/time-series/date-time-data-types#time-series-timezones
+            (ClickHouse, Named(name)) => write!(f, "'{name}'")?,
+
+            (_, Named(name)) => write!(f, "{name}")?,
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
 pub enum TimeZoneSpec {
     /// WITH LOCAL TIME ZONE, TIMESTAMP_LTZ
     Local,
@@ -92,8 +119,12 @@ pub enum TimeZoneSpec {
     With,
     // WITHOUT TIME ZONE, TIMESTAMP_NTZ
     Without,
-    // no specification (e.g. TIMESTAMP)
+    /// no specification (e.g. TIMESTAMP)
     Unspecified,
+    /// Fixed timezone associated with the type instead of individual values.
+    ///
+    /// (e.g. DateTime('Europe/Berlin') on ClickHouse)
+    Fixed(TimeZone),
 }
 
 impl TimeZoneSpec {
@@ -118,6 +149,8 @@ impl TimeZoneSpec {
             (_, With) => write!(out, " WITH TIME ZONE"),
             (_, Without) => write!(out, " WITHOUT TIME ZONE"),
 
+            (_, Fixed(tz)) => write!(out, "('{}')", tz.display(backend)),
+
             (_, Unspecified) => Ok(()),
         }
     }
@@ -128,10 +161,10 @@ impl TimeZoneSpec {
         use fmt::Write as _;
         match (backend, self) {
             // See [TimeZoneSpec::write_with_leading_space] for explanation about BigQuery.
-            (BigQuery, _) => {
+            (BigQuery | ClickHouse, _) => {
                 debug_assert!(
                     matches!(self, Without | Unspecified),
-                    "BigQuery does not support time zone suffixes in its type names"
+                    "BigQuery and ClickHouse do not support time zone suffixes in their type names"
                 );
                 Ok(())
             }
@@ -168,6 +201,14 @@ impl TimeZoneSpec {
             // but we don't render it as TIMESTAMP_LTZ unless explicitly specified
             // even though TIMESTAMP_LTZ is an alias to TIMESTAMP in Databricks.
             (_, Unspecified) => Ok(()),
+
+            (_, Fixed(_)) => {
+                debug_assert!(
+                    false,
+                    "Fixed time zone specifications cannot be rendered as single-token suffixes"
+                );
+                Ok(())
+            }
         }
     }
 
@@ -191,6 +232,13 @@ Avoid constructing Snowflake TIME/TIMESTAMP types without an explicit time zone 
 
             (_, With | Local) => true,
             (_, Without | Unspecified) => false,
+            (_, Fixed(_)) => {
+                debug_assert!(
+                    false,
+                    "Fixed time zone specifications cannot be categorized as simply with or without time zone"
+                );
+                true
+            }
         }
     }
 }
@@ -480,6 +528,13 @@ impl SqlType {
                     TimeZoneSpec::Local | TimeZoneSpec::With => {
                         // for debugging purposes, we still render these invalid specs
                         time_zone_spec.write_with_leading_space(backend, out)
+                    }
+                    TimeZoneSpec::Fixed(_) => {
+                        debug_assert!(
+                            false,
+                            "Snowflake does not support fixed time zone specifications"
+                        );
+                        Ok(())
                     }
                 }
             }
@@ -1275,6 +1330,20 @@ impl SqlType {
                     (BigQuery, Unspecified) => arrow_timestamp(*precision, Some("UTC".into())),
 
                     (_, Without | Unspecified) => arrow_timestamp(*precision, None),
+                    (_, Fixed(TimeZone::Named(name))) => {
+                        let arrow_tz = if name.eq_ignore_ascii_case("UTC") {
+                            Some("UTC".into())
+                        } else if name.eq_ignore_ascii_case("Europe/Berlin") {
+                            Some("Europe/Berlin".into())
+                        } else {
+                            debug_assert!(
+                                false,
+                                "TODO: Figure how to lookup Arrow timezones from a table provided by arrow-rs"
+                            );
+                            None
+                        };
+                        arrow_timestamp(*precision, arrow_tz)
+                    }
                 }
             }
             // A DATETIME is a timestamp without time zone information

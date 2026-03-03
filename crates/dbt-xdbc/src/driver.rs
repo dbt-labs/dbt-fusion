@@ -79,12 +79,12 @@ impl Display for Backend {
             Backend::Databricks => write!(f, "Databricks"),
             Backend::Redshift => write!(f, "Redshift"),
             Backend::DuckDB => write!(f, "DuckDB"),
-            Backend::ClickHouse => write!(f, "ClickHouse"),
             Backend::DatabricksODBC => write!(f, "Databricks"),
             Backend::RedshiftODBC => write!(f, "Redshift"),
             Backend::Salesforce => write!(f, "Salesforce"),
             Backend::Spark => write!(f, "Spark"),
             Backend::SQLServer => write!(f, "SQL Server"),
+            Backend::ClickHouse => write!(f, "ClickHouse"),
             Backend::Generic { library_name, .. } => write!(f, "Generic({library_name})"),
         }
     }
@@ -102,8 +102,8 @@ impl Backend {
             Backend::Redshift => Some("adbc_driver_redshift"),
             Backend::DuckDB => Some("duckdb"),
             Backend::SQLServer => Some("adbc_driver_mssql"),
-            Backend::ClickHouse => Some("adbc_clickhouse"),
             Backend::DatabricksODBC | Backend::RedshiftODBC => None, // these use ODBC
+            Backend::ClickHouse => Some("adbc_clickhouse"),
             Backend::Generic { library_name, .. } => Some(library_name),
         }
     }
@@ -342,7 +342,6 @@ impl AdbcDriver {
             | Backend::Spark
             | Backend::DuckDB
             | Backend::SQLServer
-            | Backend::ClickHouse
             | Backend::Salesforce => {
                 debug_assert!(backend.ffi_protocol() == FFIProtocol::Adbc);
                 debug_assert!(install::is_installable_driver(backend));
@@ -388,7 +387,7 @@ impl AdbcDriver {
                 Self::try_load_driver_through_cdn_cache(backend, adbc_version)
             }
             // Drivers that are not published to the dbt Labs CDN.
-            Backend::Generic { .. } => Self::try_load_driver_from_name(
+            Backend::ClickHouse | Backend::Generic { .. } => Self::try_load_driver_from_name(
                 backend,
                 backend.adbc_library_name().unwrap(),
                 backend.adbc_driver_entrypoint(),
@@ -551,6 +550,8 @@ mod tests {
         try_load_with_builder(Backend::DuckDB, AdbcVersion::V100)?;
         try_load_with_builder(Backend::Salesforce, AdbcVersion::V100)?;
         try_load_with_builder(Backend::Spark, AdbcVersion::V100)?;
+        try_load_with_builder(Backend::SQLServer, AdbcVersion::V100)?;
+        try_load_with_builder(Backend::ClickHouse, AdbcVersion::V100)?;
         Ok(())
     }
 
@@ -564,6 +565,8 @@ mod tests {
         try_load_with_builder(Backend::DuckDB, AdbcVersion::V110)?;
         try_load_with_builder(Backend::Salesforce, AdbcVersion::V110)?;
         try_load_with_builder(Backend::Spark, AdbcVersion::V110)?;
+        try_load_with_builder(Backend::SQLServer, AdbcVersion::V110)?;
+        try_load_with_builder(Backend::ClickHouse, AdbcVersion::V110)?;
         Ok(())
     }
 
@@ -578,6 +581,8 @@ mod tests {
             Backend::DuckDB,
             Backend::Salesforce,
             Backend::Spark,
+            Backend::SQLServer,
+            Backend::ClickHouse,
         ]
         .iter()
         .copied()
