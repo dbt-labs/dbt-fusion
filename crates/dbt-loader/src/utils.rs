@@ -295,7 +295,9 @@ fn process_package_file(
             emit_warn_log_message(
                 ErrorCode::InvalidConfig,
                 format!(
-                    "Package '{}' not found in package lookup map, so skipping this dependency. Upgrade to the latest version of packages by running 'fs deps --upgrade' with a packages.yml, which resolves all dependencies.",
+                    "Package '{}' not found in package lookup map, so skipping this dependency. \
+                    Upgrade to the latest version of packages by running 'fs deps --upgrade' \
+                    with a packages.yml, which resolves all dependencies.",
                     entry_name
                 ),
                 io_args.status_reporter.as_ref(),
