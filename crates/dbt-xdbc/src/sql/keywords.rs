@@ -19,6 +19,7 @@ pub fn sorted_keywords_for(backend: Backend) -> &'static [&'static str] {
         | Salesforce
         | DuckDB
         | SQLServer
+        | ClickHouse
         | Generic { .. } => &[],
     }
 }
