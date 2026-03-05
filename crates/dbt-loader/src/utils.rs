@@ -296,7 +296,7 @@ fn process_package_file(
                 ErrorCode::InvalidConfig,
                 format!(
                     "Package '{}' not found in package lookup map, so skipping this dependency. \
-                    Upgrade to the latest version of packages by running 'fs deps --upgrade' \
+                    Upgrade to the latest version of packages by running 'dbt deps --upgrade' \
                     with a packages.yml, which resolves all dependencies.",
                     entry_name
                 ),
