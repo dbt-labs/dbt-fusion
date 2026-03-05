@@ -1076,6 +1076,36 @@ impl ConcreteAdapter {
         Ok(false)
     }
 
+    /// Check if the current DuckDB connection targets MotherDuck.
+    pub fn is_motherduck(&self) -> bool {
+        self.engine()
+            .config("path")
+            .map(|p| dbt_auth::is_motherduck_path(&p))
+            .unwrap_or(false)
+    }
+
+    /// MotherDuck does not support explicit transactions.
+    pub fn disable_transactions(&self) -> bool {
+        self.is_motherduck()
+    }
+
+    /// Returns a dict with database/schema/identifier for temp tables on MotherDuck.
+    pub fn get_temp_relation_path(
+        &self,
+        database: &str,
+        identifier: &str,
+        batch_id: &str,
+    ) -> AdapterResult<BTreeMap<String, Value>> {
+        let mut path = BTreeMap::new();
+        path.insert("database".to_owned(), Value::from(database));
+        path.insert("schema".to_owned(), Value::from("dbt_temp"));
+        path.insert(
+            "identifier".to_owned(),
+            Value::from(format!("{identifier}__{batch_id}")),
+        );
+        Ok(path)
+    }
+
     /// Rename relation
     pub fn rename_relation(
         &self,
@@ -2800,6 +2830,103 @@ impl ConcreteAdapter {
         }
     }
 
+    /// Get the external root directory from engine config, defaulting to `"."`.
+    pub fn external_root(&self) -> String {
+        self.engine()
+            .config("external_root")
+            .unwrap_or(Cow::Borrowed("."))
+            .into_owned()
+    }
+
+    /// Build the write-options string for DuckDB external materializations.
+    pub fn external_write_options(&self, write_location: &str, rendered_options: &Value) -> String {
+        let mut opts: IndexMap<String, String> = IndexMap::new();
+        if let Ok(keys) = rendered_options.try_iter() {
+            for key in keys {
+                let key_str = key.to_string();
+                if let Ok(val) = rendered_options.get_item(&key) {
+                    opts.insert(key_str, val.to_string());
+                }
+            }
+        }
+
+        // Infer format from file extension if not provided
+        if !opts.contains_key("format") {
+            let ext = write_location
+                .rsplit('.')
+                .next()
+                .filter(|e| *e != write_location)
+                .unwrap_or("");
+            if !ext.is_empty() {
+                opts.insert("format".to_string(), ext.to_lowercase());
+            } else if opts.contains_key("delimiter") {
+                opts.insert("format".to_string(), "csv".to_string());
+            } else {
+                opts.insert("format".to_string(), "parquet".to_string());
+            }
+        }
+
+        // Default CSV header
+        if opts.get("format").map(|f| f.as_str()) == Some("csv") && !opts.contains_key("header") {
+            opts.insert("header".to_string(), "1".to_string());
+        }
+
+        // Normalize partition_by parens
+        if let Some(v) = opts.get("partition_by").cloned() {
+            if v.contains(',') && !v.starts_with('(') {
+                opts.insert("partition_by".to_string(), format!("({v})"));
+            }
+        }
+
+        // Build result: quote special keys
+        let ret: Vec<String> = opts
+            .iter()
+            .map(|(k, v)| {
+                let lower = k.to_lowercase();
+                if matches!(lower.as_str(), "delimiter" | "quote" | "escape" | "null")
+                    && !v.starts_with('\'')
+                {
+                    format!("{k} '{v}'")
+                } else {
+                    format!("{k} {v}")
+                }
+            })
+            .collect();
+        ret.join(", ")
+    }
+
+    /// Build the read location (possibly a glob path) for DuckDB external materializations.
+    pub fn external_read_location(&self, write_location: &str, rendered_options: &Value) -> String {
+        let partition_by = rendered_options
+            .get_item(&Value::from("partition_by"))
+            .ok()
+            .filter(|v| !v.is_undefined() && !v.is_none());
+        let per_thread = rendered_options
+            .get_item(&Value::from("per_thread_output"))
+            .ok()
+            .filter(|v| !v.is_undefined() && !v.is_none());
+
+        if partition_by.is_some() || per_thread.is_some() {
+            let mut globs = vec![write_location.to_string(), "*".to_string()];
+            if let Some(pb) = &partition_by {
+                let pb_str = pb.to_string();
+                let count = pb_str.split(',').count();
+                for _ in 0..count {
+                    globs.push("*".to_string());
+                }
+            }
+            let format = rendered_options
+                .get_item(&Value::from("format"))
+                .ok()
+                .filter(|v| !v.is_undefined() && !v.is_none())
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "parquet".to_string());
+            format!("{}.{}", globs.join("/"), format)
+        } else {
+            write_location.to_string()
+        }
+    }
+
     // https://github.com/databricks/dbt-databricks/blob/main/dbt/adapters/databricks/impl.py#L208-L209
     pub fn compute_external_path(
         &self,
@@ -3623,7 +3750,19 @@ prevent unnecessary latency for other users."#,
             );
             vec![flag]
         }
-        Postgres | Redshift | Salesforce | Sidecar | Spark | DuckDB | Fabric => vec![],
+        Fabric => {
+            let flag = BehaviorFlag::new(
+                "empty",
+                false,
+                Some(
+                    "When enabled, table and view materializations will be created as empty structures (no data).",
+                ),
+                None,
+                None,
+            );
+            vec![flag]
+        }
+        Postgres | Redshift | Salesforce | Sidecar | Spark | DuckDB => vec![],
     }
 }
 

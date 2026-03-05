@@ -5,6 +5,7 @@ use crate::catalog_relation::CatalogRelation;
 #[cfg(debug_assertions)]
 use crate::column::Column;
 use crate::column::ColumnStatic;
+use crate::connection::*;
 use crate::funcs::*;
 use crate::metadata::*;
 use crate::parse::adapter::ParseAdapterState;
@@ -23,6 +24,7 @@ use crate::{AdapterResponse, AdapterResult, BaseAdapter};
 
 use dbt_agate::AgateTable;
 use dbt_auth::{AdapterConfig, Auth, auth_for_backend};
+use dbt_common::adapter::AdapterType;
 use dbt_common::behavior_flags::Behavior;
 use dbt_common::cancellation::CancellationToken;
 use dbt_common::{AdapterError, AdapterErrorKind, FsError, FsResult};
@@ -36,20 +38,16 @@ use dbt_schemas::schemas::properties::ModelConstraint;
 use dbt_schemas::schemas::relations::base::{BaseRelation, ComponentName};
 use dbt_schemas::schemas::serde::{minijinja_value_to_typed_struct, yml_value_to_minijinja};
 use dbt_schemas::schemas::{InternalDbtNodeAttributes, InternalDbtNodeWrapper};
-use dbt_xdbc::Connection;
 use indexmap::IndexMap;
 use minijinja::constants::TARGET_UNIQUE_ID;
 use minijinja::listener::RenderingEventListener;
 use minijinja::value::{Kwargs, Object};
 use minijinja::{State, Value};
 use tracing;
-use tracy_client::span;
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::marker::PhantomData;
-use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -58,66 +56,6 @@ use std::sync::Arc;
 // Only the outermost call is recorded/replayed.
 thread_local! {
     static ADAPTER_CALL_DEPTH: Cell<usize> = const { Cell::new(0) };
-}
-
-// Thread-local connection.
-//
-// This implementation provides an efficient connection management strategy:
-// 1. Each thread maintains its own connection instance
-// 2. Connections are reused across multiple operations within the same thread
-// 3. This approach ensures proper transaction management within a DAG node
-// 4. The ConnectionGuard wrapper ensures connections are returned to the thread-local
-thread_local! {
-    static CONNECTION: pri::TlsConnectionContainer = pri::TlsConnectionContainer::new();
-}
-
-/// A connection wrapper that automatically returns the connection to the thread local when dropped.
-/// This ensures that for a single thread, a connection is reused across multiple operations.
-///
-/// For DuckDB, `stash_on_drop` is set to `false` so that connections are dropped immediately
-/// instead of being cached in the thread-local. This is necessary because DuckDB uses
-/// process-level file locks: connections hold an internal reference to the database handle,
-/// and as long as any connection exists, the file lock is held. Since compilation runs on
-/// tokio worker threads, stashed connections would persist on those threads and keep the
-/// database locked even after the adapter is dropped — preventing the CLI from accessing
-/// the database file. DuckDB connections are in-process and cheap to create, so skipping
-/// the cache has negligible performance impact.
-pub struct ConnectionGuard<'a> {
-    conn: Option<Box<dyn Connection>>,
-    stash_on_drop: bool,
-    _phantom: PhantomData<&'a ()>,
-}
-impl ConnectionGuard<'_> {
-    fn new(conn: Box<dyn Connection>, stash_on_drop: bool) -> Self {
-        Self {
-            conn: Some(conn),
-            stash_on_drop,
-            _phantom: PhantomData,
-        }
-    }
-}
-impl Deref for ConnectionGuard<'_> {
-    type Target = Box<dyn Connection>;
-
-    fn deref(&self) -> &Self::Target {
-        self.conn.as_ref().unwrap()
-    }
-}
-impl DerefMut for ConnectionGuard<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.conn.as_mut().unwrap()
-    }
-}
-impl Drop for ConnectionGuard<'_> {
-    fn drop(&mut self) {
-        if !self.stash_on_drop {
-            // For file-locking databases (DuckDB), drop the connection immediately
-            // so the file lock is released when the database handle is dropped.
-            return;
-        }
-        let conn = self.conn.take();
-        CONNECTION.with(|c| c.replace(conn));
-    }
 }
 
 /// The inner adapter implementation inside a [BridgeAdapter].
@@ -152,7 +90,7 @@ use InnerAdapter::*;
 /// thread-local. This allows Jinja code to use the connection without
 /// explicitly referring to database connections.
 ///
-/// Use the `borrow_tlocal_connection` method, which returns a guard that
+/// Use the `borrow_tlocal_connection` function, which returns a guard that
 /// can be dereferenced into a mutable [Box<dyn Connection>]. When the
 /// guard instance is destroyed, the connection returns to the thread-local
 /// variable.
@@ -270,27 +208,18 @@ impl BridgeAdapter {
     /// the thread-local variable. If another connection became the thread-local
     /// in the mean time, that connection is dropped and the return proceeds as
     /// normal.
+    ///
+    /// # Panic
+    ///
+    /// This method will panic if called on a [BridgeAdapter] in parse mode, since
+    /// the parse adapter does not support real connections.
     pub(crate) fn borrow_tlocal_connection(
         &self,
         state: Option<&State>,
         node_id: Option<String>,
     ) -> Result<ConnectionGuard<'_>, minijinja::Error> {
-        let _span = span!("BridgeAdapter::borrow_thread_local_connection");
-        let stash_on_drop = self.adapter_type() != AdapterType::DuckDB;
-        let mut conn = if stash_on_drop {
-            CONNECTION.with(|c| c.take())
-        } else {
-            // DuckDB: skip thread-local cache to avoid holding file locks
-            None
-        };
-        if conn.is_none() {
-            self.new_connection(state, node_id)
-                .map(|new_conn| conn.replace(new_conn))?;
-        } else if let Some(c) = conn.as_mut() {
-            c.update_node_id(node_id);
-        }
-        let guard = ConnectionGuard::new(conn.unwrap(), stash_on_drop);
-        Ok(guard)
+        let adapter = self.as_concrete_adapter();
+        borrow_tlocal_connection(adapter, state, node_id)
     }
 
     /// Checks if the given [BaseRelation] matches the node currently being rendered
@@ -385,21 +314,6 @@ impl BaseAdapter for BridgeAdapter {
 
     fn as_value(&self) -> Value {
         Value::from_object(self.clone())
-    }
-
-    fn new_connection(
-        &self,
-        state: Option<&State>,
-        node_id: Option<String>,
-    ) -> Result<Box<dyn Connection>, minijinja::Error> {
-        let _span = span!("BrideAdapter::new_connection");
-        match &self.inner {
-            Typed { adapter, .. } => {
-                let conn = adapter.new_connection(state, node_id)?;
-                Ok(conn)
-            }
-            Parse(_) => unimplemented!("new_connection is not implemented for ParseAdapter"),
-        }
     }
 
     /// Used internally to hydrate the relation cache with the given schema -> relation map
@@ -637,8 +551,11 @@ impl BaseAdapter for BridgeAdapter {
     ) -> AdapterResult<(AdapterResponse, AgateTable)> {
         match &self.inner {
             Typed { adapter, .. } => {
-                let mut conn =
-                    self.borrow_tlocal_connection(Some(state), node_id_from_state(state))?;
+                let mut conn = borrow_tlocal_connection(
+                    adapter.as_ref(),
+                    Some(state),
+                    node_id_from_state(state),
+                )?;
                 let ctx = query_ctx_from_state(state)?.with_desc("execute adapter call");
                 let (response, table) = adapter.execute(
                     Some(state),
@@ -1598,6 +1515,88 @@ impl BaseAdapter for BridgeAdapter {
         }
     }
 
+    #[tracing::instrument(skip(self), level = "trace")]
+    fn is_motherduck(&self) -> bool {
+        match &self.inner {
+            Typed { adapter, .. } => adapter.is_motherduck(),
+            Parse(_) => false,
+        }
+    }
+
+    #[tracing::instrument(skip(self), level = "trace")]
+    fn disable_transactions(&self) -> bool {
+        match &self.inner {
+            Typed { adapter, .. } => adapter.disable_transactions(),
+            Parse(_) => false,
+        }
+    }
+
+    #[tracing::instrument(skip(self), level = "trace")]
+    fn get_temp_relation_path(
+        &self,
+        database: &str,
+        identifier: &str,
+        batch_id: &str,
+    ) -> AdapterResult<BTreeMap<String, Value>> {
+        match &self.inner {
+            Typed { adapter, .. } => adapter.get_temp_relation_path(database, identifier, batch_id),
+            Parse(_) => Err(AdapterError::new(
+                AdapterErrorKind::NotSupported,
+                "get_temp_relation_path is not available during parsing",
+            )),
+        }
+    }
+
+    #[tracing::instrument(skip_all, level = "trace")]
+    fn external_root(&self, _state: &State) -> Result<Value, minijinja::Error> {
+        match &self.inner {
+            Typed { adapter, .. } => Ok(Value::from(adapter.external_root())),
+            Parse(_) => Ok(Value::from(".")),
+        }
+    }
+
+    #[tracing::instrument(skip_all, level = "trace")]
+    fn external_write_options(
+        &self,
+        _state: &State,
+        write_location: &str,
+        rendered_options: &Value,
+    ) -> Result<Value, minijinja::Error> {
+        match &self.inner {
+            Typed { adapter, .. } => Ok(Value::from(
+                adapter.external_write_options(write_location, rendered_options),
+            )),
+            Parse(_) => Ok(empty_string_value()),
+        }
+    }
+
+    #[tracing::instrument(skip_all, level = "trace")]
+    fn external_read_location(
+        &self,
+        _state: &State,
+        write_location: &str,
+        rendered_options: &Value,
+    ) -> Result<Value, minijinja::Error> {
+        match &self.inner {
+            Typed { adapter, .. } => Ok(Value::from(
+                adapter.external_read_location(write_location, rendered_options),
+            )),
+            Parse(_) => Ok(Value::from(write_location)),
+        }
+    }
+
+    #[tracing::instrument(skip_all, level = "trace")]
+    fn location_exists(&self, state: &State, location: &str) -> Result<Value, minijinja::Error> {
+        match &self.inner {
+            Typed { .. } => {
+                let sql = format!("select 1 from '{}' where 1=0", location);
+                let result = self.execute(state, &sql, false, false, None, None);
+                Ok(Value::from(result.is_ok()))
+            }
+            Parse(_) => Ok(Value::from(false)),
+        }
+    }
+
     #[tracing::instrument(skip_all, level = "trace")]
     fn compute_external_path(
         &self,
@@ -2189,61 +2188,6 @@ fn debug_compare_column_types(
             Err(e) => {
                 println!("Error getting columns in relation from remote: {e}");
             }
-        }
-    }
-}
-
-mod pri {
-    use super::*;
-
-    /// A wrapper around a [Connection] stored in thread-local storage
-    ///
-    /// The point of this struct is to avoid calling the `Drop` destructor on
-    /// the wrapped [Connection] during process exit, which dead locks on
-    /// Windows.
-    pub(super) struct TlsConnectionContainer(RefCell<Option<Box<dyn Connection>>>);
-
-    impl TlsConnectionContainer {
-        pub(super) fn new() -> Self {
-            TlsConnectionContainer(RefCell::new(None))
-        }
-
-        pub(super) fn replace(&self, conn: Option<Box<dyn Connection>>) {
-            let prev = self.take();
-            *self.0.borrow_mut() = conn;
-            if prev.is_some() {
-                // We should avoid nested borrows because they mean we are creating more
-                // than one connection when one would be sufficient. But if we reached
-                // this branch, we did exactly that (!).
-                //
-                //     {
-                //       let outer_guard = adapter.borrow_tlocal_connection()?;
-                //       f(outer_guard.as_mut());  // Pass the conn as ref. GOOD.
-                //       {
-                //         // We tried to borrow, but a new connection had to
-                //         // be created. BAD.
-                //         let inner_guard = adapter.borrow_tlocal_connection()?;
-                //         ...
-                //       }  // Connection from inner_guard returns to CONNECTION.
-                //     }  // Connection from outer_guard is returning to CONNECTION,
-                //        // but one was already there -- the one from inner_guard.
-                //
-                // The right choice is to simply drop the innermost connection.
-                drop(prev);
-                // An assert could be added here to help finding code that creates
-                // a connection instead of taking one as a parameter so that the
-                // outermost caller can pass the thread-local one by reference.
-            }
-        }
-
-        pub(super) fn take(&self) -> Option<Box<dyn Connection>> {
-            self.0.borrow_mut().take()
-        }
-    }
-
-    impl Drop for TlsConnectionContainer {
-        fn drop(&mut self) {
-            std::mem::forget(self.take());
         }
     }
 }
