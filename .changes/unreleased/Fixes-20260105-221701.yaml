@@ -1,0 +1,7 @@
+kind: Fixes
+body: doc test errors in dbt-adapter
+time: 2026-01-05T22:17:01.726512-06:00
+custom:
+    author: dimasgonzales
+    issue: ""
+    project: dbt-fusion
