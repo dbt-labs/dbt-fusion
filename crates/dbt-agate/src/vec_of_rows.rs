@@ -35,6 +35,34 @@ impl VecOfRows {
         Ok(vec_of_rows)
     }
 
+    /// Create a VecOfRows that preserves nested types (Struct, List) as Jinja
+    /// dicts/lists instead of flattening them into separate columns.
+    ///
+    /// Uses the original (unflattened) RecordBatch converters when available,
+    /// falling back to the flat converters otherwise.
+    pub fn from_flat_record_batch_preserving_nesting(
+        batch: &FlatRecordBatch,
+    ) -> Result<Self, ArrowError> {
+        match batch.original_converters() {
+            Some(Ok(converters)) => {
+                let nrows = batch.num_rows();
+                let ncols = converters.len();
+                let mut rows = Vec::with_capacity(nrows);
+                for row_idx in 0..nrows {
+                    let mut row = Vec::with_capacity(ncols);
+                    for col_converter in converters.iter() {
+                        let value = col_converter.to_value(row_idx);
+                        row.push(value);
+                    }
+                    rows.push(Value::from(row));
+                }
+                Ok(VecOfRows { rows })
+            }
+            Some(Err(e)) => Err(e),
+            None => Self::from_flat_record_batch(batch),
+        }
+    }
+
     /// Create a VecOfRows from an Arrow RecordBatch.
     #[allow(dead_code)]
     pub fn from_record_batch(batch: Arc<RecordBatch>) -> Result<Self, ArrowError> {

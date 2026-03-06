@@ -21,6 +21,7 @@ use minijinja::value::{Enumerator, Kwargs, Object, ValueMap, mutable_map::Mutabl
 use minijinja::{Error, ErrorKind, State, Value};
 use std::cmp::Ordering;
 use std::collections::HashSet;
+use std::fmt;
 use std::hint::unreachable_unchecked;
 use std::io;
 use std::rc::Rc;
@@ -32,7 +33,6 @@ use std::sync::{Arc, OnceLock};
 /// optionally, a vector of Jinja objects -- one iterable per row.
 ///
 /// Both representations are immutable.
-#[derive(Debug)]
 pub(crate) struct TableRepr {
     /// Arrow representation of the table.
     flat: Arc<FlatRecordBatch>,
@@ -40,6 +40,19 @@ pub(crate) struct TableRepr {
     row_table: OnceLock<Result<Arc<VecOfRows>, Arc<ArrowError>>>,
     /// Optional row names array (same length as number of rows).
     row_names: Option<Arc<StringViewArray>>,
+    /// Lazy-cached converters from the original (unflattened) RecordBatch.
+    /// Used by row iteration to preserve nested types as Jinja dicts/lists.
+    original_converters: OnceLock<Option<Vec<Box<dyn ArrayConverter>>>>,
+}
+
+impl fmt::Debug for TableRepr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TableRepr")
+            .field("flat", &self.flat)
+            .field("row_table", &self.row_table)
+            .field("row_names", &self.row_names)
+            .finish_non_exhaustive()
+    }
 }
 
 impl TableRepr {
@@ -56,6 +69,7 @@ impl TableRepr {
             flat,
             row_table,
             row_names,
+            original_converters: OnceLock::new(),
         }
     }
 
@@ -79,7 +93,8 @@ impl TableRepr {
     #[allow(dead_code)]
     pub fn force_row_table(&self) -> Result<&Arc<VecOfRows>, Error> {
         let res = self.row_table.get_or_init(|| {
-            let vec_of_rows = VecOfRows::from_flat_record_batch(&self.flat)?;
+            let vec_of_rows =
+                VecOfRows::from_flat_record_batch_preserving_nesting(&self.flat)?;
             Ok(Arc::new(vec_of_rows))
         });
         match res {
@@ -228,6 +243,49 @@ impl TableRepr {
         self.flat.column_converter(index)
     }
 
+    // Row-oriented accessors (use original/unflattened schema) ----------------
+
+    /// Returns the number of columns for row iteration (original column count).
+    ///
+    /// This uses the original (unflattened) column count when available,
+    /// so that tuple unpacking in Jinja `{% for a, b, c in table %}` gets
+    /// the correct number of elements per row.
+    pub(crate) fn row_num_columns(&self) -> usize {
+        self.flat.original_num_columns()
+    }
+
+    /// Get the lazily-cached original converters, if an original batch exists.
+    fn get_original_converters(&self) -> Option<&Vec<Box<dyn ArrayConverter>>> {
+        self.original_converters
+            .get_or_init(|| {
+                self.flat
+                    .original_converters()
+                    .and_then(|result| result.ok())
+            })
+            .as_ref()
+    }
+
+    /// Get a cell value using the original (unflattened) converters.
+    ///
+    /// Falls back to the flat cell accessor if no original converters are available.
+    pub(crate) fn row_cell(&self, row_idx: usize, col_idx: usize) -> Option<Value> {
+        if let Some(converters) = self.get_original_converters() {
+            if col_idx < converters.len() && row_idx < self.num_rows() {
+                return Some(converters[col_idx].to_value(row_idx));
+            }
+            return None;
+        }
+        // Fall back to flat cell access
+        self.cell(row_idx as isize, col_idx as isize)
+    }
+
+    /// Returns column name from the original schema at the given index.
+    pub(crate) fn original_column_name(&self, idx: usize) -> Option<&str> {
+        self.flat
+            .original_column_name(idx)
+            .or_else(|| self.flat.column_name(idx).as_str().into())
+    }
+
     // Rows -------------------------------------------------------------------
 
     pub fn num_rows(&self) -> usize {
@@ -261,23 +319,6 @@ impl TableRepr {
         todo!("index_of_row")
     }
 
-    pub fn count_occurrences_of_value_in_row(
-        self: &Arc<Self>,
-        _needle: &Value,
-        row_idx: isize,
-    ) -> usize {
-        let _row = self.row_by_index(row_idx).unwrap();
-        todo!("count_occurrences_of_value_in_row")
-    }
-
-    pub fn index_of_value_in_row(
-        self: &Arc<Self>,
-        _needle: &Value,
-        row_idx: isize,
-    ) -> Option<usize> {
-        let _row = self.row_by_index(row_idx).unwrap();
-        todo!("index_of_value_in_row")
-    }
 
     pub(crate) fn select_rows(
         &self,
@@ -2080,5 +2121,110 @@ mod tests {
         let distinct_table = result.downcast_object::<AgateTable>().unwrap();
 
         assert_eq!(distinct_table.num_rows(), 6);
+    }
+
+    #[test]
+    fn test_nested_struct_row_iteration_preserves_column_count() {
+        use arrow_array::StructArray;
+        use arrow_schema::Fields;
+
+        // Create a RecordBatch with 3 columns: id(Int32), name(Utf8), metadata(Struct<a:Utf8, b:Int32>)
+        let struct_fields = Fields::from(vec![
+            Field::new("a", DataType::Utf8, true),
+            Field::new("b", DataType::Int32, true),
+        ]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("metadata", DataType::Struct(struct_fields.clone()), true),
+        ]));
+        let id_array: ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
+        let name_array: ArrayRef = Arc::new(StringArray::from(vec!["alice", "bob"]));
+        let a_array: ArrayRef = Arc::new(StringArray::from(vec![Some("x"), Some("y")]));
+        let b_array: ArrayRef = Arc::new(Int32Array::from(vec![Some(10), Some(20)]));
+        let metadata_array: ArrayRef =
+            Arc::new(StructArray::new(struct_fields, vec![a_array, b_array], None));
+
+        let batch =
+            RecordBatch::try_new(schema, vec![id_array, name_array, metadata_array]).unwrap();
+        let table = AgateTable::from_record_batch(Arc::new(batch));
+
+        // Flattened view should have 4 columns: id, name, metadata/a, metadata/b
+        assert_eq!(table.num_columns(), 4);
+
+        // Row iteration should yield rows with 3 elements (original: id, name, metadata-as-dict)
+        let table_value = table.into_value();
+        let mut iter = table_value.try_iter().unwrap();
+
+        let row0 = iter.next().unwrap();
+        // Row should have 3 elements
+        let row0_obj = row0.as_object().unwrap();
+        assert_eq!(row0_obj.enumerator_len().unwrap(), 3);
+
+        // Check values
+        assert_eq!(row0.get_item_by_index(0).unwrap(), Value::from(1));
+        assert_eq!(row0.get_item_by_index(1).unwrap(), Value::from("alice"));
+
+        // The metadata element should be a dict with "a" and "b" keys
+        let metadata = row0.get_item_by_index(2).unwrap();
+        let a_val = metadata.get_attr("a").unwrap();
+        assert_eq!(a_val, Value::from("x"));
+        let b_val = metadata.get_attr("b").unwrap();
+        assert_eq!(b_val, Value::from(10));
+
+        let row1 = iter.next().unwrap();
+        assert_eq!(row1.get_item_by_index(0).unwrap(), Value::from(2));
+        assert_eq!(row1.get_item_by_index(1).unwrap(), Value::from("bob"));
+        let metadata1 = row1.get_item_by_index(2).unwrap();
+        assert_eq!(metadata1.get_attr("a").unwrap(), Value::from("y"));
+        assert_eq!(metadata1.get_attr("b").unwrap(), Value::from(20));
+
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn test_nested_list_row_iteration_preserves_column_count() {
+        // Create a RecordBatch with 2 columns: id(Int32), tags(List<Utf8>)
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            ),
+        ]));
+        let id_array: ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
+        let tags_array: ArrayRef = {
+            let mut builder = ListBuilder::new(StringBuilder::new());
+            builder.append_value(vec![Some("a"), Some("b")]);
+            builder.append_value(vec![Some("c")]);
+            Arc::new(builder.finish())
+        };
+
+        let batch = RecordBatch::try_new(schema, vec![id_array, tags_array]).unwrap();
+        let table = AgateTable::from_record_batch(Arc::new(batch));
+
+        // Flattened view should have 3 columns: id, tags.0, tags.1
+        assert_eq!(table.num_columns(), 3);
+
+        // Row iteration should yield rows with 2 elements (original: id, tags-as-list)
+        let table_value = table.into_value();
+        let mut iter = table_value.try_iter().unwrap();
+
+        let row0 = iter.next().unwrap();
+        let row0_obj = row0.as_object().unwrap();
+        assert_eq!(row0_obj.enumerator_len().unwrap(), 2);
+
+        assert_eq!(row0.get_item_by_index(0).unwrap(), Value::from(1));
+        let tags0 = row0.get_item_by_index(1).unwrap();
+        assert_eq!(tags0.get_item_by_index(0).unwrap(), Value::from("a"));
+        assert_eq!(tags0.get_item_by_index(1).unwrap(), Value::from("b"));
+
+        let row1 = iter.next().unwrap();
+        assert_eq!(row1.get_item_by_index(0).unwrap(), Value::from(2));
+        let tags1 = row1.get_item_by_index(1).unwrap();
+        assert_eq!(tags1.get_item_by_index(0).unwrap(), Value::from("c"));
+
+        assert!(iter.next().is_none());
     }
 }

@@ -655,6 +655,44 @@ impl FlatRecordBatch {
     pub(crate) fn column_converter(&self, idx: usize) -> &dyn ArrayConverter {
         self.converters[idx].as_ref()
     }
+
+    /// Build converters from the original (unflattened) RecordBatch columns.
+    ///
+    /// Returns `None` if no original batch is available (e.g. for derived tables).
+    pub(crate) fn original_converters(
+        &self,
+    ) -> Option<Result<Vec<Box<dyn ArrayConverter>>, ArrowError>> {
+        self.original.as_ref().map(|batch| {
+            batch
+                .columns()
+                .iter()
+                .map(|array| make_array_converter(&**array))
+                .collect::<Result<Vec<_>, ArrowError>>()
+        })
+    }
+
+    /// Returns the number of columns in the original (unflattened) RecordBatch,
+    /// falling back to the flat column count if no original is available.
+    pub(crate) fn original_num_columns(&self) -> usize {
+        self.original
+            .as_ref()
+            .map(|batch| batch.num_columns())
+            .unwrap_or_else(|| self.flat.num_columns())
+    }
+
+    /// Returns the column name from the original (unflattened) schema at the given index.
+    ///
+    /// Returns `None` if no original batch is available or the index is out of bounds.
+    pub(crate) fn original_column_name(&self, idx: usize) -> Option<&str> {
+        self.original.as_ref().and_then(|batch| {
+            let schema = batch.schema_ref();
+            if idx < schema.fields().len() {
+                Some(schema.field(idx).name().as_str())
+            } else {
+                None
+            }
+        })
+    }
 }
 
 impl fmt::Debug for FlatRecordBatch {

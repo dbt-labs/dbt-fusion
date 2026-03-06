@@ -9,7 +9,7 @@ use arrow::datatypes::*;
 use arrow::util::display::FormatOptions;
 use arrow_array::{
     Array, ArrowPrimitiveType, BooleanArray, GenericByteArray, GenericListArray, MapArray,
-    OffsetSizeTrait,
+    OffsetSizeTrait, StructArray,
 };
 use arrow_buffer::i256;
 use arrow_schema::ArrowError;
@@ -585,6 +585,51 @@ impl ArrayConverter for MapConverter {
 
 // }}}
 
+// Struct {{{
+pub(crate) struct StructArrayConverter {
+    field_names: Vec<String>,
+    field_converters: Vec<Box<dyn ArrayConverter>>,
+    nulls: Option<NullBuffer>,
+}
+
+impl StructArrayConverter {
+    pub fn new(struct_array: &StructArray) -> Result<Self, ArrowError> {
+        let fields = struct_array.fields();
+        let mut field_names = Vec::with_capacity(fields.len());
+        let mut field_converters = Vec::with_capacity(fields.len());
+        for (i, field) in fields.iter().enumerate() {
+            field_names.push(field.name().clone());
+            let child_array = struct_array.column(i);
+            field_converters.push(make_array_converter(child_array.as_ref())?);
+        }
+        Ok(Self {
+            field_names,
+            field_converters,
+            nulls: struct_array.nulls().cloned(),
+        })
+    }
+
+    #[inline(always)]
+    pub fn is_valid(&self, idx: usize) -> bool {
+        self.nulls.as_ref().is_none_or(|nulls| nulls.is_valid(idx))
+    }
+}
+
+impl ArrayConverter for StructArrayConverter {
+    fn to_value(&self, idx: usize) -> Value {
+        if self.is_valid(idx) {
+            let mut map = ValueMap::with_capacity(self.field_names.len());
+            for (name, converter) in self.field_names.iter().zip(self.field_converters.iter()) {
+                map.insert(Value::from(name.as_str()), converter.to_value(idx));
+            }
+            Value::from(map)
+        } else {
+            Value::from(())
+        }
+    }
+}
+// }}}
+
 pub fn make_array_converter(array: &dyn Array) -> Result<Box<dyn ArrayConverter>, ArrowError> {
     let converter: Box<dyn ArrayConverter> = match array.data_type() {
         DataType::Boolean => Box::new(BooleanArrayConverter::new(array.as_boolean())),
@@ -687,6 +732,10 @@ pub fn make_array_converter(array: &dyn Array) -> Result<Box<dyn ArrayConverter>
             Box::new(LargeListArrayConverter::new(array.as_list::<i64>())?)
         }
         DataType::Map(_field, _is_sorted) => Box::new(MapConverter::new(array.as_map())?),
+        DataType::Struct(_fields) => {
+            let struct_array = array.as_any().downcast_ref::<StructArray>().unwrap();
+            Box::new(StructArrayConverter::new(struct_array)?)
+        }
         _ => {
             // FALLBACK: Turn every Arrow value into a [minijinja::Value] string.
             let format_options = FormatOptions::new().with_null("None");
@@ -1178,6 +1227,43 @@ mod tests {
                 Value::from(ValueMap::new()), // empty dict
                 Value::from(())               // None
             ]
+        );
+    }
+
+    #[test]
+    fn test_struct_converter() {
+        use arrow_array::StructArray;
+        use arrow_schema::Fields;
+
+        let fields = Fields::from(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("age", DataType::Int32, true),
+        ]);
+        let name_array: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("alice"),
+            Some("bob"),
+            Some("charlie"),
+        ]));
+        let age_array: ArrayRef = Arc::new(Int32Array::from(vec![Some(30), None, Some(25)]));
+        let struct_array = StructArray::new(fields, vec![name_array, age_array], None);
+
+        let result = arrow_to_values(&struct_array).unwrap();
+
+        let mut m0 = ValueMap::new();
+        m0.insert(Value::from("name"), Value::from("alice"));
+        m0.insert(Value::from("age"), Value::from(30));
+
+        let mut m1 = ValueMap::new();
+        m1.insert(Value::from("name"), Value::from("bob"));
+        m1.insert(Value::from("age"), Value::from(()));
+
+        let mut m2 = ValueMap::new();
+        m2.insert(Value::from("name"), Value::from("charlie"));
+        m2.insert(Value::from("age"), Value::from(25));
+
+        assert_eq!(
+            result,
+            vec![Value::from(m0), Value::from(m1), Value::from(m2)]
         );
     }
 }
