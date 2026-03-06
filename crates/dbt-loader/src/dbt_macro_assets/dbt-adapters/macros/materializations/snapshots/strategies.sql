@@ -16,7 +16,8 @@
     {% set package_context = context[package_name] %}
   {% else %}
     {% set error_msg %}
-        Could not find package '{{package_name}}', called with '{{original_name}}'
+        Unable to find package '{{package_name}}', called with '
+        {{original_name}}'. Upgrade to the latest version of the package from the package hub.
     {% endset %}
     {{ exceptions.raise_compiler_error(error_msg | trim) }}
   {% endif %}
