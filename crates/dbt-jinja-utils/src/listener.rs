@@ -251,8 +251,12 @@ impl TypecheckingEventListener for DagExtractListener {
     }
 }
 
+/// Warning printer for typechecking events
+///
+/// This listener captures warnings during typechecking and can either emit them
+/// via logging or store them for testing purposes.
 #[allow(dead_code)]
-struct WarningPrinter {
+pub struct WarningPrinter {
     args: IoArgs,
     path: PathBuf,
     noqa_comments: Option<HashSet<u32>>,
@@ -262,6 +266,7 @@ struct WarningPrinter {
 }
 
 impl WarningPrinter {
+    /// Creates a new warning printer
     #[allow(dead_code)]
     pub fn new(args: IoArgs, path: PathBuf, noqa_comments: Option<HashSet<u32>>) -> Self {
         Self {
@@ -272,6 +277,32 @@ impl WarningPrinter {
             pending_warnings: RefCell::new(HashMap::new()),
             current_span: RefCell::new(None),
         }
+    }
+
+    /// Get all warnings (for testing purposes)
+    ///
+    /// This returns the warnings without emitting them via emit_warn_log_message.
+    /// The warnings are sorted by location (line, column, message).
+    pub fn get_warnings(&self) -> Vec<(CodeLocation, String)> {
+        let mut warnings: Vec<_> = self
+            .pending_warnings
+            .borrow()
+            .iter()
+            .flat_map(|(_, warnings)| warnings.iter().cloned())
+            .collect();
+        warnings.sort_by(|(loc1, msg1), (loc2, msg2)| {
+            (loc1.line, loc1.col, msg1).cmp(&(loc2.line, loc2.col, msg2))
+        });
+        warnings
+    }
+
+    /// Get all visited blocks (for testing purposes)
+    ///
+    /// Returns a sorted list of block IDs that were visited during typechecking.
+    pub fn get_blocks(&self) -> Vec<usize> {
+        let mut blocks: Vec<_> = self.pending_warnings.borrow().keys().copied().collect();
+        blocks.sort();
+        blocks
     }
 }
 
