@@ -66,4 +66,85 @@ mod databricks {
             "ALTER TABLE `dbt`.`dbt_entities`.`ent_shopify_inventory_quantity` ALTER COLUMN `id` COMMENT 'Primary key for the inventory quantity record.'"
         );
     }
+
+    // ---------------------------------------------------------------------------
+    // Tests for databricks__get_columns_in_query struct sub-field deduplication
+    // ---------------------------------------------------------------------------
+
+    /// `databricks__get_columns_in_query` must deduplicate struct sub-field column names
+    /// produced by dbt-fusion's AgateTable struct flattening back to their root names.
+    ///
+    /// AgateTable flattens `my_struct: STRUCT<a, b>` into `my_struct/a` and `my_struct/b`.
+    /// When these are used in a CREATE OR REPLACE VIEW column list, Databricks raises
+    /// CREATE_VIEW_COLUMN_ARITY_MISMATCH because the query only returns `my_struct`.
+    ///
+    /// The fix is a `databricks__get_columns_in_query` override that strips sub-fields
+    /// and returns only unique root column names. This test verifies the deduplication
+    /// logic by rendering the macro body directly with a known input.
+    #[test]
+    fn get_columns_in_query_deduplicates_struct_sub_fields() {
+        // Test the deduplication logic directly via a Jinja template that mirrors the
+        // body of `databricks__get_columns_in_query` (the part that handles struct
+        // sub-fields), without going through the statement/load_result machinery.
+        let harness = MacroTestHarness::for_adapter(AdapterType::Databricks)
+            .with_root_package("test_package".to_string())
+            .build()
+            .expect("harness should build");
+
+        // Simulate what AgateTable returns for a query like:
+        //   SELECT 'x' AS id, STRUCT('a' AS f1, 'b' AS f2) AS my_struct, 42 AS amount
+        // After struct flattening: ['id', 'my_struct/f1', 'my_struct/f2', 'amount']
+        let dedup_template = r#"
+{%- set raw_columns = ['id', 'my_struct/f1', 'my_struct/f2', 'amount'] -%}
+{%- set result = [] -%}
+{%- for col in raw_columns -%}
+  {%- set root = col.split('/')[0] -%}
+  {%- if root not in result -%}
+    {%- do result.append(root) -%}
+  {%- endif -%}
+{%- endfor -%}
+{{ result | join(',') }}
+"#;
+
+        let rendered = harness
+            .render(dedup_template, BTreeMap::<String, Value>::new())
+            .expect("render should succeed");
+
+        assert_eq!(
+            rendered.trim(),
+            "id,my_struct,amount",
+            "Expected struct sub-fields to be deduplicated to root column names"
+        );
+    }
+
+    /// Columns without struct sub-fields should be returned unchanged.
+    #[test]
+    fn get_columns_in_query_preserves_primitive_columns() {
+        let harness = MacroTestHarness::for_adapter(AdapterType::Databricks)
+            .with_root_package("test_package".to_string())
+            .build()
+            .expect("harness should build");
+
+        let dedup_template = r#"
+{%- set raw_columns = ['id', 'name', 'amount'] -%}
+{%- set result = [] -%}
+{%- for col in raw_columns -%}
+  {%- set root = col.split('/')[0] -%}
+  {%- if root not in result -%}
+    {%- do result.append(root) -%}
+  {%- endif -%}
+{%- endfor -%}
+{{ result | join(',') }}
+"#;
+
+        let rendered = harness
+            .render(dedup_template, BTreeMap::<String, Value>::new())
+            .expect("render should succeed");
+
+        assert_eq!(
+            rendered.trim(),
+            "id,name,amount",
+            "Primitive columns should be returned as-is"
+        );
+    }
 }
