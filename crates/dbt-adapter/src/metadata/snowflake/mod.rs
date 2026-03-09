@@ -17,6 +17,7 @@ use dbt_schemas::schemas::common::ResolvedQuoting;
 use dbt_schemas::schemas::legacy_catalog::*;
 use dbt_schemas::schemas::relations::base::*;
 use dbt_xdbc::{Connection, MapReduce, QueryCtx};
+use indexmap::IndexMap;
 use minijinja::State;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -309,7 +310,7 @@ impl MetadataAdapter for SnowflakeMetadataAdapter {
 
                 let node = CatalogTable {
                     metadata: node_metadata,
-                    columns: BTreeMap::new(),
+                    columns: IndexMap::new(),
                     stats,
                     unique_id: None,
                 };
@@ -393,6 +394,7 @@ impl MetadataAdapter for SnowflakeMetadataAdapter {
         let adapter = self.adapter.clone();
         let new_connection_f = move || {
             adapter
+                .engine()
                 .new_connection(None, None)
                 .map_err(Cancellable::Error)
         };
@@ -493,6 +495,7 @@ impl MetadataAdapter for SnowflakeMetadataAdapter {
         let adapter = self.adapter.clone(); // clone needed to move it into lambda
         let new_connection_f = Box::new(move || {
             adapter
+                .engine()
                 .new_connection(None, None)
                 .map_err(Cancellable::Error)
         });
@@ -583,6 +586,7 @@ ORDER BY TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION"
         let adapter = self.adapter.clone();
         let new_connection_f = move || {
             adapter
+                .engine()
                 .new_connection(None, None)
                 .map_err(Cancellable::Error)
         };
@@ -648,6 +652,7 @@ ORDER BY TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION"
         let adapter = self.adapter.clone();
         let new_connection_f = move || {
             adapter
+                .engine()
                 .new_connection(None, None)
                 .map_err(Cancellable::Error)
         };
@@ -725,6 +730,7 @@ ORDER BY TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION"
         let adapter = self.adapter.clone();
         let new_connection_f = move || {
             adapter
+                .engine()
                 .new_connection(None, None)
                 .map_err(Cancellable::Error)
         };

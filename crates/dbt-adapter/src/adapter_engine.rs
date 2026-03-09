@@ -40,6 +40,7 @@ use serde::Deserialize;
 use std::borrow::Cow;
 use tracy_client::span;
 
+use indexmap::IndexMap;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -299,7 +300,7 @@ fn adbc_execute_with_options(
     {
         let mut job_labels = maybe_query_comment
             .as_ref()
-            .map_or_else(BTreeMap::new, |comment| {
+            .map_or_else(IndexMap::new, |comment| {
                 engine
                     .query_comment()
                     .get_job_labels_from_query_comment(comment)
@@ -349,6 +350,10 @@ fn adbc_execute_with_options(
             OptionStatement::Other(DBT_METADATA.to_string()),
             OptionValue::Int(ctx.is_metadata() as i64),
         )?;
+        stmt.set_option(
+            OptionStatement::Other(DBT_FETCH.to_string()),
+            OptionValue::Int(fetch as i64),
+        )?;
         options
             .into_iter()
             .try_for_each(|(key, value)| stmt.set_option(OptionStatement::Other(key), value))?;
@@ -394,33 +399,44 @@ fn adbc_execute_with_options(
 
     let (schema, batches) = match do_execute(conn) {
         Ok(res) => res,
-        Err(Cancellable::Cancelled) => {
-            let e = AdapterError::new(
-                AdapterErrorKind::Cancelled,
-                "SQL statement execution was cancelled",
-            );
-
-            record_current_span_status_from_attrs(|attrs| {
+        Err(err @ (Cancellable::Cancelled | Cancellable::Error(_))) => {
+            let cancelled = || {
+                AdapterError::new(
+                    AdapterErrorKind::Cancelled,
+                    "SQL statement execution was cancelled",
+                )
+            };
+            let (adapter_error, error_message, vendor_code) = match err {
+                Cancellable::Cancelled => (cancelled(), None, None),
+                // Statements that were running while cancellation was triggered
+                // fail with an error here. But that error is a consequence of a
+                // forced cancellation, so we check the `CancellationToken` and
+                // treat the error as a cancellation and that makes the terminal
+                // output much better for users. Nothing went wrong with the SQL
+                // execution, it was just killed because the user asked for
+                // cancellation.
+                Cancellable::Error(_) if token.is_cancelled() => (cancelled(), None, None),
+                Cancellable::Error(e) => {
+                    let error_message = Some(format!("{:?}: {}", e.status, e.message));
+                    let vendor_code = Some(e.vendor_code);
+                    let adapter_error = adbc_error_to_adapter_error(e);
+                    (adapter_error, error_message, vendor_code)
+                }
+            };
+            let outcome = if adapter_error.kind() == AdapterErrorKind::Cancelled {
+                QueryOutcome::Canceled
+            } else {
+                QueryOutcome::Error
+            };
+            record_current_span_status_from_attrs(move |attrs| {
                 if let Some(attrs) = attrs.downcast_mut::<QueryExecuted>() {
                     attrs.dbt_core_event_code = "E017".to_string();
-                    attrs.set_query_outcome(QueryOutcome::Canceled);
+                    attrs.set_query_outcome(outcome);
+                    attrs.query_error_adapter_message = error_message.clone();
+                    attrs.query_error_vendor_code = vendor_code;
                 }
             });
-
-            return Err(e);
-        }
-        Err(Cancellable::Error(e)) => {
-            record_current_span_status_from_attrs(|attrs| {
-                if let Some(attrs) = attrs.downcast_mut::<QueryExecuted>() {
-                    attrs.dbt_core_event_code = "E017".to_string();
-                    attrs.set_query_outcome(QueryOutcome::Error);
-                    attrs.query_error_adapter_message =
-                        Some(format!("{:?}: {}", e.status, e.message));
-                    attrs.query_error_vendor_code = Some(e.vendor_code);
-                }
-            });
-
-            return Err(adbc_error_to_adapter_error(e));
+            return Err(adapter_error);
         }
     };
     let total_batch = concat_batches(&schema, &batches).map_err(arrow_error_to_adapter_error)?;
@@ -583,6 +599,7 @@ impl XdbcEngine {
     ///
     /// Used for replay modes and test adapters that must never talk to a
     /// real warehouse.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_mock(
         adapter_type: AdapterType,
         auth: Arc<dyn Auth>,
@@ -591,6 +608,7 @@ impl XdbcEngine {
         type_ops: Box<dyn TypeOps>,
         splitter: Arc<dyn StmtSplitter>,
         relation_cache: Arc<RelationCache>,
+        behavior_flag_overrides: BTreeMap<String, bool>,
     ) -> Self {
         Self::build(
             adapter_type,
@@ -602,7 +620,7 @@ impl XdbcEngine {
             splitter,
             None,
             relation_cache,
-            BTreeMap::new(),
+            behavior_flag_overrides,
             never_cancels(),
             EngineMode::Mock,
         )
@@ -652,6 +670,7 @@ impl XdbcEngine {
         type_ops: Box<dyn TypeOps>,
         splitter: Arc<dyn StmtSplitter>,
         relation_cache: Arc<RelationCache>,
+        behavior_flag_overrides: BTreeMap<String, bool>,
         token: CancellationToken,
         recordings_path: PathBuf,
     ) -> Self {
@@ -665,7 +684,7 @@ impl XdbcEngine {
             splitter,
             None,
             relation_cache,
-            BTreeMap::new(),
+            behavior_flag_overrides,
             token,
             EngineMode::Replay(recordings_path),
         )
@@ -812,42 +831,41 @@ impl AdapterEngine for XdbcEngine {
         state: Option<&State>,
         node_id: Option<String>,
     ) -> AdapterResult<Box<dyn Connection>> {
+        let do_create_connection =
+            |adapter_type: AdapterType| -> AdapterResult<Box<dyn Connection>> {
+                let config = match adapter_type {
+                    AdapterType::Databricks => {
+                        if let Some(databricks_compute) =
+                            state.and_then(databricks_compute_from_state)
+                        {
+                            let augmented_config = {
+                                let mut mapping = self.config.repr().clone();
+                                mapping
+                                    .insert("databricks_compute".into(), databricks_compute.into());
+                                AdapterConfig::new(mapping)
+                            };
+                            Cow::Owned(augmented_config)
+                        } else {
+                            Cow::Borrowed(&self.config)
+                        }
+                    }
+                    _ => Cow::Borrowed(&self.config),
+                };
+                self.new_connection_with_config(config.as_ref())
+            };
+
         match &self.mode {
-            EngineMode::Mock => return Ok(Box::new(NoopConnection)),
+            EngineMode::Mock => Ok(Box::new(NoopConnection)),
             EngineMode::Replay(path) => {
-                return Ok(Box::new(ReplayEngineConnection::new(path.clone(), node_id)));
+                let replay_engine_conn = ReplayEngineConnection::new(path.clone(), node_id);
+                Ok(Box::new(replay_engine_conn))
             }
-            EngineMode::Live | EngineMode::Record(_) => {}
-        }
-
-        let conn = match self.adapter_type {
-            AdapterType::Databricks => {
-                if let Some(databricks_compute) = state.and_then(databricks_compute_from_state) {
-                    let augmented_config = {
-                        let mut mapping = self.config.repr().clone();
-                        mapping.insert("databricks_compute".into(), databricks_compute.into());
-                        AdapterConfig::new(mapping)
-                    };
-                    self.new_connection_with_config(&augmented_config)?
-                } else {
-                    self.new_connection_with_config(&self.config)?
-                }
+            EngineMode::Live => do_create_connection(self.adapter_type),
+            EngineMode::Record(path) => {
+                let conn = do_create_connection(self.adapter_type)?;
+                let record_engine_conn = RecordEngineConnection::new(path.clone(), conn, node_id);
+                Ok(Box::new(record_engine_conn))
             }
-            _ => {
-                // TODO(felipecrv): Make this codepath more efficient
-                // (no need to reconfigure the default database)
-                self.new_connection_with_config(&self.config)?
-            }
-        };
-
-        if let EngineMode::Record(path) = &self.mode {
-            Ok(Box::new(RecordEngineConnection::new(
-                path.clone(),
-                conn,
-                node_id,
-            )))
-        } else {
-            Ok(conn)
         }
     }
 

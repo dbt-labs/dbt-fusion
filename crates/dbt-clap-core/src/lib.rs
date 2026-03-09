@@ -196,6 +196,10 @@ impl CliParserTrait for CliParser {
         self.try_parse_from_arg_matches_mut(&mut matches)
             .map_err(|err| self.format_error(err))
     }
+
+    fn fail_fast_flag(&self, cli: &Self::CliType) -> bool {
+        cli.common_args.fail_fast
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -263,6 +267,12 @@ got {:?}, expected an instance of {}",
             match &self.command {
                 Command::Core(System(_)) | Command::Core(Man(_)) | Command::Core(Init(_)) => {
                     // These commands do not require a project directory
+                    (PathBuf::from("."), PathBuf::from("."))
+                }
+                Command::Extension(_) => {
+                    // Extension commands determine their own project requirements.
+                    // Avoid resolving project dir here, which can fail for commands
+                    // that intentionally run outside project context.
                     (PathBuf::from("."), PathBuf::from("."))
                 }
                 _ => in_out_dir(&common_args)?,

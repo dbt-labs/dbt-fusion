@@ -18,7 +18,7 @@ use dbt_schemas::schemas::dbt_column::DbtColumn;
 use dbt_schemas::schemas::project::QueryComment;
 use dbt_schemas::schemas::properties::ModelConstraint;
 use dbt_schemas::schemas::relations::base::{BaseRelation, ComponentName};
-use dbt_xdbc::{Backend, Connection};
+use dbt_xdbc::Backend;
 use indexmap::IndexMap;
 use minijinja::dispatch_object::DispatchObject;
 use minijinja::{State, Value};
@@ -41,7 +41,7 @@ pub fn backend_of(adapter_type: AdapterType) -> Backend {
         AdapterType::Spark => Backend::Spark,
         AdapterType::DuckDB => Backend::DuckDB,
         AdapterType::Sidecar => Backend::DuckDB,
-        AdapterType::Fabric => todo!(),
+        AdapterType::Fabric => Backend::SQLServer,
     }
 }
 
@@ -144,13 +144,6 @@ pub trait BaseAdapter: fmt::Debug + AdapterTyping + Send + Sync {
     fn commit(&self) -> Result<Value, minijinja::Error> {
         Ok(Value::from(true))
     }
-
-    /// Create a new connection
-    fn new_connection(
-        &self,
-        state: Option<&State>,
-        node_id: Option<String>,
-    ) -> Result<Box<dyn Connection>, minijinja::Error>;
 
     /// Cache added
     ///
@@ -1041,6 +1034,24 @@ pub trait BaseAdapter: fmt::Debug + AdapterTyping + Send + Sync {
         _minor: i64,
     ) -> Result<Value, minijinja::Error>;
 
+    fn external_root(&self, state: &State) -> Result<Value, minijinja::Error>;
+
+    fn external_write_options(
+        &self,
+        state: &State,
+        write_location: &str,
+        rendered_options: &Value,
+    ) -> Result<Value, minijinja::Error>;
+
+    fn external_read_location(
+        &self,
+        state: &State,
+        write_location: &str,
+        rendered_options: &Value,
+    ) -> Result<Value, minijinja::Error>;
+
+    fn location_exists(&self, state: &State, location: &str) -> Result<Value, minijinja::Error>;
+
     /// Compute external path for Databricks external tables.
     ///
     /// https://github.com/databricks/dbt-databricks/blob/main/dbt/adapters/databricks/impl.py#L208-L209
@@ -1180,6 +1191,17 @@ pub trait BaseAdapter: fmt::Debug + AdapterTyping + Send + Sync {
 
     /// redact_credentials
     fn redact_credentials(&self, _state: &State, _sql: &str) -> Result<Value, minijinja::Error>;
+
+    fn is_motherduck(&self) -> bool;
+
+    fn disable_transactions(&self) -> bool;
+
+    fn get_temp_relation_path(
+        &self,
+        database: &str,
+        identifier: &str,
+        batch_id: &str,
+    ) -> AdapterResult<BTreeMap<String, Value>>;
 
     /// Behavior (flags)
     fn behavior(&self) -> Value;
