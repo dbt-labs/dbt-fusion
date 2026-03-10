@@ -195,6 +195,19 @@ mod tests {
         Ok(builder)
     }
 
+    fn duckdb_per_user_file_path(prefix: &str) -> std::path::PathBuf {
+        let base_dir = dirs::cache_dir()
+            .map(|path| path.join("com.getdbt").join("dbt-xdbc-tests"))
+            .unwrap_or_else(env::temp_dir);
+        let file_name = format!("{prefix}.duckdb");
+
+        if std::fs::create_dir_all(&base_dir).is_ok() {
+            base_dir.join(file_name)
+        } else {
+            env::temp_dir().join(file_name)
+        }
+    }
+
     fn database_for(backend: Backend) -> Result<Box<dyn Database>> {
         let mut driver = driver_for(backend)?;
         let database_builder = database_builder_for(backend)?;
@@ -340,9 +353,8 @@ mod tests {
     fn duckdb_file_persistence() -> Result<()> {
         use std::fs;
 
-        // Create a temp file path
-        let temp_dir = env::temp_dir();
-        let db_path = temp_dir.join("dbt_xdbc_test.duckdb");
+        // Create a deterministic per-user file path
+        let db_path = duckdb_per_user_file_path("dbt_xdbc_test_persistence");
         let db_path_str = db_path.to_string_lossy().to_string();
 
         // Clean up any existing file
@@ -934,8 +946,7 @@ mod tests {
     fn duckdb_file_lock_released_after_drop() -> Result<()> {
         use std::fs;
 
-        let temp_dir = env::temp_dir();
-        let db_path = temp_dir.join("dbt_xdbc_test_lock.duckdb");
+        let db_path = duckdb_per_user_file_path("dbt_xdbc_test_lock");
         let db_path_str = db_path.to_string_lossy().to_string();
 
         // Clean up any existing file
@@ -998,8 +1009,7 @@ mod tests {
             return Ok(());
         }
 
-        let temp_dir = env::temp_dir();
-        let db_path = temp_dir.join("dbt_xdbc_test_cross_process_lock.duckdb");
+        let db_path = duckdb_per_user_file_path("dbt_xdbc_test_cross_process_lock");
         let db_path_str = db_path.to_string_lossy().to_string();
 
         // Clean up any existing file
@@ -1077,8 +1087,7 @@ mod tests {
             return Ok(());
         }
 
-        let temp_dir = env::temp_dir();
-        let db_path = temp_dir.join("dbt_xdbc_test_conn_holds_lock.duckdb");
+        let db_path = duckdb_per_user_file_path("dbt_xdbc_test_conn_holds_lock");
         let db_path_str = db_path.to_string_lossy().to_string();
         let _ = fs::remove_file(&db_path);
         let _ = fs::remove_file(format!("{}.wal", db_path_str));

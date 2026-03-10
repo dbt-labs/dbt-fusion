@@ -1,6 +1,7 @@
 use crate::adapter_engine::{AdapterEngine, Options as ExecuteOptions, execute_query_with_retry};
 use crate::catalog_relation::CatalogRelation;
 use crate::column::{BigqueryColumnMode, Column, ColumnBuilder};
+use crate::connection::{ConnectionGuard, borrow_tlocal_connection};
 use crate::errors::{
     AdapterError, AdapterErrorKind, adbc_error_to_adapter_error, arrow_error_to_adapter_error,
 };
@@ -69,7 +70,7 @@ use dbt_xdbc::{Connection, QueryCtx};
 use dbt_yaml::Value as YmlValue;
 use indexmap::IndexMap;
 use minijinja::dispatch_object::DispatchObject;
-use minijinja::value::ValueMap;
+use minijinja::value::{Object, ValueMap};
 use minijinja::{self, invalid_argument, invalid_argument_inner};
 use minijinja::{State, Value, args};
 use once_cell::sync::Lazy;
@@ -334,16 +335,18 @@ impl ConcreteAdapter {
         unimplemented!("get_partitions_metadata")
     }
 
-    /// Create a new connection
-    pub fn new_connection(
+    /// Borrow the current thread-local connection or create one if it's not set yet.
+    ///
+    /// A guard is returned. When destroyed, the guard returns the connection to
+    /// the thread-local variable. If another connection became the thread-local
+    /// in the mean time, that connection is dropped and the return proceeds as
+    /// normal.
+    pub fn borrow_tlocal_connection(
         &self,
         state: Option<&State>,
         node_id: Option<String>,
-    ) -> AdapterResult<Box<dyn Connection>> {
-        match self.inner_adapter() {
-            Replay(_, replay) => replay.replay_new_connection(state, node_id),
-            Impl(_, engine) => engine.new_connection(state, node_id),
-        }
+    ) -> Result<ConnectionGuard<'_>, minijinja::Error> {
+        borrow_tlocal_connection(self.engine().as_ref(), state, node_id)
     }
 
     /// Helper method for execute
@@ -362,9 +365,11 @@ impl ConcreteAdapter {
         options: Option<HashMap<String, String>>,
     ) -> AdapterResult<(AdapterResponse, AgateTable)> {
         let adapter_type = self.adapter_type();
-        // BigQuery API supports multi-statement
-        // https://cloud.google.com/bigquery/docs/reference/standard-sql/procedural-language
-        let statements = if adapter_type == Bigquery {
+        // BigQuery and DuckDB support multi-statement execution.
+        // BigQuery: https://cloud.google.com/bigquery/docs/reference/standard-sql/procedural-language
+        // DuckDB: temp tables are connection-scoped; batching CREATE TEMP + DML in one
+        // execute() call avoids the need for cross-call connection caching.
+        let statements = if adapter_type == Bigquery || adapter_type == DuckDB {
             if engine.splitter().is_empty(sql, adapter_type) {
                 vec![]
             } else {
@@ -535,19 +540,6 @@ impl ConcreteAdapter {
             limit, // limit
             None,  // options
         )
-    }
-
-    /// Execute a query with a new connection
-    pub fn execute_with_new_connection(
-        &self,
-        ctx: &QueryCtx,
-        sql: &str,
-        auto_begin: bool,
-        fetch: bool,
-        limit: Option<i64>,
-    ) -> AdapterResult<(AdapterResponse, AgateTable)> {
-        let mut conn = self.new_connection(None, None)?;
-        self.execute(None, &mut *conn, ctx, sql, auto_begin, fetch, limit, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1076,6 +1068,36 @@ impl ConcreteAdapter {
         Ok(false)
     }
 
+    /// Check if the current DuckDB connection targets MotherDuck.
+    pub fn is_motherduck(&self) -> bool {
+        self.engine()
+            .config("path")
+            .map(|p| dbt_auth::is_motherduck_path(&p))
+            .unwrap_or(false)
+    }
+
+    /// MotherDuck does not support explicit transactions.
+    pub fn disable_transactions(&self) -> bool {
+        self.is_motherduck()
+    }
+
+    /// Returns a dict with database/schema/identifier for temp tables on MotherDuck.
+    pub fn get_temp_relation_path(
+        &self,
+        database: &str,
+        identifier: &str,
+        batch_id: &str,
+    ) -> AdapterResult<BTreeMap<String, Value>> {
+        let mut path = BTreeMap::new();
+        path.insert("database".to_owned(), Value::from(database));
+        path.insert("schema".to_owned(), Value::from("dbt_temp"));
+        path.insert(
+            "identifier".to_owned(),
+            Value::from(format!("{identifier}__{batch_id}")),
+        );
+        Ok(path)
+    }
+
     /// Rename relation
     pub fn rename_relation(
         &self,
@@ -1177,12 +1199,45 @@ impl ConcreteAdapter {
         }
 
         let macro_execution_result: AdapterResult<Value> = match self.adapter_type() {
-            Databricks => execute_macro_with_package(
-                state,
-                &[RelationObject::new(relation.to_owned()).as_value()],
-                "get_columns_comments",
-                "dbt_databricks",
-            ),
+            Databricks => {
+                // use DESCRIBE TABLE EXTENDED ... AS JSON for full type strings
+                // Plain DESCRIBE TABLE truncates long data types server-side
+                //
+                // https://github.com/databricks/dbt-databricks/blob/822b105b15e644676d9e1f47cbfd765cd4c1541f/dbt/adapters/databricks/impl.py#L439-L452
+                let use_legacy = relation.is_hive_metastore().is_true()
+                    || relation.is_materialized_view()
+                    || relation.is_streaming_table();
+
+                if !use_legacy {
+                    let json_result = execute_macro_with_package(
+                        state,
+                        &[RelationObject::new(relation.to_owned()).as_value()],
+                        "get_columns_comments_as_json",
+                        "dbt_databricks",
+                    );
+                    match json_result {
+                        Ok(ref val) => {
+                            if let Some(columns) = self.try_columns_from_json_describe(val) {
+                                return columns;
+                            }
+                        }
+                        Err(ref e) => {
+                            if e.message().contains("[TABLE_OR_VIEW_NOT_FOUND]") {
+                                return Ok(Vec::new());
+                            }
+                            // PARSE_SYNTAX_ERROR / UNSUPPORTED_FEATURE -> DBR < 16.2;
+                            // fall through to legacy DESCRIBE TABLE
+                        }
+                    }
+                }
+
+                execute_macro_with_package(
+                    state,
+                    &[RelationObject::new(relation.to_owned()).as_value()],
+                    "get_columns_comments",
+                    "dbt_databricks",
+                )
+            }
             Postgres | Snowflake | Bigquery | Sidecar | Redshift | DuckDB | Fabric => {
                 execute_macro(
                     state,
@@ -1308,6 +1363,43 @@ impl ConcreteAdapter {
         }
     }
 
+    /// Try to parse columns from a `DESCRIBE TABLE EXTENDED ... AS JSON` result.
+    ///
+    /// Returns `Some(Ok(columns))` on success, `Some(Err(...))` on hard failure,
+    /// or `None` if the result couldn't be parsed as JSON metadata (caller should
+    /// fall back to plain DESCRIBE TABLE).
+    fn try_columns_from_json_describe(&self, result: &Value) -> Option<AdapterResult<Vec<Column>>> {
+        use crate::metadata::MetadataProcessor as _;
+        use crate::metadata::databricks::describe_table::DatabricksTableMetadata;
+
+        let batch = match convert_macro_result_to_record_batch(result) {
+            Ok(b) => b,
+            Err(_) => return None,
+        };
+        let metadata = match DatabricksTableMetadata::from_record_batch(batch) {
+            Ok(m) => m,
+            Err(_) => return None,
+        };
+
+        let columns = metadata
+            .columns
+            .iter()
+            .map(|col| {
+                let comment = col.comment.clone().filter(|s| !s.is_empty());
+                Column::new(
+                    Databricks,
+                    col.name.clone(),
+                    col.type_.sql_type(),
+                    None,
+                    None,
+                    None,
+                )
+                .with_comment(comment)
+            })
+            .collect();
+        Some(Ok(columns))
+    }
+
     /// Truncate relation
     ///
     /// https://github.com/dbt-labs/dbt-adapters/blob/main/dbt-adapters/src/dbt/adapters/sql/impl.py#L147
@@ -1426,9 +1518,11 @@ impl ConcreteAdapter {
             Replay(_, replay) => {
                 replay.replay_expand_target_column_types(state, from_relation, to_relation)
             }
-            Impl(Bigquery, _) => {
-                // This method is a noop for BigQuery
-                // https://github.com/dbt-labs/dbt-adapters/blob/main/dbt-bigquery/src/dbt/adapters/bigquery/impl.py#L260-L261
+            Impl(Bigquery, _) | Impl(DuckDB, _) => {
+                // This method is a noop for BigQuery and DuckDB.
+                // BigQuery: https://github.com/dbt-labs/dbt-adapters/blob/main/dbt-bigquery/src/dbt/adapters/bigquery/impl.py#L260-L261
+                // DuckDB: type widening (e.g. INT→BIGINT) is handled implicitly;
+                // real mismatches surface as SQL errors.
                 Ok(none_value())
             }
             Impl(_, _) => {
@@ -1454,9 +1548,14 @@ impl ConcreteAdapter {
                         let col_string_size = reference_column.string_size().map_err(|msg| {
                             AdapterError::new(AdapterErrorKind::UnexpectedResult, msg)
                         })?;
-                        let new_type = reference_column
+                        let mut new_type = reference_column
                             .as_static()
                             .string_type(Some(col_string_size as usize));
+
+                        // Preserve collation from the target (existing) column
+                        if let Some(collation) = target_column.collation() {
+                            new_type = format!("{new_type} collate '{collation}'");
+                        }
 
                         // Create args for macro execution
                         execute_macro(
@@ -2800,6 +2899,103 @@ impl ConcreteAdapter {
         }
     }
 
+    /// Get the external root directory from engine config, defaulting to `"."`.
+    pub fn external_root(&self) -> String {
+        self.engine()
+            .config("external_root")
+            .unwrap_or(Cow::Borrowed("."))
+            .into_owned()
+    }
+
+    /// Build the write-options string for DuckDB external materializations.
+    pub fn external_write_options(&self, write_location: &str, rendered_options: &Value) -> String {
+        let mut opts: IndexMap<String, String> = IndexMap::new();
+        if let Ok(keys) = rendered_options.try_iter() {
+            for key in keys {
+                let key_str = key.to_string();
+                if let Ok(val) = rendered_options.get_item(&key) {
+                    opts.insert(key_str, val.to_string());
+                }
+            }
+        }
+
+        // Infer format from file extension if not provided
+        if !opts.contains_key("format") {
+            let ext = write_location
+                .rsplit('.')
+                .next()
+                .filter(|e| *e != write_location)
+                .unwrap_or("");
+            if !ext.is_empty() {
+                opts.insert("format".to_string(), ext.to_lowercase());
+            } else if opts.contains_key("delimiter") {
+                opts.insert("format".to_string(), "csv".to_string());
+            } else {
+                opts.insert("format".to_string(), "parquet".to_string());
+            }
+        }
+
+        // Default CSV header
+        if opts.get("format").map(|f| f.as_str()) == Some("csv") && !opts.contains_key("header") {
+            opts.insert("header".to_string(), "1".to_string());
+        }
+
+        // Normalize partition_by parens
+        if let Some(v) = opts.get("partition_by").cloned() {
+            if v.contains(',') && !v.starts_with('(') {
+                opts.insert("partition_by".to_string(), format!("({v})"));
+            }
+        }
+
+        // Build result: quote special keys
+        let ret: Vec<String> = opts
+            .iter()
+            .map(|(k, v)| {
+                let lower = k.to_lowercase();
+                if matches!(lower.as_str(), "delimiter" | "quote" | "escape" | "null")
+                    && !v.starts_with('\'')
+                {
+                    format!("{k} '{v}'")
+                } else {
+                    format!("{k} {v}")
+                }
+            })
+            .collect();
+        ret.join(", ")
+    }
+
+    /// Build the read location (possibly a glob path) for DuckDB external materializations.
+    pub fn external_read_location(&self, write_location: &str, rendered_options: &Value) -> String {
+        let partition_by = rendered_options
+            .get_item(&Value::from("partition_by"))
+            .ok()
+            .filter(|v| !v.is_undefined() && !v.is_none());
+        let per_thread = rendered_options
+            .get_item(&Value::from("per_thread_output"))
+            .ok()
+            .filter(|v| !v.is_undefined() && !v.is_none());
+
+        if partition_by.is_some() || per_thread.is_some() {
+            let mut globs = vec![write_location.to_string(), "*".to_string()];
+            if let Some(pb) = &partition_by {
+                let pb_str = pb.to_string();
+                let count = pb_str.split(',').count();
+                for _ in 0..count {
+                    globs.push("*".to_string());
+                }
+            }
+            let format = rendered_options
+                .get_item(&Value::from("format"))
+                .ok()
+                .filter(|v| !v.is_undefined() && !v.is_none())
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "parquet".to_string());
+            format!("{}.{}", globs.join("/"), format)
+        } else {
+            write_location.to_string()
+        }
+    }
+
     // https://github.com/databricks/dbt-databricks/blob/main/dbt/adapters/databricks/impl.py#L208-L209
     pub fn compute_external_path(
         &self,
@@ -2992,21 +3188,19 @@ impl ConcreteAdapter {
                     ));
                 }
 
-                let use_uniform =
-                    if let Some(val) = catalog_relation.adapter_properties.get("use_uniform") {
-                        val.eq_ignore_ascii_case("true")
-                    } else {
-                        false
-                    };
+                let use_managed_iceberg = self
+                    .behavior_object()
+                    .get_value(&Value::from("use_managed_iceberg"))
+                    .is_some_and(|flag| flag.is_true());
 
-                if use_uniform && catalog_relation.catalog_type != "unity" {
+                if use_managed_iceberg && catalog_relation.catalog_type != "unity" {
                     return Err(AdapterError::new(
                         AdapterErrorKind::Configuration,
                         "Managed Iceberg tables are only supported in Unity Catalog. Set 'use_uniform' adapter property to true for Hive Metastore.",
                     ));
                 }
 
-                Ok(use_uniform)
+                Ok(!use_managed_iceberg)
             }
             Postgres | Snowflake | Bigquery | Redshift | Salesforce | Sidecar | Spark | DuckDB
             | Fabric => {
@@ -3568,22 +3762,15 @@ pub(crate) static DEFAULT_BASE_BEHAVIOR_FLAGS: LazyLock<[BehaviorFlag; 2]> = Laz
 pub(crate) fn adapter_specific_behavior_flags(adapter_type: AdapterType) -> Vec<BehaviorFlag> {
     match adapter_type {
         Snowflake => {
-            // https://github.com/dbt-labs/dbt-adapters/blob/917301379d4ece300d32a3366c71daf0c4ac44aa/dbt-snowflake/src/dbt/adapters/snowflake/impl.py#L87
+            // https://github.com/dbt-labs/dbt-adapters/blob/c4c04de76d5a6c56c95965041a93156fdeaf4641/dbt-snowflake/src/dbt/adapters/snowflake/impl.py#L46
             let flag = BehaviorFlag::new(
-                "enable_iceberg_materializations",
+                "snowflake_default_transient_dynamic_tables",
                 false,
                 Some(
-                    "Enabling Iceberg materializations introduces latency to metadata queries, specifically within the list_relations_without_caching macro. Since Iceberg benefits only those actively using it, we've made this behavior opt-in to prevent unnecessary latency for other users.",
+                    "When enabled, dynamic tables default to transient (matching regular table behavior). This is a breaking change from previous behavior where dynamic tables were non-transient.",
                 ),
-                Some(
-                    r#"Enabling Iceberg materializations introduces latency to metadata queries,
-specifically within the list_relations_without_caching macro. Since Iceberg
-benefits only those actively using it, we've made this behavior opt-in to
-prevent unnecessary latency for other users."#,
-                ),
-                Some(
-                    "https://docs.getdbt.com/reference/resource-configs/snowflake-configs#iceberg-table-format",
-                ),
+                None,
+                None,
             );
             vec![flag]
         }
@@ -3608,7 +3795,32 @@ prevent unnecessary latency for other users."#,
                 None,
             );
 
-            vec![use_user_folder_for_python, use_materialization_v2]
+            let use_replace_on_for_insert_overwrite = BehaviorFlag::new(
+                "use_replace_on_for_insert_overwrite",
+                true,
+                Some(
+                    "Use INSERT INTO ... REPLACE ON syntax for insert_overwrite on SQL Warehouses. When enabled, only matching partitions are overwritten; historical partitions are preserved.",
+                ),
+                None,
+                None,
+            );
+
+            let use_managed_iceberg = BehaviorFlag::new(
+                "use_managed_iceberg",
+                false,
+                Some(
+                    "Use managed Iceberg tables when table_format is iceberg. When this flag is disabled, UniForm is used instead.",
+                ),
+                None,
+                None,
+            );
+
+            vec![
+                use_user_folder_for_python,
+                use_materialization_v2,
+                use_replace_on_for_insert_overwrite,
+                use_managed_iceberg,
+            ]
         }
         Bigquery => {
             // https://github.com/dbt-labs/dbt-adapters/blob/b9ebd240e39882a8c43ed659de423c7504d4642a/dbt-bigquery/src/dbt/adapters/bigquery/impl.py#L109-L110
@@ -3623,7 +3835,19 @@ prevent unnecessary latency for other users."#,
             );
             vec![flag]
         }
-        Postgres | Redshift | Salesforce | Sidecar | Spark | DuckDB | Fabric => vec![],
+        Fabric => {
+            let flag = BehaviorFlag::new(
+                "empty",
+                false,
+                Some(
+                    "When enabled, table and view materializations will be created as empty structures (no data).",
+                ),
+                None,
+                None,
+            );
+            vec![flag]
+        }
+        Postgres | Redshift | Salesforce | Sidecar | Spark | DuckDB => vec![],
     }
 }
 
@@ -3679,6 +3903,7 @@ impl ConcreteAdapter {
             type_ops,
             stmt_splitter,
             Arc::new(crate::cache::RelationCache::default()),
+            BTreeMap::new(),
         ));
         let is_true = flags.get("is_true").is_none_or(|v| v.is_true());
         let is_false = flags.get("is_false").is_some_and(|v| v.is_true());
@@ -3794,12 +4019,6 @@ pub trait Replayer: fmt::Debug + Send + Sync {
     fn replay_peek_is_replaceable_next(&self, _state: &State) -> AdapterResult<bool> {
         Ok(false)
     }
-
-    fn replay_new_connection(
-        &self,
-        state: Option<&State>,
-        node_id: Option<String>,
-    ) -> AdapterResult<Box<dyn Connection>>;
 
     #[allow(clippy::too_many_arguments)]
     fn replay_execute(
