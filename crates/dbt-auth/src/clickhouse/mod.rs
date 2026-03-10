@@ -11,7 +11,7 @@ const DEFAULT_USER: &str = "default";
 
 #[derive(Debug)]
 enum ClickHouseAuthIR<'a> {
-    Database {
+    UserPass {
         user: &'a str,
         password: Cow<'a, str>,
         host: &'a str,
@@ -23,7 +23,7 @@ enum ClickHouseAuthIR<'a> {
 impl<'a> ClickHouseAuthIR<'a> {
     pub fn apply(self, mut builder: DatabaseBuilder) -> Result<DatabaseBuilder, AuthError> {
         match self {
-            Self::Database {
+            Self::UserPass {
                 user,
                 password,
                 host,
@@ -53,7 +53,7 @@ fn parse_auth<'a>(config: &'a AdapterConfig) -> Result<ClickHouseAuthIR<'a>, Aut
         DEFAULT_HTTP_PORT
     };
 
-    Ok(ClickHouseAuthIR::Database {
+    Ok(ClickHouseAuthIR::UserPass {
         user: config.get_str("user").unwrap_or(DEFAULT_USER),
         password: config.get_string("password").unwrap_or(Cow::Borrowed("")),
         host: config.get_str("host").unwrap_or(DEFAULT_HOST),
