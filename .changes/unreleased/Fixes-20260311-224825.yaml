@@ -1,0 +1,7 @@
+kind: Fixes
+body: Fix `**` operator with negative exponents in Jinja (e.g. `10 ** -9`) to return float results, matching Python/Jinja2 behavior
+time: 2026-03-11T22:48:25.000000Z
+custom:
+    author: manikantapachineelam
+    issue: ""
+    project: dbt-fusion

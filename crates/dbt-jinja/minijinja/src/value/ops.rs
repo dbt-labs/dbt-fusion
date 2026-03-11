@@ -412,9 +412,15 @@ pub fn int_div(lhs: &Value, rhs: &Value) -> Result<Value, Error> {
 pub fn pow(lhs: &Value, rhs: &Value) -> Result<Value, Error> {
     match coerce(lhs, rhs, true) {
         Some(CoerceResult::I128(a, b)) => {
-            match TryFrom::try_from(b).ok().and_then(|b| a.checked_pow(b)) {
-                Some(val) => Ok(int_as_value(val)),
-                None => Err(failed_op("**", lhs, rhs)),
+            if b < 0 {
+                // Negative exponents produce fractional results; promote to float
+                // to match Python/Jinja2 behavior (e.g. 10 ** -9 == 1e-9).
+                Ok((a as f64).powf(b as f64).into())
+            } else {
+                match TryFrom::try_from(b).ok().and_then(|b| a.checked_pow(b)) {
+                    Some(val) => Ok(int_as_value(val)),
+                    None => Err(failed_op("**", lhs, rhs)),
+                }
             }
         }
         Some(CoerceResult::F64(a, b)) => Ok((a.powf(b)).into()),
@@ -719,5 +725,21 @@ mod tests {
                 "Invalid value for on_schema_change () specified. Setting default value of ignore."
             )
         );
+    }
+
+    #[test]
+    fn test_pow_negative_exponent() {
+        // Negative integer exponents should produce float results to match
+        // Python/Jinja2 behavior (e.g. used in dbt macros like conversion_factors).
+        assert_eq!(pow(&Value::from(10i64), &Value::from(-9i64)).unwrap(), Value::from(1e-9_f64));
+        assert_eq!(pow(&Value::from(10i64), &Value::from(-6i64)).unwrap(), Value::from(1e-6_f64));
+        assert_eq!(pow(&Value::from(10i64), &Value::from(-3i64)).unwrap(), Value::from(1e-3_f64));
+
+        // Positive integer exponents should still return integers.
+        assert_eq!(pow(&Value::from(10i64), &Value::from(2i64)).unwrap(), Value::from(100i64));
+        assert_eq!(pow(&Value::from(2i64), &Value::from(8i64)).unwrap(), Value::from(256i64));
+
+        // Float exponents should continue to work.
+        assert_eq!(pow(&Value::from(2.0f64), &Value::from(-1.0f64)).unwrap(), Value::from(0.5f64));
     }
 }
