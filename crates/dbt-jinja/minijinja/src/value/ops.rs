@@ -413,9 +413,12 @@ pub fn pow(lhs: &Value, rhs: &Value) -> Result<Value, Error> {
     match coerce(lhs, rhs, true) {
         Some(CoerceResult::I128(a, b)) => {
             if b < 0 {
-                // Negative exponents produce fractional results; promote to float
-                // to match Python/Jinja2 behavior (e.g. 10 ** -9 == 1e-9).
-                Ok((a as f64).powf(b as f64).into())
+                // Negative exponents yield fractions; promote to f64 (Python/Jinja2 behavior).
+                // as_f64(lossy=false) round-trips to catch precision loss on huge integers.
+                match as_f64(lhs, false).zip(as_f64(rhs, false)) {
+                    Some((a_f, b_f)) => Ok(a_f.powf(b_f).into()),
+                    None => Err(failed_op("**", lhs, rhs)),
+                }
             } else {
                 match TryFrom::try_from(b).ok().and_then(|b| a.checked_pow(b)) {
                     Some(val) => Ok(int_as_value(val)),
