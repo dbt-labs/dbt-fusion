@@ -744,5 +744,8 @@ mod tests {
 
         // Float exponents should continue to work.
         assert_eq!(pow(&Value::from(2.0f64), &Value::from(-1.0f64)).unwrap(), Value::from(0.5f64));
+
+        // Huge integers that lose precision in f64 should return Err, not panic.
+        assert!(pow(&Value::from(i128::MAX - 1), &Value::from(-1i64)).is_err());
     }
 }
