@@ -1,0 +1,9 @@
+---
+source: crates/dbt-jinja-utils/tests/test_typechecking.rs
+expression: snapshot
+---
+warnings:
+  - line: 2
+    col: 1
+    file: test.jinja
+    message: "Potential TypeError: Unknown local variable 'b'"
