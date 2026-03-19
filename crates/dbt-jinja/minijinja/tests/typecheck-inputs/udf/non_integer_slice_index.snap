@@ -1,0 +1,5 @@
+---
+source: crates/dbt-jinja/minijinja/tests/test_typecheck.rs
+---
+- "Type mismatch for slice start: type = String(a)"
+- "Type mismatch for slice stop: type = String(b)"
