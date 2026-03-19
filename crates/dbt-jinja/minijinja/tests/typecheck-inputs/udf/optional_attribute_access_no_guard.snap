@@ -1,0 +1,4 @@
+---
+source: crates/dbt-jinja/minijinja/tests/test_typecheck.rs
+---
+- "[String| None].upper is not supported"
