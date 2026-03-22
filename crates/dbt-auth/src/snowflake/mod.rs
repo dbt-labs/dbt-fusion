@@ -1623,7 +1623,9 @@ mod tests {
         use std::env;
 
         // Ensure environment variable is not set
-        env::remove_var(crate::driver_logging::SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV);
+        unsafe {
+            env::remove_var(driver_logging::SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV);
+        }
 
         let config = base_config();
         let expected = [
@@ -1645,10 +1647,12 @@ mod tests {
     fn test_connector_debug_logging_debug() {
         use std::env;
 
-        env::set_var(
-            crate::driver_logging::SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV,
-            "debug",
-        );
+        unsafe {
+            env::set_var(
+                driver_logging::SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV,
+                "debug",
+            );
+        }
 
         let config = base_config();
         let expected = [
@@ -1664,7 +1668,9 @@ mod tests {
         ];
         run_config_test(config, &expected);
 
-        env::remove_var(crate::driver_logging::SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV);
+        unsafe {
+            env::remove_var(driver_logging::SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV);
+        }
     }
 
     #[test]
@@ -1672,10 +1678,12 @@ mod tests {
     fn test_connector_debug_logging_info() {
         use std::env;
 
-        env::set_var(
-            crate::driver_logging::SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV,
-            "info",
-        );
+        unsafe {
+            env::set_var(
+                driver_logging::SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV,
+                "info",
+            );
+        }
 
         let config = base_config();
         let expected = [
@@ -1691,7 +1699,9 @@ mod tests {
         ];
         run_config_test(config, &expected);
 
-        env::remove_var(crate::driver_logging::SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV);
+        unsafe {
+            env::remove_var(driver_logging::SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV);
+        }
     }
 
     #[test]
@@ -1699,10 +1709,12 @@ mod tests {
     fn test_connector_debug_logging_trace() {
         use std::env;
 
-        env::set_var(
-            crate::driver_logging::SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV,
-            "trace",
-        );
+        unsafe {
+            env::set_var(
+                driver_logging::SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV,
+                "trace",
+            );
+        }
 
         let config = base_config();
         let expected = [
@@ -1718,7 +1730,9 @@ mod tests {
         ];
         run_config_test(config, &expected);
 
-        env::remove_var(crate::driver_logging::SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV);
+        unsafe {
+            env::remove_var(driver_logging::SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV);
+        }
     }
 
     #[test]
@@ -1726,10 +1740,12 @@ mod tests {
     fn test_connector_debug_logging_case_insensitive() {
         use std::env;
 
-        env::set_var(
-            crate::driver_logging::SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV,
-            "DEBUG",
-        );
+        unsafe {
+            env::set_var(
+                driver_logging::SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV,
+                "DEBUG",
+            );
+        }
 
         let config = base_config();
         let expected = [
@@ -1745,7 +1761,9 @@ mod tests {
         ];
         run_config_test(config, &expected);
 
-        env::remove_var(crate::driver_logging::SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV);
+        unsafe {
+            env::remove_var(driver_logging::SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV);
+        }
     }
 
     #[test]
@@ -1753,10 +1771,12 @@ mod tests {
     fn test_connector_debug_logging_invalid_falls_back_to_default() {
         use std::env;
 
-        env::set_var(
-            crate::driver_logging::SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV,
-            "invalid_level",
-        );
+        unsafe {
+            env::set_var(
+                driver_logging::SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV,
+                "invalid_level",
+            );
+        }
 
         let config = base_config();
         let expected = [
@@ -1772,6 +1792,8 @@ mod tests {
         ];
         run_config_test(config, &expected);
 
-        env::remove_var(crate::driver_logging::SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV);
+        unsafe {
+            env::remove_var(driver_logging::SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV);
+        }
     }
 }

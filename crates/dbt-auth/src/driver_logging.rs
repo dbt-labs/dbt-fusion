@@ -76,7 +76,9 @@ mod tests {
     #[serial]
     fn test_get_driver_log_level_not_set() {
         let env_var = "DBT_TEST_DRIVER_LOG_LEVEL";
-        env::remove_var(env_var);
+        unsafe {
+            env::remove_var(env_var);
+        }
 
         let level = get_driver_log_level(env_var, LogLevel::Error);
         assert_eq!(level.to_string(), "error");
@@ -98,30 +100,40 @@ mod tests {
             ("DEBUG", "debug"), // case insensitive
             ("  info  ", "info"), // whitespace trimming
         ] {
-            env::set_var(env_var, input);
+            unsafe {
+                env::set_var(env_var, input);
+            }
             let level = get_driver_log_level(env_var, LogLevel::Fatal);
             assert_eq!(level.to_string(), expected, "Failed for input: {}", input);
         }
 
-        env::remove_var(env_var);
+        unsafe {
+            env::remove_var(env_var);
+        }
     }
 
     #[test]
     #[serial]
     fn test_get_driver_log_level_invalid() {
         let env_var = "DBT_TEST_DRIVER_LOG_LEVEL";
-        env::set_var(env_var, "invalid_level");
+        unsafe {
+            env::set_var(env_var, "invalid_level");
+        }
 
         let level = get_driver_log_level(env_var, LogLevel::Warn);
         assert_eq!(level.to_string(), "warn");
 
-        env::remove_var(env_var);
+        unsafe {
+            env::remove_var(env_var);
+        }
     }
 
     #[test]
     #[serial]
     fn test_snowflake_log_level_default() {
-        env::remove_var(SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV);
+        unsafe {
+            env::remove_var(SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV);
+        }
 
         let level = snowflake_log_level();
         assert_eq!(level.to_string(), "fatal");
@@ -130,22 +142,30 @@ mod tests {
     #[test]
     #[serial]
     fn test_snowflake_log_level_debug() {
-        env::set_var(SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV, "debug");
+        unsafe {
+            env::set_var(SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV, "debug");
+        }
 
         let level = snowflake_log_level();
         assert_eq!(level.to_string(), "debug");
 
-        env::remove_var(SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV);
+        unsafe {
+            env::remove_var(SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV);
+        }
     }
 
     #[test]
     #[serial]
     fn test_snowflake_log_level_info() {
-        env::set_var(SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV, "info");
+        unsafe {
+            env::set_var(SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV, "info");
+        }
 
         let level = snowflake_log_level();
         assert_eq!(level.to_string(), "info");
 
-        env::remove_var(SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV);
+        unsafe {
+            env::remove_var(SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV);
+        }
     }
 }
