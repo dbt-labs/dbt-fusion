@@ -6,6 +6,7 @@ use std::io;
 use dbt_xdbc::{Backend, database};
 
 mod config;
+mod driver_logging;
 
 // Database-specific auth implementations
 mod bigquery;
