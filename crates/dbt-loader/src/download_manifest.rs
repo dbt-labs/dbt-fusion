@@ -173,6 +173,13 @@ pub async fn hydrate_or_download_manifest_from_cloud(
             "".to_string()
         };
 
+        // Add helpful hint for 404 errors when defer-env-id is not set
+        let defer_hint = if status.as_u16() == 404 && dbt_cloud_config.defer_env_id.is_none() {
+            ". If you are using deferral, ensure that 'defer-env-id' is specified in the 'dbt-cloud' section of your dbt_project.yml"
+        } else {
+            ""
+        };
+
         emit_warn_log_message(
             if status.as_u16() == 429 {
                 ErrorCode::RateLimited
@@ -180,8 +187,8 @@ pub async fn hydrate_or_download_manifest_from_cloud(
                 ErrorCode::HttpError
             },
             format!(
-                "Failed to request deferral manifest from the dbt platform for project {}, continuing without deferral. HTTP status {}{}",
-                project_id, status, error_message
+                "Failed to request deferral manifest from the dbt platform for project {}, continuing without deferral. HTTP status {}{}{}",
+                project_id, status, error_message, defer_hint
             ),
             io.status_reporter.as_ref(),
         );
