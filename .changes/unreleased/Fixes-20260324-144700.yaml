@@ -1,0 +1,7 @@
+kind: Fixes
+body: Improve error message for deferral manifest 404 errors to suggest checking defer-env-id configuration
+time: 2026-03-24T14:47:00.000000000Z
+custom:
+    author: cursoragent
+    issue: "1123"
+    project: dbt-fusion
