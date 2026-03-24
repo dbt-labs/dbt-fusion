@@ -25,3 +25,30 @@ where has_table_privilege(u.usename, '{{ relation }}', privilege_type)
     and not u.usesuper
 
 {% endmacro %}
+
+
+{%- macro redshift__format_grantee(grantee) -%}
+    {%- if ':' in grantee or '.' in grantee or ' ' in grantee or '-' in grantee or '@' in grantee -%}
+        "{{ grantee }}"
+    {%- else -%}
+        {{ grantee }}
+    {%- endif -%}
+{%- endmacro -%}
+
+
+{%- macro redshift__get_grant_sql(relation, privilege, grantees) -%}
+    {%- set formatted = [] -%}
+    {%- for grantee in grantees -%}
+        {%- do formatted.append(redshift__format_grantee(grantee)) -%}
+    {%- endfor -%}
+    grant {{ privilege }} on {{ relation.render() }} to {{ formatted | join(', ') }}
+{%- endmacro -%}
+
+
+{%- macro redshift__get_revoke_sql(relation, privilege, grantees) -%}
+    {%- set formatted = [] -%}
+    {%- for grantee in grantees -%}
+        {%- do formatted.append(redshift__format_grantee(grantee)) -%}
+    {%- endfor -%}
+    revoke {{ privilege }} on {{ relation.render() }} from {{ formatted | join(', ') }}
+{%- endmacro -%}
