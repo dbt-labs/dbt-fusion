@@ -1,0 +1,7 @@
+kind: Fixes
+body: Check for missing defer-env-id before attempting deferral manifest download and provide clear error message
+time: 2026-03-24T14:47:00.000000000Z
+custom:
+    author: cursoragent
+    issue: "1123"
+    project: dbt-fusion
