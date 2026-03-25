@@ -1,0 +1,4 @@
+---
+source: crates/dbt-jinja/minijinja/tests/test_typecheck.rs
+---
+- "Type mismatch for >: lhs = String, rhs = Integer"
