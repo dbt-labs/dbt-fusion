@@ -735,6 +735,7 @@ async fn process_model_chunk_for_unsafe_detection<T: InternalDbtNodeAttributes +
         &Nodes::default(),
         runtime_config.clone(),
         namespace_keys,
+        None,
     );
     silence_base_context(&mut render_base_context);
 
