@@ -1,10 +1,7 @@
+use crate::record_batch_utils::array_first_value_as_i64;
 use crate::AdapterType;
 
-use arrow::array::{
-    Array, Decimal128Array, Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, UInt8Array,
-    UInt16Array, UInt32Array, UInt64Array,
-};
-use arrow::datatypes::DataType;
+use arrow::array::RecordBatch;
 use dbt_agate::AgateTable;
 use minijinja::listener::RenderingEventListener;
 use minijinja::value::{Enumerator, Object};
@@ -50,74 +47,38 @@ impl AdapterResponse {
             return 0;
         }
         if adapter_type == AdapterType::Snowflake {
-            let inserted = Self::first_i64(batch, "number of rows inserted");
-            let updated = Self::first_i64(batch, "number of rows updated");
-            let deleted = Self::first_i64(batch, "number of rows deleted");
-            if inserted.is_some() || updated.is_some() || deleted.is_some() {
-                return inserted.unwrap_or(0) + updated.unwrap_or(0) + deleted.unwrap_or(0);
+            let values: Vec<_> = Self::SNOWFLAKE_DML_COLUMNS
+                .iter()
+                .map(|col| Self::first_i64(batch, col))
+                .collect();
+            if values.iter().any(Option::is_some) {
+                return values.into_iter().map(|v| v.unwrap_or(0)).sum();
             }
         }
         batch.num_rows() as i64
     }
 
     /// Read the first row of a named numeric column as i64, or None if
-    /// missing/null. Handles Int8–64, UInt8–64, and Decimal128(_, 0) to
-    /// account for Snowflake ADBC returning Decimal128(38, 0) when
-    /// USE_HIGH_PRECISION is enabled.
+    /// missing/null. Delegates to [`array_first_value_as_i64`] which handles
+    /// Int8–64, UInt8–64, and Decimal128(_, 0) to account for Snowflake ADBC
+    /// returning Decimal128(38, 0) when USE_HIGH_PRECISION is enabled.
     fn first_i64(batch: &RecordBatch, column_name: &str) -> Option<i64> {
         let schema = batch.schema();
         let idx = schema.index_of(column_name).ok()?;
-        let col = batch.column(idx);
-        if col.is_empty() || col.is_null(0) {
-            return None;
-        }
-        match schema.field(idx).data_type() {
-            DataType::Int8 => col
-                .as_any()
-                .downcast_ref::<Int8Array>()
-                .map(|a| a.value(0) as i64),
-            DataType::Int16 => col
-                .as_any()
-                .downcast_ref::<Int16Array>()
-                .map(|a| a.value(0) as i64),
-            DataType::Int32 => col
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .map(|a| a.value(0) as i64),
-            DataType::Int64 => col
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .map(|a| a.value(0)),
-            DataType::UInt8 => col
-                .as_any()
-                .downcast_ref::<UInt8Array>()
-                .map(|a| a.value(0) as i64),
-            DataType::UInt16 => col
-                .as_any()
-                .downcast_ref::<UInt16Array>()
-                .map(|a| a.value(0) as i64),
-            DataType::UInt32 => col
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .map(|a| a.value(0) as i64),
-            DataType::UInt64 => col
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .map(|a| a.value(0) as i64),
-            DataType::Decimal128(_, 0) => col
-                .as_any()
-                .downcast_ref::<Decimal128Array>()
-                .map(|a| a.value(0) as i64),
-            _ => None,
-        }
+        array_first_value_as_i64(batch.column(idx).as_ref(), schema.field(idx).data_type())
     }
+
+    /// Column names that Snowflake returns for DML result metadata.
+    const SNOWFLAKE_DML_COLUMNS: &'static [&'static str] = &[
+        "number of rows inserted",
+        "number of rows updated",
+        "number of rows deleted",
+    ];
 
     /// Returns true if the schema contains DML metadata columns that should
     /// be drained even when `fetch=false`. Keeps detection logic co-located
-    /// with the parsing in `rows_affected`.
-    ///
-    /// NOTE: Snowflake COPY INTO returns "number of rows loaded" which is
-    /// detected here but not yet summed in `rows_affected`.
+    /// with the parsing in `rows_affected` — only the columns that are
+    /// actually summed are matched here.
     pub fn schema_has_dml_metadata(
         schema: &arrow::datatypes::Schema,
         adapter_type: AdapterType,
@@ -126,7 +87,7 @@ impl AdapterResponse {
             AdapterType::Snowflake => schema
                 .fields()
                 .iter()
-                .any(|f| f.name().starts_with("number of rows ")),
+                .any(|f| Self::SNOWFLAKE_DML_COLUMNS.contains(&f.name().as_str())),
             _ => false,
         }
     }

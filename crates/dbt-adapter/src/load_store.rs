@@ -144,7 +144,6 @@ impl ResultStore {
                 code: code.unwrap_or_default(),
                 rows_affected,
                 query_id: None,
-                ..Default::default()
             };
             // Call store_result directly instead of using function
             let mut results = store.results.lock().unwrap();

@@ -476,7 +476,6 @@ impl ConcreteAdapter {
                 code: sql.to_string(),
                 rows_affected: 1,
                 query_id: None,
-                ..Default::default()
             };
 
             let schema = Arc::new(Schema::new(vec![Field::new(
