@@ -34,6 +34,7 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 dbt-test-primitives = { workspace = true }
+serial_test = { workspace = true }
 tempfile = { workspace = true }
 
 [lib]
