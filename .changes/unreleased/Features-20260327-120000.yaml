@@ -1,5 +1,5 @@
-kind: Fixes
-body: '[dbt-fusion] populate adapter_response with DML metadata from warehouse results (#1437)'
+kind: Features
+body: '[dbt-fusion] compute rows_affected from Snowflake DML result metadata (#1437)'
 time: 2026-03-27T12:00:00.000000000-04:00
 custom:
     author: rmankad
