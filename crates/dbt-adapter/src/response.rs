@@ -1,6 +1,10 @@
 use crate::AdapterType;
 
-use arrow::array::{Array, Int64Array, RecordBatch};
+use arrow::array::{
+    Array, Decimal128Array, Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
+};
+use arrow::datatypes::DataType;
 use dbt_agate::AgateTable;
 use minijinja::listener::RenderingEventListener;
 use minijinja::value::{Enumerator, Object};
@@ -56,23 +60,73 @@ impl AdapterResponse {
         batch.num_rows() as i64
     }
 
-    /// Read the first row of a named Int64 column, or None if missing/null.
+    /// Read the first row of a named numeric column as i64, or None if
+    /// missing/null. Handles Int8–64, UInt8–64, and Decimal128(_, 0) to
+    /// account for Snowflake ADBC returning Decimal128(38, 0) when
+    /// USE_HIGH_PRECISION is enabled.
     fn first_i64(batch: &RecordBatch, column_name: &str) -> Option<i64> {
-        let col = batch.column_by_name(column_name)?;
+        let schema = batch.schema();
+        let idx = schema.index_of(column_name).ok()?;
+        let col = batch.column(idx);
         if col.is_empty() || col.is_null(0) {
             return None;
         }
-        col.as_any().downcast_ref::<Int64Array>().map(|a| a.value(0))
+        match schema.field(idx).data_type() {
+            DataType::Int8 => col
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .map(|a| a.value(0) as i64),
+            DataType::Int16 => col
+                .as_any()
+                .downcast_ref::<Int16Array>()
+                .map(|a| a.value(0) as i64),
+            DataType::Int32 => col
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .map(|a| a.value(0) as i64),
+            DataType::Int64 => col
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .map(|a| a.value(0)),
+            DataType::UInt8 => col
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .map(|a| a.value(0) as i64),
+            DataType::UInt16 => col
+                .as_any()
+                .downcast_ref::<UInt16Array>()
+                .map(|a| a.value(0) as i64),
+            DataType::UInt32 => col
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .map(|a| a.value(0) as i64),
+            DataType::UInt64 => col
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .map(|a| a.value(0) as i64),
+            DataType::Decimal128(_, 0) => col
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .map(|a| a.value(0) as i64),
+            _ => None,
+        }
     }
 
     /// Returns true if the schema contains DML metadata columns that should
     /// be drained even when `fetch=false`. Keeps detection logic co-located
     /// with the parsing in `rows_affected`.
-    pub fn schema_has_dml_metadata(schema: &arrow::datatypes::Schema, adapter_type: AdapterType) -> bool {
+    ///
+    /// NOTE: Snowflake COPY INTO returns "number of rows loaded" which is
+    /// detected here but not yet summed in `rows_affected`.
+    pub fn schema_has_dml_metadata(
+        schema: &arrow::datatypes::Schema,
+        adapter_type: AdapterType,
+    ) -> bool {
         match adapter_type {
-            AdapterType::Snowflake => schema.fields().iter().any(|f| {
-                f.name().to_lowercase().starts_with("number of rows ")
-            }),
+            AdapterType::Snowflake => schema
+                .fields()
+                .iter()
+                .any(|f| f.name().starts_with("number of rows ")),
             _ => false,
         }
     }
@@ -216,7 +270,7 @@ impl Object for ResultObject {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::Int64Array;
+    use arrow::array::{Decimal128Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
 
     #[test]
@@ -245,6 +299,94 @@ mod tests {
     }
 
     #[test]
+    fn test_snowflake_merge_decimal128_high_precision() {
+        // Snowflake ADBC returns Decimal128(38, 0) when USE_HIGH_PRECISION is enabled
+        let schema = Schema::new(vec![
+            Field::new(
+                "number of rows inserted",
+                DataType::Decimal128(38, 0),
+                false,
+            ),
+            Field::new("number of rows updated", DataType::Decimal128(38, 0), false),
+            Field::new("number of rows deleted", DataType::Decimal128(38, 0), false),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(
+                    Decimal128Array::from(vec![200])
+                        .with_precision_and_scale(38, 0)
+                        .unwrap(),
+                ),
+                Arc::new(
+                    Decimal128Array::from(vec![75])
+                        .with_precision_and_scale(38, 0)
+                        .unwrap(),
+                ),
+                Arc::new(
+                    Decimal128Array::from(vec![25])
+                        .with_precision_and_scale(38, 0)
+                        .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+        let resp = AdapterResponse::new(&batch, AdapterType::Snowflake);
+        assert_eq!(resp.rows_affected, 300);
+        assert_eq!(resp.message, "SUCCESS 300");
+    }
+
+    #[test]
+    fn test_snowflake_insert_only_partial_dml_columns() {
+        // INSERT...SELECT returns only "number of rows inserted"
+        let schema = Schema::new(vec![Field::new(
+            "number of rows inserted",
+            DataType::Int64,
+            false,
+        )]);
+        let batch =
+            RecordBatch::try_new(Arc::new(schema), vec![Arc::new(Int64Array::from(vec![42]))])
+                .unwrap();
+        let resp = AdapterResponse::new(&batch, AdapterType::Snowflake);
+        assert_eq!(resp.rows_affected, 42);
+        assert_eq!(resp.message, "SUCCESS 42");
+    }
+
+    #[test]
+    fn test_snowflake_empty_batch_returns_zero() {
+        let schema = Schema::new(vec![
+            Field::new("number of rows inserted", DataType::Int64, false),
+            Field::new("number of rows updated", DataType::Int64, false),
+            Field::new("number of rows deleted", DataType::Int64, false),
+        ]);
+        let batch = RecordBatch::new_empty(Arc::new(schema));
+        let resp = AdapterResponse::new(&batch, AdapterType::Snowflake);
+        assert_eq!(resp.rows_affected, 0);
+        assert_eq!(resp.message, "SUCCESS 0");
+    }
+
+    #[test]
+    fn test_snowflake_null_dml_values_treated_as_zero() {
+        let schema = Schema::new(vec![
+            Field::new("number of rows inserted", DataType::Int64, true),
+            Field::new("number of rows updated", DataType::Int64, true),
+            Field::new("number of rows deleted", DataType::Int64, true),
+        ]);
+        // inserted = 50, updated = NULL, deleted = NULL
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int64Array::from(vec![Some(50)])),
+                Arc::new(Int64Array::from(vec![None])),
+                Arc::new(Int64Array::from(vec![None])),
+            ],
+        )
+        .unwrap();
+        let resp = AdapterResponse::new(&batch, AdapterType::Snowflake);
+        assert_eq!(resp.rows_affected, 50);
+    }
+
+    #[test]
     fn test_snowflake_select_uses_num_rows() {
         let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
         let batch = RecordBatch::try_new(
@@ -256,15 +398,26 @@ mod tests {
         assert_eq!(resp.rows_affected, 3);
 
         // DML metadata detection returns false for non-DML schemas
-        assert!(!AdapterResponse::schema_has_dml_metadata(&schema, AdapterType::Snowflake));
+        assert!(!AdapterResponse::schema_has_dml_metadata(
+            &schema,
+            AdapterType::Snowflake
+        ));
     }
 
     #[test]
     fn test_schema_has_dml_metadata() {
-        let dml_schema = Schema::new(vec![
-            Field::new("number of rows inserted", DataType::Int64, false),
-        ]);
-        assert!(AdapterResponse::schema_has_dml_metadata(&dml_schema, AdapterType::Snowflake));
-        assert!(!AdapterResponse::schema_has_dml_metadata(&dml_schema, AdapterType::Bigquery));
+        let dml_schema = Schema::new(vec![Field::new(
+            "number of rows inserted",
+            DataType::Int64,
+            false,
+        )]);
+        assert!(AdapterResponse::schema_has_dml_metadata(
+            &dml_schema,
+            AdapterType::Snowflake
+        ));
+        assert!(!AdapterResponse::schema_has_dml_metadata(
+            &dml_schema,
+            AdapterType::Bigquery
+        ));
     }
 }
