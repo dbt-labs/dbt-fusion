@@ -3,10 +3,12 @@ use crate::AdapterType;
 
 use arrow::array::RecordBatch;
 use dbt_agate::AgateTable;
+use dbt_yaml::Value as YmlValue;
 use minijinja::listener::RenderingEventListener;
 use minijinja::value::{Enumerator, Object};
 use minijinja::{State, Value};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -90,6 +92,28 @@ impl AdapterResponse {
                 .any(|f| Self::SNOWFLAKE_DML_COLUMNS.contains(&f.name().as_str())),
             _ => false,
         }
+    }
+
+    /// Convert to the `BTreeMap<String, YmlValue>` format expected by
+    /// `ContextRunResult.adapter_response` / `RunResultOutput.adapter_response`.
+    ///
+    /// Keys match dbt-core's serialisation: `_message` (not `message`),
+    /// `code`, `rows_affected`, and optionally `query_id`.
+    pub fn to_adapter_response_map(&self) -> BTreeMap<String, YmlValue> {
+        let mut map = BTreeMap::new();
+        map.insert(
+            "_message".to_string(),
+            YmlValue::string(self.message.clone()),
+        );
+        map.insert("code".to_string(), YmlValue::string(self.code.clone()));
+        map.insert(
+            "rows_affected".to_string(),
+            dbt_yaml::to_value(self.rows_affected).expect("i64 serialises to YAML"),
+        );
+        if let Some(qid) = &self.query_id {
+            map.insert("query_id".to_string(), YmlValue::string(qid.clone()));
+        }
+        map
     }
 
     /// Get the code for the response from the batch.
@@ -380,5 +404,49 @@ mod tests {
             &dml_schema,
             AdapterType::Bigquery
         ));
+    }
+
+    #[test]
+    fn test_to_adapter_response_map_matches_core_format() {
+        let resp = AdapterResponse {
+            message: "SUCCESS 42".to_string(),
+            code: "SUCCESS".to_string(),
+            rows_affected: 42,
+            query_id: Some("01c2f954-abc".to_string()),
+        };
+        let map = resp.to_adapter_response_map();
+
+        // Core uses `_message`, not `message`
+        assert_eq!(
+            map.get("_message").and_then(|v| v.as_str()),
+            Some("SUCCESS 42")
+        );
+        assert_eq!(
+            map.get("code").and_then(|v| v.as_str()),
+            Some("SUCCESS")
+        );
+        assert_eq!(
+            map.get("rows_affected").and_then(|v| v.as_i64()),
+            Some(42)
+        );
+        assert_eq!(
+            map.get("query_id").and_then(|v| v.as_str()),
+            Some("01c2f954-abc")
+        );
+        // `message` key should NOT be present (Core uses `_message`)
+        assert!(map.get("message").is_none());
+    }
+
+    #[test]
+    fn test_to_adapter_response_map_omits_null_query_id() {
+        let resp = AdapterResponse {
+            message: "SUCCESS 0".to_string(),
+            code: "SUCCESS".to_string(),
+            rows_affected: 0,
+            query_id: None,
+        };
+        let map = resp.to_adapter_response_map();
+        assert!(map.get("query_id").is_none());
+        assert_eq!(map.len(), 3); // _message, code, rows_affected
     }
 }
