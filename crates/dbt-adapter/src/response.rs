@@ -71,7 +71,7 @@ impl AdapterResponse {
     }
 
     /// Column names that Snowflake returns for DML result metadata.
-    const SNOWFLAKE_DML_COLUMNS: &'static [&'static str] = &[
+    const SNOWFLAKE_DML_COLUMNS: &[&str] = &[
         "number of rows inserted",
         "number of rows updated",
         "number of rows deleted",
@@ -404,6 +404,19 @@ mod tests {
             &dml_schema,
             AdapterType::Bigquery
         ));
+    }
+
+    #[test]
+    fn test_first_i64_missing_column_returns_none() {
+        // Schema has no DML columns — first_i64 should return None for each
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(Int64Array::from(vec![99]))],
+        )
+        .unwrap();
+        assert!(AdapterResponse::first_i64(&batch, "number of rows inserted").is_none());
+        assert!(AdapterResponse::first_i64(&batch, "nonexistent").is_none());
     }
 
     #[test]

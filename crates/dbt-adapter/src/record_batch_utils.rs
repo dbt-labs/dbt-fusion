@@ -54,11 +54,11 @@ pub fn array_first_value_as_i64(column: &dyn Array, data_type: &DataType) -> Opt
         DataType::UInt64 => column
             .as_any()
             .downcast_ref::<UInt64Array>()
-            .map(|arr| arr.value(0) as i64),
+            .and_then(|arr| i64::try_from(arr.value(0)).ok()),
         DataType::Decimal128(_, 0) => column
             .as_any()
             .downcast_ref::<Decimal128Array>()
-            .map(|arr| arr.value(0) as i64),
+            .and_then(|arr| i64::try_from(arr.value(0)).ok()),
         _ => {
             debug_assert!(
                 false,
