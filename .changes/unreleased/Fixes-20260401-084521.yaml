@@ -1,0 +1,7 @@
+kind: Fixes
+body: Force quoting for non-ASCII column names in generic tests to prevent ANTLR lexer parse errors
+time: 2026-04-01T08:45:21.647675+09:00
+custom:
+    author: Benjamin0313
+    issue: "1527"
+    project: dbt-fusion
