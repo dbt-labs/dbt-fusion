@@ -1216,7 +1216,10 @@ pub fn _normalize_quote(quoting: bool, adapter_type: AdapterType, name: &str) ->
     if (quoted && !quoting) && !name.is_empty() {
         (name[1..name.len() - 1].to_string(), true)
     } else {
-        (name.to_string(), quoting)
+        // Force quoting for names containing non-ASCII characters, as ANTLR-generated
+        // SQL lexers only accept ASCII characters in unquoted identifiers.
+        let needs_quote = quoting || name.chars().any(|c| !c.is_ascii());
+        (name.to_string(), needs_quote)
     }
 }
 
@@ -1690,6 +1693,23 @@ mod tests {
             r#""GROUP""#,
         );
     }
+    #[test]
+    fn test_non_ascii_column_name_forces_quoting_snowflake() {
+        // Non-ASCII column names must be quoted for ANTLR lexers
+        helper(AdapterType::Snowflake, false, "名前", true, "名前");
+    }
+
+    #[test]
+    fn test_non_ascii_column_name_already_quoted_snowflake() {
+        // Already quoted non-ASCII names should stay quoted
+        helper(AdapterType::Snowflake, true, "名前", true, "名前");
+    }
+
+    #[test]
+    fn test_non_ascii_column_name_forces_quoting_postgres() {
+        helper(AdapterType::Postgres, false, "名前", true, "名前");
+    }
+
     fn helper(
         adapter_type: AdapterType,
         quoting: bool,
