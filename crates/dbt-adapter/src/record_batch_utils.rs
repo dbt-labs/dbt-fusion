@@ -11,15 +11,14 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 
-pub fn extract_first_value_as_i64(batch: &RecordBatch) -> Option<i64> {
-    let column = batch.columns().first()?;
-    let field = batch.schema_ref().fields().first()?;
-
+/// Downcast the first element of an Arrow array to i64.
+/// Handles Bool, Int8–64, UInt8–64, and Decimal128(_, 0).
+/// Returns `None` for empty/null arrays or unsupported types.
+pub fn array_first_value_as_i64(column: &dyn Array, data_type: &DataType) -> Option<i64> {
     if column.is_empty() || column.is_null(0) {
         return None;
     }
-
-    match field.data_type() {
+    match data_type {
         DataType::Boolean => column
             .as_any()
             .downcast_ref::<arrow::array::BooleanArray>()
@@ -55,20 +54,26 @@ pub fn extract_first_value_as_i64(batch: &RecordBatch) -> Option<i64> {
         DataType::UInt64 => column
             .as_any()
             .downcast_ref::<UInt64Array>()
-            .map(|arr| arr.value(0) as i64),
+            .and_then(|arr| i64::try_from(arr.value(0)).ok()),
         DataType::Decimal128(_, 0) => column
             .as_any()
             .downcast_ref::<Decimal128Array>()
-            .map(|arr| arr.value(0) as i64),
+            .and_then(|arr| i64::try_from(arr.value(0)).ok()),
         _ => {
             debug_assert!(
                 false,
-                "extract_first_value_as_i64: unsupported data type {:?}",
-                field.data_type()
+                "array_first_value_as_i64: unsupported data type {:?}",
+                data_type
             );
             None
         }
     }
+}
+
+pub fn extract_first_value_as_i64(batch: &RecordBatch) -> Option<i64> {
+    let column = batch.columns().first()?;
+    let field = batch.schema_ref().fields().first()?;
+    array_first_value_as_i64(column.as_ref(), field.data_type())
 }
 
 pub fn column_by_name<'a>(batch: &'a RecordBatch, name: &str) -> AdapterResult<&'a Arc<dyn Array>> {
