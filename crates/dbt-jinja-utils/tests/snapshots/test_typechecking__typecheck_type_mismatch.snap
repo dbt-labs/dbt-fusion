@@ -1,0 +1,9 @@
+---
+source: crates/dbt-jinja-utils/tests/test_typechecking.rs
+expression: snapshot
+---
+warnings:
+  - line: 1
+    col: 1
+    file: test.jinja
+    message: "Type mismatch for +: lhs = String(abc), rhs = Integer(123)"
