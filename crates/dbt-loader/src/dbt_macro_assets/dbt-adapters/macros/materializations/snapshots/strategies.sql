@@ -14,12 +14,14 @@
     {% set package_context = context %}
   {% elif package_name in context %}
     {% set package_context = context[package_name] %}
-  {% else %}
-    {% set error_msg %}
-        Could not find package '{{package_name}}', called with '{{original_name}}'
-    {% endset %}
-    {{ exceptions.raise_compiler_error(error_msg | trim) }}
-  {% endif %}
+ {% else %}
+    {% set error_msg =
+        "Unable to find package '" ~ package_name ~
+        "', called with '" ~ original_name ~ "'.\n\n" ~
+        "Upgrade to the latest version of the package from the package hub."
+    %}
+    {{ exceptions.raise_compiler_error(error_msg) }}
+{% endif %}
 
   {%- set search_name = 'snapshot_' ~ name ~ '_strategy' -%}
 
