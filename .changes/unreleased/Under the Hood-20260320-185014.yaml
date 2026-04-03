@@ -1,0 +1,7 @@
+kind: Under the Hood
+body: '`build_compile_and_run_base_context`, `extend_base_context_stateful_fn`, and `build_run_node_context` now accept an `Option<ResultStore>` parameter so callers can inject a shared store instead of allocating a private one'
+time: 2026-03-20T18:50:14.799749+01:00
+custom:
+    author: thejens
+    issue: "1291"
+    project: dbt-fusion
