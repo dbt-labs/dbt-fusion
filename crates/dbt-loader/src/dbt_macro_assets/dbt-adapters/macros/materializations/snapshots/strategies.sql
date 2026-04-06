@@ -18,7 +18,7 @@
     {% set error_msg =
         "Unable to find package '" ~ package_name ~
         "', called with '" ~ original_name ~ "'.\n\n" ~
-        "Upgrade to the latest version of the package from the package hub."
+        "Upgrade to the latest version of this package from the package hub."
     %}
     {{ exceptions.raise_compiler_error(error_msg) }}
 {% endif %}
