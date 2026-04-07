@@ -177,6 +177,7 @@ impl TrieNode {
 
 /// Example:
 ///
+/// ```text
 ///     columns: {
 ///         "a": {"name": "a", "data_type": "string", "description": ...},
 ///         "b.nested": {"name": "b.nested", "data_type": "string"},
@@ -184,8 +185,9 @@ impl TrieNode {
 ///     }
 ///     returns: {
 ///         "a": {"name": "a", "data_type": "string"},
-///         "b": {"name": "b": "data_type": "struct<nested string, nested2 string>}
+///         "b": {"name": "b", "data_type": "struct<nested string, nested2 string>"}
 ///     }
+/// ```
 ///
 /// arbitrarily nested struct/array types are allowed, for more details check out the
 /// tests/data/nest_column_data_types example
