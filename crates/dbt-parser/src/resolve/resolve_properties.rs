@@ -60,6 +60,7 @@ impl MinimalProperties {
         jinja_env: &JinjaEnv,
         properties_path: &Path,
         base_ctx: &BTreeMap<String, MinijinjaValue>,
+        macro_properties_ctx: &BTreeMap<String, MinijinjaValue>,
     ) -> FsResult<()> {
         // TODO: This is a bit repetetive. Can be shortened!
         if let Some(models) = other.models {
@@ -545,9 +546,9 @@ impl MinimalProperties {
                     macro_value.clone(),
                     false,
                     jinja_env,
-                    base_ctx,
+                    macro_properties_ctx,
                     &[],
-                    dependency_package_name_from_ctx(jinja_env, base_ctx),
+                    dependency_package_name_from_ctx(jinja_env, macro_properties_ctx),
                     true,
                 )?;
                 if let Some(existing_macro) = self.macros.get_mut(&macro_props.name) {
@@ -597,6 +598,7 @@ pub fn resolve_minimal_properties(
     root_package_name: &str,
     jinja_env: &JinjaEnv,
     base_ctx: &BTreeMap<String, MinijinjaValue>,
+    macro_properties_ctx: &BTreeMap<String, MinijinjaValue>,
     token: &CancellationToken,
 ) -> FsResult<MinimalProperties> {
     let mut minimal_resolved_properties = MinimalProperties {
@@ -646,6 +648,7 @@ pub fn resolve_minimal_properties(
                         jinja_env,
                         properties_path,
                         base_ctx,
+                        macro_properties_ctx,
                     )?;
 
                     if !minimal_resolved_properties.semantic_layer_spec_is_legacy

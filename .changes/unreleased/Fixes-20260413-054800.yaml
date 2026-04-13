@@ -1,0 +1,7 @@
+kind: Fixes
+body: "[dbt-fusion] Use restricted Jinja context for macro property resolution to match dbt Core behavior (#1576)"
+time: 2026-04-13T05:48:00.000000+00:00
+custom:
+    author: yxshwanth
+    issue: "1576"
+    project: dbt-fusion

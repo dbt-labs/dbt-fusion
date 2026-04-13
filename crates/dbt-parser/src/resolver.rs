@@ -15,7 +15,7 @@ use dbt_jinja_utils::listener::JinjaTypeCheckingEventListenerFactory;
 use dbt_jinja_utils::node_resolver::{
     NodeResolver, check_for_model_deprecations, resolve_dependencies,
 };
-use dbt_jinja_utils::phases::parse::build_resolve_context;
+use dbt_jinja_utils::phases::parse::{build_macro_properties_resolve_context, build_resolve_context};
 use dbt_jinja_utils::phases::parse::init::initialize_parse_jinja_environment;
 use dbt_jinja_utils::serde::{into_typed_with_error, into_typed_with_jinja};
 use dbt_jinja_utils::utils::dependency_package_name_from_ctx;
@@ -275,17 +275,11 @@ pub async fn resolve(
             .iter()
             .find(|p| p.dbt_project.name == package_name);
         if let Some(package) = package {
-            let namespace_keys: Vec<String> = jinja_env
-                .env
-                .get_macro_namespace_registry()
-                .map(|r| r.keys().map(|k| k.to_string()).collect())
-                .unwrap_or_default();
-            let base_ctx = build_resolve_context(
+            let macro_properties_ctx = build_macro_properties_resolve_context(
                 root_project_name,
                 package.dbt_project.name.as_str(),
                 &macros.docs_macros,
                 DISPATCH_CONFIG.get().unwrap().read().unwrap().clone(),
-                namespace_keys,
             );
             apply_macro_patches(
                 &arg.io,
@@ -293,7 +287,7 @@ pub async fn resolve(
                 &macro_properties,
                 &package_name,
                 &jinja_env,
-                &base_ctx,
+                &macro_properties_ctx,
                 validate_macro_args,
             )?;
         }
@@ -568,6 +562,12 @@ pub async fn resolve_inner(
         DISPATCH_CONFIG.get().unwrap().read().unwrap().clone(),
         namespace_keys,
     );
+    let macro_properties_ctx = build_macro_properties_resolve_context(
+        root_package_name,
+        package.dbt_project.name.as_str(),
+        &macros.docs_macros,
+        DISPATCH_CONFIG.get().unwrap().read().unwrap().clone(),
+    );
     // Resolve the dbt properties (schema.yml) files
     let mut min_properties = resolve_minimal_properties(
         arg,
@@ -575,6 +575,7 @@ pub async fn resolve_inner(
         root_package_name,
         &jinja_env,
         &base_ctx,
+        &macro_properties_ctx,
         token,
     )?;
 
