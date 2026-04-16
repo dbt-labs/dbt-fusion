@@ -63,12 +63,16 @@ impl Object for DummyConfig {
 }
 
 /// Configure the Jinja environment for the compile phase.
+///
+/// Pass `Some(store)` to share a `ResultStore` with the context; `None` creates
+/// a private default store.
 pub fn build_compile_and_run_base_context(
     node_resolver: Arc<dyn NodeResolverTracker>,
     package_name: &str,
     nodes: &Nodes,
     runtime_config: Arc<DbtRuntimeConfig>,
     namespace_keys: Vec<String>,
+    result_store: Option<ResultStore>,
 ) -> BTreeMap<String, MinijinjaValue> {
     let mut ctx = BTreeMap::new();
     let config = DummyConfig {};
@@ -162,7 +166,7 @@ pub fn build_compile_and_run_base_context(
         "graph".to_string(),
         MinijinjaValue::from_object(LazyFlatGraph::new(nodes)),
     );
-    let result_store = ResultStore::default();
+    let result_store = result_store.unwrap_or_default();
     ctx.insert(
         "store_result".to_owned(),
         MinijinjaValue::from_function(result_store.store_result()),
@@ -1047,9 +1051,56 @@ impl Object for LazyFlatGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dbt_adapter::load_store::ResultStore;
     use dbt_schemas::state::DummyNodeResolverTracker;
     use dbt_test_utils::TestEnvGuard;
+    use minijinja::Environment;
     use std::env;
+
+    fn make_base_context(
+        result_store: Option<ResultStore>,
+    ) -> BTreeMap<String, MinijinjaValue> {
+        let node_resolver = Arc::new(DummyNodeResolverTracker);
+        let nodes = Nodes::default();
+        let runtime_config = Arc::new(DbtRuntimeConfig::default());
+        build_compile_and_run_base_context(
+            node_resolver,
+            "test_pkg",
+            &nodes,
+            runtime_config,
+            vec![],
+            result_store,
+        )
+    }
+
+    fn render_with_ctx(ctx: &BTreeMap<String, MinijinjaValue>, template: &str) -> String {
+        let mut env = Environment::new();
+        for (k, v) in ctx {
+            env.add_global(k.clone(), v.clone());
+        }
+        env.render_str(template, minijinja::Value::UNDEFINED, &[])
+            .expect("render failed")
+    }
+
+    #[test]
+    fn test_result_store_none_creates_private_store() {
+        let ctx = make_base_context(None);
+        assert!(ctx.contains_key("store_result"), "store_result missing from context");
+        assert!(ctx.contains_key("load_result"), "load_result missing from context");
+        let out = render_with_ctx(&ctx, "{{ load_result('k') is none }}");
+        assert_eq!(out, "True");
+    }
+
+    #[test]
+    fn test_result_store_some_shares_store_with_caller() {
+        let store = ResultStore::default();
+        store
+            .store_result()(&[MinijinjaValue::from("sentinel"), MinijinjaValue::from("OK")])
+            .expect("store_result failed");
+        let ctx = make_base_context(Some(store));
+        let out = render_with_ctx(&ctx, "{{ load_result('sentinel') is not none }}");
+        assert_eq!(out, "True");
+    }
 
     #[test]
     fn test_dbt_metadata_envs_populated_from_env() {
@@ -1077,6 +1128,7 @@ mod tests {
             &nodes,
             runtime_config,
             vec![],
+            None,
         );
 
         // Cleanup env to avoid side effects
