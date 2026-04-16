@@ -1,0 +1,13 @@
+---
+source: crates/dbt-jinja-utils/tests/test_typechecking.rs
+expression: snapshot
+---
+warnings:
+  - line: 1
+    col: 7
+    file: test.jinja
+    message: "Potential TypeError: Unknown local variable 'name'"
+  - line: 2
+    col: 9
+    file: test.jinja
+    message: "Potential TypeError: Unknown local variable 'name'"
