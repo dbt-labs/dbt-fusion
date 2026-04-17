@@ -354,6 +354,7 @@ pub fn do_create_relation(
             relation_type,
         )) as Box<dyn BaseRelation>,
         ClickHouse => todo!("ClickHouse"),
+        Exasol => todo!("Exasol"),
         Starburst => todo!("Starburst"),
         Athena => todo!("Athena"),
         Trino => todo!("Trino"),

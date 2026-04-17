@@ -314,6 +314,7 @@ pub fn driver_parameters(backend: Backend) -> (&'static str, DriverTriplet<'stat
         Backend::DuckDB => ("duckdb", DUCKDB_DRIVER_VERSION),
         Backend::SQLServer => ("mssql", MSSQLSERVER_DRIVER_VERSION),
         Backend::ClickHouse
+        | Backend::Exasol
         | Backend::DatabricksODBC
         | Backend::RedshiftODBC
         | Backend::Generic { .. } => {
