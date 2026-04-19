@@ -1081,6 +1081,7 @@ fn expected_type_rendering_for(backend: Backend) -> Vec<(u32, SqlType, &'static 
                 Databricks | DatabricksODBC => dbx,
                 DuckDB => todo!("DuckDB tests not implemented yet"),
                 ClickHouse => todo!("ClickHouse tests not implemented yet"),
+                Exasol => todo!("Exasol tests not implemented yet"),
                 Spark => todo!("Spark tests not implemented yet"),
                 SQLServer => todo!("SQL Server tests not implemented yet"),
                 Generic { .. } => generic,

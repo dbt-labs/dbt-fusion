@@ -12,6 +12,7 @@ mod bigquery;
 mod clickhouse;
 mod databricks;
 mod duckdb;
+mod exasol;
 #[cfg(test)]
 mod flock;
 mod postgres;
@@ -75,6 +76,7 @@ pub fn auth_for_backend(backend: Backend) -> Box<dyn Auth> {
         Backend::DuckDB => Box::new(duckdb::DuckDbAuth {}),
         Backend::SQLServer => Box::new(sqlserver::SQLServerAuth {}),
         Backend::ClickHouse => Box::new(clickhouse::ClickHouseAuth {}),
+        Backend::Exasol => Box::new(exasol::ExasolAuth {}),
         Backend::Generic { .. } => unimplemented!("generic backend authentication"),
     }
 }

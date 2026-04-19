@@ -73,6 +73,8 @@ pub enum Backend {
     SQLServer,
     /// ClickHouse driver implementation (ADBC).
     ClickHouse,
+    /// Exasol driver implementation (ADBC).
+    Exasol,
     /// Databricks driver implementation (ODBC).
     DatabricksODBC,
     /// Redshift driver implementation (ODBC).
@@ -108,6 +110,7 @@ impl fmt::Display for Backend {
             Backend::Spark => write!(f, "Spark"),
             Backend::SQLServer => write!(f, "SQL Server"),
             Backend::ClickHouse => write!(f, "ClickHouse"),
+            Backend::Exasol => write!(f, "Exasol"),
             Backend::Generic { library_name, .. } => write!(f, "Generic({library_name})"),
         }
     }
@@ -127,6 +130,7 @@ impl Backend {
             Backend::SQLServer => Some("adbc_driver_mssql"),
             Backend::DatabricksODBC | Backend::RedshiftODBC => None, // these use ODBC
             Backend::ClickHouse => Some("adbc_clickhouse"),
+            Backend::Exasol => Some("adbc_driver_exasol"),
             Backend::Generic { library_name, .. } => Some(library_name),
         }
     }
@@ -155,6 +159,7 @@ impl Backend {
             | Backend::DuckDB
             | Backend::SQLServer
             | Backend::ClickHouse
+            | Backend::Exasol
             | Backend::Generic { .. } => FFIProtocol::Adbc,
             Backend::DatabricksODBC | Backend::RedshiftODBC => FFIProtocol::Odbc,
         }
@@ -429,7 +434,7 @@ impl AdbcDriver {
                 ));
             }
             // CDN strategy for non-CDN drivers: just fall back to the system strategy.
-            (CdnCache | SystemThenCdnCache | Remote, ClickHouse) => System(None),
+            (CdnCache | SystemThenCdnCache | Remote, ClickHouse | Exasol) => System(None),
             // Generic drivers can only be loaded from a file, so fallback to the System strategy.
             (CdnCache | SystemThenCdnCache | Remote, Generic { library_name, .. }) => {
                 System(Some(library_name.to_string()))
