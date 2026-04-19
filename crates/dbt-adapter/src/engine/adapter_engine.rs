@@ -286,7 +286,14 @@ pub(crate) fn adbc_execute_with_options(
         let reader = stmt.execute()?;
         let schema = reader.schema();
         let mut batches = Vec::with_capacity(1);
-        if !fetch {
+
+        // Even with fetch=false, drain the reader when the result schema
+        // contains DML metadata columns (e.g. Snowflake MERGE/INSERT/UPDATE/DELETE).
+        // This ensures the RecordBatch is available for AdapterResponse and
+        // load_result()['table'] without affecting the query cache.
+        let has_dml_metadata =
+            AdapterResponse::schema_has_dml_metadata(&schema, engine.adapter_type());
+        if !fetch && !has_dml_metadata {
             return Ok((schema, batches));
         }
 
