@@ -34,7 +34,7 @@ jobs:
     steps:
       - uses: actions/github-script@60a0d83039f74a4aee543508d2ffcb1c3799cdea  # actions/github-script@v7
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${ { secrets.GITHUB_TOKEN } }
           script: |
             const issue = context.issue.number;
 
@@ -85,7 +85,7 @@ jobs:
                 '',
                 'This issue has been resolved and the fix is merged, but it has not yet shipped in a release.',
                 '',
-                'Releases typically go out within **~1 week**. We\'ll update this issue with the exact version once it\'s live.',
+                'Releases typically go out within **~1 week**. We\'s update this issue with the exact version once it\'s live.',
                 '',
                 'Subscribe to this issue to get notified when the fix is available.',
               ].join('\n'),
