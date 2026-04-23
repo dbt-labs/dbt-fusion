@@ -104,6 +104,7 @@ impl fmt::Display for TimeZoneDisplay<'_> {
         match (self.1, self.0) {
             // https://clickhouse.com/docs/use-cases/time-series/date-time-data-types#time-series-timezones
             (ClickHouse, Named(name)) => write!(f, "'{name}'")?,
+            (Exasol, Named(name)) => write!(f, "'{name}'")?,
 
             (_, Named(name)) => write!(f, "{name}")?,
         }
@@ -165,6 +166,13 @@ impl TimeZoneSpec {
                 debug_assert!(
                     matches!(self, Without | Unspecified),
                     "BigQuery and ClickHouse do not support time zone suffixes in their type names"
+                );
+                Ok(())
+            }
+            (Exasol, _) => {
+                debug_assert!(
+                    matches!(self, Without | Unspecified),
+                    "Exasol does not support time zone suffixes in type names"
                 );
                 Ok(())
             }
@@ -257,6 +265,7 @@ pub fn default_time_unit(backend: Backend) -> TimeUnit {
         // The adbc_driver_athena is being updated to emit Timestamp_ms to match;
         // see https://github.com/dbt-labs/athena/issues/6
         Athena => Millisecond,
+        Exasol => Millisecond,
         Generic { .. } => Microsecond, // a reasonable default
     }
 }
@@ -766,7 +775,7 @@ impl SqlType {
                     BigQuery | Databricks | DatabricksODBC | Spark | Athena => {
                         write!(out, "STRUCT<")?
                     }
-                    Postgres | Salesforce | DuckDB | ClickHouse => write!(out, "(")?,
+                    Postgres | Salesforce | DuckDB | ClickHouse | Exasol => write!(out, "(")?,
                     // Redshift doesn't support object/struct types
                     Redshift | RedshiftODBC => write!(out, "(")?,
                     SQLServer => unimplemented!("SQL Server does't have a struct type"),
@@ -807,7 +816,7 @@ impl SqlType {
                     BigQuery | Databricks | DatabricksODBC | Spark | Athena => {
                         write!(out, ">")
                     }
-                    Postgres | Salesforce | DuckDB | ClickHouse => write!(out, ")"),
+                    Postgres | Salesforce | DuckDB | ClickHouse | Exasol => write!(out, ")"),
                     Redshift | RedshiftODBC => write!(out, ")"),
                     SQLServer => unimplemented!("SQL Server does't have a struct type"),
                     Generic { .. } => write!(out, ">"),
@@ -1223,6 +1232,10 @@ impl SqlType {
                 // https://clickhouse.com/docs/sql-reference/data-types/decimal#parameters
                 DataType::Decimal128(10, 0)
             }
+            (Exasol, Numeric(None) | BigNumeric(None)) => {
+                // Exasol default: DECIMAL(18, 0)
+                DataType::Decimal128(18, 0)
+            }
             // }}}
 
             // PostgreSQL {{{
@@ -1319,6 +1332,7 @@ impl SqlType {
                     // Athena (Presto/Trino-based) TIME has millisecond precision
                     // https://docs.aws.amazon.com/athena/latest/ug/data-types.html
                     (Athena, None) => TimeUnit::Millisecond,
+                    (Exasol, None) => TimeUnit::Millisecond,
                     (Generic { .. }, None) => {
                         // we pick microseconds as a reasonable default
                         TimeUnit::Microsecond
@@ -1468,6 +1482,7 @@ impl SqlType {
                     BigQuery | Postgres | DuckDB => MonthDayNano, // MonthDayNano is exactly what BQ and PG use internally
                     // FIXME: ClickHouse doesn't actually seem to support Arrow's Interval
                     ClickHouse => MonthDayNano,
+                    Exasol => MonthDayNano,
                     Salesforce => MonthDayNano, // Salesforce seems to follow PostgreSQL
                     SQLServer => MonthDayNano, // SQL Server doesn't appear to have an INTERVAL type
                     // Athena (Presto/Trino-based) uses MonthDayNano as a reasonable default
@@ -1612,6 +1627,7 @@ const DATABRICKS_KEYS: [&str; 2] = ["DBX:type", "type_text"];
 const REDSHIFT_KEYS: [&str; 2] = ["REDSHIFT:type", "type_text"];
 const DUCKDB_KEYS: [&str; 2] = ["DUCKDB:type", "type_text"];
 const CLICKHOUSE_KEYS: [&str; 2] = ["CLICKHOUSE:type", "type_text"];
+const EXASOL_KEYS: [&str; 2] = ["EXASOL:type", "type_text"];
 const SPARK_KEYS: [&str; 2] = ["SPARK:type", "type_text"];
 const SQLSERVER_KEYS: [&str; 2] = ["SQLSERVER:type", "type_text"];
 const GENERIC_KEYS: [&str; 2] = ["SQL:type", "type_text"];
@@ -1632,6 +1648,7 @@ fn metadata_type_candidate_keys(backend: Backend) -> &'static [&'static str] {
         Backend::SQLServer => &SQLSERVER_KEYS, // TODO
         Backend::ClickHouse => &CLICKHOUSE_KEYS,
         Backend::Athena => &ATHENA_KEYS,
+        Backend::Exasol => &EXASOL_KEYS,
         Backend::Generic { .. } => &GENERIC_KEYS,
     }
 }
