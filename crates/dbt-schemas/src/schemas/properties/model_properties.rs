@@ -53,7 +53,6 @@ pub struct ModelProperties {
     pub data_tests: Option<Vec<DataTests>>,
     pub deprecation_date: Option<String>,
     pub description: Option<String>,
-    pub identifier: Option<String>,
     pub latest_version: Option<FloatOrString>,
     pub name: String,
     #[serde(skip_deserializing, default)]
@@ -111,7 +110,6 @@ impl ModelProperties {
             data_tests: None,
             deprecation_date: None,
             description: None,
-            identifier: None,
             latest_version: None,
             static_analysis_off_reason: None,
             tests: None,
