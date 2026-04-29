@@ -6,7 +6,7 @@
 # (fix merged), they need to know it's not live yet — average ~1 week to release.
 
 # **when?**
-# Whenever any issue in dbt-labs/dbt-fusion is closed by a merged PR.
+# Whenever any issue in dbt-labs/dbt-fusion is closed.
 
 name: "Release Tracker: Awaiting Release"
 
@@ -32,42 +32,11 @@ jobs:
       !contains(toJson(github.event.issue.labels.*.name), 'release/released') &&
       !contains(toJson(github.event.issue.labels.*.name), 'release/rolled-back')
     steps:
-      - uses: actions/github-script@60a0d83039f74a4aee543508d2ffcb1c3799cdea  # actions/github-script@v7
+      - uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # actions/github-script@v7
         with:
-          github-token: ${ { secrets.GITHUB_TOKEN } }
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const issue = context.issue.number;
-
-            // Verify the issue was actually closed by a PR (not manually closed).
-            // Uses a targeted GraphQL query — only fetches CLOSED_EVENT items,
-            // so this is a single cheap round-trip with minimal payload.
-            const result = await github.graphql(`
-              query($owner: String!, $repo: String!, $number: Int!) {
-                repository(owner: $owner, name: $repo) {
-                  issue(number: $number) {
-                    timelineItems(last: 5, itemTypes: [CLOSED_EVENT]) {
-                      nodes {
-                        ... on ClosedEvent {
-                          closer { __typename }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            `, {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              number: issue,
-            });
-
-            const closedByPR = result.repository.issue.timelineItems.nodes
-              .some(e => e.closer?.__typename === 'PullRequest');
-
-            if (!closedByPR) {
-              core.notice(`Issue #${issue} was not closed by a PR — skipping`);
-              return;
-            }
 
             await github.rest.issues.addLabels({
               owner: context.repo.owner,
@@ -85,7 +54,7 @@ jobs:
                 '',
                 'This issue has been resolved and the fix is merged, but it has not yet shipped in a release.',
                 '',
-                'Releases typically go out within **~1 week**. We\'s update this issue with the exact version once it\'s live.',
+                'Releases typically go out within **~1 week**. We\'ll update this issue with the exact version once it\'s live.',
                 '',
                 'Subscribe to this issue to get notified when the fix is available.',
               ].join('\n'),
