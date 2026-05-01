@@ -25,7 +25,8 @@ use crate::schemas::semantic_layer::semantic_manifest::SemanticLayerElementConfi
 
 use super::relations::base::ComponentName;
 use super::serde::{
-    StringOrArrayOfStrings, bool_or_string_bool, bool_or_string_bool_default, i64_or_string_i64,
+    StringOrArrayOfStrings, VersionOrVersionList, bool_or_string_bool,
+    bool_or_string_bool_default, i64_or_string_i64,
 };
 
 /// Indicates where schema metadata originates from.
@@ -863,8 +864,8 @@ impl DbtChecksum {
 #[skip_serializing_none]
 #[derive(Deserialize, Serialize, Debug, Clone, DbtSchema)]
 pub struct IncludeExclude {
-    pub exclude: Option<StringOrArrayOfStrings>,
-    pub include: Option<StringOrArrayOfStrings>,
+    pub exclude: Option<VersionOrVersionList>,
+    pub include: Option<VersionOrVersionList>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, DbtSchema, Default)]

@@ -433,6 +433,45 @@ pub enum StringOrMap {
     MapValue(HashMap<String, YmlValue>),
 }
 
+// Number before String so YAML integers (e.g. `2`) match Number, not fail on String
+#[derive(Serialize, UntaggedEnumDeserialize, Debug, Clone, DbtSchema)]
+#[serde(untagged)]
+pub enum VersionIdentifier {
+    Number(f64),
+    String(String),
+}
+
+impl VersionIdentifier {
+    pub fn to_version_string(&self) -> String {
+        match self {
+            VersionIdentifier::Number(n) => {
+                if n.fract() == 0.0 {
+                    (*n as i64).to_string()
+                } else {
+                    n.to_string()
+                }
+            }
+            VersionIdentifier::String(s) => s.clone(),
+        }
+    }
+}
+
+#[derive(Serialize, UntaggedEnumDeserialize, Debug, Clone, DbtSchema)]
+#[serde(untagged)]
+pub enum VersionOrVersionList {
+    Single(VersionIdentifier),
+    List(Vec<VersionIdentifier>),
+}
+
+impl VersionOrVersionList {
+    pub fn to_strings(&self) -> Vec<String> {
+        match self {
+            VersionOrVersionList::Single(v) => vec![v.to_version_string()],
+            VersionOrVersionList::List(vs) => vs.iter().map(|v| v.to_version_string()).collect(),
+        }
+    }
+}
+
 #[derive(Serialize, UntaggedEnumDeserialize, Debug, Clone, DbtSchema)]
 #[serde(untagged)]
 pub enum StringOrArrayOfStrings {
@@ -991,12 +1030,37 @@ impl std::fmt::Display for FloatOrString {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schemas::common::IncludeExclude;
     use dbt_common::serde_utils::Omissible;
 
     #[derive(Serialize, Deserialize)]
     struct TestConfig {
         #[serde(default)]
         grants: OmissibleGrantConfig,
+    }
+
+    #[test]
+    fn test_include_exclude_parses_integer_version() {
+        let yaml = "include:\n  - 2\n  - 3\n";
+        let ie: IncludeExclude = dbt_yaml::from_str(yaml).unwrap();
+        let strings = ie.include.unwrap().to_strings();
+        assert_eq!(strings, vec!["2", "3"]);
+    }
+
+    #[test]
+    fn test_include_exclude_parses_string_version() {
+        let yaml = "include:\n  - \"2\"\n  - \"3\"\n";
+        let ie: IncludeExclude = dbt_yaml::from_str(yaml).unwrap();
+        let strings = ie.include.unwrap().to_strings();
+        assert_eq!(strings, vec!["2", "3"]);
+    }
+
+    #[test]
+    fn test_include_exclude_parses_single_integer_version() {
+        let yaml = "include: 2\n";
+        let ie: IncludeExclude = dbt_yaml::from_str(yaml).unwrap();
+        let strings = ie.include.unwrap().to_strings();
+        assert_eq!(strings, vec!["2"]);
     }
 
     #[test]
