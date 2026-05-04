@@ -201,13 +201,17 @@ fn extend_with_model_context<S: Serialize>(
     base_context.insert("connection_name".to_owned(), MinijinjaValue::from(""));
 }
 
-/// Extend the base context with stateful functions
+/// Extend the base context with stateful functions.
+///
+/// Pass `Some(store)` to share a `ResultStore` with the context; `None` creates
+/// a private default store.
 pub fn extend_base_context_stateful_fn(
     base_context: &mut BTreeMap<String, MinijinjaValue>,
     root_project_name: &str,
     packages: BTreeSet<String>,
+    result_store: Option<ResultStore>,
 ) {
-    let result_store = ResultStore::default();
+    let result_store = result_store.unwrap_or_default();
     base_context.insert(
         "store_result".to_owned(),
         MinijinjaValue::from_function(result_store.store_result()),
@@ -254,10 +258,16 @@ pub fn build_run_node_context<S: Serialize>(
     resource_type: NodeType,
     sql_header: Option<MinijinjaValue>,
     packages: BTreeSet<String>,
+    result_store: Option<ResultStore>,
 ) -> BTreeMap<String, MinijinjaValue> {
     // Build model-specific context
     let mut context = base_context.clone();
-    extend_base_context_stateful_fn(&mut context, &common_attr.package_name, packages);
+    extend_base_context_stateful_fn(
+        &mut context,
+        &common_attr.package_name,
+        packages,
+        result_store,
+    );
 
     extend_with_model_context(
         &mut context,
@@ -571,5 +581,44 @@ fn submit_python_job_context_fn()
             &[parsed_model.clone(), MinijinjaValue::from(compiled_code)],
             &[],
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dbt_adapter::load_store::ResultStore;
+    use minijinja::Environment;
+
+    fn render_with_ctx(ctx: &BTreeMap<String, MinijinjaValue>, template: &str) -> String {
+        let mut env = Environment::new();
+        for (k, v) in ctx {
+            env.add_global(k.clone(), v.clone());
+        }
+        env.render_str(template, minijinja::Value::UNDEFINED, &[])
+            .expect("render failed")
+    }
+
+    #[test]
+    fn test_extend_none_creates_private_store() {
+        let mut ctx = BTreeMap::new();
+        extend_base_context_stateful_fn(&mut ctx, "test_pkg", BTreeSet::new(), None);
+        assert!(ctx.contains_key("store_result"), "store_result missing");
+        assert!(ctx.contains_key("load_result"), "load_result missing");
+        assert!(ctx.contains_key("store_raw_result"), "store_raw_result missing");
+        let out = render_with_ctx(&ctx, "{{ load_result('k') is none }}");
+        assert_eq!(out, "True");
+    }
+
+    #[test]
+    fn test_extend_some_shares_store_with_caller() {
+        let store = ResultStore::default();
+        store
+            .store_result()(&[MinijinjaValue::from("sentinel"), MinijinjaValue::from("OK")])
+            .expect("store_result failed");
+        let mut ctx = BTreeMap::new();
+        extend_base_context_stateful_fn(&mut ctx, "test_pkg", BTreeSet::new(), Some(store));
+        let out = render_with_ctx(&ctx, "{{ load_result('sentinel') is not none }}");
+        assert_eq!(out, "True");
     }
 }
