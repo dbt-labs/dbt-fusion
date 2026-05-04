@@ -174,8 +174,9 @@ fn process_package_file(
             emit_warn_log_message(
                 ErrorCode::InvalidConfig,
                 format!(
-                    "Package dependency '{}' not found in package-lock.yml. Skipping. \
-                     Run 'fs deps --upgrade' with a packages.yml to resolve all dependencies.",
+                    "Package '{}' not found in package lookup map, so skipping this dependency. \
+                    Upgrade to the latest version of packages by running 'dbt deps --upgrade' \
+                    with a packages.yml, which resolves all dependencies.",
                     entry_name
                 ),
                 io_args.status_reporter.as_ref(),
