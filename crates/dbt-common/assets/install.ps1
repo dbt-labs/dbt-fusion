@@ -479,7 +479,12 @@ function Set-DbtAlias {
     )
 
     try {
-        $null = New-Item -ItemType File -Path $PROFILE -Force -ErrorAction SilentlyContinue
+        if (-not (Test-Path $PROFILE)) {
+            Write-GrayLog "Creating PowerShell profile at $PROFILE"
+            $null = New-Item -ItemType File -Path $PROFILE -Force -ErrorAction SilentlyContinue
+        } else {
+            Write-GrayLog "Using existing PowerShell profile at $PROFILE"
+        }
         $aliasCommand = "Set-Alias -Name dbtf -Value '$InstallPath\dbt.exe'"
 
         if (-not (Select-String -Path $PROFILE -Pattern "Set-Alias.*dbtf.*dbt\.exe" -Quiet)) {
@@ -522,7 +527,7 @@ function Show-AsciiArt {
     # This differs from the original install.sh because windows doesn't support ANSI escape codes
     Write-Host @"
 
- =====              =====    DBT  
+ =====              =====    DBT
 =========        =========  FUSION
  ===========    >========   ------
   ======================    ********************************************
@@ -532,9 +537,9 @@ function Show-AsciiArt {
     ========--========      *                                          *
    ====================     *     Run 'dbt --help' to get started      *
   ======================    ********************************************
- ========<   ============   
-=========      ==========   
- =====             =====    
+ ========<   ============
+=========      ==========
+ =====             =====
 
 "@
 }
