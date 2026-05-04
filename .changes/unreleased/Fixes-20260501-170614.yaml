@@ -1,0 +1,7 @@
+kind: Fixes
+body: Add support for integer versions in unit test versions.include/exclude
+time: 2026-05-01T17:06:14.295008-05:00
+custom:
+    author: grahamwetzler
+    issue: ""
+    project: dbt-fusion
