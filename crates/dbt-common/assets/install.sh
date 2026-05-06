@@ -564,7 +564,7 @@ install_package() {
             continue
         }
 
-        log_debug "Installing $f to $dest/$package_name"
+        log_debug "Moving $f to $dest/$package_name"
 
         # Ensure the destination directory exists
         mkdir -p "$dest" || err_and_exit "Error: Failed to create installation directory: $dest"
