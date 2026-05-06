@@ -573,7 +573,9 @@ install_package() {
         # install sets permissions before the file goes live; mv -f atomically
         # replaces any existing binary without a removal gap.
         tmp_bin="$dest/.${package_name}.tmp.$$"
-        install -m 755 "$td/$f" "$tmp_bin" || {
+        install -v -m 755 "$td/$f" "$tmp_bin" 2>&1 | while IFS= read -r line; do
+            log_debug "$line"
+        done || {
             rm -f "$tmp_bin"
             err_and_exit "Error: Failed to stage $package_name binary."
         }
