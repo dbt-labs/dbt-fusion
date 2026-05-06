@@ -575,14 +575,8 @@ install_package() {
         tmp_bin="$dest/.${package_name}.tmp.$$"
         install -v -m 755 "$td/$f" "$tmp_bin" 2>&1 | while IFS= read -r line; do
             log_debug "$line"
-        done || {
-            rm -f "$tmp_bin"
-            err_and_exit "Error: Failed to stage $package_name binary."
-        }
-        mv -f "$tmp_bin" "$dest/$package_name" || {
-            rm -f "$tmp_bin"
-            err_and_exit "Error: Failed to replace $package_name binary."
-        }
+        done || err_and_exit "Error: Failed to stage $package_name binary."
+        mv -f "$tmp_bin" "$dest/$package_name" || err_and_exit "Error: Failed to replace $package_name binary."
         log_debug "Installed $package_name to $dest/$package_name"
     done
 
