@@ -569,19 +569,15 @@ install_package() {
         # Ensure the destination directory exists
         mkdir -p "$dest" || err_and_exit "Error: Failed to create installation directory: $dest"
 
-        # Write to a temp file in the same directory as the destination so the
-        # subsequent mv is atomic (same filesystem). This avoids a window where
-        # the binary is absent (rm then install) or partially written.
+        # Stage into a temp file in the same directory (same filesystem = atomic mv).
+        # install sets permissions before the file goes live; mv -f atomically
+        # replaces any existing binary without a removal gap.
         tmp_bin="$dest/.${package_name}.tmp.$$"
-        cp "$td/$f" "$tmp_bin" || {
+        install -m 755 "$td/$f" "$tmp_bin" || {
             rm -f "$tmp_bin"
-            err_and_exit "Error: Failed to copy $package_name binary to staging path."
+            err_and_exit "Error: Failed to stage $package_name binary."
         }
-        chmod 755 "$tmp_bin" || {
-            rm -f "$tmp_bin"
-            err_and_exit "Error: Failed to set permissions on $package_name binary."
-        }
-        mv "$tmp_bin" "$dest/$package_name" || {
+        mv -f "$tmp_bin" "$dest/$package_name" || {
             rm -f "$tmp_bin"
             err_and_exit "Error: Failed to replace $package_name binary."
         }
