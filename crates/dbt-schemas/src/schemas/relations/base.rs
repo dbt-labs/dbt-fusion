@@ -558,11 +558,11 @@ pub trait BaseRelation: BaseRelationProperties + Any + Send + Sync + fmt::Debug 
             | AdapterType::Salesforce
             | AdapterType::Spark
             | AdapterType::DuckDB
-            | AdapterType::Fabric => (
+            | AdapterType::Fabric
+            | AdapterType::ClickHouse => (
                 start.map(|start| format!("{event_time} >= '{start}'")),
                 end.map(|end| format!("{event_time} < '{end}'")),
             ),
-            AdapterType::ClickHouse => todo!("ClickHouse"),
             AdapterType::Exasol => todo!("Exasol"),
             AdapterType::Starburst => todo!("Starburst"),
             AdapterType::Athena => todo!("Athena"),
