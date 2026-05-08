@@ -1647,6 +1647,8 @@ pub struct ClickHouseTargetEnv {
     pub custom_settings: Option<HashMap<String, YmlValue>>,
     pub use_lw_deletes: Option<bool>,
     pub allow_automatic_deduplication: Option<bool>,
+    pub local_suffix: Option<String>,
+    pub local_db_prefix: Option<String>,
     pub __common__: CommonTargetContext,
 }
 
@@ -2038,6 +2040,8 @@ impl TryFrom<DbConfig> for TargetContext {
                     custom_settings: config.custom_settings.clone(),
                     use_lw_deletes: config.use_lw_deletes,
                     allow_automatic_deduplication: config.allow_automatic_deduplication,
+                    local_suffix: config.local_suffix.clone(),
+                    local_db_prefix: config.local_db_prefix.clone(),
                     __common__: CommonTargetContext {
                         database: String::new(),
                         schema: config.schema.clone().ok_or_else(|| missing("schema"))?,
@@ -2362,6 +2366,8 @@ use_lw_deletes: true
 allow_automatic_deduplication: true
 custom_settings:
   async_insert: 1
+local_suffix: _shard
+local_db_prefix: shard_
 threads: 8
 "#;
         let config: DbConfig = dbt_yaml::from_str(yaml_str).unwrap();
@@ -2398,7 +2404,8 @@ threads: 8
             .as_ref()
             .expect("custom_settings populated");
         assert!(custom.contains_key("async_insert"));
-
+        assert_eq!(t.local_suffix.as_deref(), Some("_shard"));
+        assert_eq!(t.local_db_prefix.as_deref(), Some("shard_"));
         // Common context exposes schema/threads/database/type.
         assert_eq!(t.__common__.database, "");
         assert_eq!(t.__common__.schema, "analytics");
@@ -2454,6 +2461,8 @@ threads: 8
                 .is_some_and(|cs| cs.is_empty()),
             "custom_settings must default to empty map"
         );
+        assert_eq!(t.local_suffix.as_deref(), Some("_local"));
+        assert_eq!(t.local_db_prefix.as_deref(), Some(""));
         assert_eq!(t.__common__.schema, "default");
         assert_eq!(t.__common__.threads, Some(1));
     }
