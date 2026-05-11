@@ -174,9 +174,9 @@ pub fn infer_seed_column_name_strategy(
             AdapterType::Bigquery
             | AdapterType::Databricks
             | AdapterType::Spark
-            | AdapterType::Fabric,
+            | AdapterType::Fabric
+            | AdapterType::ClickHouse,
         ) => InferColumnNameStrategy::Verbatim,
-        (false, AdapterType::ClickHouse) => todo!("ClickHouse"),
         (false, AdapterType::Exasol) => InferColumnNameStrategy::Uppercase,
         (false, AdapterType::Starburst) => todo!("Starburst"),
         (false, AdapterType::Athena) => todo!("Athena"),

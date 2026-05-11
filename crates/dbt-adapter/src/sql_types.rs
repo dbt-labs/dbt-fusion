@@ -16,6 +16,7 @@ pub const BIGQUERY_METADATA_SQL_TYPE_KEY: &str = "Type";
 // XXX: Snowflake does DATA_TYPE for GetTableSchema and SNOWFLAKE_TYPE for other queries...
 pub const SNOWFLAKE_METADATA_SQL_TYPE_KEY: &str = "DATA_TYPE";
 pub const FABRIC_METADATA_SQL_TYPE_KEY: &str = "DATA_TYPE";
+pub const CLICKHOUSE_METADATA_SQL_TYPE_KEY: &str = "data_type";
 
 /// An Arrow schema containing SDF types
 #[derive(Clone)]
@@ -165,8 +166,8 @@ impl TypeOps for SATypeOpsImpl {
             }
             // No type transformations have been necessary for the seed operation against
             // these data platforms so far, but this may need to be updated if that changes.
-            Postgres | Salesforce | Spark | DuckDB | Fabric => None,
-            ClickHouse | Exasol | Starburst | Athena | Trino | Dremio | Oracle | Datafusion => {
+            Postgres | Salesforce | Spark | DuckDB | Fabric | ClickHouse => None,
+            Exasol | Starburst | Athena | Trino | Dremio | Oracle | Datafusion => {
                 todo!("not yet")
             }
         }
@@ -282,7 +283,7 @@ pub const fn get_field_sql_type_metadata_key(adapter_type: AdapterType) -> &'sta
         AdapterType::Spark => todo!(),
         AdapterType::DuckDB => todo!(),
         AdapterType::Fabric => FABRIC_METADATA_SQL_TYPE_KEY,
-        AdapterType::ClickHouse => todo!(),
+        AdapterType::ClickHouse => CLICKHOUSE_METADATA_SQL_TYPE_KEY,
         AdapterType::Exasol => "DATA_TYPE",
         AdapterType::Starburst => todo!(),
         AdapterType::Athena => todo!(),
@@ -649,6 +650,61 @@ pub mod postgres {
         };
         if !nullable {
             out.push_str(" not null");
+        }
+        Ok(())
+    }
+}
+
+pub mod clickhouse {
+    use arrow_schema::{DataType, TimeUnit};
+
+    use crate::AdapterResult;
+    use crate::errors::{AdapterError, AdapterErrorKind};
+
+    /// TODO: long-term, ClickHouse column SQL types should be sourced from the
+    /// driver's schema metadata rather than reconstructed from Arrow types here.
+    pub fn try_format_type(
+        datatype: &DataType,
+        _nullable: bool,
+        out: &mut String,
+    ) -> AdapterResult<()> {
+        use std::fmt::Write as _;
+
+        match datatype {
+            DataType::Null => out.push_str("String"),
+            DataType::Boolean => out.push_str("Bool"),
+            DataType::Int8 => out.push_str("Int8"),
+            DataType::Int16 => out.push_str("Int16"),
+            DataType::Int32 => out.push_str("Int32"),
+            DataType::Int64 => out.push_str("Int64"),
+            DataType::UInt8 => out.push_str("UInt8"),
+            DataType::UInt16 => out.push_str("UInt16"),
+            DataType::UInt32 => out.push_str("UInt32"),
+            DataType::UInt64 => out.push_str("UInt64"),
+            DataType::Float16 | DataType::Float32 => out.push_str("Float32"),
+            DataType::Float64 => out.push_str("Float64"),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => out.push_str("String"),
+            DataType::Binary | DataType::LargeBinary => out.push_str("String"),
+            DataType::Date32 | DataType::Date64 => out.push_str("Date"),
+            DataType::Timestamp(TimeUnit::Second, _) => out.push_str("DateTime"),
+            DataType::Timestamp(TimeUnit::Millisecond, _) => out.push_str("DateTime64(3)"),
+            DataType::Timestamp(TimeUnit::Microsecond, _) => out.push_str("DateTime64(6)"),
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => out.push_str("DateTime64(9)"),
+            DataType::Time32(_) | DataType::Time64(_) => out.push_str("String"),
+            DataType::Decimal128(precision, scale) | DataType::Decimal256(precision, scale) => {
+                write!(out, "Decimal({precision}, {scale})").unwrap()
+            }
+            DataType::List(inner) | DataType::LargeList(inner) => {
+                let mut inner_type = String::new();
+                try_format_type(inner.data_type(), true, &mut inner_type)?;
+                write!(out, "Array({inner_type})").unwrap()
+            }
+            _ => {
+                return Err(AdapterError::new(
+                    AdapterErrorKind::UnsupportedType,
+                    format!("{datatype} is not convertible to clickhouse sql type"),
+                ));
+            }
         }
         Ok(())
     }
@@ -1035,6 +1091,27 @@ mod tests {
         assert_eq!(convert_integer_type(Postgres), "integer");
         assert_eq!(convert_integer_type(Snowflake), "integer");
         assert_eq!(convert_integer_type(Redshift), "integer");
+    }
+
+    #[test]
+    fn clickhouse_try_format_type_formats_supported_arrow_types() {
+        let mut out = String::new();
+        clickhouse::try_format_type(&DataType::Int32, true, &mut out).unwrap();
+        assert_eq!(out, "Int32");
+
+        out.clear();
+        let field = Arc::new(Field::new("item", DataType::Utf8, true));
+        clickhouse::try_format_type(&DataType::List(field), true, &mut out).unwrap();
+        assert_eq!(out, "Array(String)");
+    }
+
+    #[test]
+    fn clickhouse_try_format_type_rejects_unsupported_arrow_types() {
+        let mut out = String::new();
+        let fields = arrow_schema::Fields::from(Vec::<Field>::new());
+        let err = clickhouse::try_format_type(&DataType::Struct(fields), true, &mut out)
+            .expect_err("structs must not silently format as String");
+        assert_eq!(err.kind(), AdapterErrorKind::UnsupportedType);
     }
 
     #[test]

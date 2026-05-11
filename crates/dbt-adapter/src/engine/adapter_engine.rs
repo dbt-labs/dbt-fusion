@@ -6,6 +6,7 @@ use adbc_core::options::{OptionStatement, OptionValue};
 use arrow::compute::concat_batches;
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
+use dbt_adapter_sql::statements::is_update_statement;
 use dbt_auth::AdapterConfig;
 use dbt_common::behavior_flags::Behavior;
 use dbt_common::cancellation::CancellationToken;
@@ -214,9 +215,10 @@ pub(crate) fn adbc_execute_with_options(
         None => Cow::Borrowed(sql),
     };
 
+    let adapter_type = engine.adapter_type();
     let mut options = options;
     if let Some(state) = state
-        && engine.adapter_type() == AdapterType::Bigquery
+        && adapter_type == AdapterType::Bigquery
     {
         let mut job_labels = maybe_query_comment
             .as_ref()
@@ -273,7 +275,7 @@ pub(crate) fn adbc_execute_with_options(
             OptionStatement::Other(DBT_FETCH.to_string()),
             OptionValue::Int(fetch as i64),
         )?;
-        if engine.adapter_type() == AdapterType::Snowflake
+        if adapter_type == AdapterType::Snowflake
             && let Some(traceparent) = read_current_span_start_info(|info| {
                 format!("00-{:032x}-{:016x}-01", info.trace_id, info.span_id)
             })
@@ -294,6 +296,16 @@ pub(crate) fn adbc_execute_with_options(
         // Track the statement so execution can be cancelled
         // when the user Ctrl-C's the process.
         let mut stmt = TrackedStatement::new(stmt);
+
+        // ClickHouse DDL/DML does not return an Arrow IPC schema header. Tracking upstream:
+        // https://github.com/adbc-drivers/clickhouse/issues/14
+        if adapter_type == AdapterType::ClickHouse
+            && is_update_statement(sql.as_ref(), adapter_type)
+        {
+            stmt.execute_update()?;
+            token.check_cancellation()?;
+            return Ok((Arc::new(Schema::empty()), Vec::new()));
+        }
 
         let reader = stmt.execute()?;
         let schema = reader.schema();
@@ -316,7 +328,6 @@ pub(crate) fn adbc_execute_with_options(
     let _span = span!("SqlEngine::execute");
 
     let sql_hash = code_hash(sql.as_ref());
-    let adapter_type = engine.adapter_type();
     let _query_span_guard = create_debug_span(QueryExecuted::start(
         sql.to_string(),
         sql_hash,

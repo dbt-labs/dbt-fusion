@@ -36,14 +36,13 @@ pub fn create_static_relation(
             let salesforce_relation_type = SalesforceRelationType(quoting);
             StaticBaseRelationObject::new(Arc::new(salesforce_relation_type))
         }
-        Databricks | Spark | Fabric | DuckDB | Exasol | Postgres => {
+        Databricks | Spark | Fabric | DuckDB | ClickHouse | Exasol | Postgres => {
             let relation_type = RelationStatic {
                 adapter_type,
                 quoting,
             };
             StaticBaseRelationObject::new(Arc::new(relation_type))
         }
-        ClickHouse => todo!("ClickHouse"),
         Starburst => todo!("Starburst"),
         Athena => todo!("Athena"),
         Trino => todo!("Trino"),
