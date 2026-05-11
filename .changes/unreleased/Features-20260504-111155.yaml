@@ -1,0 +1,7 @@
+kind: Features
+body: Add ClickHouseMetadataAdapter, clickhouse_get_relation, and adapter auth tests
+time: 2026-05-04T11:11:55.197009-05:00
+custom:
+    author: dave-connors-3
+    issue: "9514"
+    project: dbt-fusion
