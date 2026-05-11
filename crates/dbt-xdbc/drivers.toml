@@ -1,12 +1,14 @@
 # Backend drivers hosted on the CDN.
 # Each entry is "<backend>-<version>".
 # Used by `cargo run --bin xdbc-sync` to generate src/checksums.rs.
+# Keep entries sorted alphabetically by backend, then by version.
 
 drivers = [
   "bigquery-0.21.0.dev+dbt0.21.8",
   "bigquery-0.21.0.dev+dbt0.21.9",
   "bigquery-0.21.0.dev+dbt0.21.10",
   "bigquery-0.21.0.dev+dbt0.21.11",
+  "clickhouse-0.1.0-alpha.1",
   "databricks-0.21.0+dbt0.21.5",
   "databricks-0.21.0+dbt0.21.6",
   "databricks-0.21.0+dbt0.21.7",
