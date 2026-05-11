@@ -479,7 +479,7 @@ pub fn do_create_relation(
             None,
             custom_quoting,
         )) as Box<dyn BaseRelation>,
-        Databricks | Spark | Fabric => Box::new(Relation::new(
+        Databricks | Spark | Fabric | ClickHouse => Box::new(Relation::new(
             adapter_type,
             Some(database),
             Some(schema),
@@ -511,7 +511,6 @@ pub fn do_create_relation(
             identifier,
             relation_type,
         )) as Box<dyn BaseRelation>,
-        ClickHouse => todo!("ClickHouse"),
         Starburst => todo!("Starburst"),
         Athena => todo!("Athena"),
         Trino => todo!("Trino"),
