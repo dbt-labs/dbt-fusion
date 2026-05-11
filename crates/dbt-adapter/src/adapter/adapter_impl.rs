@@ -446,8 +446,8 @@ impl AdapterImpl {
             Redshift => &[Append, DeleteInsert, Merge, Microbatch],
             Fabric => &[Append, DeleteInsert, Merge, Microbatch],
             Salesforce => &[Append, Merge],
-            Spark | ClickHouse | Exasol | Athena | Starburst | Trino | Datafusion | Dremio
-            | Oracle => {
+            ClickHouse => &[Append, DeleteInsert, InsertOverwrite, Microbatch, Legacy],
+            Spark | Exasol | Athena | Starburst | Trino | Datafusion | Dremio | Oracle => {
                 unimplemented!("valid_incremental_strategies not implemented")
             }
         }
@@ -4132,6 +4132,7 @@ fn builtin_incremental_strategies() -> Vec<DbtIncrementalStrategy> {
         DbtIncrementalStrategy::Merge,
         DbtIncrementalStrategy::InsertOverwrite,
         DbtIncrementalStrategy::Microbatch,
+        DbtIncrementalStrategy::Legacy, // ClickHouse only — intermediate-table + swap
     ]
 }
 
