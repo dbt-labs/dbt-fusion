@@ -1,0 +1,7 @@
+kind: Features
+body: 'Wire ClickHouse into dbt-adapter core: factory, columns, relations, type key, and listing-table column strategy'
+time: 2026-05-04T11:07:50.000857-05:00
+custom:
+    author: dave-connors-3
+    issue: "9513"
+    project: dbt-fusion
