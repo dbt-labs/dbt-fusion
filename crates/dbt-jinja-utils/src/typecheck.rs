@@ -5,7 +5,7 @@ use dbt_common::{
     tracing::emit::emit_error_log_message,
 };
 use minijinja::{
-    AdapterDispatchFunction, Value,
+    AdapterDispatchFunction, ErrorKind, Value,
     compiler::codegen::CodeGenerationProfile,
     constants::{DBT_AND_ADAPTERS_NAMESPACE, ROOT_PACKAGE_NAME, TARGET_PACKAGE_NAME},
     load_builtins_with_namespace,
@@ -17,7 +17,11 @@ use std::{
 };
 
 #[allow(clippy::too_many_arguments)]
-/// Typecheck a batch of files
+/// Typecheck a batch of files.
+///
+/// When `skip_redundant_template_syntax_error_log` is true, template parse failures
+/// ([`ErrorKind::SyntaxError`]) are not logged: use this when the same `content` is rendered
+/// immediately afterward so the render path can emit a single diagnostic (e.g. dbt1502).
 pub fn typecheck(
     arg_io: &IoArgs,
     env: Arc<JinjaEnv>,
@@ -30,7 +34,8 @@ pub fn typecheck(
     content: &str,
     offset: &dbt_common::CodeLocationWithFile,
     unique_id: &str,
-    adapter_type: Option<AdapterType>,
+    adapter_type: AdapterType,
+    skip_redundant_template_syntax_error_log: bool,
 ) -> FsResult<()> {
     let function_signatures = env.jinja_function_registry.clone();
     let mut jinja_typecheck_env = env.env.clone();
@@ -39,8 +44,7 @@ pub fn typecheck(
         .map_err(|e| FsError::from_jinja_err(e, "Failed to load built-ins"))?;
 
     let mut typecheck_resolved_context: BTreeMap<String, Value> = BTreeMap::new();
-    AdapterDispatchFunction::instance()
-        .set_adapter_type(&adapter_type.map(|adapter_type| adapter_type.to_string()));
+    AdapterDispatchFunction::instance().set_adapter_type(&adapter_type.to_string().into());
 
     if let Some(target_package_name) = target_package_name {
         typecheck_resolved_context.insert(
@@ -81,6 +85,9 @@ pub fn typecheck(
     {
         Ok(tmpl) => tmpl,
         Err(e) => {
+            if skip_redundant_template_syntax_error_log && e.kind() == ErrorKind::SyntaxError {
+                return Ok(());
+            }
             emit_error_log_message(
                 ErrorCode::Generic,
                 format!("Failed to create template: {}", e),

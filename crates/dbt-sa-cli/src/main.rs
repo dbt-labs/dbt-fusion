@@ -3,6 +3,7 @@ use clap::error::ErrorKind;
 use dbt_common::cancellation::CancellationTokenSource;
 use dbt_common::tracing::{FsTraceConfig, init_tracing};
 use dbt_common::{constants::PANIC, pretty_string::GREEN, pretty_string::RED};
+use dbt_error::FsError;
 use dbt_sa_lib::dbt_sa_clap::CliParser;
 use dbt_sa_lib::dbt_sa_clap::from_main;
 use dbt_sa_lib::dbt_sa_lib::execute_fs;
@@ -47,20 +48,23 @@ fn main() -> ExitCode {
     let arg = from_main(&cli);
 
     // Init tracing
-    let mut telemetry_handle = match init_tracing(FsTraceConfig::new_from_io_args(
-        arg.command,
-        cli.project_dir().as_ref(),
-        cli.target_path().as_ref(),
-        &arg.io,
-        "dbt-sa",
-    )) {
-        Ok(handle) => handle,
-        Err(e) => {
-            let msg = e.to_string();
-            print_trimmed_error(msg);
-            std::process::exit(1);
-        }
-    };
+    let (telemetry_shutdown_handle, _tracing_config_provider) =
+        match init_tracing(FsTraceConfig::new_from_io_args(
+            arg.command,
+            cli.project_dir().as_ref(),
+            cli.target_path().as_ref(),
+            &arg.io,
+            None,
+            "dbt-sa",
+            false, // write_index not supported by dbt-sa
+        )) {
+            Ok(handle) => handle,
+            Err(e) => {
+                let msg = e.to_string();
+                print_trimmed_error(msg);
+                std::process::exit(1);
+            }
+        };
 
     // XXX: when dbt-sa-cli and dbt-cli are unified, this will be the event emitter
     // we inject into execute_fs. This instantiation is here as proof that our build
@@ -71,37 +75,25 @@ fn main() -> ExitCode {
     // Setup tokio runtime and set stack-size to 8MB
     // DO NOT USE Rayon, it is not compatible with Tokio
 
-    let tokio_rt = match arg.num_threads {
-        Some(1) => {
-            // Simiulate single-threaded runtime
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .thread_stack_size(FS_DEFAULT_STACK_SIZE)
-                .worker_threads(1)
-                .max_blocking_threads(1)
-                .build()
-                .expect("failed to initialize 'single-threaded' tokio runtime")
-        }
-        // Uncomment this if you want to limit the number of threads in multi-threaded runtime
-        // Some(num_threads) if num_threads > 1 => {
-        //     // Multi-threaded runtime: limit to num_threads
-        //     tokio::runtime::Builder::new_multi_thread()
-        //         .enable_all()
-        //         .worker_threads(num_threads)
-        //         .max_blocking_threads(FS_DEFAULT_MAX_BLOCKING_THREADS)
-        //         .thread_stack_size(FS_DEFAULT_STACK_SIZE)
-        //         .build()
-        //         .expect("failed to initialize multi-threaded tokio runtime")
-        // }
-        _ => {
-            // Multi-threaded runtime: use default (max parallelism)
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .max_blocking_threads(FS_DEFAULT_MAX_BLOCKING_THREADS)
-                .thread_stack_size(FS_DEFAULT_STACK_SIZE)
-                .build()
-                .expect("failed to initialize default multi-threaded tokio runtime")
-        }
+    // Only `--no-parallel` pins the tokio runtime to a single worker.
+    // `--threads` is exclusively the adapter connection-backpressure knob
+    // and does not affect the runtime.
+    let tokio_rt = if arg.no_parallel {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_stack_size(FS_DEFAULT_STACK_SIZE)
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .build()
+            .expect("failed to initialize 'single-worker' tokio runtime")
+    } else {
+        // Multi-threaded runtime: use default (max parallelism)
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .max_blocking_threads(FS_DEFAULT_MAX_BLOCKING_THREADS)
+            .thread_stack_size(FS_DEFAULT_STACK_SIZE)
+            .build()
+            .expect("failed to initialize default multi-threaded tokio runtime")
     };
 
     // If execution panics, exit with a status 2 (but not if RUST_BACKTRACE is
@@ -122,8 +114,11 @@ fn main() -> ExitCode {
     let result = tokio_rt.block_on(async { tokio_rt.spawn(future).await.unwrap() });
 
     // Shut down telemetry
-    for err in telemetry_handle.shutdown() {
-        eprintln!("{}", err.pretty());
+    if let Err(errors) = telemetry_shutdown_handle.shutdown_once() {
+        for err in errors {
+            let err = FsError::from(err);
+            eprintln!("{}", err.pretty());
+        }
     }
 
     // Remove the panic hook

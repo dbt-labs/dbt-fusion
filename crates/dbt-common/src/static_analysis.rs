@@ -5,7 +5,7 @@ use dbt_error::ErrorCode;
 use crate::{
     io_args::StaticAnalysisKind,
     io_utils::StatusReporter,
-    tracing::emit::{emit_warn_log_message, emit_warn_log_message_package_scoped},
+    tracing::emit::{emit_error_log_message, emit_error_log_message_package_scoped},
 };
 
 pub enum StaticAnalysisDeprecationOrigin<'a> {
@@ -33,6 +33,11 @@ pub fn is_static_analysis_off_or_baseline(kind: StaticAnalysisKind) -> bool {
 #[inline]
 pub fn is_strict_static_analysis(kind: StaticAnalysisKind) -> bool {
     normalize_static_analysis_kind(kind) == StaticAnalysisKind::Strict
+}
+
+#[inline]
+pub fn is_baseline_static_analysis(kind: StaticAnalysisKind) -> bool {
+    matches!(kind, StaticAnalysisKind::Baseline)
 }
 
 #[inline]
@@ -72,7 +77,7 @@ pub fn check_deprecated_static_analysis_kind(
             ),
             _ => return,
         };
-        emit_warn_log_message_package_scoped(
+        emit_error_log_message_package_scoped(
             ErrorCode::DeprecatedStaticAnalysisValue,
             message,
             package_name,
@@ -117,7 +122,7 @@ pub fn check_deprecated_static_analysis_kind(
         _ => return,
     };
 
-    emit_warn_log_message(
+    emit_error_log_message(
         ErrorCode::DeprecatedStaticAnalysisValue,
         message,
         status_reporter,

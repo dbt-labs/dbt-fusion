@@ -1,5 +1,5 @@
 use crate::AdapterEngine;
-use crate::typed_adapter::ConcreteAdapter;
+use crate::adapter::adapter_impl::AdapterImpl;
 use crate::{
     AdapterResult, errors::AsyncAdapterResult, metadata::*, record_batch_utils::get_column_values,
 };
@@ -8,7 +8,7 @@ use dbt_common::cancellation::CancellationToken;
 
 use arrow_array::{Array, Decimal128Array, RecordBatch, StringArray};
 
-use dbt_common::adapter::ExecutionPhase;
+use dbt_adapter_core::ExecutionPhase;
 use dbt_schemas::schemas::{
     legacy_catalog::{CatalogNodeStats, CatalogTable, ColumnMetadata, TableMetadata},
     relations::base::{BaseRelation, RelationPattern},
@@ -21,12 +21,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 pub struct PostgresMetadataAdapter {
-    adapter: ConcreteAdapter,
+    adapter: AdapterImpl,
 }
 
 impl PostgresMetadataAdapter {
     pub fn new(engine: Arc<dyn AdapterEngine>) -> Self {
-        let adapter = ConcreteAdapter::new(engine);
+        let adapter = AdapterImpl::new(engine, None);
         Self { adapter }
     }
 }

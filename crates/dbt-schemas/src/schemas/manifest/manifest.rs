@@ -1,5 +1,7 @@
+use crate::schemas::project::ResolvableConfig;
 use chrono::{DateTime, Utc};
-use dbt_common::{Span, adapter::AdapterType};
+use dbt_adapter_core::AdapterType;
+use dbt_common::Span;
 use dbt_yaml::{Spanned, UntaggedEnumDeserialize};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -7,6 +9,9 @@ use std::{collections::BTreeMap, path::PathBuf, str::FromStr as _, sync::Arc};
 // Type aliases for clarity
 type YmlValue = dbt_yaml::Value;
 
+use crate::schemas::project::DataTestConfig;
+use crate::schemas::project::configs::model_config::ModelConfig;
+use crate::schemas::project::configs::snapshot_config::SnapshotConfig;
 use crate::{
     dbt_utils::get_dbt_schema_version,
     schemas::{
@@ -122,6 +127,7 @@ pub fn build_manifest(invocation_id: &str, resolver_state: &ResolverState) -> Db
                 dbt_version: env!("CARGO_PKG_VERSION").to_string(),
                 generated_at: Utc::now(),
                 invocation_id: Some(invocation_id.to_string()),
+                env: dbt_common::constants::collect_dbt_custom_envs(),
                 ..Default::default()
             },
             project_name: resolver_state.root_project_name.clone(),
@@ -608,10 +614,11 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                             schema: test.__common_attr__.schema,
                             alias: test.__base_attr__.alias,
                             relation_name: test.__base_attr__.relation_name,
-                            materialized: DbtMaterialization::Test,
+                            materialized: DataTestConfig::default_materialized(),
                             static_analysis: Default::default(),
                             static_analysis_off_reason: None,
-                            enabled: test.config.enabled.unwrap_or(true),
+                            compute: test.config.compute,
+                            enabled: test.config.get_enabled_with_default(),
                             extended_model: false,
                             quoting: test
                                 .config
@@ -640,6 +647,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                             file_key_name: test.file_key_name,
                             introspection: IntrospectionKind::None,
                             original_name: None,
+                            group: None,
                         },
                         __adapter_attr__: AdapterAttr::from_config_and_dialect(
                             &test.config.__warehouse_specific_config__,
@@ -697,13 +705,14 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                             schema: snapshot.__common_attr__.schema,
                             alias: snapshot.__base_attr__.alias,
                             relation_name: snapshot.__base_attr__.relation_name,
+                            compute: snapshot.config.compute,
                             enabled: snapshot.config.enabled.unwrap_or(true),
                             extended_model: false,
                             materialized: snapshot
                                 .config
                                 .materialized
                                 .clone()
-                                .unwrap_or(DbtMaterialization::Table),
+                                .unwrap_or_else(SnapshotConfig::default_materialized),
                             static_analysis: Default::default(),
                             static_analysis_off_reason: None,
                             quoting: snapshot
@@ -780,6 +789,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                             materialized: DbtMaterialization::Table,
                             static_analysis: Default::default(),
                             static_analysis_off_reason: None,
+                            compute: None,
                             enabled: seed.config.enabled.unwrap_or(true),
                             quoting: seed
                                 .config
@@ -868,6 +878,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                             static_analysis: Spanned::new(analysis.static_analysis),
                             enabled: analysis.enabled,
                             static_analysis_off_reason: None,
+                            compute: None,
                             extended_model: false,
                             quoting: analysis
                                 .quoting
@@ -929,6 +940,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                     materialized: DbtMaterialization::Table,
                     static_analysis: Default::default(),
                     static_analysis_off_reason: None,
+                    compute: None,
                     enabled: source.config.enabled.unwrap_or(true),
                     extended_model: false,
                     quoting: source
@@ -995,6 +1007,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                     materialized: Default::default(),
                     static_analysis: Default::default(),
                     static_analysis_off_reason: None,
+                    compute: None,
                     enabled: true,
                     extended_model: false,
                     persist_docs: None,
@@ -1053,6 +1066,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                     materialized: DbtMaterialization::Table,
                     static_analysis: Default::default(),
                     static_analysis_off_reason: None,
+                    compute: unit_test.config.compute,
                     quoting: dbt_quoting.try_into().expect("DbtQuoting should be set"),
                     quoting_ignore_case: false,
                     enabled: unit_test.config.enabled.unwrap_or(true),
@@ -1078,6 +1092,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                 field_pre_injected_sql: unit_test.field_pre_injected_sql,
                 tested_node_unique_id: unit_test.tested_node_unique_id,
                 this_input_node_unique_id: unit_test.this_input_node_unique_id,
+                defined_at: None,
                 deprecated_config: unit_test.config,
             }),
         );
@@ -1126,6 +1141,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                     materialized: Default::default(),
                     static_analysis: Default::default(),
                     static_analysis_off_reason: None,
+                    compute: None,
                     enabled: true,
                     extended_model: false,
                     persist_docs: None,
@@ -1182,6 +1198,7 @@ pub fn nodes_from_dbt_manifest(manifest: DbtManifest, dbt_quoting: DbtQuoting) -
                     materialized: Default::default(),
                     static_analysis: Default::default(),
                     static_analysis_off_reason: None,
+                    compute: None,
                     enabled: true,
                     extended_model: false,
                     persist_docs: None,
@@ -1295,9 +1312,10 @@ pub fn manifest_model_to_dbt_model(
                 .config
                 .materialized
                 .clone()
-                .unwrap_or(DbtMaterialization::View),
+                .unwrap_or_else(ModelConfig::default_materialized),
             static_analysis: Default::default(),
             static_analysis_off_reason: None,
+            compute: model.config.compute,
             enabled: model.config.enabled.unwrap_or(true),
             extended_model: false,
             quoting: model
@@ -1396,6 +1414,7 @@ pub fn manifest_function_to_dbt_function(
             materialized: DbtMaterialization::Function,
             static_analysis: Default::default(),
             static_analysis_off_reason: None,
+            compute: None,
             quoting: function
                 .config
                 .quoting

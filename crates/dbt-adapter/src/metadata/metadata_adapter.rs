@@ -1,17 +1,16 @@
-use crate::AdapterTyping;
+use crate::adapter::adapter_impl::AdapterImpl;
 use crate::errors::{AdapterError, AdapterResult, AsyncAdapterResult};
-use crate::funcs::execute_macro;
-use crate::relation::{create_relation, do_create_relation};
+use crate::macro_exec::execute_macro;
+use crate::relation::{RelationObject, create_relation, do_create_relation};
 use crate::sql_types::{SdfSchema, arrow_schema_to_sdf_schema};
 use crate::time_machine::{
     args_freshness, args_list_relations_in_parallel, args_list_relations_schemas,
     args_list_relations_schemas_by_patterns, args_list_udfs, with_time_machine_metadata_wrapper,
 };
-use crate::typed_adapter::ConcreteAdapter;
 use crate::{AdapterEngine, metadata::*};
 
 use arrow::array::RecordBatch;
-use dbt_common::adapter::ExecutionPhase;
+use dbt_adapter_core::ExecutionPhase;
 use dbt_common::cancellation::CancellationToken;
 
 use dbt_schemas::schemas::{
@@ -24,9 +23,6 @@ use dbt_telemetry::NodeType;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
-
-/// Maximum number of connections
-pub const MAX_CONNECTIONS: usize = 48;
 
 // XXX: we should unify relation representation as Arrow schemas across the codebase
 
@@ -334,7 +330,7 @@ pub trait MetadataAdapter: Send + Sync {
 /// before using it to create schemas
 #[allow(clippy::type_complexity)]
 pub fn create_schemas_if_not_exists(
-    adapter: &ConcreteAdapter,
+    adapter: &AdapterImpl,
     metadata_adapter: &dyn MetadataAdapter,
     state: &State,
     catalog_schemas: Vec<(String, String, String)>,
@@ -349,7 +345,7 @@ pub fn create_schemas_if_not_exists(
             adapter.quoting()
         )?;
         let res =
-        match execute_macro(state, &[mock_relation.as_value()], "create_schema") {
+        match execute_macro(state, &[RelationObject::new(Arc::from(mock_relation)).into_value()], "create_schema") {
             Ok(_) => Ok(()),
             Err(e) => {
                 if metadata_adapter.is_permission_error(&e) {

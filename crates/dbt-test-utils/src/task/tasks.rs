@@ -338,7 +338,10 @@ impl ExecuteAndCompare {
         func: Arc<CommandFn>,
         use_recording: bool,
     ) -> Self {
-        cmd_vec.push("--threads=1".to_string());
+        // `--no-parallel` forces sequential task execution for
+        // deterministic golden output without throttling the connection pool
+        // via `--threads`, which now controls adapter connection backpressure.
+        cmd_vec.push("--no-parallel".to_string());
         if !cmd_vec.iter().any(|s| *s == "--log-format") {
             cmd_vec.push("--log-format=text".to_string());
         }
@@ -442,6 +445,10 @@ pub struct ExecuteAndCompareTelemetry {
     cmd_vec: Vec<String>,
     func: Arc<CommandFn>,
     telemetry_deserializer: TelemetryArrowDeserializer,
+    /// When true, span_id/event_id are added to volatile keys and
+    /// a full line sort is applied as the final normalization step.
+    /// Use for commands with non-deterministic span ordering (e.g. parallel deps).
+    deterministic_sort: bool,
 }
 
 impl ExecuteAndCompareTelemetry {
@@ -472,11 +479,11 @@ impl ExecuteAndCompareTelemetry {
         );
         Self::assert_flag_absent(
             &cmd_vec,
-            "--threads",
-            "ExecuteAndCompareTelemetry forces --threads=1",
+            "--no-parallel",
+            "ExecuteAndCompareTelemetry forces --no-parallel",
         );
 
-        cmd_vec.push("--threads=1".to_string());
+        cmd_vec.push("--no-parallel".to_string());
         cmd_vec.push(format!("--otel-file-name={}", Self::OTEL_JSONL_FILE_NAME));
         cmd_vec.push(format!(
             "--otel-parquet-file-name={}",
@@ -489,7 +496,16 @@ impl ExecuteAndCompareTelemetry {
             cmd_vec,
             func,
             telemetry_deserializer,
+            deterministic_sort: false,
         }
+    }
+
+    /// Enable deterministic sorting: span_id/event_id become volatile keys
+    /// and a full line sort is applied as the final normalization step.
+    /// Use for commands with non-deterministic span ordering (e.g. parallel deps).
+    pub fn with_deterministic_sort(mut self) -> Self {
+        self.deterministic_sort = true;
+        self
     }
 
     fn assert_flag_absent(cmd_vec: &[String], flag: &str, message: &str) {
@@ -546,8 +562,11 @@ impl ExecuteAndCompareTelemetry {
         }
 
         // Read and postprocess native JSONL telemetry
-        let actual_jsonl_content =
-            Self::postprocess_jsonl(stdfs::read_to_string(&actual_jsonl_path)?);
+        let deterministic_sort = self.deterministic_sort;
+        let actual_jsonl_content = Self::postprocess_jsonl(
+            stdfs::read_to_string(&actual_jsonl_path)?,
+            deterministic_sort,
+        );
 
         // Verify parquet output exists
         if !actual_parquet_path.exists() {
@@ -560,31 +579,36 @@ impl ExecuteAndCompareTelemetry {
 
         // Deserialize parquet to records, then serialize to JSONL with postprocessing
         let actual_parquet_bytes = stdfs::read(&actual_parquet_path)?;
-        let actual_parquet_as_jsonl = self.parquet_to_jsonl(actual_parquet_bytes)?;
+        let actual_parquet_as_jsonl =
+            self.parquet_to_jsonl(actual_parquet_bytes, deterministic_sort)?;
 
         if is_update_golden_files_mode() {
             // Update golden snapshots: native JSONL and parquet-derived JSONL
-            stdfs::write(&golden_jsonl_path, actual_jsonl_content)?;
-            stdfs::write(&golden_parquet_jsonl_path, actual_parquet_as_jsonl)?;
+            stdfs::write(&golden_jsonl_path, &actual_jsonl_content)?;
+            stdfs::write(&golden_parquet_jsonl_path, &actual_parquet_as_jsonl)?;
             return Ok(vec![]);
         }
+
+        // Normalizer for golden file content: postprocess + optional deterministic sort
+        let normalize_golden =
+            |content: String| -> String { Self::postprocess_jsonl(content, deterministic_sort) };
 
         // Compare native JSONL telemetry against its snapshot
         let patches = diff_goldie(
             "jsonl telemetry",
             actual_jsonl_content,
-            false, // single backslash is JSON is not a path separator, so avoid the default normalization
+            false, // single backslash in JSON is not a path separator, so avoid the default normalization
             &golden_jsonl_path,
-            Self::postprocess_jsonl,
+            normalize_golden,
         )
         .into_iter()
         // Compare parquet-derived JSONL against its snapshot
         .chain(diff_goldie(
             "parquet telemetry",
             actual_parquet_as_jsonl,
-            false, // single backslash is JSON is not a path separator, so avoid the default normalization
+            false, // single backslash in JSON is not a path separator, so avoid the default normalization
             &golden_parquet_jsonl_path,
-            Self::postprocess_jsonl,
+            normalize_golden,
         ))
         .collect::<Vec<_>>();
 
@@ -593,7 +617,11 @@ impl ExecuteAndCompareTelemetry {
 
     /// Convert parquet bytes to JSONL format with postprocessing applied.
     /// Deserializes parquet to telemetry records, serializes each to JSON, and applies normalization.
-    fn parquet_to_jsonl(&self, parquet_bytes: Vec<u8>) -> FsResult<String> {
+    fn parquet_to_jsonl(
+        &self,
+        parquet_bytes: Vec<u8>,
+        deterministic_sort: bool,
+    ) -> FsResult<String> {
         // Deserialize parquet to telemetry records
         let records = Self::read_parquet_to_records(parquet_bytes, self.telemetry_deserializer)?;
 
@@ -613,7 +641,7 @@ impl ExecuteAndCompareTelemetry {
 
         // Join lines and apply postprocessing to normalize volatile fields
         let jsonl = jsonl_lines.join("\n");
-        Ok(Self::postprocess_jsonl(jsonl))
+        Ok(Self::postprocess_jsonl(jsonl, deterministic_sort))
     }
 
     /// Read and deserialize parquet bytes into telemetry records using the provided deserializer.
@@ -758,9 +786,8 @@ impl ExecuteAndCompareTelemetry {
         }
     }
 
-    /// Normalize environment-dependent keys in JSONL content to make tests reproducible.
-    fn normalize_volatile_keys(content: String) -> String {
-        const KEYS: &[&str] = &[
+    fn volatile_keys(deterministic_sort: bool) -> Vec<&'static str> {
+        let mut keys = vec![
             // Keys that contain timestamps in nanoseconds since epoch
             "time_unix_nano",
             "start_time_unix_nano",
@@ -781,13 +808,21 @@ impl ExecuteAndCompareTelemetry {
             // dbt version changes frequently and it's embedded in process & invocation spans
             "version",
         ];
+        if deterministic_sort {
+            keys.extend(["span_id", "event_id", "parent_span_id"]);
+        }
+        keys
+    }
 
+    /// Normalize environment-dependent keys in JSONL content to make tests reproducible.
+    fn normalize_volatile_keys(content: String, deterministic_sort: bool) -> String {
         // Keys to normalize with regex patterns, format: (key_path, regex_pattern, replacement)
         const REGEX_KEYS: &[(&str, &str, &str)] = &[(
             "attributes.target",
-            r"\d+\.\d+\.\d+(-[a-zA-Z]+\.\d+)?",
+            r"(?:\d+\.\d+\.\d+|dbt-fusion-version)(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?",
             "dbt-fusion-version",
         )];
+        let keys = Self::volatile_keys(deterministic_sort);
 
         content
             .lines()
@@ -800,7 +835,7 @@ impl ExecuteAndCompareTelemetry {
                     .unwrap_or_else(|_| panic!("Failed to parse jsonl line: {line}"));
 
                 // Normalize unconditional keys
-                for key in KEYS {
+                for key in &keys {
                     Self::find_key_and_normalize(&mut json, key);
                 }
 
@@ -862,19 +897,29 @@ impl ExecuteAndCompareTelemetry {
     }
 
     /// Apply all normalization transforms to JSONL content for stable golden file comparison.
-    fn postprocess_jsonl(content: String) -> String {
-        [
-            maybe_normalize_schema_name,
-            maybe_normalize_tmp_paths,
-            Self::normalize_unrendered_config_in_model_strings,
-            Self::normalize_volatile_keys,
-            Self::strip_non_replayable_keys,
-            Self::json_safe_normalize_slashes,
-            normalize_version,
-            normalize_inline_sql_files,
-        ]
-        .iter()
-        .fold(content, |acc, transform| transform(acc))
+    fn postprocess_jsonl(content: String, deterministic_sort: bool) -> String {
+        let mut transforms: Vec<Box<dyn Fn(String) -> String>> = vec![
+            Box::new(maybe_normalize_schema_name),
+            Box::new(maybe_normalize_tmp_paths),
+            Box::new(Self::normalize_unrendered_config_in_model_strings),
+            Box::new(move |content| Self::normalize_volatile_keys(content, deterministic_sort)),
+            Box::new(Self::strip_non_replayable_keys),
+            Box::new(Self::json_safe_normalize_slashes),
+            Box::new(normalize_version),
+            Box::new(normalize_inline_sql_files),
+        ];
+
+        if deterministic_sort {
+            transforms.push(Box::new(|content| {
+                let mut lines: Vec<&str> = content.lines().collect();
+                lines.sort();
+                lines.join("\n")
+            }));
+        }
+
+        transforms
+            .into_iter()
+            .fold(content, |acc, transform| transform(acc))
     }
 
     /// Strip `unrendered_config` from the debug-printed node representation that appears in
@@ -1089,5 +1134,20 @@ async fn exec_sh(
                 .expect("Could not write");
             Err(FsError::exit_with_status(1))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ExecuteAndCompareTelemetry;
+
+    #[test]
+    fn normalizes_preview_nightly_version_targets() {
+        let content = r#"{"attributes":{"action":"dbt-fusion","target":"dbt-fusion-version-preview-nightly.176"},"event_type":"v1.public.events.fusion.log.ProgressMessage"}"#.to_string();
+
+        let normalized = ExecuteAndCompareTelemetry::normalize_volatile_keys(content, false);
+
+        assert!(normalized.contains(r#""target":"dbt-fusion-version""#));
+        assert!(!normalized.contains("preview-nightly.176"));
     }
 }

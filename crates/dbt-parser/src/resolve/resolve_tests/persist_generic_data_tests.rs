@@ -1,10 +1,8 @@
 use super::utils::{base_tests_inner, column_tests_inner};
 use crate::args::ResolveArgs;
+use dbt_adapter_core::*;
 use dbt_common::FsError;
 use dbt_common::FsResult;
-use dbt_common::adapter::AdapterType;
-use dbt_common::adapter::dialect_of;
-use dbt_common::adapter::quote_char;
 use dbt_common::constants::DBT_GENERIC_TESTS_DIR_NAME;
 use dbt_common::io_args;
 use dbt_common::io_args::IoArgs;
@@ -167,8 +165,15 @@ fn persist_inner(
     );
 
     // Generate unique_id hash from UNCLEANED kwargs to match mantle's behavior.
-    let test_hash =
-        generate_test_unique_id_hash(&full_name, &test_macro_name, namespace.as_ref(), &kwargs);
+    // Use the original (non-truncated) name for the hash input, since dbt-core/Mantle
+    // compute the hash from the full name, not the truncated form.
+    let fqn_name_for_hash = test_name_truncations.get(&full_name).unwrap_or(&full_name);
+    let test_hash = generate_test_unique_id_hash(
+        fqn_name_for_hash,
+        &test_macro_name,
+        namespace.as_ref(),
+        &kwargs,
+    );
     let unique_id = format!("{}.{}", full_name, test_hash);
 
     let path = PathBuf::from(DBT_GENERIC_TESTS_DIR_NAME).join(format!("{full_name}.sql"));
@@ -188,7 +193,7 @@ fn persist_inner(
         match column_name {
             Some(column_name) => {
                 return err!(
-                    ErrorCode::SchemaError,
+                    ErrorCode::DbtYamlValidationError,
                     "dbt found two data_tests with the same name \"{}\" on column \"{}\" in \"{}\" in the file \"{}\"",
                     full_name,
                     column_name,
@@ -198,7 +203,7 @@ fn persist_inner(
             }
             None => {
                 return err!(
-                    ErrorCode::SchemaError,
+                    ErrorCode::DbtYamlValidationError,
                     "dbt found two data_tests with the same name \"{}\" in \"{}\" in the file \"{}\"",
                     full_name,
                     test_config.resource_name,
@@ -227,14 +232,28 @@ fn persist_inner(
                 .filter_map(|v| v.as_str().map(|s| s.to_string()))
                 .collect()
         });
-    // Extract model kwarg and wrap with {{ }} for Jinja expression
+    // Extract model kwarg for test_metadata; the value from get_test_details already
+    // includes {{ }} Jinja delimiters (e.g. "{{ get_where_subquery(ref('...')) }}").
     let test_metadata_model = kwargs
         .get("model")
         .and_then(|v| v.as_str())
-        .map(|s| format!("{{{{ {} }}}}", s));
+        .map(|s| s.to_string());
 
     // If the test name was truncated, get the original name from the truncations map
     let original_name = test_name_truncations.get(&full_name).cloned();
+
+    // Convert full kwargs to dbt_yaml::Value for storage in the manifest.
+    // Excludes "config" and "_config_raw" which are FS-internal config representations,
+    // not macro arguments (mirrors dbt-core which pops config keys before storing kwargs).
+    let test_metadata_kwargs: BTreeMap<String, dbt_yaml::Value> = kwargs
+        .into_iter()
+        .filter(|(k, _)| k.as_str() != "config" && k.as_str() != "_config_raw")
+        .filter_map(|(k, v)| {
+            serde_json::from_value::<dbt_yaml::Value>(v)
+                .ok()
+                .map(|yml_v| (k, yml_v))
+        })
+        .collect();
 
     Ok(GenericTestAsset {
         dbt_asset,
@@ -247,7 +266,9 @@ fn persist_inner(
         test_metadata_column_name: column_name,
         test_metadata_combination_of_columns: combination_of_columns,
         test_metadata_model,
+        test_metadata_kwargs,
         original_name,
+        unique_id_hash: Some(test_hash),
     })
 }
 
@@ -283,14 +304,17 @@ fn get_test_details(
                 )
             } else {
                 return err!(
-                    ErrorCode::SchemaError,
+                    ErrorCode::DbtYamlValidationError,
                     "Source identifiers are missing for a source resource",
                 );
             }
         }
         _ => {
             if let Some(ref version_num) = test_config.version_num {
-                format!("ref('{}', v='{}')", &test_config.resource_name, version_num)
+                format!(
+                    "ref('{}', version='{}')",
+                    &test_config.resource_name, version_num
+                )
             } else {
                 format!("ref('{}')", &test_config.resource_name)
             }
@@ -299,7 +323,7 @@ fn get_test_details(
 
     kwargs.insert(
         "model".to_string(),
-        Value::String(format!("get_where_subquery({model_string})")),
+        Value::String(format!("{{{{ get_where_subquery({model_string}) }}}}")),
     );
     if let Some(col) = column_name {
         kwargs.insert("column_name".to_string(), Value::String(col.to_string()));
@@ -328,7 +352,7 @@ fn get_test_details(
             CustomTest::SimpleKeyValue(sk) => {
                 if sk.len() != 1 {
                     return err!(
-                        ErrorCode::SchemaError,
+                        ErrorCode::DbtYamlValidationError,
                         "Simple key-value custom test must contain exactly one test"
                     );
                 }
@@ -381,7 +405,7 @@ fn extract_reserved_name_kwarg(
             Ok(())
         }
         other => err!(
-            ErrorCode::SchemaError,
+            ErrorCode::DbtYamlValidationError,
             "Generic test 'name' must be a string (got {other})"
         ),
     }
@@ -452,7 +476,7 @@ fn extract_kwargs_and_jinja_vars_and_dep_kwarg_and_configs(
         };
 
         let schema_error = fs_err!(
-            code => ErrorCode::SchemaError,
+            code => ErrorCode::DbtYamlValidationError,
             loc => deprecated.iter().next().map(|(_, v)| v.span().clone()).unwrap_or_default(),
             "{}",
             message
@@ -485,7 +509,7 @@ fn extract_kwargs_and_jinja_vars_and_dep_kwarg_and_configs(
             for key in config_from_deprecated.keys() {
                 if existing_map.contains_key(key) {
                     return err!(
-                        ErrorCode::SchemaError,
+                        ErrorCode::DbtYamlValidationError,
                         "Test cannot have the same key '{}' at the top-level and in config",
                         key
                     );
@@ -511,7 +535,7 @@ fn extract_kwargs_and_jinja_vars_and_dep_kwarg_and_configs(
     // Check for reserved "model" argument in combined args
     if combined_args.contains_key("model") {
         return err!(
-            ErrorCode::SchemaError,
+            ErrorCode::DbtYamlValidationError,
             "Test arguments include \"model\", which is a reserved argument",
         );
     }
@@ -595,6 +619,7 @@ static CONFIG_ARGS: &[&str] = &[
     "store_failures_as",
     "quoting",
     "static_analysis",
+    "sql_header",
 ];
 
 /// Extract config keys from a BTreeMap, filtering to only include valid config fields
@@ -706,6 +731,27 @@ fn merge_yaml_values(lhs: dbt_yaml::Value, rhs: dbt_yaml::Value) -> (bool, dbt_y
 static CLEAN_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[^0-9a-zA-Z_]+").expect("valid regex"));
 
+/// Narrow sanitizer for the test-name segments that become a filename
+/// (`source_name` / `resource_name`). The synthesized name is used directly
+/// as `target/generic_tests/<name>.sql`, so only path separators must be
+/// rewritten — anything else is left alone to avoid changing test names /
+/// `unique_id`s for inputs that already worked (e.g. `prod.events`,
+/// `my-source`).
+static PATH_UNSAFE_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[/\\]").expect("valid regex"));
+
+/// Matches strings that are a single bare call to one of dbt-Core's whitelisted
+/// renderable test-arg functions (e.g. `var('foo')`, `env_var('FOO', 'default')`).
+/// Mirrors `looks_like_func` in dbt-core/clients/jinja.py — used by
+/// `add_rendered_test_kwargs` to decide which test-arg strings get wrapped in
+/// `{{ }}` and rendered through the native Jinja env. The end-of-string anchor
+/// is significant: shapes like `var('x') ~ 'y'` that have content after the
+/// closing paren are intentionally excluded so we don't diverge from Core by
+/// accepting expressions Core rejects.
+static LOOKS_LIKE_FUNC: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\s*(env_var|ref|var|source|doc)\s*\(.+\)\s*$").expect("valid regex")
+});
+
 /// Generates a unique hash for a generic test based on uncleaned kwargs.
 /// This matches mantle's behavior where the unique_id includes a hash of the
 /// test metadata (namespace, name, kwargs) WITHOUT cleaning, ensuring that
@@ -772,7 +818,7 @@ fn build_hashable_metadata_repr(
         Some(ns) => {
             let _ = write!(out, ", 'namespace': '{}'", ns);
         }
-        None => out.push_str(", 'namespace': None"),
+        None => out.push_str(", 'namespace': 'None'"),
     }
 
     out.push('}');
@@ -811,15 +857,24 @@ fn write_value_to_hashable_repr(out: &mut String, value: &Value) {
             out.push(']');
         }
         Value::String(s) => {
-            let _ = write!(out, "'{}'", s);
+            // Match Python's repr(): use double quotes when the string contains single quotes,
+            // otherwise use single quotes.
+            if s.contains('\'') {
+                let _ = write!(out, "\"{}\"", s);
+            } else {
+                let _ = write!(out, "'{}'", s);
+            }
         }
+        // dbt-core's get_hashable_md recursively wraps every leaf primitive with `str()`
+        // before `repr()`-ing the metadata, so leaves appear in the hash input as quoted
+        // Python strings (e.g. `'True'`, `'-90'`, `'None'`) — not raw types. Match that.
         Value::Number(n) => {
-            let _ = write!(out, "{}", n);
+            let _ = write!(out, "'{}'", n);
         }
         Value::Bool(b) => {
-            out.push_str(if *b { "True" } else { "False" });
+            out.push_str(if *b { "'True'" } else { "'False'" });
         }
-        Value::Null => out.push_str("None"),
+        Value::Null => out.push_str("'None'"),
     }
 }
 
@@ -869,10 +924,22 @@ fn generate_test_name(
             arg_val.clone()
         };
 
-        let parts = match actual_value {
-            Value::Object(map) => map.values().map(|v| v.to_string()).collect::<Vec<_>>(),
-            Value::Array(arr) => arr.iter().map(|v| v.to_string()).collect(),
-            _ => vec![actual_value.to_string()],
+        // Match dbt-core's `str(value)` semantics for leaf primitives: Python renders
+        // `True`/`False`/`None`, not the JSON forms `true`/`false`/`null`. This affects
+        // the synthesized test name (and therefore the unique_id hash) — diverging here
+        // breaks `state:modified` parity against Mantle.
+        let render = |v: &Value| -> String {
+            match v {
+                Value::Bool(true) => "True".to_string(),
+                Value::Bool(false) => "False".to_string(),
+                Value::Null => "None".to_string(),
+                _ => v.to_string(),
+            }
+        };
+        let parts = match &actual_value {
+            Value::Object(map) => map.values().map(&render).collect::<Vec<_>>(),
+            Value::Array(arr) => arr.iter().map(&render).collect(),
+            _ => vec![render(&actual_value)],
         };
 
         flat_args.extend(parts);
@@ -902,16 +969,29 @@ fn generate_test_name(
         String::new()
     };
 
-    // Build the test name from here
+    // Build the test name from here.
+    //
+    // The synthesized name is also used as the SQL filename written under
+    // `target/generic_tests/`, so path separators in source / resource names
+    // (e.g. `raw/data/table`) would otherwise be interpreted as directory
+    // boundaries and cause the write to fail. Sanitize only those — every
+    // other character is preserved so test names and `unique_id`s for
+    // already-working inputs (e.g. `prod.events`, `my-source`) don't drift.
     let (prefix, resource_name) = match &test_config.source_name {
-        Some(source_name) => (
+        Some(source_name) => {
             // handles the test from a source model
-            format!("source_{test_macro_name}"),
-            format!("{}_{}", source_name, &test_config.resource_name),
-        ),
+            let safe_source = PATH_UNSAFE_REGEX.replace_all(source_name, "_");
+            let safe_resource = PATH_UNSAFE_REGEX.replace_all(&test_config.resource_name, "_");
+            (
+                format!("source_{test_macro_name}"),
+                format!("{safe_source}_{safe_resource}"),
+            )
+        }
         None => (
             test_macro_name.to_string(),
-            test_config.resource_name.clone(),
+            PATH_UNSAFE_REGEX
+                .replace_all(&test_config.resource_name, "_")
+                .into_owned(),
         ),
     };
 
@@ -1000,7 +1080,7 @@ fn generate_test_macro(
             let cfg_json = Value::Object(obj.clone());
             let cfg_yaml: dbt_yaml::Value = serde_json::from_value(cfg_json).map_err(|e| {
                 fs_err!(
-                    ErrorCode::SchemaError,
+                    ErrorCode::DbtYamlValidationError,
                     "Failed to convert embedded config: {}",
                     e
                 )
@@ -1010,13 +1090,35 @@ fn generate_test_macro(
         _ => dbt_yaml::Value::Mapping(dbt_yaml::Mapping::new(), Span::default()),
     };
 
+    // Compute the config block emit ahead of the macro call so we can place it
+    // *after* the macro call below (matching dbt-Core). dbt's `config()` is
+    // resolution-order sensitive — multiple calls merge with last-call-wins —
+    // so when a custom test macro internally calls `{{ config(severity=...) }}`
+    // and the user also supplies an embedded `config:` block, Core's order
+    // (macro call then embedded config) lets the embedded block win. Fusion
+    // previously emitted the embedded block first, which inverted precedence.
+    //
+    // We use `format_value_for_jinja` (not `serde_json::to_string`) so string
+    // values that are references to a generated `{% set %}` variable — created
+    // by `process_kwarg` when an embedded config value contained `{{ ... }}` —
+    // are emitted unquoted and Jinja resolves them at render time. Raw JSON
+    // serialization would quote those names into literal strings (e.g.
+    // `"dbt_custom_arg_config_severity"`), and a strict downstream config
+    // deserializer (e.g. the `severity` enum) would reject them as
+    // `unknown variant` (production conformance bucket dbt1501).
     let (non_empty, cfg_json) = merge_yaml_values(passed_in_cfg, embedded_cfg);
-    if non_empty {
-        // we write the config out as a JSON in {{ config(...) }}
-        let config_str = serde_json::to_string(&cfg_json)
-            .map_err(|e| fs_err!(ErrorCode::SchemaError, "Failed to serialize config: {}", e))?;
-        sql.push_str(&format!("{{{{ config({config_str}) }}}}\n"));
-    }
+    let config_emit = if non_empty {
+        let cfg_serde: Value = serde_json::to_value(&cfg_json).map_err(|e| {
+            fs_err!(
+                ErrorCode::DbtYamlValidationError,
+                "Failed to serialize config: {}",
+                e
+            )
+        })?;
+        Some(format_value_for_jinja(&cfg_serde, jinja_set_vars))
+    } else {
+        None
+    };
 
     // Build test macro call with namespace
     // dbt allows referencing a macro of test_<name> using just <name> in data_tests
@@ -1031,13 +1133,27 @@ fn generate_test_macro(
     fn format_value_for_jinja(value: &Value, jinja_set_vars: &BTreeMap<String, String>) -> String {
         match value {
             Value::String(s) => {
-                // Check if this is a reference to one of our Jinja set variables
+                // Strings shaped like a single bare call to one of dbt-Core's renderable
+                // functions (`env_var(...)`, `ref(...)`, `var(...)`, `source(...)`, `doc(...)`)
+                // are emitted unquoted so Jinja evaluates them when the generated test SQL is
+                // rendered. Core does the same in `add_rendered_test_kwargs` (clients/jinja.py)
+                // by re-wrapping such values in `{{ }}` before native rendering. Without this,
+                // Fusion would forward the literal string into `config()` and a strict enum
+                // deserializer (e.g. `severity`) would reject it as `unknown variant `var('...')``
+                // (production conformance bucket dbt1501). The end-of-string anchor in
+                // `LOOKS_LIKE_FUNC` keeps us aligned with Core: shapes like `var('x') ~ 'y'`
+                // are not matched here, mirroring Core's rejection of those expressions.
+                //
+                // `get_where_subquery(` is Fusion-internal: emitted by `get_test_details` to
+                // wrap the `model` test arg, and must always pass through unquoted.
                 if s.starts_with("get_where_subquery(")
-                    || s.starts_with("ref(")
-                    || s.starts_with("source(")
+                    || LOOKS_LIKE_FUNC.is_match(s)
                     || jinja_set_vars.iter().any(|(var_name, _)| var_name == s)
                 {
-                    s.to_string() // Don't add quotes if it's already a ref, source, or jinja var
+                    s.to_string()
+                } else if s.starts_with("{{") && s.ends_with("}}") {
+                    // Strip Jinja delimiters: {{ expr }} → expr (used directly inside macro args)
+                    s[2..s.len() - 2].trim().to_string()
                 } else {
                     let escaped = s
                         .replace('\\', "\\\\") // Escape backslashes
@@ -1071,7 +1187,7 @@ fn generate_test_macro(
     }
 
     // Format all kwargs, handling ref calls specially
-    // Exclude an embedded 'config' kwarg as it is emitted via config(...) above
+    // Exclude an embedded 'config' kwarg as it is emitted via config(...) below
     // Exclude reserved 'name' kwarg (used to name the test node, not passed to the macro).
     let formatted_args: Vec<String> = kwargs
         .iter()
@@ -1086,6 +1202,9 @@ fn generate_test_macro(
         qualified_name,
         formatted_args.join(", ")
     ));
+    if let Some(config_str) = config_emit {
+        sql.push_str(&format!("{{{{ config({config_str}) }}}}"));
+    }
     Ok(sql)
 }
 
@@ -1167,7 +1286,7 @@ fn collect_versioned_model_tests(
     for version in versions {
         let Some(version_suffix) = version.get_version() else {
             return err!(
-                ErrorCode::InvalidSchema,
+                ErrorCode::InvalidConfig,
                 "Version '{:?}' does not meet the required format",
                 version.v
             );
@@ -1179,12 +1298,13 @@ fn collect_versioned_model_tests(
 
         // Override with version-specific tests if they exist
         // Base model level tests are exclusive or with versioned model level tests
-        if let Some(tests) = version
-            .__additional_properties__
-            .get("tests")
-            .or_else(|| version.__additional_properties__.get("data_tests"))
-            && let Ok(version_tests) = dbt_yaml::from_value::<Vec<DataTests>>(tests.clone())
-        {
+        if version.tests.is_some() && version.data_tests.is_some() {
+            return err!(
+                ErrorCode::InvalidConfig,
+                "Cannot have both 'tests' and 'data_tests' defined"
+            );
+        }
+        if let Some(version_tests) = version.tests.clone().or_else(|| version.data_tests.clone()) {
             version_config.model_tests = Some(version_tests);
         }
 
@@ -1220,7 +1340,7 @@ fn collect_versioned_model_tests(
                 for col in column_map {
                     if col.tests.is_some() && col.data_tests.is_some() {
                         return err!(
-                            ErrorCode::InvalidSchema,
+                            ErrorCode::InvalidConfig,
                             "Cannot have both 'tests' and 'data_tests' defined"
                         );
                     }
@@ -1235,9 +1355,10 @@ fn collect_versioned_model_tests(
                 }
             }
 
-            if !column_tests.is_empty() {
-                version_config.column_tests = Some(column_tests);
-            }
+            // Always assign even when empty: a version with `columns` that excludes
+            // all testable columns should produce zero tests, not fall back to the
+            // base config (which still carries the excluded column tests from the clone).
+            version_config.column_tests = Some(column_tests);
         } else {
             // No columns section at all - inherit all column tests
             version_config.column_tests = base_test_config.column_tests.clone();
@@ -1414,7 +1535,7 @@ mod tests {
     use super::*;
     use dbt_schemas::schemas::data_tests::{CustomTestInner, CustomTestMultiKey};
     use serde_json::Value;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
 
     #[test]
     fn test_no_double_quoting() {
@@ -1695,6 +1816,109 @@ mod tests {
     }
 
     #[test]
+    fn test_version_column_exclude_suppresses_inherited_tests() {
+        // Regression test for https://github.com/dbt-labs/dbt-fusion/issues/1666
+        //
+        // When a versioned model uses `columns.exclude` to omit a column from a
+        // specific version, any tests defined on that column in the base model
+        // must NOT appear in that version's column_tests.
+        //
+        // The bug: after filtering, if every testable column is excluded the
+        // resulting BTreeMap is empty.  The old guard `if !is_empty()` skipped
+        // the assignment, leaving the cloned base config (with all tests) intact.
+
+        use dbt_schemas::schemas::common::Versions;
+        use dbt_yaml::{Mapping, Verbatim};
+
+        // Build a base config: one column "cost_center_bkey" with a `unique` test.
+        let unique_test = DataTests::String(Spanned::from("unique".to_string()));
+        let mut base_col_tests = BTreeMap::new();
+        base_col_tests.insert("cost_center_bkey".to_string(), (false, vec![unique_test]));
+        let base_config = GenericTestConfig {
+            resource_type: "model".to_string(),
+            resource_name: "cost_centers".to_string(),
+            version_num: None,
+            model_tests: None,
+            column_tests: Some(base_col_tests),
+            source_name: None,
+        };
+
+        // Helper: build `columns` YAML value for a version spec.
+        let make_columns_value = |include: &str, exclude: Vec<&str>| -> dbt_yaml::Value {
+            let mut entry = Mapping::new();
+            entry.insert(
+                dbt_yaml::Value::string("include".to_string()),
+                dbt_yaml::Value::string(include.to_string()),
+            );
+            if !exclude.is_empty() {
+                let seq = exclude
+                    .iter()
+                    .map(|s| dbt_yaml::Value::string((*s).to_string()))
+                    .collect();
+                entry.insert(
+                    dbt_yaml::Value::string("exclude".to_string()),
+                    dbt_yaml::Value::sequence(seq),
+                );
+            }
+            dbt_yaml::Value::sequence(vec![dbt_yaml::Value::mapping(entry)])
+        };
+
+        let make_version = |v: i64, columns_value: dbt_yaml::Value| -> Versions {
+            let mut extra: HashMap<String, dbt_yaml::Value> = HashMap::new();
+            extra.insert("columns".to_string(), columns_value);
+            Versions {
+                v: dbt_yaml::Value::Number(dbt_yaml::Number::from(v), Span::zero()),
+                deprecation_date: None,
+                defined_in: None,
+                description: None,
+                access: None,
+                config: Verbatim::from(None),
+                constraints: None,
+                data_tests: None,
+                tests: None,
+                columns: None,
+                __additional_properties__: Verbatim::from(extra),
+            }
+        };
+
+        // v1: include all (no exclusions) — test must be present
+        let v1 = make_version(1, make_columns_value("all", vec![]));
+        // v2: include all, exclude cost_center_bkey — test must be absent
+        let v2 = make_version(2, make_columns_value("all", vec!["cost_center_bkey"]));
+
+        let result =
+            collect_versioned_model_tests(&base_config, &[v1, v2]).expect("should not fail");
+
+        assert_eq!(result.len(), 2, "expected one config per version");
+
+        let v1_cfg = result
+            .iter()
+            .find(|c| c.version_num.as_deref() == Some("1"))
+            .unwrap();
+        assert!(
+            v1_cfg
+                .column_tests
+                .as_ref()
+                .map(|m| m.contains_key("cost_center_bkey"))
+                .unwrap_or(false),
+            "v1 should inherit the unique test for cost_center_bkey"
+        );
+
+        let v2_cfg = result
+            .iter()
+            .find(|c| c.version_num.as_deref() == Some("2"))
+            .unwrap();
+        assert!(
+            !v2_cfg
+                .column_tests
+                .as_ref()
+                .map(|m| m.contains_key("cost_center_bkey"))
+                .unwrap_or(false),
+            "v2 must not have a test for cost_center_bkey (it is excluded)"
+        );
+    }
+
+    #[test]
     fn test_generate_test_name_with_custom_test_name() {
         // Create test inputs
         let custom_test_name = "custom_test_name";
@@ -1721,6 +1945,127 @@ mod tests {
         assert_eq!(
             test_name_no_vars, custom_test_name,
             "Test name should exactly match the custom test name when provided"
+        );
+    }
+
+    #[test]
+    fn test_generate_test_name_sanitizes_path_unsafe_chars_in_source_table() {
+        // A source table name containing `/` would otherwise leak path
+        // separators into the synthesized test name and the generic test
+        // SQL filename, producing missing intermediate directories on write.
+        let mut kwargs = BTreeMap::new();
+        kwargs.insert(
+            "model".to_string(),
+            Value::String(
+                "{{ get_where_subquery(source('special_chars_source', 'raw/data/table')) }}"
+                    .to_string(),
+            ),
+        );
+        kwargs.insert("column_name".to_string(), Value::String("id".to_string()));
+
+        let test_config = GenericTestConfig {
+            resource_type: "source".to_string(),
+            resource_name: "raw/data/table".to_string(),
+            version_num: None,
+            model_tests: None,
+            column_tests: None,
+            source_name: Some("special_chars_source".to_string()),
+        };
+
+        let name = generate_test_name(
+            "not_null",
+            None,
+            "project_name",
+            &test_config,
+            &kwargs,
+            None,
+            &BTreeMap::new(),
+            &mut HashMap::new(),
+        );
+
+        assert!(
+            !name.contains('/'),
+            "synthesized test name must not contain `/`: {name}"
+        );
+        assert_eq!(
+            name, "source_not_null_special_chars_source_raw_data_table_id",
+            "slashes in the source table name should be normalized to `_`"
+        );
+    }
+
+    #[test]
+    fn test_generate_test_name_preserves_non_path_special_chars() {
+        // Hyphens, dots, etc. previously produced working filenames; the
+        // path-separator-only sanitizer must leave them alone so existing
+        // test names and `unique_id`s do not drift.
+        let mut kwargs = BTreeMap::new();
+        kwargs.insert(
+            "model".to_string(),
+            Value::String("{{ get_where_subquery(ref('weird.name-model')) }}".to_string()),
+        );
+        kwargs.insert("column_name".to_string(), Value::String("id".to_string()));
+
+        let test_config = GenericTestConfig {
+            resource_type: "model".to_string(),
+            resource_name: "weird.name-model".to_string(),
+            version_num: None,
+            model_tests: None,
+            column_tests: None,
+            source_name: None,
+        };
+
+        let name = generate_test_name(
+            "unique",
+            None,
+            "project_name",
+            &test_config,
+            &kwargs,
+            None,
+            &BTreeMap::new(),
+            &mut HashMap::new(),
+        );
+
+        assert_eq!(name, "unique_weird.name-model_id");
+    }
+
+    #[test]
+    fn test_generate_test_name_sanitizes_windows_path_separator() {
+        // Backslashes are path separators on Windows. Treat them like `/`
+        // so the same source table name behaves identically across platforms.
+        let mut kwargs = BTreeMap::new();
+        kwargs.insert(
+            "model".to_string(),
+            Value::String(
+                "{{ get_where_subquery(source('special_chars_source', 'raw\\data\\table')) }}"
+                    .to_string(),
+            ),
+        );
+        kwargs.insert("column_name".to_string(), Value::String("id".to_string()));
+
+        let test_config = GenericTestConfig {
+            resource_type: "source".to_string(),
+            resource_name: "raw\\data\\table".to_string(),
+            version_num: None,
+            model_tests: None,
+            column_tests: None,
+            source_name: Some("special_chars_source".to_string()),
+        };
+
+        let name = generate_test_name(
+            "not_null",
+            None,
+            "project_name",
+            &test_config,
+            &kwargs,
+            None,
+            &BTreeMap::new(),
+            &mut HashMap::new(),
+        );
+
+        assert!(!name.contains('\\'));
+        assert_eq!(
+            name,
+            "source_not_null_special_chars_source_raw_data_table_id"
         );
     }
 
@@ -1851,6 +2196,125 @@ mod tests {
             "Full generated name should treat escaped newlines as whitespace: {full}"
         );
     }
+
+    #[test]
+    fn test_generate_test_name_renders_primitives_as_python_str() {
+        // Regression: `serde_json::Value::{Bool, Null}.to_string()` produces JSON-style
+        // forms (`"true"`, `"false"`, `"null"`), but dbt-core uses Python's `str(value)`
+        // which produces (`"True"`, `"False"`, `"None"`) when building the synthesized
+        // test name. The wrong form changes both the displayed name and the trailing
+        // unique_id hash (since the hash is computed over the name), breaking
+        // `state:modified` parity against Mantle-produced manifests.
+        // Cover all three branches of the kwargs match in `generate_test_name`:
+        //   - bare leaf       -> `_ => actual_value.to_string()`
+        //   - leaf in Object  -> `Value::Object(map) => map.values().map(.to_string())`
+        //   - leaf in Array   -> `Value::Array(arr) => arr.iter().map(.to_string())`
+
+        let test_config = GenericTestConfig {
+            resource_type: "model".to_string(),
+            resource_name: "my_model".to_string(),
+            version_num: None,
+            model_tests: None,
+            column_tests: None,
+            source_name: None,
+        };
+
+        // ── bare leaf kwargs (bool + null) ────────────────────────────────
+        let mut kwargs = BTreeMap::new();
+        kwargs.insert(
+            "model".to_string(),
+            Value::String("ref('my_model')".to_string()),
+        );
+        kwargs.insert("inclusive".to_string(), Value::Bool(true));
+        kwargs.insert("strict".to_string(), Value::Bool(false));
+        kwargs.insert("missing".to_string(), Value::Null);
+
+        let mut test_name_truncations = HashMap::new();
+        let generated = generate_test_name(
+            "accepted_range",
+            None,
+            "my_project",
+            &test_config,
+            &kwargs,
+            None,
+            &BTreeMap::new(),
+            &mut test_name_truncations,
+        );
+
+        assert!(
+            generated.contains("True"),
+            "Bare bool kwarg should render as Python `True`, got: {generated}"
+        );
+        assert!(
+            generated.contains("False"),
+            "Bare bool kwarg should render as Python `False`, got: {generated}"
+        );
+        assert!(
+            generated.contains("None"),
+            "Bare null kwarg should render as Python `None`, got: {generated}"
+        );
+
+        // ── leaves nested in Value::Object ────────────────────────────────
+        let mut kwargs = BTreeMap::new();
+        kwargs.insert(
+            "model".to_string(),
+            Value::String("ref('my_model')".to_string()),
+        );
+        let mut constraint = serde_json::Map::new();
+        constraint.insert("strict".to_string(), Value::Bool(false));
+        constraint.insert("default".to_string(), Value::Null);
+        kwargs.insert("constraint".to_string(), Value::Object(constraint));
+
+        let mut test_name_truncations = HashMap::new();
+        let generated = generate_test_name(
+            "accepted_range",
+            None,
+            "my_project",
+            &test_config,
+            &kwargs,
+            None,
+            &BTreeMap::new(),
+            &mut test_name_truncations,
+        );
+
+        assert!(
+            generated.contains("False"),
+            "Bool inside Value::Object should render as Python `False`, got: {generated}"
+        );
+        assert!(
+            generated.contains("None"),
+            "Null inside Value::Object should render as Python `None`, got: {generated}"
+        );
+
+        // ── leaves inside Value::Array ────────────────────────────────────
+        let mut kwargs = BTreeMap::new();
+        kwargs.insert(
+            "model".to_string(),
+            Value::String("ref('my_model')".to_string()),
+        );
+        kwargs.insert(
+            "values".to_string(),
+            Value::Array(vec![Value::Bool(true), Value::Bool(false), Value::Null]),
+        );
+
+        let mut test_name_truncations = HashMap::new();
+        let generated = generate_test_name(
+            "accepted_range",
+            None,
+            "my_project",
+            &test_config,
+            &kwargs,
+            None,
+            &BTreeMap::new(),
+            &mut test_name_truncations,
+        );
+
+        assert!(
+            generated.contains("True") && generated.contains("False") && generated.contains("None"),
+            "Leaves inside Value::Array should render as Python `True`/`False`/`None`, got: {generated}"
+        );
+    }
+
     #[test]
     fn test_generate_test_name_with_name_longer_than_63_chars() {
         //This test is to ensure that if the generated test name is longer than 63 characters
@@ -1925,6 +2389,19 @@ mod tests {
         assert!(
             !test_name_no_vars.contains("id"),
             "Test name should not contain the 'id' column name after truncation"
+        );
+        // Verify the truncations map records the full original name, which is the name
+        // that dbt-core/Mantle use for unique_id construction.
+        let original_name = test_name_truncations
+            .get(&test_name_no_vars)
+            .expect("truncated name should be recorded in test_name_truncations");
+        assert!(
+            original_name.len() >= 64,
+            "Original name should be the untruncated form (>=64 chars), got: {original_name}"
+        );
+        assert!(
+            original_name.contains("id"),
+            "Original name should contain 'id' which was truncated away, got: {original_name}"
         );
     }
 
@@ -2493,31 +2970,36 @@ mod tests {
 
     #[test]
     fn test_write_value_to_hashable_repr_number() {
+        // dbt-core's `get_hashable_md` wraps every leaf primitive in `str()` before
+        // `repr()`-ing the metadata, so numbers appear as quoted strings in the hash input.
         let mut out = String::new();
         write_value_to_hashable_repr(&mut out, &Value::Number(42.into()));
-        assert_eq!(out, "42");
+        assert_eq!(out, "'42'");
     }
 
     #[test]
     fn test_write_value_to_hashable_repr_bool() {
+        // Match Python's `repr(str(True))` / `repr(str(False))` — quoted strings.
         let mut out = String::new();
         write_value_to_hashable_repr(&mut out, &Value::Bool(true));
-        assert_eq!(out, "True");
+        assert_eq!(out, "'True'");
 
         out.clear();
         write_value_to_hashable_repr(&mut out, &Value::Bool(false));
-        assert_eq!(out, "False");
+        assert_eq!(out, "'False'");
     }
 
     #[test]
     fn test_write_value_to_hashable_repr_null() {
+        // Match Python's `repr(str(None))` — `'None'` (quoted string).
         let mut out = String::new();
         write_value_to_hashable_repr(&mut out, &Value::Null);
-        assert_eq!(out, "None");
+        assert_eq!(out, "'None'");
     }
 
     #[test]
     fn test_write_value_to_hashable_repr_array() {
+        // Numbers inside arrays are also leaf primitives, so they get quoted.
         let mut out = String::new();
         write_value_to_hashable_repr(
             &mut out,
@@ -2526,7 +3008,7 @@ mod tests {
                 Value::Number(1.into()),
             ]),
         );
-        assert_eq!(out, "['a', 1]");
+        assert_eq!(out, "['a', '1']");
     }
 
     #[test]
@@ -2564,7 +3046,47 @@ mod tests {
         let kwargs = BTreeMap::new();
         let repr = build_hashable_metadata_repr("unique", None, &kwargs);
 
-        assert!(repr.contains("'namespace': None"));
+        assert!(repr.contains("'namespace': 'None'"));
+    }
+
+    #[test]
+    fn test_generate_test_unique_id_hash_matches_dbt_core() {
+        // Regression: pin the hash output for `dbt_utils.accepted_range` against a
+        // Mantle-produced value. This caught two parity bugs:
+        //   1. boolean arg lowercased in fqn_name (`__true__` vs `__True__`)
+        //   2. leaf primitives in the hashable-metadata repr emitted as raw types
+        //      (`'inclusive': True`) instead of dbt-core's stringified form
+        //      (`'inclusive': 'True'`).
+        // Inputs mirror the YAML:
+        //   - dbt_utils.accepted_range:
+        //       arguments: { min_value: -90, max_value: 90, inclusive: true }
+        // applied to source SWIMPLY_SWIMPLY_PROD.POOLS column `latitude`.
+        let fqn_name =
+            "dbt_utils_source_accepted_range_SWIMPLY_SWIMPLY_PROD_POOLS_latitude__True__90___90";
+
+        let mut kwargs = BTreeMap::new();
+        kwargs.insert(
+            "column_name".to_string(),
+            Value::String("latitude".to_string()),
+        );
+        kwargs.insert("min_value".to_string(), Value::Number((-90).into()));
+        kwargs.insert("max_value".to_string(), Value::Number(90.into()));
+        kwargs.insert("inclusive".to_string(), Value::Bool(true));
+        kwargs.insert(
+            "model".to_string(),
+            Value::String(
+                "{{ get_where_subquery(source('SWIMPLY_SWIMPLY_PROD', 'POOLS')) }}".to_string(),
+            ),
+        );
+
+        let namespace = "dbt_utils".to_string();
+        let hash =
+            generate_test_unique_id_hash(fqn_name, "accepted_range", Some(&namespace), &kwargs);
+
+        assert_eq!(
+            hash, "1a34381004",
+            "Hash must match Mantle/dbt-core for replay parity. Got: {hash}"
+        );
     }
 
     #[test]
@@ -2760,11 +3282,11 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap();
         assert_eq!(
-            model, "get_where_subquery(ref('turmoenster', v='1_1'))",
+            model, "{{ get_where_subquery(ref('turmoenster', version='1_1')) }}",
             "Version should be emitted as a quoted string to avoid Jinja interpreting 1_1 as numeric 11"
         );
         assert!(
-            !model.contains("v=1_1"),
+            !model.contains("version=1_1"),
             "Unquoted v=1_1 would be parsed by Jinja as the numeric literal 11"
         );
     }

@@ -5,7 +5,10 @@ use dbt_common::{
 };
 use dbt_env::env::InternalEnv;
 use dbt_jinja_utils::invocation_args::InvocationArgs;
-use dbt_schemas::{schemas::InternalDbtNodeAttributes, state::ResolverState};
+use dbt_schemas::{
+    schemas::{InternalDbtNodeAttributes, ResolvedCloudConfig},
+    state::ResolverState,
+};
 use proto_rust::v1::public::events::fusion::{
     AdapterInfo, AdapterInfoV2, Invocation, InvocationEnv, PackageInstall, ResourceCounts, RunModel,
 };
@@ -182,8 +185,12 @@ pub fn run_model_event(
 ) {
     let unique_id = node.unique_id();
     if !run_stats.contains_key(&unique_id) {
-        // This got called for a seed, which didn't have stats.
-        // There might be a better way of doing this...
+        // Seeds are expected to not have stats. Any other node type missing
+        // stats indicates a bug (see PR #9146 regression).
+        debug_assert!(
+            node.resource_type().as_static_ref() == "seed",
+            "run_stats missing for non-seed node {unique_id} — telemetry will be skipped"
+        );
         return;
     }
     let stat = run_stats.get(&unique_id).unwrap();
@@ -202,6 +209,7 @@ pub fn run_model_event(
     let mut skipped_reason = "".to_string();
     match stat.status {
         NodeStatus::Succeeded
+        | NodeStatus::SucceededWithWarning
         | NodeStatus::TestWarned
         | NodeStatus::TestPassed
         | NodeStatus::Errored => {}
@@ -282,6 +290,7 @@ pub fn run_model_event(
 /// Emit ObservabilityMetric for private package resolution visibility (Datadog/Vortex).
 /// Called when resolving a private package via cloud providers - on success and failure.
 pub fn private_package_usage_event(
+    cloud_config: &Option<ResolvedCloudConfig>,
     package_name: &str,
     provider: Option<&str>,
     matched: bool,
@@ -298,15 +307,24 @@ pub fn private_package_usage_event(
     tags.extend([
         format!(
             "account:{}",
-            std::env::var("DBT_CLOUD_ACCOUNT_ID").unwrap_or_else(|_| "unknown".to_string())
+            cloud_config
+                .as_ref()
+                .and_then(|c| c.credentials.as_ref().map(|cr| cr.account_id.as_str()))
+                .unwrap_or("unknown")
         ),
         format!(
             "project:{}",
-            std::env::var("DBT_CLOUD_PROJECT_ID").unwrap_or_else(|_| "unknown".to_string())
+            cloud_config
+                .as_ref()
+                .and_then(|c| c.project_id.as_deref())
+                .unwrap_or("unknown")
         ),
         format!(
             "environment:{}",
-            std::env::var("DBT_CLOUD_ENVIRONMENT_ID").unwrap_or_else(|_| "unknown".to_string())
+            cloud_config
+                .as_ref()
+                .and_then(|c| c.environment_id.as_deref())
+                .unwrap_or("unknown")
         ),
     ]);
 

@@ -4,8 +4,8 @@ use dbt_telemetry::{AnyTelemetryEvent, LogMessage, LogRecordInfo, SeverityNumber
 
 use super::super::{
     data_provider::DataProvider,
+    dbt_metrics::{FusionMetricKey, InvocationMetricKey},
     layer::TelemetryMiddleware,
-    metrics::{InvocationMetricKey, MetricKey},
 };
 
 /// An unfortunate temporary wrapper used to mark log messages that are parsing errors.
@@ -152,7 +152,7 @@ impl TelemetryMiddleware for TelemetryParsingErrorFilter {
                     }
 
                     // Not seen before, replace with a general message
-                    log_message.code = Some(ErrorCode::DependencyWarning as u32);
+                    log_message.code = Some(ErrorCode::PackageParsingCompatibility as u32);
                     record.body = format!(
                         "Package `{package_name}` issued one or more compatibility warnings. To display all warnings associated with this package, run with `--show-all-deprecations`."
                     );
@@ -188,7 +188,7 @@ impl TelemetryMiddleware for TelemetryParsingErrorFilter {
 
             // Increment autofix counter
             data_provider.increment_metric(
-                MetricKey::InvocationMetric(InvocationMetricKey::AutoFixSuggestions),
+                FusionMetricKey::InvocationMetric(InvocationMetricKey::AutoFixSuggestions),
                 1,
             );
 

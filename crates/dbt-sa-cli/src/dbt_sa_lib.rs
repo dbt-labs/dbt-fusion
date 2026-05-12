@@ -2,11 +2,11 @@ use crate::dbt_sa_clap::{Cli, Commands, ProjectTemplate};
 use dbt_common::cancellation::CancellationToken;
 use dbt_common::create_root_info_span;
 use dbt_common::io_utils::checkpoint_maybe_exit;
+use dbt_common::tracing::dbt_metrics::error_count_checkpoint;
 use dbt_common::tracing::emit::{
     emit_error_log_from_fs_error, emit_info_log_message, emit_info_progress_message,
 };
 use dbt_common::tracing::invocation::create_invocation_attributes;
-use dbt_common::tracing::metrics::error_count_checkpoint;
 use dbt_init::{FsError, init};
 use dbt_jinja_utils::invocation_args::InvocationArgs;
 use dbt_jinja_utils::listener::DefaultJinjaTypeCheckEventListenerFactory;
@@ -20,7 +20,6 @@ use dbt_common::{
     constants::{DBT_MANIFEST_JSON, INSTALLING, VALIDATING},
     fs_err,
     io_args::{Phases, ShowOptions, SystemArgs},
-    logging::init_logger,
     pretty_string::GREEN,
     stdfs,
     tracing::{emit::emit_info_event, span_info::record_span_status},
@@ -33,6 +32,7 @@ use dbt_schemas::state::{
 };
 #[allow(unused_imports)]
 use git_version::git_version;
+use std::borrow::Cow;
 
 use dbt_schemas::schemas::manifest::build_manifest;
 use tracing::Instrument;
@@ -48,14 +48,12 @@ use serde_json::to_string_pretty;
 
 pub async fn execute_fs(
     system_arg: SystemArgs,
-    cli: Cli,
+    cli: Box<Cli>,
     token: CancellationToken,
 ) -> FsResult<()> {
     // Resolve EvalArgs from SystemArgs and Cli. This will create out folders,
     // for commands that need it and canonicalize the paths. May error on invalid paths.
     let eval_arg = cli.to_eval_args(system_arg)?;
-
-    init_logger((&eval_arg.io).into()).expect("Failed to initialize logger");
 
     // Create the Invocation span as a new root
     let invocation_span = create_root_info_span(create_invocation_attributes("dbt-sa", &eval_arg));
@@ -79,7 +77,11 @@ pub async fn execute_fs(
 }
 
 #[allow(clippy::cognitive_complexity)]
-async fn do_execute_fs(eval_arg: &EvalArgs, cli: Cli, token: CancellationToken) -> FsResult<()> {
+async fn do_execute_fs(
+    eval_arg: &EvalArgs,
+    cli: Box<Cli>,
+    token: CancellationToken,
+) -> FsResult<()> {
     if let Commands::Man(_) = &cli.command {
         return execute_man_command(eval_arg).await;
     } else if let Commands::Init(init_args) = &cli.command {
@@ -138,7 +140,7 @@ async fn do_execute_fs(eval_arg: &EvalArgs, cli: Cli, token: CancellationToken) 
 #[allow(clippy::cognitive_complexity)]
 async fn execute_setup_and_all_phases(
     eval_arg: &EvalArgs,
-    cli: Cli,
+    cli: Box<Cli>,
     token: &CancellationToken,
 ) -> FsResult<()> {
     // Header ..
@@ -187,13 +189,14 @@ async fn execute_all_phases(arg: &EvalArgs, _cli: &Cli, token: &CancellationToke
     // Loads all .yml files + collects all included files
     let load_args = LoadArgs::from_eval_args(arg);
     let invocation_args = InvocationArgs::from_eval_args(arg);
-    let (dbt_state, _dbt_cloud_config) = load(&load_args, &invocation_args, token).await?;
+    let dbt_state = load(&load_args, Cow::Borrowed(&invocation_args), None, token).await?;
 
     let arg = EvalArgsBuilder::from_eval_args(arg)
+        .with_warn_error_options(dbt_state.warn_error, dbt_state.warn_error_options.clone())
         .with_additional(
             dbt_state.dbt_profile.target.to_string(),
             dbt_state.dbt_profile.threads,
-            dbt_state.dbt_profile.db_config.adapter_type_if_supported(),
+            dbt_state.dbt_profile.db_config.adapter_type(),
         )
         .build();
 

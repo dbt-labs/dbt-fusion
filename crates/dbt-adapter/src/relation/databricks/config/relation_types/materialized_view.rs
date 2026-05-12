@@ -11,7 +11,7 @@ fn requires_full_refresh(components: &IndexMap<&'static str, ComponentConfigChan
 }
 
 /// Create a `RelationConfigLoader` for Databricks materialized views
-pub(crate) fn new_loader() -> RelationConfigLoader<DatabricksRelationMetadata> {
+pub(crate) fn new_loader() -> RelationConfigLoader<'static, DatabricksRelationMetadata> {
     // TODO: missing from Python dbt-databricks:
     // - liquid clustering
     // - relation tags
@@ -34,7 +34,9 @@ pub(crate) fn new_loader() -> RelationConfigLoader<DatabricksRelationMetadata> {
 mod tests {
     use super::{new_loader, requires_full_refresh};
     use crate::AdapterType;
-    use crate::relation::config_v2::{ComponentConfigChange, RelationComponentConfigChangeSet};
+    use crate::relation::config_v2::{
+        ComponentConfigChange, ComponentConfigLoader, RelationComponentConfigChangeSet,
+    };
     use crate::relation::databricks::config::{
         DatabricksRelationMetadata, components,
         test_helpers::{TestModelConfig, run_test_cases},
@@ -79,7 +81,7 @@ mod tests {
                     AdapterType::Databricks,
                     [
                         (
-                            components::TblPropertiesLoader::type_name(),
+                            components::TblPropertiesLoader.type_name(),
                             ComponentConfigChange::Some(
                                 components::TblPropertiesLoader::new_component_type_erased(
                                     IndexMap::from_iter([(
@@ -90,7 +92,7 @@ mod tests {
                             ),
                         ),
                         (
-                            components::PartitionByLoader::type_name(),
+                            components::PartitionByLoader.type_name(),
                             ComponentConfigChange::Some(
                                 components::PartitionByLoader::new_component_type_erased(vec![
                                     "partition_column_new".to_string(),
@@ -100,6 +102,26 @@ mod tests {
                     ],
                     requires_full_refresh,
                 ),
+                changeset_jinja: "
+<partitioned_by>
+    <partition_by>
+        partition_column_new
+    </partition_by>
+</partitioned_by>
+<tblproperties>
+    <tblproperties>
+        <custom.key>
+            new
+        </custom.key>
+        <delta.enableRowTracking>
+            true
+        </delta.enableRowTracking>
+    </tblproperties>
+    <pipeline_id>
+        my_old_pipeline
+    </pipeline_id>
+</tblproperties>
+                    ",
                 requires_full_refresh: true,
             },
             TestCase {
@@ -124,7 +146,7 @@ mod tests {
                     AdapterType::Databricks,
                     [
                         (
-                            components::RefreshLoader::type_name(),
+                            components::RefreshLoader.type_name(),
                             ComponentConfigChange::Some(
                                 components::RefreshLoader::new_component_type_erased(
                                     Some("*/60 * * * *".to_string()),
@@ -134,7 +156,7 @@ mod tests {
                         ),
                         // TODO: re-add tags
                         // (
-                        //     components::RelationTagsLoader::type_name(),
+                        //     components::RelationTagsLoader.type_name(),
                         //     ComponentConfigChange::Some(components::RelationTagsLoader::new_component_type_erased(
                         //         IndexMap::from_iter([("a_tag".to_string(), "new".to_string())]),
                         //     )),
@@ -142,6 +164,19 @@ mod tests {
                     ],
                     requires_full_refresh,
                 ),
+                changeset_jinja: "
+<refresh>
+    <cron>
+        */60 * * * *
+    </cron>
+    <time_zone_value>
+        UTC
+    </time_zone_value>
+    <is_altered>
+        True
+    </is_altered>
+</refresh>
+                    ",
                 requires_full_refresh: false,
             },
         ]

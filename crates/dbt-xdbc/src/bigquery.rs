@@ -1,6 +1,7 @@
 // from https://github.com/apache/arrow-adbc/blob/9a10e6791db6d54b813fde4df3925c354822192e/go/adbc/driver/bigquery/driver.go#L31
 
 pub const AUTH_TYPE: &str = "adbc.bigquery.sql.auth_type";
+pub const API_ENDPOINT: &str = "adbc.bigquery.sql.api_endpoint";
 pub const LOCATION: &str = "adbc.bigquery.sql.location";
 pub const PROJECT_ID: &str = "adbc.bigquery.sql.project_id";
 pub const DATASET_ID: &str = "adbc.bigquery.sql.dataset_id";
@@ -77,6 +78,7 @@ pub const INGEST_FILE_DELIMITER: &str = "adbc.bigquery.ingest.csv_delimiter";
 pub const INGEST_PATH: &str = "adbc.bigquery.ingest.csv_filepath";
 pub const INGEST_SCHEMA: &str = "adbc.bigquery.ingest.csv_schema";
 pub const UPDATE_TABLE_COLUMNS_DESCRIPTION: &str = "adbc.bigquery.table.update_columns_description";
+pub const UPDATE_TABLE_COLUMNS_POLICY_TAGS: &str = "adbc.bigquery.table.update_columns_policy_tags";
 pub const UPDATE_TABLE_DESCRIPTION: &str = "adbc.bigquery.table.update_description";
 pub const UPDATE_DATASET_AUTHORIZE_VIEW_TO_DATASETS: &str =
     "adbc.bigquery.dataset.authorize_view_to_datasets";

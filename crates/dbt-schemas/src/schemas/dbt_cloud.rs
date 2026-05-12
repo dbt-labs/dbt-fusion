@@ -1,9 +1,10 @@
+use dbt_yaml::DbtSchema;
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 
 /// Represents a dbt Cloud project configuration
 #[skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, DbtSchema)]
 pub struct DbtCloudProject {
     #[serde(rename = "project-name")]
     pub project_name: String,
@@ -23,7 +24,7 @@ pub struct DbtCloudProject {
 
 /// Represents the context section of the dbt Cloud configuration
 #[skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, DbtSchema)]
 pub struct DbtCloudContext {
     #[serde(rename = "active-project")]
     pub active_project: String,
@@ -35,7 +36,7 @@ pub struct DbtCloudContext {
 
 /// Represents the top-level dbt Cloud configuration file
 #[skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, DbtSchema)]
 pub struct DbtCloudConfig {
     pub version: String,
     pub context: DbtCloudContext,
@@ -54,4 +55,27 @@ impl DbtCloudConfig {
 pub struct DbtCloudProjectConfig {
     pub defer_env_id: Option<String>,
     pub project: Option<DbtCloudProject>,
+}
+
+/// Resolved credentials for authenticating with dbt Cloud APIs.
+/// All fields are required — if any credential is missing, this struct is not constructed.
+#[derive(Debug, Clone)]
+pub struct CloudCredentials {
+    pub account_id: String,
+    pub host: String,
+    pub token: String,
+}
+
+/// Fully-resolved dbt Cloud configuration.
+///
+/// Precedence: env var > dbt_project.yml > dbt_cloud.yml, applied once at
+/// construction time via `resolve_cloud_config()`.
+#[derive(Clone, Debug, Default)]
+pub struct ResolvedCloudConfig {
+    pub credentials: Option<CloudCredentials>,
+    pub project_id: Option<String>,
+    pub account_identifier: Option<String>,
+    pub environment_id: Option<String>,
+    pub defer_env_id: Option<String>,
+    pub job_id: Option<String>,
 }

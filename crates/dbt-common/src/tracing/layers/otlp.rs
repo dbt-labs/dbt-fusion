@@ -2,12 +2,10 @@ use std::borrow::Cow;
 
 use super::super::{
     data_provider::DataProvider,
+    error::{TracingError, TracingResult},
     layer::{ConsumerLayer, TelemetryConsumer},
     shutdown::{TelemetryShutdown, TelemetryShutdownItem},
 };
-use crate::constants::DBT_FUSION;
-
-use dbt_error::{ErrorCode, FsResult};
 
 use dbt_telemetry::{
     LogMessage,
@@ -24,10 +22,46 @@ use opentelemetry_sdk::trace::{SdkTracer, SdkTracerProvider};
 use opentelemetry_sdk::{logs as sdk_logs, trace as sdk_trace};
 use opentelemetry_semantic_conventions::resource::{SERVICE_NAME, SERVICE_VERSION};
 
+#[derive(Clone, Debug)]
+pub struct OtlpResourceConfig {
+    service_name: &'static str,
+    service_version: &'static str,
+    resource_attributes: Vec<KeyValue>,
+}
+
+impl OtlpResourceConfig {
+    pub fn new(service_name: &'static str, service_version: &'static str) -> Self {
+        Self {
+            service_name,
+            service_version,
+            resource_attributes: Vec::new(),
+        }
+    }
+
+    pub fn with_resource_attributes(
+        mut self,
+        resource_attributes: impl IntoIterator<Item = KeyValue>,
+    ) -> Self {
+        self.resource_attributes.extend(resource_attributes);
+        self
+    }
+
+    fn into_resource_attributes(self) -> Vec<KeyValue> {
+        let mut resource_attributes = self.resource_attributes;
+        resource_attributes.extend([
+            KeyValue::new(SERVICE_NAME, self.service_name),
+            KeyValue::new(SERVICE_VERSION, self.service_version),
+        ]);
+        resource_attributes
+    }
+}
+
 /// Build an OTLP layer with HTTP exporters. If exporters cannot be built,
 /// it will return None.
-pub fn build_otlp_layer() -> Option<(ConsumerLayer, Vec<TelemetryShutdownItem>)> {
-    let layer = OTLPExporterLayer::new_with_http_export()?;
+pub fn build_otlp_layer(
+    resource_config: OtlpResourceConfig,
+) -> Option<(ConsumerLayer, Vec<TelemetryShutdownItem>)> {
+    let layer = OTLPExporterLayer::new_with_http_export(resource_config)?;
 
     let shutdown_items: Vec<TelemetryShutdownItem> = vec![
         Box::new(layer.tracer_provider()),
@@ -50,33 +84,68 @@ impl OTLPExporterLayer {
     pub(crate) fn new(
         trace_exporter: impl sdk_trace::SpanExporter + 'static,
         log_exporter: impl sdk_logs::LogExporter + 'static,
+        resource_config: OtlpResourceConfig,
     ) -> Self {
+        Self::new_with_exporters(trace_exporter, log_exporter, resource_config, true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_tests(
+        trace_exporter: impl sdk_trace::SpanExporter + 'static,
+        log_exporter: impl sdk_logs::LogExporter + 'static,
+        resource_config: OtlpResourceConfig,
+    ) -> Self {
+        // These tests validate OTLP layer filtering/serialization, not the OpenTelemetry
+        // SDK's batch processor lifecycle. Using simple exporters avoids flaky shutdown
+        // interactions when libtest runs adjacent tracing tests with high parallelism.
+        Self::new_with_exporters(trace_exporter, log_exporter, resource_config, false)
+    }
+
+    fn new_with_exporters(
+        trace_exporter: impl sdk_trace::SpanExporter + 'static,
+        log_exporter: impl sdk_logs::LogExporter + 'static,
+        resource_config: OtlpResourceConfig,
+        use_batch_exporters: bool,
+    ) -> Self {
+        let service_name = resource_config.service_name;
+
         // Set up resource with service information
         let resource = Resource::builder()
             .with_detectors(&[Box::new(EnvResourceDetector::new())])
-            .with_attributes(vec![
-                KeyValue::new(SERVICE_NAME, DBT_FUSION),
-                KeyValue::new(SERVICE_VERSION, env!("CARGO_PKG_VERSION")),
-            ])
+            .with_attributes(resource_config.into_resource_attributes())
             .build();
 
         // Initialize a tracer provider.
-        let tracer_provider = SdkTracerProvider::builder()
-            .with_resource(resource.clone())
-            .with_batch_exporter(trace_exporter)
-            .build();
+        let tracer_provider = if use_batch_exporters {
+            SdkTracerProvider::builder()
+                .with_resource(resource.clone())
+                .with_batch_exporter(trace_exporter)
+                .build()
+        } else {
+            SdkTracerProvider::builder()
+                .with_resource(resource.clone())
+                .with_simple_exporter(trace_exporter)
+                .build()
+        };
 
         // Initialize a logger provider.
-        let logger_provider = SdkLoggerProvider::builder()
-            .with_resource(resource)
-            .with_batch_exporter(log_exporter)
-            .build();
+        let logger_provider = if use_batch_exporters {
+            SdkLoggerProvider::builder()
+                .with_resource(resource)
+                .with_batch_exporter(log_exporter)
+                .build()
+        } else {
+            SdkLoggerProvider::builder()
+                .with_resource(resource)
+                .with_simple_exporter(log_exporter)
+                .build()
+        };
 
         // Get tracer
-        let tracer = tracer_provider.tracer(DBT_FUSION);
+        let tracer = tracer_provider.tracer(service_name);
 
         // Get root logger
-        let logger = logger_provider.logger(DBT_FUSION);
+        let logger = logger_provider.logger(service_name);
 
         OTLPExporterLayer {
             tracer_provider,
@@ -97,7 +166,7 @@ impl OTLPExporterLayer {
     ///   be used to specify a full endpoint for traces, with non-default routes.
     /// - the environment variable `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` - can
     ///   be used to specify a full endpoint for logs, with non-default routes.
-    pub(crate) fn new_with_http_export() -> Option<Self> {
+    pub(crate) fn new_with_http_export(resource_config: OtlpResourceConfig) -> Option<Self> {
         // Add OTLP trace HTTP exporter
         let trace_exporter = match opentelemetry_otlp::SpanExporter::builder()
             .with_http()
@@ -118,7 +187,7 @@ impl OTLPExporterLayer {
             Err(_) => return None,
         };
 
-        Some(Self::new(trace_exporter, log_exporter))
+        Some(Self::new(trace_exporter, log_exporter, resource_config))
     }
 
     pub(crate) fn tracer_provider(&self) -> SdkTracerProvider {
@@ -133,23 +202,21 @@ impl OTLPExporterLayer {
 }
 
 impl TelemetryShutdown for SdkTracerProvider {
-    fn shutdown(&mut self) -> FsResult<()> {
+    fn shutdown(&mut self) -> TracingResult<()> {
         SdkTracerProvider::shutdown(self).map_err(|otel_error| {
-            fs_err!(
-                ErrorCode::IoError,
+            TracingError::shutdown(format!(
                 "Failed to gracefully shutdown OTLP trace exporter: {otel_error}"
-            )
+            ))
         })
     }
 }
 
 impl TelemetryShutdown for SdkLoggerProvider {
-    fn shutdown(&mut self) -> FsResult<()> {
+    fn shutdown(&mut self) -> TracingResult<()> {
         SdkLoggerProvider::shutdown(self).map_err(|otel_error| {
-            fs_err!(
-                ErrorCode::IoError,
+            TracingError::shutdown(format!(
                 "Failed to gracefully shutdown OTLP log exporter: {otel_error}"
-            )
+            ))
         })
     }
 }

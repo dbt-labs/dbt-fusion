@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::LazyLock};
 
 use crate::AdapterType;
 use dbt_common::{AdapterError, AdapterErrorKind, AdapterResult};
@@ -7,25 +7,9 @@ use dbt_sql_utils::sql_split_statements;
 use super::tokenizer::{AbstractToken, Token, abstract_tokenize, tokenize};
 use regex::Regex;
 
-pub fn compare_sql(actual: &str, expected: &str) -> AdapterResult<()> {
-    compare_sql_inner(actual, expected, None)
-}
-
 /// Compare two SQL strings using deviation and canonicalization checks before strict comparison,
 /// using adapter-specific canonicalization where applicable.
-pub fn compare_sql_for_adapter(
-    adapter_type: AdapterType,
-    actual: &str,
-    expected: &str,
-) -> AdapterResult<()> {
-    compare_sql_inner(actual, expected, Some(adapter_type))
-}
-
-fn compare_sql_inner(
-    actual: &str,
-    expected: &str,
-    adapter_type: Option<AdapterType>,
-) -> AdapterResult<()> {
+pub fn compare_sql(actual: &str, expected: &str, adapter_type: AdapterType) -> AdapterResult<()> {
     // Canonicalize ignorable differences first
     let actual = canonicalize_query_tag(actual);
     let expected = canonicalize_query_tag(expected);
@@ -56,12 +40,21 @@ fn compare_sql_inner(
     let actual = canonicalize_elementary_metadata_pkg_version(&actual);
     let expected = canonicalize_elementary_metadata_pkg_version(&expected);
     let actual = canonicalize_python_config_dict(&actual, &expected);
+    // Apply meta_get→get normalization to both sides: Mantle recordings vary in
+    // whether they preserve `dbt.config.meta_get(...)` or rewrite it to
+    // `dbt.config.get(...)`, and Fusion preserves the user's source verbatim.
+    // The two are semantically equivalent (the generated `config` class routes
+    // both lookups through the same dict), so we normalize them on both sides.
+    let actual = canonicalize_python_meta_get_calls(&actual);
+    let expected = canonicalize_python_meta_get_calls(&expected);
     let actual = canonicalize_python_meta_dict(&actual);
     let expected = canonicalize_python_meta_dict(&expected);
     let actual = canonicalize_databricks_legacy_alter_column_comment_to_modern(&actual);
     let expected = canonicalize_databricks_legacy_alter_column_comment_to_modern(&expected);
     let actual = canonicalize_snowflake_grant_select_to_roles(&actual);
     let expected = canonicalize_snowflake_grant_select_to_roles(&expected);
+    let actual = canonicalize_privilege_statement_order(&actual);
+    let expected = canonicalize_privilege_statement_order(&expected);
     let actual = canonicalize_numeric_to_decimal(&actual);
     let expected = canonicalize_numeric_to_decimal(&expected);
     let actual = canonicalize_alter_table_set_tblproperties_order(&actual);
@@ -76,17 +69,14 @@ fn compare_sql_inner(
     // Databricks/Spark: dbt tmp view definitions may differ in TEMPORARY vs non-temporary and
     // qualified vs unqualified view naming across runners/recorders. We treat these as equivalent
     // only for dbt tmp relations, and only when BOTH sides match the pattern.
-    if matches!(
-        adapter_type,
-        Some(AdapterType::Databricks | AdapterType::Spark)
-    ) {
+    if matches!(adapter_type, AdapterType::Databricks | AdapterType::Spark) {
         if let (Some(actual_canon), Some(expected_canon)) = (
             canonicalize_databricks_tmp_view_definition(&actual),
             canonicalize_databricks_tmp_view_definition(&expected),
         ) {
             // Avoid recursion loops: only re-compare if we actually changed something.
             if actual_canon != actual || expected_canon != expected {
-                if compare_sql_inner(&actual_canon, &expected_canon, adapter_type).is_ok() {
+                if compare_sql(&actual_canon, &expected_canon, adapter_type).is_ok() {
                     return Ok(());
                 }
             }
@@ -99,7 +89,7 @@ fn compare_sql_inner(
             canonicalize_databricks_tmp_merge_using(&expected),
         ) {
             if actual_canon != actual || expected_canon != expected {
-                if compare_sql_inner(&actual_canon, &expected_canon, adapter_type).is_ok() {
+                if compare_sql(&actual_canon, &expected_canon, adapter_type).is_ok() {
                     return Ok(());
                 }
             }
@@ -849,7 +839,7 @@ fn canonicalize_databricks_tmp_view_definition(sql: &str) -> Option<String> {
         return None;
     }
 
-    static RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
+    static RE: LazyLock<Regex> = LazyLock::new(|| {
         // Note: we only strip *leading* line comments; we do not attempt full comment-aware parsing.
         Regex::new(
             r"(?is)^\s*(?:--[^\n]*\n\s*)*create\s+or\s+replace\s+(?:(?P<temp>temporary)\s+)?view\s+(?P<name>.+?)\s+as\s+(?P<body>.*)$",
@@ -896,7 +886,7 @@ fn canonicalize_databricks_tmp_merge_using(sql: &str) -> Option<String> {
         return None;
     }
 
-    static RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
+    static RE: LazyLock<Regex> = LazyLock::new(|| {
         // Match the USING <relation> portion of a MERGE statement, allowing leading line comments.
         // The relation may be a multi-part quoted name like `db`.`schema`.`table__dbt_tmp`.
         Regex::new(
@@ -937,7 +927,7 @@ fn canonicalize_databricks_tmp_merge_using(sql: &str) -> Option<String> {
 /// For replay diffs we treat them as equivalent by rewriting the legacy form into the modern form.
 fn canonicalize_databricks_legacy_alter_column_comment_to_modern(sql: &str) -> String {
     // NOTE: We scope this extremely narrowly (anchored) to avoid masking unrelated DDL.
-    static RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
+    static RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
             r#"(?is)^\s*alter\s+table\s+(?P<rel>.+?)\s+change\s+column\s+(?P<col>`[^`]+`|[A-Za-z_][A-Za-z0-9_$]*)\s+comment\s+'(?P<comment>(?:\\'|''|[^'])*)'\s*;?\s*$"#,
         )
@@ -997,7 +987,7 @@ fn canonicalize_snowflake_grant_select_to_roles(sql: &str) -> String {
     }
 
     // Match "grant select on <obj> to <to>"
-    static GRANT_RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
+    static GRANT_RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r#"(?is)^\s*grant\s+select\s+on\s+(?P<object>.+?)\s+to\s+(?P<to>.+?)\s*$"#)
             .unwrap()
     });
@@ -1109,13 +1099,148 @@ fn unquote_identifier_like(s: &str) -> Option<String> {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PrivilegeStatement {
+    pub(crate) verb: String,
+    pub(crate) privilege: String,
+    pub(crate) object: String,
+    pub(crate) principal: String,
+}
+
+impl PrivilegeStatement {
+    pub(crate) fn render(&self) -> String {
+        match self.verb.as_str() {
+            "grant" => format!(
+                "grant {} on {} to {};",
+                self.privilege, self.object, self.principal
+            ),
+            "revoke" => format!(
+                "revoke {} on {} from {};",
+                self.privilege, self.object, self.principal
+            ),
+            _ => unreachable!("unexpected privilege statement verb"),
+        }
+    }
+}
+
+/// Canonicalize batches of semicolon-separated GRANT/REVOKE privilege statements by sorting
+/// statements within contiguous verb groups.
+///
+/// This is intentionally narrow:
+/// - every statement must be a simple `grant <priv> on <obj> to <principal>` or
+///   `revoke <priv> on <obj> from <principal>`
+/// - all statements must target the same object and principal
+/// - the relative order of GRANT groups vs REVOKE groups is preserved
+///
+/// This lets replay ignore nondeterministic privilege iteration order without collapsing a
+/// semantically meaningful revoke-then-grant sequence into grant-then-revoke.
+fn canonicalize_privilege_statement_order(sql: &str) -> String {
+    let trimmed = sql.trim();
+    if trimmed.is_empty() {
+        return sql.to_string();
+    }
+
+    let statements = sql_split_statements(trimmed, None);
+    if statements.len() < 2 {
+        return sql.to_string();
+    }
+
+    static PRIVILEGE_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r#"(?is)^\s*(?P<verb>grant|revoke)\s+(?P<privilege>.+?)\s+on\s+(?P<object>.+?)\s+(?P<direction>to|from)\s+(?P<principal>.+?)\s*$"#,
+        )
+        .unwrap()
+    });
+
+    let mut parsed = Vec::with_capacity(statements.len());
+    for stmt in statements {
+        let stmt = stmt.trim();
+        if stmt.is_empty() {
+            continue;
+        }
+
+        let Some(caps) = PRIVILEGE_RE.captures(stmt) else {
+            return sql.to_string();
+        };
+
+        let verb = caps
+            .name("verb")
+            .expect("verb capture exists")
+            .as_str()
+            .trim()
+            .to_ascii_lowercase();
+        let direction = caps
+            .name("direction")
+            .expect("direction capture exists")
+            .as_str()
+            .trim()
+            .to_ascii_lowercase();
+        if (verb == "grant" && direction != "to") || (verb == "revoke" && direction != "from") {
+            return sql.to_string();
+        }
+
+        parsed.push(PrivilegeStatement {
+            verb,
+            privilege: caps
+                .name("privilege")
+                .expect("privilege capture exists")
+                .as_str()
+                .trim()
+                .to_string(),
+            object: caps
+                .name("object")
+                .expect("object capture exists")
+                .as_str()
+                .trim()
+                .to_string(),
+            principal: caps
+                .name("principal")
+                .expect("principal capture exists")
+                .as_str()
+                .trim()
+                .to_string(),
+        });
+    }
+
+    let Some(first) = parsed.first() else {
+        return sql.to_string();
+    };
+    if parsed
+        .iter()
+        .any(|stmt| stmt.object != first.object || stmt.principal != first.principal)
+    {
+        return sql.to_string();
+    }
+
+    let mut out = Vec::with_capacity(parsed.len());
+    let mut start = 0usize;
+    while start < parsed.len() {
+        let verb = parsed[start].verb.clone();
+        let mut end = start + 1;
+        while end < parsed.len() && parsed[end].verb == verb {
+            end += 1;
+        }
+
+        let mut group = parsed[start..end].to_vec();
+        group.sort_by(|a, b| {
+            a.privilege
+                .cmp(&b.privilege)
+                .then_with(|| a.render().cmp(&b.render()))
+        });
+        out.extend(group.into_iter().map(|stmt| stmt.render()));
+        start = end;
+    }
+
+    out.join("\n")
+}
+
 /// Canonicalize `ALTER TABLE ... SET tblproperties (...)` by sorting the key-value
 /// entries alphabetically by key. Databricks/Spark tblproperties are an unordered set
 /// of key-value pairs, but Fusion and dbt-databricks may emit them in different order.
 fn canonicalize_alter_table_set_tblproperties_order(sql: &str) -> String {
     // Match: ALTER TABLE <name> SET tblproperties (<entries>)
     // Anchored to the full statement to avoid masking unrelated DDL.
-    static RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
+    static RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?is)^(\s*ALTER\s+TABLE\s+.+?\s+SET\s+tblproperties\s*\()(.+?)(\)\s*)$")
             .unwrap()
     });
@@ -1129,9 +1254,8 @@ fn canonicalize_alter_table_set_tblproperties_order(sql: &str) -> String {
     let suffix = &caps[3]; // ")"
 
     // Extract 'key' = 'value' pairs via regex to avoid breaking on commas inside quoted values.
-    static ENTRY_RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
-        Regex::new(r"'(?:[^'\\]|\\.)*'\s*=\s*'(?:[^'\\]|\\.)*'").unwrap()
-    });
+    static ENTRY_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"'(?:[^'\\]|\\.)*'\s*=\s*'(?:[^'\\]|\\.)*'").unwrap());
 
     let mut entries: Vec<&str> = ENTRY_RE
         .find_iter(entries_raw)
@@ -1148,8 +1272,8 @@ fn canonicalize_alter_table_set_tblproperties_order(sql: &str) -> String {
 /// NUMERIC and DECIMAL are SQL-standard synonyms. Fusion may emit one while the
 /// recording uses the other. Normalize `numeric(` → `decimal(` so comparisons succeed.
 fn canonicalize_numeric_to_decimal(sql: &str) -> String {
-    static NUMERIC_RE: once_cell::sync::Lazy<Regex> =
-        once_cell::sync::Lazy::new(|| Regex::new(r"(?i)\bnumeric\s*\(").unwrap());
+    static NUMERIC_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)\bnumeric\s*\(").unwrap());
     NUMERIC_RE
         .replace_all(sql, |caps: &regex::Captures<'_>| {
             // Preserve original whitespace between "numeric" and "("
@@ -1170,11 +1294,7 @@ fn canonicalize_numeric_to_decimal(sql: &str) -> String {
 /// - Else, if both look like a `union all` chain at top level, split into components,
 ///   sort components, and recursively compare pair-wise.
 /// - All recursive comparisons call back into `compare_sql`.
-fn compare_sql_structurally(
-    actual: &str,
-    expected: &str,
-    adapter_type: Option<AdapterType>,
-) -> bool {
+fn compare_sql_structurally(actual: &str, expected: &str, adapter_type: AdapterType) -> bool {
     // Quick trims to reduce edge whitespace noise
     let a = actual.trim();
     let b = expected.trim();
@@ -1187,8 +1307,8 @@ fn compare_sql_structurally(
         parse_select_star_from_parenthesized(a),
         parse_select_star_from_parenthesized(b),
     ) {
-        return compare_sql_inner(a_sub, b_sub, adapter_type).is_ok()
-            && compare_sql_inner(a_rest, b_rest, adapter_type).is_ok();
+        return compare_sql(a_sub, b_sub, adapter_type).is_ok()
+            && compare_sql(a_rest, b_rest, adapter_type).is_ok();
     }
 
     // 2) with n1 as (<sub1>), ..., nk as (<subk>) <sub>
@@ -1209,18 +1329,18 @@ fn compare_sql_structurally(
             if a_name != b_name {
                 return false;
             }
-            if compare_sql_inner(a_sql, b_sql, adapter_type).is_err() {
+            if compare_sql(a_sql, b_sql, adapter_type).is_err() {
                 return false;
             }
         }
-        return compare_sql_inner(a_tail, b_tail, adapter_type).is_ok();
+        return compare_sql(a_tail, b_tail, adapter_type).is_ok();
     }
 
     // 3) CREATE [OR REPLACE] <stuff> AS (<subquery>)
     if let (Some((a_stuff, a_sub)), Some((b_stuff, b_sub))) =
         (parse_create_as_subquery(&a), parse_create_as_subquery(&b))
     {
-        return a_stuff == b_stuff && compare_sql_inner(a_sub, b_sub, adapter_type).is_ok();
+        return a_stuff == b_stuff && compare_sql(a_sub, b_sub, adapter_type).is_ok();
     }
 
     // 4) <sub1> union all <sub2> ... union all <sub_q>
@@ -1233,7 +1353,7 @@ fn compare_sql_structurally(
             b_parts.sort();
 
             for (ax, bx) in a_parts.iter().zip(b_parts.iter()) {
-                if compare_sql_inner(ax, bx, adapter_type).is_err() {
+                if compare_sql(ax, bx, adapter_type).is_err() {
                     return false;
                 }
             }
@@ -1728,7 +1848,7 @@ fn canonicalize_query_tag(sql: &str) -> String {
     // Match: ALTER SESSION SET QUERY_TAG = '...'
     // Flags: (?i) case-insensitive, (?s) allow '.' to match newlines (defensive)
     // We specifically capture a single-quoted literal to avoid over-matching.
-    static RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
+    static RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?is)\balter\s+session\s+set\s+query_tag\s*=\s*'[^']*'").unwrap()
     });
     RE.replace_all(sql, "alter session set query_tag = '__TAG__'")
@@ -1742,7 +1862,7 @@ fn canonicalize_query_tag(sql: &str) -> String {
 /// is available in manifest.json. We should consider using it in replay. TODO: Do this!
 fn canonicalize_uuid_literals(sql: &str) -> String {
     // Case-insensitive UUID regex inside single quotes
-    static UUID_RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
+    static UUID_RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?i)'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'").unwrap()
     });
     UUID_RE.replace_all(sql, "'UUID'").to_string()
@@ -1776,7 +1896,7 @@ fn canonicalize_elementary_metadata_pkg_version(sql: &str) -> String {
         return sql.to_string();
     }
 
-    static RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
+    static RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?i)'[0-9]+(?:\.[0-9]+){2}'\s+as\s+dbt_pkg_version").unwrap()
     });
     RE.replace_all(sql, "'DBT_PKG_VERSION' as dbt_pkg_version")
@@ -1966,7 +2086,7 @@ fn remove_redundant_nested_ctes_recursive(
 /// Mantle/Fusion can differ in invocation_id and in how they truncate/hash test names, but
 /// the specific embedded literal is not semantically meaningful for replay comparison.
 fn canonicalize_uuid_prefixed_test_unique_id_literals(sql: &str) -> String {
-    static RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
+    static RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
             r"(?i)'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.test\.[^']*'",
         )
@@ -1984,8 +2104,7 @@ fn canonicalize_uuid_prefixed_test_unique_id_literals(sql: &str) -> String {
 /// This is intentionally narrow (must start with `test.` inside single quotes) to avoid
 /// masking unrelated string literals.
 fn canonicalize_dbt_test_unique_id_literals(sql: &str) -> String {
-    static RE: once_cell::sync::Lazy<Regex> =
-        once_cell::sync::Lazy::new(|| Regex::new(r"(?i)'test\.[^']*'").unwrap());
+    static RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)'test\.[^']*'").unwrap());
     RE.replace_all(sql, "'test.TEST_UNIQUE_ID'").to_string()
 }
 
@@ -1995,7 +2114,7 @@ fn canonicalize_dbt_test_unique_id_literals(sql: &str) -> String {
 /// patterns like:
 ///   '2025-12-23 07:06:03' -> '2025-12-23T07:06:03'
 fn canonicalize_quoted_timestamp_space_separator(sql: &str) -> String {
-    static RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
+    static RE: LazyLock<Regex> = LazyLock::new(|| {
         // Narrow to single-quoted literals to avoid touching non-literal SQL fragments.
         // Supports optional fractional seconds and optional timezone suffix (e.g. +00:00 or Z).
         Regex::new(r"'(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2}(?:\.\d+)?)(?:([+-]\d{2}:\d{2}|Z))?'")
@@ -2012,9 +2131,8 @@ fn canonicalize_elementary_tmp_suffix(sql: &str) -> String {
     // Case-insensitive; match "__tmp_" followed by a long digit run (timestamps/unique suffixes)
     // Scope it to a plausible leading year 2000-2100 to avoid over-matching.
     // Example matched: "__tmp_20251203160139043240"
-    static RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
-        Regex::new(r"(?i)(__tmp_)(?:20[0-9]{2}|2100)\d{8,}").unwrap()
-    });
+    static RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)(__tmp_)(?:20[0-9]{2}|2100)\d{8,}").unwrap());
     RE.replace_all(sql, "${1}TIMESTAMP").to_string()
 }
 
@@ -2035,11 +2153,11 @@ fn canonicalize_test_temp_relation_identifiers(sql: &str) -> String {
         return sql.to_string();
     }
 
-    static RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
+    static RE: LazyLock<Regex> = LazyLock::new(|| {
         // Replace the variable middle portion of `test_<...>__tmp_TIMESTAMP` with `ALPHA`.
         Regex::new(r"(?i)(\btest_)[0-9a-z_]+(__tmp_TIMESTAMP\b)").unwrap()
     });
-    static QUOTED_RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
+    static QUOTED_RE: LazyLock<Regex> = LazyLock::new(|| {
         // When the identifier is quoted (e.g. Snowflake), the quotes become separate tokens and
         // can cause mismatches even after normalizing the middle portion. Strip quotes only for
         // canonical dbt test temp identifiers.
@@ -2067,7 +2185,7 @@ fn canonicalize_dbt_model_tmp_suffix(sql: &str) -> String {
         return sql.to_string();
     }
 
-    static RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
+    static RE: LazyLock<Regex> = LazyLock::new(|| {
         // Match __dbt_tmp followed by one or more digits
         // This captures the pattern used by dbt for temporary table suffixes
         Regex::new(r"(?i)(__dbt_tmp_?)\d*\b").unwrap()
@@ -2107,8 +2225,7 @@ fn normalize_for_wrapper_diff(sql: &str) -> String {
     }
     // Collapse all whitespace and lowercase
     // Precompiled regex for performance
-    static WS_RE: once_cell::sync::Lazy<Regex> =
-        once_cell::sync::Lazy::new(|| Regex::new(r"\s+").unwrap());
+    static WS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
     WS_RE.replace_all(&out, "").to_lowercase()
 }
 
@@ -2231,9 +2348,27 @@ fn canonicalize_python_config_dict(actual: &str, expected: &str) -> String {
     actual.to_string()
 }
 
-/// Strip the `meta_dict = {}` variable and the `meta_get` static method that Fusion emits inside
-/// the Python `config` helper class for Snowflake Python models.  Mantle does not emit these, but
-/// they are semantically inert – removing them makes both sides identical.
+/// Canonicalize `dbt.config.meta_get(` call sites to `dbt.config.get(`.  Fusion passes the user's
+/// Python source verbatim; Mantle recordings vary — some preserve `meta_get`, others rewrite to
+/// `get`.  The two forms are semantically equivalent because the generated `config` class routes
+/// all lookups through the same dict, so the caller applies this normalization to both sides.
+fn canonicalize_python_meta_get_calls(sql: &str) -> String {
+    if !sql.contains("dbt.config.meta_get(") {
+        return sql.to_string();
+    }
+    sql.replace("dbt.config.meta_get(", "dbt.config.get(")
+}
+
+/// Strip the `meta_dict` variable and the `meta_get` static method that Fusion emits inside
+/// the Python `config` helper class for Snowflake Python models.  Mantle does not emit these.
+///
+/// Two cases are handled:
+///
+/// 1. **Empty** `meta_dict = {}` – remove the line outright (original behaviour).
+/// 2. **Populated** `meta_dict = {…}` – Fusion puts meta config values here while leaving
+///    `config_dict = {}` empty; Mantle puts the same values directly in `config_dict`.
+///    When this pattern is detected, the meta_dict content is first promoted into config_dict,
+///    then the meta_dict line is removed, making both sides identical.
 fn canonicalize_python_meta_dict(sql: &str) -> String {
     // Fast-path: nothing to do when there is no meta_dict.
     if !sql.contains("meta_dict") {
@@ -2241,23 +2376,45 @@ fn canonicalize_python_meta_dict(sql: &str) -> String {
     }
 
     // 1. Remove the standalone `meta_dict = {}` line (with surrounding blank lines collapsed).
-    static RE_META_DICT_VAR: once_cell::sync::Lazy<Regex> =
-        once_cell::sync::Lazy::new(|| Regex::new(r"(?m)^\s*meta_dict\s*=\s*\{\}\s*\n").unwrap());
+    static RE_META_DICT_EMPTY: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?m)^\s*meta_dict\s*=\s*\{\}\s*\n").unwrap());
 
-    // 2. Remove the `meta_get` static method block inside the config class.
+    // 2. Match a non-empty `meta_dict = {…}` line and capture the dict literal.
+    //    The assignment is always on a single line; greedy [^\n]* followed by \} finds the last
+    //    closing brace on that line, correctly handling nested dicts.
+    static RE_META_DICT_NONEMPTY: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?m)^[ \t]*meta_dict\s*=\s*(\{[^\n]*\})\s*\n").unwrap());
+
+    // 3. Remove the `meta_get` static method block inside the config class.
     //    Matches:
     //        @staticmethod
     //        def meta_get(key, default=None):
     //            return meta_dict.get(key, default)
     //    (with flexible indentation and an optional trailing blank line)
-    static RE_META_GET_METHOD: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
+    static RE_META_GET_METHOD: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
                 r"(?m)^[ \t]*@staticmethod\s*\n[ \t]*def meta_get\(.*?\):\s*\n[ \t]*return meta_dict\.get\(.*?\)\s*\n?"
             )
             .unwrap()
     });
 
-    let result = RE_META_DICT_VAR.replace_all(sql, "");
+    let mut result = sql.to_string();
+
+    // When config_dict is empty and meta_dict is populated, promote meta_dict → config_dict.
+    if result.contains("config_dict = {}") {
+        if let Some(caps) = RE_META_DICT_NONEMPTY.captures(&result.clone()) {
+            if let Some(meta_content) = caps.get(1).map(|m| m.as_str()) {
+                result = result.replacen(
+                    "config_dict = {}",
+                    &format!("config_dict = {}", meta_content),
+                    1,
+                );
+            }
+        }
+    }
+
+    let result = RE_META_DICT_EMPTY.replace_all(&result, "");
+    let result = RE_META_DICT_NONEMPTY.replace_all(&result, "");
     let result = RE_META_GET_METHOD.replace_all(&result, "");
     result.into_owned()
 }
@@ -2775,7 +2932,7 @@ mod tests {
         let sql1 = "SELECT   *\nFROM    users";
         let sql2 = "SELECT*FROMusers";
 
-        let result = compare_sql(sql1, sql2);
+        let result = compare_sql(sql1, sql2, AdapterType::Snowflake);
         assert!(
             result.is_ok(),
             "Should be OK when SQL is identical ignoring whitespace"
@@ -2787,7 +2944,7 @@ mod tests {
         let sql1 = "SELECT * FROM users";
         let sql2 = "select * from users";
 
-        let result = compare_sql(sql1, sql2);
+        let result = compare_sql(sql1, sql2, AdapterType::Snowflake);
         assert!(result.is_err(), "Should fail when case differs");
     }
 
@@ -2796,7 +2953,7 @@ mod tests {
         let sql1 = "SELECT * FROM users WHERE id = 1";
         let sql2 = "SELECT * FROM orders WHERE id = 2";
 
-        let result = compare_sql(sql1, sql2);
+        let result = compare_sql(sql1, sql2, AdapterType::Snowflake);
         assert!(result.is_err(), "Should fail when SQL content differs");
     }
 
@@ -2805,7 +2962,7 @@ mod tests {
         let sql1 = "SELECT * FROM users";
         let sql2 = "SELECT * FROM users WHERE active = true";
 
-        let result = compare_sql(sql1, sql2);
+        let result = compare_sql(sql1, sql2, AdapterType::Snowflake);
         assert!(result.is_err(), "Should fail when SQL length differs");
     }
 
@@ -2826,7 +2983,7 @@ mod tests {
         let sql1 = "SELECT\nu.id,\nu.name\nFROM users u";
         let sql2 = "SELECT u.id, u.name FROM users u";
 
-        let result = compare_sql(sql1, sql2);
+        let result = compare_sql(sql1, sql2, AdapterType::Snowflake);
         assert!(
             result.is_ok(),
             "Should ignore newlines and whitespace differences"
@@ -2845,7 +3002,7 @@ mod tests {
             u.email
         FROM users u"#;
 
-        let result = compare_sql(sql1, sql2);
+        let result = compare_sql(sql1, sql2, AdapterType::Snowflake);
         assert!(
             result.is_err(),
             "Should detect content differences even with newlines"
@@ -2887,7 +3044,8 @@ create or replace table `db`.`sch`.`opportunity_product_entity_stream_base` as (
 );
 "#;
 
-        compare_sql(sql_fusion, sql_recorded).expect("STRUCT field order drift should be ignored");
+        compare_sql(sql_fusion, sql_recorded, AdapterType::Snowflake)
+            .expect("STRUCT field order drift should be ignored");
     }
 
     #[test]
@@ -2944,7 +3102,7 @@ create or replace table `db`.`sch`.`opportunity_product_entity_stream_base` as (
                 .join(", ")
         );
 
-        compare_sql_for_adapter(AdapterType::Bigquery, &actual_sql, &expected_sql)
+        compare_sql(&actual_sql, &expected_sql, AdapterType::Bigquery)
             .expect("projection order drift should be ignored");
     }
 
@@ -3018,7 +3176,7 @@ create or replace table `db`.`sch`.`opportunity_product_entity_stream_base` as (
                 .join(", ")
         );
 
-        compare_sql_for_adapter(AdapterType::Bigquery, &actual_sql, &expected_sql)
+        compare_sql(&actual_sql, &expected_sql, AdapterType::Bigquery)
             .expect("projection order drift should be ignored even with apostrophes in comments");
     }
 
@@ -3092,7 +3250,7 @@ create or replace table `db`.`sch`.`opportunity_product_entity_stream_base` as (
                 .join(", ")
         );
 
-        compare_sql_for_adapter(AdapterType::Bigquery, &actual_sql, &expected_sql).expect(
+        compare_sql(&actual_sql, &expected_sql, AdapterType::Bigquery).expect(
             "simple projection order drift should be ignored even with apostrophes in comments",
         );
     }
@@ -3145,7 +3303,7 @@ from filled_data
 qualify row_number() over (partition by billing_group_id, __as_of order by rn desc) = 1
 "#;
 
-        compare_sql(sql_fusion, sql_recorded)
+        compare_sql(sql_fusion, sql_recorded, AdapterType::Snowflake)
             .expect("Forward-fill projection column order drift should be ignored");
     }
 
@@ -3177,13 +3335,13 @@ qualify row_number() over (partition by billing_group_id, __as_of order by rn de
 
     #[test]
     fn test_empty_sql_comparison() {
-        let result1 = compare_sql("", "");
+        let result1 = compare_sql("", "", AdapterType::Snowflake);
         assert!(result1.is_ok(), "Empty SQL should match empty SQL");
 
-        let result2 = compare_sql("SELECT 1", "");
+        let result2 = compare_sql("SELECT 1", "", AdapterType::Snowflake);
         assert!(result2.is_err(), "Non-empty SQL should not match empty SQL");
 
-        let result3 = compare_sql("", "SELECT 1");
+        let result3 = compare_sql("", "SELECT 1", AdapterType::Snowflake);
         assert!(result3.is_err(), "Empty SQL should not match non-empty SQL");
     }
 
@@ -3192,7 +3350,7 @@ qualify row_number() over (partition by billing_group_id, __as_of order by rn de
         let sql1 = "   \n\t  ";
         let sql2 = "  \t\n   ";
 
-        let result = compare_sql(sql1, sql2);
+        let result = compare_sql(sql1, sql2, AdapterType::Snowflake);
         assert!(
             result.is_ok(),
             "Whitespace-only SQL should match regardless of type/order"
@@ -3204,7 +3362,7 @@ qualify row_number() over (partition by billing_group_id, __as_of order by rn de
         let actual = "SELECT %s, %s FROM table";
         let expected = "SELECT 1, 'test' FROM table";
 
-        let result = compare_sql(actual, expected);
+        let result = compare_sql(actual, expected, AdapterType::Snowflake);
         assert!(
             result.is_err(),
             "Should detect placeholder vs value differences"
@@ -3221,7 +3379,7 @@ qualify row_number() over (partition by billing_group_id, __as_of order by rn de
         let actual = "alter table `dbt`.`dbt_entities`.`ent_shopify_inventory_quantity` change column id comment 'Primary key for the inventory quantity record.';";
         let expected = "COMMENT ON COLUMN `dbt`.`dbt_entities`.`ent_shopify_inventory_quantity`.`id` IS 'Primary key for the inventory quantity record.'";
 
-        let result = compare_sql(actual, expected);
+        let result = compare_sql(actual, expected, AdapterType::Snowflake);
         assert!(
             result.is_ok(),
             "Expected legacy ALTER TABLE CHANGE COLUMN COMMENT to be equivalent to COMMENT ON COLUMN"
@@ -3239,10 +3397,64 @@ qualify row_number() over (partition by billing_group_id, __as_of order by rn de
             grant select on SILVER_DEV.PRODUCT.products to ANALYTICS_PRODUCT;
         "#;
 
-        let result = compare_sql(actual, expected);
+        let result = compare_sql(actual, expected, AdapterType::Snowflake);
         assert!(
             result.is_ok(),
             "Expected python-list GRANT form to be equivalent to multiple GRANT statements"
+        );
+    }
+
+    #[test]
+    fn test_snowflake_revoke_privilege_order_drift_should_be_ignorable() {
+        let actual = r#"
+            revoke delete on DB.SCH.tbl from ROLE_A;
+            revoke rebuild on DB.SCH.tbl from ROLE_A;
+            revoke evolve schema on DB.SCH.tbl from ROLE_A;
+            revoke select error table on DB.SCH.tbl from ROLE_A;
+            revoke truncate on DB.SCH.tbl from ROLE_A;
+            revoke update on DB.SCH.tbl from ROLE_A;
+            revoke insert on DB.SCH.tbl from ROLE_A;
+            revoke references on DB.SCH.tbl from ROLE_A;
+            revoke select on DB.SCH.tbl from ROLE_A;
+            revoke applybudget on DB.SCH.tbl from ROLE_A;
+            grant all on DB.SCH.tbl to ROLE_A;
+        "#;
+        let expected = r#"
+            revoke select error table on DB.SCH.tbl from ROLE_A;
+            revoke delete on DB.SCH.tbl from ROLE_A;
+            revoke rebuild on DB.SCH.tbl from ROLE_A;
+            revoke evolve schema on DB.SCH.tbl from ROLE_A;
+            revoke insert on DB.SCH.tbl from ROLE_A;
+            revoke truncate on DB.SCH.tbl from ROLE_A;
+            revoke update on DB.SCH.tbl from ROLE_A;
+            revoke references on DB.SCH.tbl from ROLE_A;
+            revoke select on DB.SCH.tbl from ROLE_A;
+            revoke applybudget on DB.SCH.tbl from ROLE_A;
+            grant all on DB.SCH.tbl to ROLE_A;
+        "#;
+
+        let result = compare_sql(actual, expected, AdapterType::Snowflake);
+        assert!(
+            result.is_ok(),
+            "Expected Snowflake revoke privilege ordering drift to be ignored"
+        );
+    }
+
+    #[test]
+    fn test_snowflake_grant_revoke_group_order_is_not_ignorable() {
+        let actual = r#"
+            revoke select on DB.SCH.tbl from ROLE_A;
+            grant all on DB.SCH.tbl to ROLE_A;
+        "#;
+        let expected = r#"
+            grant all on DB.SCH.tbl to ROLE_A;
+            revoke select on DB.SCH.tbl from ROLE_A;
+        "#;
+
+        let result = compare_sql(actual, expected, AdapterType::Snowflake);
+        assert!(
+            result.is_err(),
+            "Expected grant/revoke group ordering to remain significant"
         );
     }
 
@@ -3256,7 +3468,7 @@ qualify row_number() over (partition by billing_group_id, __as_of order by rn de
         ];
 
         for (sql1, sql2) in scenarios {
-            let result = compare_sql(sql1, sql2);
+            let result = compare_sql(sql1, sql2, AdapterType::Snowflake);
             assert!(
                 result.is_ok(),
                 "Should ignore all whitespace variations: '{sql1}' vs '{sql2}'"
@@ -3284,7 +3496,7 @@ qualify row_number() over (partition by billing_group_id, __as_of order by rn de
                AND table_name = 'stg_shopify_order_stage';
         "#;
 
-        let result = compare_sql(actual, expected);
+        let result = compare_sql(actual, expected, AdapterType::Snowflake);
         assert!(
             result.is_ok(),
             "Trailing semicolon should not cause SQL mismatch for single-statement queries"
@@ -3305,7 +3517,7 @@ qualify row_number() over (partition by billing_group_id, __as_of order by rn de
             let sql1 = format!("{upper} * FROM table");
             let sql2 = format!("{lower} * FROM table");
 
-            let result = compare_sql(&sql1, &sql2);
+            let result = compare_sql(&sql1, &sql2, AdapterType::Snowflake);
             assert!(
                 result.is_err(),
                 "Should be case sensitive: '{upper}' vs '{lower}'"
@@ -3324,7 +3536,7 @@ qualify row_number() over (partition by billing_group_id, __as_of order by rn de
         ];
 
         for (sql1, sql2, should_match) in test_cases {
-            let result = compare_sql(sql1, sql2);
+            let result = compare_sql(sql1, sql2, AdapterType::Snowflake);
             if should_match {
                 assert!(result.is_ok(), "Should match: '{sql1}' vs '{sql2}'");
             } else {
@@ -3341,7 +3553,7 @@ qualify row_number() over (partition by billing_group_id, __as_of order by rn de
         )
         SELECT * FROM users"#;
 
-        let result = compare_sql(simple_select, with_clause_select);
+        let result = compare_sql(simple_select, with_clause_select, AdapterType::Snowflake);
         assert!(
             result.is_err(),
             "Should detect difference between simple SELECT and WITH clause"
@@ -3353,7 +3565,7 @@ qualify row_number() over (partition by billing_group_id, __as_of order by rn de
         let sql1 = r#"    alter session set query_tag = '{"dbt_environment_name": "default", "dbt_job_id": "not set", "dbt_run_id": "not set", "dbt_run_reason": "development_and_testing", "dbt_project_name": "fishtown_internal_analytics", "dbt_user_name": "ZHONG.XU", "dbt_model_name": "not_null_int_incident_io__inci_a94c7199c374113430d951145e2f84e8", "dbt_materialization_type": "test", "dbt_incremental_full_refresh": "false", "dbt_is_cold_storage_refresh": "false", "dbt_invocation_env": "null"}'"#;
         let sql2 = r#"    alter session set query_tag = '{"dbt_environment_name": "default", "dbt_job_id": "not set", "dbt_run_id": "not set", "dbt_run_reason": "development_and_testing", "dbt_project_name": "fishtown_internal_analytics", "dbt_user_name": "ZHONG.XU", "dbt_model_name": "not_null_int_incident_io__incident_field_entries_listed_unique_id", "dbt_materialization_type": "test", "dbt_incremental_full_refresh": "false", "dbt_is_cold_storage_refresh": "false", "dbt_invocation_env": "null"}'"#;
 
-        let result = compare_sql(sql1, sql2);
+        let result = compare_sql(sql1, sql2, AdapterType::Snowflake);
         assert!(
             result.is_ok(),
             "Should ignore difference between truncated and full test name"
@@ -3390,7 +3602,7 @@ qualify row_number() over (partition by billing_group_id, __as_of order by rn de
     ;
     "#;
 
-        let result = compare_sql(sql1, sql2);
+        let result = compare_sql(sql1, sql2, AdapterType::Snowflake);
         assert!(result.is_ok(), "Should ignore difference for dbt_utils_");
     }
 
@@ -3398,7 +3610,7 @@ qualify row_number() over (partition by billing_group_id, __as_of order by rn de
     fn test_compare_sql_with_dbt_utils_table_name_2() {
         let sql1 = r#"alter session set query_tag = '{"dbt_environment_name": "default", "dbt_job_id": "not set", "dbt_run_id": "not set", "dbt_run_reason": "development_and_testing", "dbt_project_name": "fishtown_internal_analytics", "dbt_user_name": "ZHONG.XU", "dbt_model_name": "source_unique_combination_of_c_7d86b29e62ff0d9a2521eecdb583ae14", "dbt_materialization_type": "test", "dbt_incremental_full_refresh": "false", "dbt_is_cold_storage_refresh": "false", "dbt_invocation_env": "null"}'"#;
         let sql2 = r#"alter session set query_tag = '{"dbt_environment_name": "default", "dbt_job_id": "not set", "dbt_run_id": "not set", "dbt_run_reason": "development_and_testing", "dbt_project_name": "fishtown_internal_analytics", "dbt_user_name": "ZHONG.XU", "dbt_model_name": "dbt_utils_source_unique_combination_of_columns_incident_io_incident_timestamp_value_incident_id__incident_timestamp_id", "dbt_materialization_type": "test", "dbt_incremental_full_refresh": "false", "dbt_is_cold_storage_refresh": "false", "dbt_invocation_env": "null"}'"#;
-        let result = compare_sql(sql1, sql2);
+        let result = compare_sql(sql1, sql2, AdapterType::Snowflake);
         assert!(result.is_ok(), "Should ignore difference for dbt_utils_");
     }
 
@@ -3408,7 +3620,7 @@ qualify row_number() over (partition by billing_group_id, __as_of order by rn de
       where created_date >= '2025-09-10T18:07:45.449898-07:00'"#;
         let sql2 = r#"delete from ANALYTICS.intermediate.int_serp_trends 
       where created_date >= '2025-09-10T14:16:52.500487'"#;
-        let result = compare_sql(sql1, sql2);
+        let result = compare_sql(sql1, sql2, AdapterType::Snowflake);
         assert!(
             result.is_ok(),
             "Should ignore difference for timestamp value difference"
@@ -3449,7 +3661,7 @@ with cur as (
     cast ('2025-12-23T07:06:04' as timestamp)
 "#;
 
-        let result = compare_sql(sql3, sql4);
+        let result = compare_sql(sql3, sql4, AdapterType::Snowflake);
         assert!(
             result.is_ok(),
             "Should ignore difference for timestamp value difference inside CTE fragment"
@@ -3466,7 +3678,7 @@ with cur as (
             min(bucket_start) as min_bucket_start,
             cast('2025-12-23 08:28:37+00:00' as timestamp) as max_bucket_end
 "#;
-        let result = compare_sql(sql5, sql6);
+        let result = compare_sql(sql5, sql6, AdapterType::Snowflake);
         assert!(
             result.is_ok(),
             "Should ignore differences for timestamp value drift in cast() literal with timezone"
@@ -3482,7 +3694,7 @@ with cur as (
         let sql2 = r#"
   md5(cast(coalesce(cast(data_issue_id as varchar), '') || '-' || coalesce(cast(cast('c406f8ee-28dd-4a60-91eb-639ae6a8a613.test.dis_asko_servering.elementary_schema_changes_from_baseline_prs_dim_hendelse_innholdsnavn_.c99b82db3f' as varchar) as varchar), '') as TEXT)) as id,
 "#;
-        let result = compare_sql(sql1, sql2);
+        let result = compare_sql(sql1, sql2, AdapterType::Snowflake);
         assert!(
             result.is_ok(),
             "Should ignore differences for invocation_id/test unique_id embedded in string literal"
@@ -3495,7 +3707,7 @@ with cur as (
         let sql4 = r#"
 cast('test.dis_asko_servering.elementary_schema_changes_from_baseline_prs_dim_hendelse_hendelseskategori_.4d86bc1ad2' as varchar) as test_unique_id,
 "#;
-        let result = compare_sql(sql3, sql4);
+        let result = compare_sql(sql3, sql4, AdapterType::Snowflake);
         assert!(
             result.is_ok(),
             "Should ignore differences for test unique_id embedded in string literal"
@@ -3504,7 +3716,7 @@ cast('test.dis_asko_servering.elementary_schema_changes_from_baseline_prs_dim_he
         // Quoted vs unquoted test temp relation identifier in DDL.
         let sql5 = r#"create or replace  table BE_DPL_PR.elementary.test_ALPHA__tmp_TIMESTAMP"#;
         let sql6 = r#"create or replace table BE_DPL_PR.elementary."test_ALPHA__tmp_TIMESTAMP""#;
-        let result = compare_sql(sql5, sql6);
+        let result = compare_sql(sql5, sql6, AdapterType::Snowflake);
         assert!(
             result.is_ok(),
             "Should ignore differences for quoted vs unquoted test temp relation identifier"
@@ -3517,7 +3729,7 @@ cast('test.dis_asko_servering.elementary_schema_changes_from_baseline_prs_dim_he
       where created_date >= '2025-09-10T18:07:45.449898'"#;
         let sql2 = r#"delete from ANALYTICS.intermediate.int_serp_trends 
       where created_date >= '2025-09-1014:16:52.500487'"#;
-        let result = compare_sql(sql1, sql2);
+        let result = compare_sql(sql1, sql2, AdapterType::Snowflake);
         assert!(
             result.is_ok(),
             "Should ignore difference for timestamp value difference"
@@ -3530,7 +3742,7 @@ cast('test.dis_asko_servering.elementary_schema_changes_from_baseline_prs_dim_he
       where created_date >= '2025-09-10T18:07:45.449898'"#;
         let sql2 = r#"delete from ANALYTICS.intermediate.int_serp_trends 
       where created_date >= '2025-09-10 14:16:52.500487'"#;
-        let result = compare_sql(sql1, sql2);
+        let result = compare_sql(sql1, sql2, AdapterType::Snowflake);
         assert!(
             result.is_ok(),
             "Should ignore difference for timestamp value difference"
@@ -3541,7 +3753,7 @@ cast('test.dis_asko_servering.elementary_schema_changes_from_baseline_prs_dim_he
     fn test_compare_sql_timestamp_in_cast_with_space_separator() {
         let sql1 = "select cast ('2025-12-23 07:06:03' as timestamp)";
         let sql2 = "select cast ('2025-12-30 06:11:01' as timestamp)";
-        compare_sql(sql1, sql2).unwrap_or_else(|e| {
+        compare_sql(sql1, sql2, AdapterType::Snowflake).unwrap_or_else(|e| {
             panic!(
                 "Should ignore difference for timestamp value difference in cast() literal, but got:\n{e}"
             )
@@ -3611,7 +3823,7 @@ select *
 from aggregated
     )
 ;"#;
-        let result = compare_sql(sql1, sql2);
+        let result = compare_sql(sql1, sql2, AdapterType::Snowflake);
         assert!(result.is_ok(), "Should match");
     }
 
@@ -3717,7 +3929,7 @@ LEFT OUTER JOIN
   aggregated_data s ON t.entity_id = s.entity_id
   );
 "#;
-        let result = compare_sql(sql1, sql2);
+        let result = compare_sql(sql1, sql2, AdapterType::Snowflake);
         assert!(result.is_ok(), "Should match");
     }
 
@@ -3750,7 +3962,7 @@ SELECT id FROM `project`.`dataset`.`source_table`
 )
 SELECT * FROM enriched;
 "#;
-        let result = compare_sql(sql1, sql2);
+        let result = compare_sql(sql1, sql2, AdapterType::Snowflake);
         assert!(
             result.is_ok(),
             "Should match: block comment in wrapper body"
@@ -3789,7 +4001,7 @@ from dummy_cte
 where 1 = 0
 "#;
 
-        compare_sql_for_adapter(AdapterType::Databricks, actual, expected)
+        compare_sql(actual, expected, AdapterType::Databricks)
             .expect("should treat persisted view vs temp view as equivalent");
 
         // Same pattern but in a MERGE statement: Fusion uses a three-part qualified name for the
@@ -3837,7 +4049,7 @@ where 1 = 0
             *
 "#;
 
-        compare_sql_for_adapter(AdapterType::Databricks, merge_actual, merge_expected)
+        compare_sql(merge_actual, merge_expected, AdapterType::Databricks)
             .expect("should treat qualified vs unqualified __dbt_tmp in MERGE USING as equivalent");
     }
 
@@ -3845,7 +4057,7 @@ where 1 = 0
     fn test_compare_sql_query_tag_payload_ignored() {
         let actual = r#"    alter session set query_tag = '{""model_name"":""stg_base_orders"",""env"":""PRD"",""job"":{""run_id"":"""",""execution_date"":"""",""start_date"":""""}}'"#;
         let expected = r#"    alter session set query_tag = '{""env"": ""PRD"", ""job"": {""execution_date"": """", ""run_id"": """", ""start_date"": """"}, ""model_name"": ""stg_base_orders""}'"#;
-        let result = compare_sql(actual, expected);
+        let result = compare_sql(actual, expected, AdapterType::Snowflake);
         assert!(
             result.is_ok(),
             "Query tag payload differences should be ignored"
@@ -3918,7 +4130,7 @@ WHERE
     abac_job.job_target = 'ldw_prtnr_all_wk_sumr_sales'
         "#;
 
-        let result = compare_sql(actual, expected);
+        let result = compare_sql(actual, expected, AdapterType::Snowflake);
         assert!(result.is_ok(), "UUID literal differences should be ignored");
     }
 
@@ -3941,7 +4153,7 @@ select *
 from base
 )
 "#;
-        let result = compare_sql(wrapped, with_cte);
+        let result = compare_sql(wrapped, with_cte, AdapterType::Snowflake);
         assert!(
             result.is_ok(),
             "Wrapper-only difference with identical body should be ignored"
@@ -3972,7 +4184,7 @@ as (
 )
 ;
 "#;
-        let result = compare_sql(actual, expected);
+        let result = compare_sql(actual, expected, AdapterType::Snowflake);
         assert!(
             result.is_ok(),
             "Dynamic tmp suffixes starting with a plausible year should be ignored"
@@ -4773,7 +4985,7 @@ where full_table_name is not null
     limit 0
         "#;
 
-        let result = compare_sql(actual, expected);
+        let result = compare_sql(actual, expected, AdapterType::Snowflake);
         assert!(
             result.is_ok(),
             "Should treat union-all sets equal regardless of order within the CTE body"
@@ -4784,7 +4996,7 @@ where full_table_name is not null
     fn test_compare_sql_dollar_quoted_typographic_quotes_ignored() {
         let actual = r#""ORDER_TYPE" COMMENT $$If is_renewal flag is set to 'TRUE' then we are tagging them as 'RENEWAL ORDER'.If it is set to false, but it is a later transaction of Credit type then it is called a "REFUND ORDER" else "FIRST ORDER"$$"#;
         let expected = r#""ORDER_TYPE" COMMENT $$If is_renewal flag is set to 'TRUE' then we are tagging them as 'RENEWAL ORDER'.If it is set to false, but it is a later transaction of Credit type then it is called a “REFUND ORDER” else “FIRST ORDER”$$"#;
-        let result = compare_sql(actual, expected);
+        let result = compare_sql(actual, expected, AdapterType::Snowflake);
         assert!(
             result.is_ok(),
             "Typographic quotes inside dollar-quoted strings should be ignored"
@@ -4818,7 +5030,7 @@ SELECT
 ;
 "#;
 
-        let result = compare_sql(actual, expected);
+        let result = compare_sql(actual, expected, AdapterType::Snowflake);
         assert!(
             result.is_ok(),
             "Elementary metadata package version drift should be ignored"
@@ -4846,7 +5058,7 @@ SELECT
 ;
 "#;
 
-        let result = compare_sql(actual, expected);
+        let result = compare_sql(actual, expected, AdapterType::Snowflake);
         assert!(
             result.is_ok(),
             "Elementary metadata package version drift should be ignored even when schema is renamed"
@@ -4864,7 +5076,7 @@ SELECT
     from OPERATIONS_PRD.MFG_INSTRUMENTS.dbt_exposures
     order by metadata_hash"#;
 
-        let result = compare_sql(actual, expected);
+        let result = compare_sql(actual, expected, AdapterType::Snowflake);
         assert!(
             result.is_ok(),
             "Elementary metadata comments should be ignored"
@@ -4898,14 +5110,22 @@ __dbt__cte__efg as (
 select abc.a from __dbt__cte__abc, efg.a from __dbt__cte__efg
 "#;
 
-        let result = compare_sql(sql_with_nested_cte, sql_reusing_outer_cte);
+        let result = compare_sql(
+            sql_with_nested_cte,
+            sql_reusing_outer_cte,
+            AdapterType::Snowflake,
+        );
         assert!(
             result.is_ok(),
             "Nested redundant dbt CTEs should be treated as equivalent to outer CTE reuse"
         );
 
         // Also test in reverse order
-        let result_reversed = compare_sql(sql_reusing_outer_cte, sql_with_nested_cte);
+        let result_reversed = compare_sql(
+            sql_reusing_outer_cte,
+            sql_with_nested_cte,
+            AdapterType::Snowflake,
+        );
         assert!(result_reversed.is_ok(), "Comparison should be symmetric");
     }
 
@@ -4936,7 +5156,11 @@ __dbt__cte__efg as (
 select abc.a from __dbt__cte__abc, efg.a from __dbt__cte__efg
 "#;
 
-        let result = compare_sql(sql_with_different_nested, sql_reusing_outer_cte);
+        let result = compare_sql(
+            sql_with_different_nested,
+            sql_reusing_outer_cte,
+            AdapterType::Snowflake,
+        );
         assert!(
             result.is_err(),
             "Nested dbt CTEs with different definitions should NOT be treated as equivalent"
@@ -4979,7 +5203,7 @@ __dbt__cte__efg as (
 select * from __dbt__cte__efg
 "#;
 
-        let result = compare_sql(sql_with_nested, sql_reusing);
+        let result = compare_sql(sql_with_nested, sql_reusing, AdapterType::Snowflake);
         assert!(
             result.is_ok(),
             "Multiple nested redundant dbt CTEs should be treated as equivalent"
@@ -5032,14 +5256,22 @@ __dbt__cte__efg as (
 select * from __dbt__cte__abc, __dbt__cte__efg
 "#;
 
-        let result = compare_sql(sql_with_deep_nesting, sql_reusing_parent_scopes);
+        let result = compare_sql(
+            sql_with_deep_nesting,
+            sql_reusing_parent_scopes,
+            AdapterType::Snowflake,
+        );
         assert!(
             result.is_ok(),
             "Deeply nested redundant dbt CTEs should be treated as equivalent"
         );
 
         // Also test in reverse order
-        let result_reversed = compare_sql(sql_reusing_parent_scopes, sql_with_deep_nesting);
+        let result_reversed = compare_sql(
+            sql_reusing_parent_scopes,
+            sql_with_deep_nesting,
+            AdapterType::Snowflake,
+        );
         assert!(result_reversed.is_ok(), "Comparison should be symmetric");
     }
 
@@ -5070,7 +5302,11 @@ __dbt__cte__efg as (
 select * from __dbt__cte__abc, __dbt__cte__efg
 "#;
 
-        let result = compare_sql(sql_with_different_deep_nested, sql_reusing_parent);
+        let result = compare_sql(
+            sql_with_different_deep_nested,
+            sql_reusing_parent,
+            AdapterType::Snowflake,
+        );
         assert!(
             result.is_err(),
             "Nested dbt CTEs with different definitions at inner levels should NOT be equivalent"
@@ -5106,7 +5342,11 @@ __dbt__cte__efg as (
 select * from __dbt__cte__efg
 "#;
 
-        let result = compare_sql(sql_with_redundant_sibling, sql_without_redundant);
+        let result = compare_sql(
+            sql_with_redundant_sibling,
+            sql_without_redundant,
+            AdapterType::Snowflake,
+        );
         assert!(
             result.is_ok(),
             "Sibling dbt CTE references should be properly handled"
@@ -5140,7 +5380,11 @@ outer_cte as (
 select * from outer_cte
 "#;
 
-        let result = compare_sql(sql_with_nested_user_cte, sql_without_nested);
+        let result = compare_sql(
+            sql_with_nested_user_cte,
+            sql_without_nested,
+            AdapterType::Snowflake,
+        );
         // This should NOT be equivalent because user CTEs are not normalized
         assert!(
             result.is_err(),
@@ -5209,7 +5453,7 @@ select
 from dummy_cte
 where 1 = 0";
 
-        let result = compare_sql_for_adapter(AdapterType::Databricks, actual, expected);
+        let result = compare_sql(actual, expected, AdapterType::Databricks);
         assert!(
             result.is_ok(),
             "numeric(28,6) and decimal(28,6) should be treated as equivalent: {result:?}"
@@ -5228,7 +5472,7 @@ where 1 = 0";
     tblproperties ('delta.enableChangeDataFeed' = 'true' , 'delta.columnMapping.mode' = 'name' 
     )"#;
 
-        let result = compare_sql_for_adapter(AdapterType::Databricks, actual, expected);
+        let result = compare_sql(actual, expected, AdapterType::Databricks);
         assert!(
             result.is_ok(),
             "ALTER TABLE SET tblproperties should be order-independent: {result:?}"
@@ -5275,10 +5519,114 @@ class this:
     database = "DB"
 "#;
 
-        let result = compare_sql(actual, expected);
+        let result = compare_sql(actual, expected, AdapterType::Snowflake);
         assert!(
             result.is_ok(),
             "meta_dict and meta_get differences should be ignorable: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_python_nonempty_meta_dict_promoted_to_config_dict_and_meta_get_calls_rewritten() {
+        // Regression test for: Fusion emits `config_dict = {}` (empty) + `meta_dict = {data}`
+        // + `dbt.config.meta_get(...)` call sites in the model body, while Mantle emits
+        // `config_dict = {data}` (populated from meta) + no meta_dict + `dbt.config.get(...)`
+        // call sites. The two forms are semantically equivalent and should not cause a mismatch.
+        //
+        // This covers models like rte_followup_key_message, clinical_trial_start_end,
+        // event_congress_activity, email_bounced, etc. that use dbt.config.meta_get() to read
+        // values defined under `meta:` in their config.yml.
+        let actual = r#"
+config_dict = {}
+meta_dict = {'days': {'ID': 7, 'TH': 7}, 'countries': ['ID', 'TH']}
+
+class config:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    @staticmethod
+    def get(key, default=None):
+        return config_dict.get(key, default)
+
+class this:
+    database = "DB"
+    schema = "SCH"
+    identifier = "my_model"
+
+def model(dbt, session):
+    last_n_days = dbt.config.meta_get("days")
+    countries = dbt.config.meta_get("countries")
+    return session.table("something")
+"#;
+
+        let expected = r#"
+config_dict = {'days': {'ID': 7, 'TH': 7}, 'countries': ['ID', 'TH']}
+
+class config:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    @staticmethod
+    def get(key, default=None):
+        return config_dict.get(key, default)
+
+class this:
+    database = "DB"
+    schema = "SCH"
+    identifier = "my_model"
+
+def model(dbt, session):
+    last_n_days = dbt.config.get("days")
+    countries = dbt.config.get("countries")
+    return session.table("something")
+"#;
+
+        let result = compare_sql(actual, expected, AdapterType::Snowflake);
+        assert!(
+            result.is_ok(),
+            "Populated meta_dict + meta_get call sites should be treated as equivalent \
+             to populated config_dict + get call sites: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_python_meta_get_normalizes_both_sides() {
+        // Some Mantle recordings preserve `dbt.config.meta_get(...)` in the
+        // generated stored procedure body (rather than rewriting to `get`).
+        // Fusion's actual passes the user's source verbatim, so it also has
+        // `meta_get`. The canonicalizer must normalize BOTH sides — otherwise
+        // the actual gets rewritten to `get` while the expected keeps
+        // `meta_get`, causing a spurious mismatch.
+        let actual = r#"
+config_dict = {'k': 'v'}
+
+class config:
+    @staticmethod
+    def get(key, default=None):
+        return config_dict.get(key, default)
+
+def model(dbt, session):
+    x = dbt.config.meta_get("k")
+    return session.table("t")
+"#;
+
+        let expected = r#"
+config_dict = {'k': 'v'}
+
+class config:
+    @staticmethod
+    def get(key, default=None):
+        return config_dict.get(key, default)
+
+def model(dbt, session):
+    x = dbt.config.meta_get("k")
+    return session.table("t")
+"#;
+
+        let result = compare_sql(actual, expected, AdapterType::Snowflake);
+        assert!(
+            result.is_ok(),
+            "matching meta_get on both sides should compare equal: {result:?}"
         );
     }
 

@@ -1,7 +1,8 @@
 //! https://github.com/databricks/dbt-databricks/blob/main/dbt/adapters/databricks/relation_configs/column_comments.py
 
+use crate::errors::AdapterResult;
 use crate::relation::config_v2::{
-    ComponentConfig, ComponentConfigLoader, SimpleComponentConfigImpl, diff,
+    ComponentConfig, ComponentConfigLoader, SimpleComponentConfigImpl, diff, impl_loader,
 };
 use crate::relation::databricks::config::{
     DatabricksRelationMetadata, DatabricksRelationMetadataKey,
@@ -80,10 +81,10 @@ fn new_component(column_comments: IndexMap<String, String>) -> ColumnComments {
     }
 }
 
-fn from_remote_state(results: &DatabricksRelationMetadata) -> ColumnComments {
+fn from_remote_state(results: &DatabricksRelationMetadata) -> AdapterResult<ColumnComments> {
     let Some(describe_extended) = results.get(&DatabricksRelationMetadataKey::DescribeExtended)
     else {
-        return new_component(IndexMap::new());
+        return Ok(new_component(IndexMap::new()));
     };
     let mut comments = IndexMap::new();
 
@@ -116,10 +117,12 @@ fn from_remote_state(results: &DatabricksRelationMetadata) -> ColumnComments {
     // The engine might return them in random order so sorting to always be consistent
     comments.sort_keys();
 
-    new_component(comments)
+    Ok(new_component(comments))
 }
 
-fn from_local_config(relation_config: &dyn InternalDbtNodeAttributes) -> ColumnComments {
+fn from_local_config(
+    relation_config: &dyn InternalDbtNodeAttributes,
+) -> AdapterResult<ColumnComments> {
     let columns = &relation_config.base().columns;
 
     // Check if persist_docs.relation is enabled
@@ -146,40 +149,16 @@ fn from_local_config(relation_config: &dyn InternalDbtNodeAttributes) -> ColumnC
         }
     }
 
-    new_component(comments)
+    Ok(new_component(comments))
 }
 
-pub(crate) struct ColumnCommentsLoader;
+impl_loader!(ColumnComments, DatabricksRelationMetadata);
 
 impl ColumnCommentsLoader {
     pub fn new_component_type_erased(
         column_comments: IndexMap<String, String>,
     ) -> Box<dyn ComponentConfig> {
         Box::new(new_component(column_comments))
-    }
-
-    pub fn type_name() -> &'static str {
-        TYPE_NAME
-    }
-}
-
-impl ComponentConfigLoader<DatabricksRelationMetadata> for ColumnCommentsLoader {
-    fn type_name(&self) -> &'static str {
-        TYPE_NAME
-    }
-
-    fn from_remote_state(
-        &self,
-        remote_state: &DatabricksRelationMetadata,
-    ) -> Box<dyn ComponentConfig> {
-        Box::new(from_remote_state(remote_state))
-    }
-
-    fn from_local_config(
-        &self,
-        relation_config: &dyn InternalDbtNodeAttributes,
-    ) -> Box<dyn ComponentConfig> {
-        Box::new(from_local_config(relation_config))
     }
 }
 
@@ -247,7 +226,7 @@ email,string,\n\
     fn test_from_remote_state() {
         let table = create_mock_describe_extended_table();
         let results = IndexMap::from([(DatabricksRelationMetadataKey::DescribeExtended, table)]);
-        let config = from_remote_state(&results);
+        let config = from_remote_state(&results).unwrap();
 
         assert_eq!(config.value.len(), 3);
         assert_eq!(
@@ -261,7 +240,7 @@ email,string,\n\
     #[test]
     fn test_from_remote_state_missing_describe_extended() {
         let results = IndexMap::new();
-        let config = from_remote_state(&results);
+        let config = from_remote_state(&results).unwrap();
 
         assert!(config.value.is_empty());
     }
@@ -279,7 +258,7 @@ email,string,\n\
         .unwrap();
         let table = AgateTable::from_record_batch(Arc::new(record_batch));
         let results = IndexMap::from([(DatabricksRelationMetadataKey::DescribeExtended, table)]);
-        let config = from_remote_state(&results);
+        let config = from_remote_state(&results).unwrap();
 
         assert_eq!(config.value.len(), 0);
     }
@@ -295,7 +274,7 @@ email,string,\n\
         let batch = reader.next().unwrap().unwrap();
         let table = AgateTable::from_record_batch(Arc::new(batch));
         let results = IndexMap::from([(DatabricksRelationMetadataKey::DescribeExtended, table)]);
-        let config = from_remote_state(&results);
+        let config = from_remote_state(&results).unwrap();
 
         assert_eq!(config.value.len(), 3);
         // All keys should be lowercase
@@ -317,7 +296,7 @@ email,string,\n\
         let batch = reader.next().unwrap().unwrap();
         let table = AgateTable::from_record_batch(Arc::new(batch));
         let results = IndexMap::from([(DatabricksRelationMetadataKey::DescribeExtended, table)]);
-        let config = from_remote_state(&results);
+        let config = from_remote_state(&results).unwrap();
 
         // Should stop at first # delimiter, so only 'id' should be included
         assert_eq!(config.value.len(), 1);
@@ -345,7 +324,7 @@ email,string,\n\
         let batch = reader.next().unwrap().unwrap();
         let table = AgateTable::from_record_batch(Arc::new(batch));
         let results = IndexMap::from([(DatabricksRelationMetadataKey::DescribeExtended, table)]);
-        let config = from_remote_state(&results);
+        let config = from_remote_state(&results).unwrap();
 
         assert_eq!(config.value.len(), 2);
         // Should default to empty string when comment column is missing
@@ -365,7 +344,7 @@ email,string,\n\
         let batch = reader.next().unwrap().unwrap();
         let table = AgateTable::from_record_batch(Arc::new(batch));
         let results = IndexMap::from([(DatabricksRelationMetadataKey::DescribeExtended, table)]);
-        let config = from_remote_state(&results);
+        let config = from_remote_state(&results).unwrap();
 
         // Should only have 2 valid columns, skipping empty and whitespace-only names
         assert_eq!(config.value.len(), 2);
@@ -379,7 +358,7 @@ email,string,\n\
     fn test_from_local_config_with_persist() {
         let columns = IndexMap::from_iter([("id", "Primary key"), ("name", "User name")]);
         let mock_node = create_mock_dbt_model(columns, true);
-        let config = from_local_config(&mock_node);
+        let config = from_local_config(&mock_node).unwrap();
 
         assert_eq!(config.value.len(), 2);
         assert_eq!(config.value.get("id"), Some(&"Primary key".to_string()));
@@ -390,7 +369,7 @@ email,string,\n\
     fn test_from_local_config_without_persist() {
         let columns = IndexMap::from_iter([("id", "Primary key")]);
         let mock_node = create_mock_dbt_model(columns, false);
-        let config = from_local_config(&mock_node);
+        let config = from_local_config(&mock_node).unwrap();
 
         // It should behave as if no config was specified
         assert_eq!(config.value.len(), 0);

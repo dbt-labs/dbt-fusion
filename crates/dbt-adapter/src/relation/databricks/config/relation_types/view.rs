@@ -11,7 +11,7 @@ fn requires_full_refresh(components: &IndexMap<&'static str, ComponentConfigChan
 }
 
 /// Create a `RelationConfigLoader` for Databricks views
-pub(crate) fn new_loader() -> RelationConfigLoader<DatabricksRelationMetadata> {
+pub(crate) fn new_loader() -> RelationConfigLoader<'static, DatabricksRelationMetadata> {
     let loaders: [Box<dyn ComponentConfigLoader<DatabricksRelationMetadata>>; 5] = [
         Box::new(components::ColumnCommentsLoader),
         Box::new(components::QueryLoader),
@@ -27,7 +27,9 @@ pub(crate) fn new_loader() -> RelationConfigLoader<DatabricksRelationMetadata> {
 mod tests {
     use super::{new_loader, requires_full_refresh};
     use crate::AdapterType;
-    use crate::relation::config_v2::{ComponentConfigChange, RelationComponentConfigChangeSet};
+    use crate::relation::config_v2::{
+        ComponentConfigChange, ComponentConfigLoader, RelationComponentConfigChangeSet,
+    };
     use crate::relation::databricks::config::{
         DatabricksRelationMetadata, components,
         test_helpers::{TestModelColumn, TestModelConfig, run_test_cases},
@@ -108,7 +110,7 @@ mod tests {
                     AdapterType::Databricks,
                     [
                         (
-                            components::ColumnCommentsLoader::type_name(),
+                            components::ColumnCommentsLoader.type_name(),
                             ComponentConfigChange::Some(
                                 components::ColumnCommentsLoader::new_component_type_erased(
                                     IndexMap::from_iter([(
@@ -119,7 +121,7 @@ mod tests {
                             ),
                         ),
                         (
-                            components::RelationTagsLoader::type_name(),
+                            components::RelationTagsLoader.type_name(),
                             ComponentConfigChange::Some(
                                 components::RelationTagsLoader::new_component_type_erased(
                                     IndexMap::from_iter([
@@ -131,13 +133,13 @@ mod tests {
                         ),
                         // TODO: query is not implemented
                         // (
-                        //     components::QueryLoader::type_name(),
+                        //     components::QueryLoader.type_name(),
                         //     ComponentConfigChange::Some(components::QueryLoader::new_component_type_erased(
                         //         "SELECT 1000",
                         //     )),
                         // ),
                         (
-                            components::TblPropertiesLoader::type_name(),
+                            components::TblPropertiesLoader.type_name(),
                             ComponentConfigChange::Some(
                                 components::TblPropertiesLoader::new_component_type_erased(
                                     IndexMap::from_iter([
@@ -150,6 +152,44 @@ mod tests {
                     ],
                     requires_full_refresh,
                 ),
+                changeset_jinja: "
+<column_comments>
+    <comments>
+        <a_column>
+            new comment
+        </a_column>
+    </comments>
+    <persist>
+        True
+    </persist>
+</column_comments>
+<tags>
+    <set_tags>
+        <a_tag>
+            new
+        </a_tag>
+        <b_tag>
+            old
+        </b_tag>
+    </set_tags>
+</tags>
+<tblproperties>
+    <tblproperties>
+        <customKey>
+            new
+        </customKey>
+        <customKey2>
+            value
+        </customKey2>
+        <delta.enableRowTracking>
+            true
+        </delta.enableRowTracking>
+    </tblproperties>
+    <pipeline_id>
+        my_new_pipeline
+    </pipeline_id>
+</tblproperties>
+                    ",
                 requires_full_refresh: false,
             },
             TestCase {
@@ -169,7 +209,7 @@ mod tests {
                 expected_changeset: RelationComponentConfigChangeSet::new(
                     AdapterType::Databricks,
                     [(
-                        components::RelationCommentLoader::type_name(),
+                        components::RelationCommentLoader.type_name(),
                         ComponentConfigChange::Some(
                             components::RelationCommentLoader::new_component_type_erased(Some(
                                 "new comment".to_string(),
@@ -178,6 +218,16 @@ mod tests {
                     )],
                     requires_full_refresh,
                 ),
+                changeset_jinja: "
+<comment>
+    <comment>
+        new comment
+    </comment>
+    <persist>
+        True
+    </persist>
+</comment>
+                    ",
                 requires_full_refresh: true,
             },
         ]

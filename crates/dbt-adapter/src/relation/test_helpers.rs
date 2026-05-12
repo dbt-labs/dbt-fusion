@@ -4,6 +4,29 @@ use crate::relation::config_v2::{
     RelationConfigLoader,
 };
 use dbt_schemas::schemas::nodes::DbtModel;
+use minijinja_contrib::testing::jinja_diff;
+
+const JINJA_INTROSPECT: &str = "
+{% macro introspect(obj) %}
+    {% if obj is number or obj is string or obj is boolean or obj is none or obj is undefined %}
+        {{ obj }}
+    {% elif obj is mapping %}
+        {% for key in obj %}
+            <{{ key }}>
+            {{ introspect(obj[key]) }}
+            </{{ key }}>
+        {% endfor %}
+    {% elif obj is iterable %}
+        {% for val in obj %}
+            {{ introspect(val) }}
+        {% endfor %}
+    {% else %}
+        UNKNOWN
+    {% endif %}
+{% endmacro %}
+
+{{ introspect(obj) }}
+";
 
 /// A single test case to test whether a relation config
 /// of a given type results in the correct changeset
@@ -11,8 +34,9 @@ pub(crate) struct TestCase<L, C> {
     pub description: &'static str,
     pub current_state: C,
     pub desired_state: C,
-    pub relation_loader: RelationConfigLoader<L>,
+    pub relation_loader: RelationConfigLoader<'static, L>,
     pub expected_changeset: RelationComponentConfigChangeSet,
+    pub changeset_jinja: &'static str,
     pub requires_full_refresh: bool,
 }
 
@@ -86,8 +110,14 @@ pub(crate) fn run_test_case<L, C>(
     let desired_local_config = create_mock_local_config(tc.desired_state);
     let current_local_config = create_mock_local_config(tc.current_state);
 
-    let desired = tc.relation_loader.from_local_config(&desired_local_config);
-    let current = tc.relation_loader.from_local_config(&current_local_config);
+    let desired = tc
+        .relation_loader
+        .from_local_config(&desired_local_config)
+        .expect("desired config loader failed: test setup produced an invalid model config");
+    let current = tc
+        .relation_loader
+        .from_local_config(&current_local_config)
+        .expect("current config loader failed: test setup produced an invalid model config");
     let changeset = RelationConfig::diff(&desired, &current);
 
     let mut errors = changesets_eq(&tc.expected_changeset, &changeset);
@@ -118,6 +148,11 @@ pub(crate) fn run_test_case<L, C>(
         out.push_str("\n\nGOT CHANGESET\n");
         out.push_str(format!("{:#?}", changeset).as_str());
 
+        Some(out)
+    } else if let Some(diff) = jinja_diff(changeset, JINJA_INTROSPECT, tc.changeset_jinja) {
+        let mut out = String::with_capacity(diff.len() + 50);
+        out.push_str("JINJA MISMATCH ERROR\n");
+        out.push_str(&diff);
         Some(out)
     } else {
         None

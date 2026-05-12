@@ -356,6 +356,38 @@ fn value_from_str(
     Ok(value)
 }
 
+/// If `s` looks like a decimal integer or float with YAML 1.1-style underscore
+/// digit separators (e.g. `24_000_000`, `-1_000.5e-2`), strips the underscores
+/// and returns a `Value::Number` with the parsed value.  Returns `None` for
+/// any other input.
+fn normalize_underscore_number(s: &str, span: &dbt_yaml::Span) -> Option<Value> {
+    if !s.contains('_') {
+        return None;
+    }
+
+    let magnitude = s.strip_prefix('-').unwrap_or(s);
+
+    if !magnitude.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+        return None;
+    }
+    if !magnitude
+        .bytes()
+        .all(|b| matches!(b, b'0'..=b'9' | b'_' | b'.' | b'e' | b'E' | b'+' | b'-'))
+    {
+        return None;
+    }
+
+    if magnitude.contains("__") || magnitude.ends_with('_') {
+        return None;
+    }
+
+    let stripped = s.replace('_', "");
+    if let Ok(number) = stripped.parse::<dbt_yaml::Number>() {
+        return Some(Value::Number(number, span.clone()));
+    }
+    None
+}
+
 /// Variant of into_typed_with_jinja which returns a Vec of warnings rather
 /// than firing them.
 fn into_typed_with_jinja_error<T, S>(
@@ -372,6 +404,12 @@ where
 {
     let jinja_renderer = |value: &Value| match value {
         Value::String(s, yaml_span) => {
+            if !RE_HAS_RENDER_CHARS.is_match(s) {
+                if let Some(normalised) = normalize_underscore_number(s, yaml_span) {
+                    return Ok(Some(normalised));
+                }
+            }
+
             let updated_ctx = ctx.with_yaml_span(yaml_span);
             let ctx = if let Some(ctx) = &updated_ctx {
                 ctx
@@ -585,39 +623,90 @@ fn perform_typecheck<F>(
 static RE_HAS_RENDER_CHARS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(\{\{|\{\%|\{\#|%\}|#\}|\}\})").expect("valid regex"));
 
-static RE_SIMPLE_EXPR: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*\{\{\s*[^{}]+\s*\}\}\s*$").expect("valid regex"));
-
-/// Check if the input is a single Jinja expression without whitespace control
+/// Check if the input is a single Jinja expression without whitespace control.
+///
+/// Bare `{` / `}` in the body are allowed so that dict and set literals
+/// (`{{ {'a': 1} }}`, `{{ {1, 2, 3} }}`) take the typed evaluation path rather
+/// than being coerced to their Display form. Nested Jinja delimiters (`{{`,
+/// `}}`, `{%`, `%}`, `{#`, `#}`) inside the body still disqualify the input,
+/// which keeps multi-expression and statement-bearing templates on the string
+/// rendering path.
 pub fn check_single_expression_without_whitepsace_control(input: &str) -> bool {
-    // The regex matches:
-    //   ^\s*      -> optional whitespace at the beginning
-    //   \{\{      -> the literal '{{'
-    //   \s*       -> optional whitespace
-    //   [^{}]+   -> one or more characters that are not '{', '}', or '-'
-    //   \s*       -> optional whitespace
-    //   \}\}      -> the literal '}}'
-    //   \s*$      -> optional whitespace at the end
-    !input.starts_with("{{-")
-        && !input.ends_with("-}}")
-        && input.starts_with("{{")
-        && input.ends_with("}}")
-        && { RE_SIMPLE_EXPR.is_match(input) }
+    if input.starts_with("{{-") || input.ends_with("-}}") {
+        return false;
+    }
+    if !input.starts_with("{{") || !input.ends_with("}}") || input.len() < 4 {
+        return false;
+    }
+    let body = &input[2..input.len() - 2];
+    let bytes = body.as_bytes();
+    for i in 0..bytes.len().saturating_sub(1) {
+        if matches!(
+            &bytes[i..i + 2],
+            b"{{" | b"}}" | b"{%" | b"%}" | b"{#" | b"#}"
+        ) {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use dbt_common::io_args::IoArgs;
-    use dbt_yaml::Value;
 
     #[test]
     fn test_check_single_expression_without_whitepsace_control() {
+        // Plain single expressions.
         assert!(check_single_expression_without_whitepsace_control(
             "{{ config(enabled=true) }}"
         ));
+        assert!(check_single_expression_without_whitepsace_control(
+            "{{ foo }}"
+        ));
+        assert!(check_single_expression_without_whitepsace_control(
+            "{{ [1, 2, 3] }}"
+        ));
+
+        // Expressions whose body contains a dict/set literal: the outer
+        // `{{ ... }}` is still a single expression and must be routed through
+        // the typed path so the literal survives as a mapping/set rather than
+        // being coerced to its Display form.
+        assert!(check_single_expression_without_whitepsace_control(
+            "{{ {'a': 1} }}"
+        ));
+        assert!(check_single_expression_without_whitepsace_control(
+            "{{ {'count': 38, 'period': 'day'} if cond else none }}"
+        ));
+        assert!(check_single_expression_without_whitepsace_control(
+            "{{ foo({'a': 1}) }}"
+        ));
+        assert!(check_single_expression_without_whitepsace_control(
+            "{{ {1, 2, 3} }}"
+        ));
+
+        // Whitespace control must stay excluded.
         assert!(!check_single_expression_without_whitepsace_control(
             "{{- config(enabled=true) -}}"
+        ));
+
+        // Multiple sibling expressions must stay on the string path.
+        assert!(!check_single_expression_without_whitepsace_control(
+            "{{ a }}{{ b }}"
+        ));
+
+        // Statement + expression must stay on the string path.
+        assert!(!check_single_expression_without_whitepsace_control(
+            "{% set x = 1 %}{{ x }}"
+        ));
+
+        // Surrounding literal text must stay on the string path.
+        assert!(!check_single_expression_without_whitepsace_control(
+            "prefix {{ foo }}"
+        ));
+        assert!(!check_single_expression_without_whitepsace_control(
+            "{{ foo }} suffix"
         ));
     }
 
@@ -637,5 +726,68 @@ mod tests {
             Value::Mapping(_, _) => {} // minimal structural check
             other => panic!("Expected top-level mapping, got: {:?}", other),
         }
+    }
+
+    // Helper: extract the dbt_yaml::Number from a Value::Number, panicking otherwise.
+    fn unwrap_number(v: Value) -> dbt_yaml::Number {
+        match v {
+            Value::Number(n, _) => n,
+            other => panic!("Expected Value::Number, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_normalize_underscore_number_valid_cases() {
+        let span = dbt_yaml::Span::default();
+
+        let result = normalize_underscore_number("24_000_000", &span);
+        assert!(result.is_some(), "24_000_000 should be recognised");
+        assert_eq!(unwrap_number(result.unwrap()).as_u64(), Some(24_000_000));
+
+        let result = normalize_underscore_number("1_500.00", &span);
+        assert!(result.is_some(), "1_500.00 should be recognised");
+        assert_eq!(unwrap_number(result.unwrap()).as_f64(), Some(1500.0));
+
+        let result = normalize_underscore_number("-1_2e3", &span);
+        assert!(result.is_some(), "-1_2e3 should be recognised");
+        assert_eq!(unwrap_number(result.unwrap()).as_f64(), Some(-12e3));
+
+        let result = normalize_underscore_number("1_000.5e-2", &span);
+        assert!(result.is_some(), "1_000.5e-2 should be recognised");
+        assert_eq!(unwrap_number(result.unwrap()).as_f64(), Some(1000.5e-2));
+    }
+
+    #[test]
+    fn test_normalize_underscore_number_invalid_cases() {
+        let span = dbt_yaml::Span::default();
+
+        assert!(
+            normalize_underscore_number("0x1_0", &span).is_none(),
+            "0x1_0 (hex) must be rejected"
+        );
+        assert!(
+            normalize_underscore_number("1__0", &span).is_none(),
+            "1__0 (double underscore) must be rejected"
+        );
+        assert!(
+            normalize_underscore_number("_10", &span).is_none(),
+            "_10 (leading underscore) must be rejected"
+        );
+        assert!(
+            normalize_underscore_number("1_", &span).is_none(),
+            "1_ (trailing underscore) must be rejected"
+        );
+        assert!(
+            normalize_underscore_number("24_000_000px", &span).is_none(),
+            "24_000_000px (non-numeric suffix) must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_normalize_underscore_number_no_underscore_is_noop() {
+        let span = dbt_yaml::Span::default();
+        assert!(normalize_underscore_number("24000000", &span).is_none());
+        assert!(normalize_underscore_number("hello", &span).is_none());
+        assert!(normalize_underscore_number("", &span).is_none());
     }
 }

@@ -1,11 +1,11 @@
-use core::fmt;
 use std::ffi::OsString;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::result::Result;
 use std::time::Duration;
-use std::{env, io};
+use std::{env, fmt, io};
 
+use crate::driver::DriverFilenameDisplay;
 use crate::*;
 use adbc_core::error::{Error, Status};
 use percent_encoding::AsciiSet;
@@ -18,11 +18,46 @@ static INSTALLABLE_DRIVERS: &[Backend; 9] = &[
     Backend::Postgres,
     Backend::Databricks,
     Backend::Redshift,
-    Backend::DuckDB,
+    Backend::DuckDBExtended,
     Backend::Salesforce,
     Backend::Spark,
     Backend::SQLServer,
 ];
+
+const LINUX_TARGET_OS: &str = "manylinux_2_17-linux-gnu";
+const MACOS_TARGET_OS: &str = "apple-darwin";
+const WINDOWS_TARGET_OS: &str = "pc-windows-msvc";
+
+/// Field order matters: the derived `Ord` compares fields top-to-bottom,
+/// matching the (os, arch, version) sort key used in `checksums.rs`.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DriverTriplet<'a> {
+    pub os: &'a str,
+    pub arch: &'a str,
+    pub version: &'a str,
+}
+
+impl<'a> DriverTriplet<'a> {
+    pub fn dll_prefix(&self) -> &'static str {
+        match self.os {
+            WINDOWS_TARGET_OS => "",
+            _ => "lib",
+        }
+    }
+
+    pub fn dll_suffix(&self) -> &'static str {
+        match self.os {
+            MACOS_TARGET_OS => ".dylib",
+            LINUX_TARGET_OS => ".so",
+            WINDOWS_TARGET_OS => ".dll",
+            _ if self.os.starts_with("manylinux") => ".so",
+            _ => {
+                debug_assert!(false, "unsupported target OS: {}", self.os);
+                ".so"
+            }
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum InstallError {
@@ -51,7 +86,7 @@ pub enum InstallError {
 }
 
 impl fmt::Display for InstallError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             InstallError::Http(error) => write!(f, "HTTP error: {error}"),
             InstallError::GetRandom(error) => write!(f, "getrandom error: {error}"),
@@ -175,7 +210,7 @@ impl InstallError {
     }
 }
 
-pub fn format_driver_url(backend_name: &str, version: &str, os: &str) -> String {
+pub fn format_driver_url(backend_name: &str, triplet: DriverTriplet) -> String {
     const PUBLIC_DBT_CDN: &str = "public.cdn.getdbt.com";
 
     // %-encode most non-alphanumeric characters in the version string
@@ -188,10 +223,10 @@ pub fn format_driver_url(backend_name: &str, version: &str, os: &str) -> String 
         PUBLIC_DBT_CDN,
         backend_name,
         backend_name,
-        percent_encoding::utf8_percent_encode(version, NON_ALPHANUMERIC),
-        env::consts::ARCH,
-        os,
-        env::consts::DLL_SUFFIX
+        percent_encoding::utf8_percent_encode(triplet.version, NON_ALPHANUMERIC),
+        triplet.arch,
+        triplet.os,
+        triplet.dll_suffix(),
     )
 }
 
@@ -211,25 +246,17 @@ pub fn format_driver_url(backend_name: &str, version: &str, os: &str) -> String 
 /// Windows
 ///
 /// ${FOLDERID_LocalAppData}/com.getdbt/adbc/x86_64-pc-windows-msvc/adbc_driver_snowflake-0.17.0+dbt0.0.1.dll
-pub fn format_driver_path(
-    backend_name: &str,
-    version: &str,
-    os: &str,
-) -> Result<PathBuf, InstallError> {
+pub fn format_driver_path(name: &str, triplet: DriverTriplet) -> Result<PathBuf, InstallError> {
     const APP_ID: &str = "com.getdbt";
     dirs::cache_dir()
         .map(|cache_dir| {
             let driver_relpath = format!(
-                "{}/adbc/{}-{}/{}adbc_driver_{}-{}{}",
-                APP_ID,
-                env::consts::ARCH,
-                os,
-                env::consts::DLL_PREFIX,
-                backend_name,
-                version,
-                env::consts::DLL_SUFFIX
+                "{}-{}/{}",
+                triplet.arch,
+                triplet.os,
+                DriverFilenameDisplay { name, triplet }
             );
-            cache_dir.join(driver_relpath)
+            cache_dir.join(APP_ID).join("adbc").join(driver_relpath)
         })
         .ok_or(InstallError::DetermineCacheDir)
 }
@@ -237,18 +264,19 @@ pub fn format_driver_path(
 /// XDBC users can call this function to pre-install the driver for the given backend.
 ///
 /// Instead of relying on the automatic installation at connection creation time.
-pub fn pre_install_driver(backend: Backend) -> Result<(), InstallError> {
+pub fn pre_install_driver(http_agent: &ureq::Agent, backend: Backend) -> Result<(), InstallError> {
     if !is_installable_driver(backend) {
         return Ok(());
     }
-    let (backend_name, version, target_os) = driver_parameters(backend);
-    install_driver_internal(backend_name, version, target_os)
+    let (backend_name, triplet) = driver_parameters(backend);
+    install_driver_internal(http_agent, backend_name, triplet)
 }
 
 /// Pre-install all supported drivers for the current platform.
 pub fn pre_install_all_drivers() -> Result<(), InstallError> {
+    let http_agent = build_http_agent();
     for backend in INSTALLABLE_DRIVERS.iter() {
-        pre_install_driver(*backend)?;
+        pre_install_driver(&http_agent, *backend)?;
     }
     Ok(())
 }
@@ -265,29 +293,12 @@ pub fn is_installable_driver(backend: Backend) -> bool {
     INSTALLABLE_DRIVERS.contains(&backend)
 }
 
-#[allow(dead_code)]
-const LINUX_TARGET_OS: &str = "manylinux_2_17-linux-gnu";
-#[allow(dead_code)]
-const MACOS_TARGET_OS: &str = "apple-darwin";
-#[allow(dead_code)]
-const WINDOWS_TARGET_OS: &str = "pc-windows-msvc";
-
-pub fn driver_parameters(
-    backend: Backend,
-) -> (
-    &'static str, // backend_name
-    &'static str, // version
-    &'static str, // target_os
-) {
-    #[cfg(target_os = "linux")]
-    const OS: &str = LINUX_TARGET_OS;
-    #[cfg(target_os = "macos")]
-    const OS: &str = MACOS_TARGET_OS;
-    #[cfg(target_os = "windows")]
-    const OS: &str = WINDOWS_TARGET_OS;
-
+/// Return the backend name and selected driver version.
+///
+/// Pre-condition: is_installable_driver(backend)
+pub fn backend_name_and_version(backend: Backend) -> (&'static str, &'static str) {
     debug_assert!(is_installable_driver(backend));
-    let (backend_name, version) = match backend {
+    match backend {
         Backend::Snowflake => ("snowflake", SNOWFLAKE_DRIVER_VERSION),
         Backend::BigQuery => ("bigquery", BIGQUERY_DRIVER_VERSION),
         Backend::Postgres => ("postgresql", POSTGRES_DRIVER_VERSION),
@@ -295,52 +306,65 @@ pub fn driver_parameters(
         Backend::Redshift => ("redshift", REDSHIFT_DRIVER_VERSION),
         Backend::Spark => ("spark", SPARK_DRIVER_VERSION),
         Backend::Salesforce => ("salesforce", SALESFORCE_DRIVER_VERSION),
-        Backend::DuckDB => ("duckdb", DUCKDB_DRIVER_VERSION),
+        Backend::DuckDBExtended => ("duckdb", DUCKDB_EXTENDED_DRIVER_VERSION),
         Backend::SQLServer => ("mssql", MSSQLSERVER_DRIVER_VERSION),
-        Backend::ClickHouse
+        Backend::Athena
+        | Backend::ClickHouse
+        | Backend::Exasol
         | Backend::DatabricksODBC
         | Backend::RedshiftODBC
         | Backend::Generic { .. } => {
             unreachable!("driver_parameters() called with backend={:?}", backend)
         }
-    };
-    (backend_name, version, OS)
+    }
 }
 
-fn find_expected_checksum_internal(
-    backend_name: &str,
-    version: &str,
-    os: &str,
-    arch: &str,
-) -> Option<&'static str> {
+/// Return the backend name is the [DriverTriplet] for the given backend for this machine.
+///
+/// Pre-condition: is_installable_driver(backend)
+pub fn driver_parameters(backend: Backend) -> (&'static str, DriverTriplet<'static>) {
+    #[cfg(target_os = "linux")]
+    const OS: &str = LINUX_TARGET_OS;
+    #[cfg(target_os = "macos")]
+    const OS: &str = MACOS_TARGET_OS;
+    #[cfg(target_os = "windows")]
+    const OS: &str = WINDOWS_TARGET_OS;
+
+    let (backend_name, version) = backend_name_and_version(backend);
+    let triplet = DriverTriplet {
+        os: OS,
+        arch: env::consts::ARCH,
+        version,
+    };
+    (backend_name, triplet)
+}
+
+/// Find the expected SHA-256 checksum for the compressed driver file.
+pub fn find_expected_checksum(backend_name: &str, triplet: DriverTriplet) -> Option<&'static str> {
     let checksums = checksums::SORTED_CDN_DRIVER_CHECKSUMS.as_ref();
+    #[cfg(debug_assertions)]
     for i in 0..checksums.len() - 1 {
         debug_assert!(
             checksums[i] < checksums[i + 1],
             "SORTED_CDN_DRIVER_CHECKSUMS must be sorted"
         );
     }
-    let query = (backend_name, os, arch, version);
+    let query = (backend_name, triplet.os, triplet.arch, triplet.version);
     checksums
         .binary_search_by(|(elem, _)| elem.cmp(&query))
         .ok()
         .map(|index| checksums[index].1)
 }
 
-/// Find the expected SHA-256 checksum for the compressed driver file.
-fn find_expected_checksum(backend_name: &str, version: &str, os: &str) -> Option<&'static str> {
-    find_expected_checksum_internal(backend_name, version, os, env::consts::ARCH)
-}
-
 pub fn install_driver_internal(
+    http_agent: &ureq::Agent,
     backend_name: &str,
-    version: &str,
-    target_os: &str,
+    triplet: DriverTriplet,
 ) -> Result<(), InstallError> {
-    let full_driver_path = format_driver_path(backend_name, version, target_os)?;
-    let url = format_driver_url(backend_name, version, target_os);
-    let checksum = find_expected_checksum(backend_name, version, target_os);
-    download_zst_driver_file(&url, &full_driver_path, checksum)
+    let full_driver_path = format_driver_path(backend_name, triplet)?;
+    let url = format_driver_url(backend_name, triplet);
+    let checksum = find_expected_checksum(backend_name, triplet);
+    download_zst_driver_file(http_agent, &url, &full_driver_path, checksum)
 }
 
 /// Unguessable temporary file name generator.
@@ -348,7 +372,7 @@ fn tmpname(
     prefix: impl AsRef<str>,
     rand_len: usize,
     suffix: impl AsRef<str>,
-) -> core::result::Result<OsString, getrandom::Error> {
+) -> Result<OsString, getrandom::Error> {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
     // get random data directly from the OS entropy source
@@ -400,44 +424,47 @@ unsafe impl zstd_safe::WriteBuf for ZstdWriteBuffer {
 
 const DRIVER_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Build a TLS configuration that uses the OS certificate store.
+///
+/// [1]: https://github.com/dbt-labs/dbt-fusion/issues/147
+pub fn build_tls_config() -> TlsConfig {
+    TlsConfig::builder()
+        .provider(TlsProvider::Rustls)
+        .root_certs(RootCerts::PlatformVerifier)
+        .build()
+}
+
+/// Configure the HTTP agent for driver downloads.
+pub fn build_http_agent() -> ureq::Agent {
+    let http_config = ureq::Agent::config_builder()
+        .tls_config(build_tls_config())
+        .timeout_global(Some(DRIVER_DOWNLOAD_TIMEOUT))
+        .build();
+    ureq::Agent::new_with_config(http_config)
+}
+
 /// Download a Zstandard-compressed file from the given URL and save (atomically and durably)
 /// it to the fully-qualified destination path.
-pub fn download_zst_driver_file<P: AsRef<Path>>(
+pub fn download_zst_driver_file(
+    http_agent: &ureq::Agent,
     url: &str,
-    destination: P,
+    destination: &Path,
     expected_sha256sum: Option<&str>,
 ) -> Result<(), InstallError> {
     debug_assert!(
-        destination.as_ref().is_absolute(),
+        destination.is_absolute(),
         "destination path must be absolute"
     );
-
-    // Configure the HTTP agent
-    let http_agent = {
-        // Use Rustls as the TLS provider but on the OS for the root certificates.
-        //
-        // [1]: https://github.com/dbt-labs/dbt-fusion/issues/147
-        let tls_config = TlsConfig::builder()
-            .provider(TlsProvider::Rustls)
-            .root_certs(RootCerts::PlatformVerifier)
-            .build();
-        let http_config = ureq::Agent::config_builder()
-            .tls_config(tls_config)
-            .timeout_global(Some(DRIVER_DOWNLOAD_TIMEOUT))
-            .build();
-        ureq::Agent::new_with_config(http_config)
-    };
-
     let mut response = http_agent.get(url).call().map_err(InstallError::Http)?;
 
     // Generate a random file name and create an empty temporary file
     let tmp_path = {
         let tmp_name = tmpname(".", 15, ".download").map_err(InstallError::GetRandom)?;
         // ensure the destination exists and create it if necessary
-        let parent = destination.as_ref().parent().ok_or_else(|| {
+        let parent = destination.parent().ok_or_else(|| {
             let message = format!(
                 "destination path must be an absolute path: {}",
-                destination.as_ref().display()
+                destination.display()
             );
             let error = io::Error::new(io::ErrorKind::InvalidInput, message);
             InstallError::Io(error)
@@ -466,7 +493,7 @@ pub fn download_zst_driver_file<P: AsRef<Path>>(
     // will be moved to the beginning of the Vec which will be resized to the remaining size.
     let mut decompress_step = |download_buffer: &mut Vec<u8>,
                                write_buffer: &mut zstd_safe::OutBuffer<'_, ZstdWriteBuffer>|
-     -> core::result::Result<usize, InstallError> {
+     -> Result<usize, InstallError> {
         debug_assert!(!download_buffer.is_empty());
         // To simplify things, we keep the compressed data always at the beginning of the
         // download_buffer, so an InBuffer around it can be created every time we use it.
@@ -585,7 +612,7 @@ pub fn download_zst_driver_file<P: AsRef<Path>>(
 
     // fsync() the temp file and atomically rename it to the destination.
     tmp.sync_data().map_err(InstallError::SyncFile)?;
-    std::fs::rename(tmp_path, destination.as_ref()).map_err(InstallError::RenameFile)?;
+    std::fs::rename(tmp_path, destination).map_err(InstallError::RenameFile)?;
     Ok(())
 }
 
@@ -596,39 +623,31 @@ mod tests {
 
     #[test]
     fn test_format_driver_url() {
-        let url = format_driver_url("snowflake", "0.17.0+dbt0.2.0", "manylinux_2_17-linux-gnu");
+        let triplet = DriverTriplet {
+            os: "manylinux_2_17-linux-gnu",
+            arch: "x86_64",
+            version: "0.17.0+dbt0.2.0",
+        };
+        let url = format_driver_url("snowflake", triplet);
         assert_eq!(
             url,
-            format!(
-                "https://public.cdn.getdbt.com/fs/adbc/snowflake/adbc_driver_snowflake-0.17.0%2Bdbt0.2.0-{}-manylinux_2_17-linux-gnu{}.zst",
-                env::consts::ARCH,
-                env::consts::DLL_SUFFIX
-            )
+            "https://public.cdn.getdbt.com/fs/adbc/snowflake/adbc_driver_snowflake-0.17.0%2Bdbt0.2.0-x86_64-manylinux_2_17-linux-gnu.so.zst",
         );
     }
 
     #[test]
     fn test_format_driver_path() {
-        let path =
-            format_driver_path("snowflake", "0.17.0+dbt0.2.0", "manylinux_2_17-linux-gnu").unwrap();
+        let triplet = DriverTriplet {
+            os: "manylinux_2_17-linux-gnu",
+            arch: "x86_64",
+            version: "0.17.0+dbt0.2.0",
+        };
+        let path = format_driver_path("snowflake", triplet).unwrap();
 
-        #[cfg(target_os = "windows")]
-        let dbt_cache_dir = format!("{}\\com.getdbt", dirs::cache_dir().unwrap().display());
-        #[cfg(not(target_os = "windows"))]
-        let dbt_cache_dir = format!("{}/com.getdbt", dirs::cache_dir().unwrap().display());
-
-        #[cfg(target_os = "windows")]
-        let filename = "adbc_driver_snowflake-0.17.0+dbt0.2.0.dll";
-        #[cfg(target_os = "linux")]
-        let filename = "libadbc_driver_snowflake-0.17.0+dbt0.2.0.so";
-        #[cfg(target_os = "macos")]
-        let filename = "libadbc_driver_snowflake-0.17.0+dbt0.2.0.dylib";
-
+        let dbt_cache_dir = dirs::cache_dir().unwrap().join("com.getdbt").join("adbc");
         let expected = PathBuf::from(format!(
-            "{}/adbc/{}-manylinux_2_17-linux-gnu/{}",
-            dbt_cache_dir,
-            env::consts::ARCH,
-            filename,
+            "{}/x86_64-manylinux_2_17-linux-gnu/libadbc_driver_snowflake-0.17.0+dbt0.2.0.so",
+            dbt_cache_dir.display(),
         ));
         assert_eq!(path, expected);
     }
@@ -644,40 +663,27 @@ mod tests {
     /// download.
     #[test]
     fn test_all_checksums_are_listed() {
-        let backend_and_versions = [
-            ("snowflake", SNOWFLAKE_DRIVER_VERSION),
-            ("bigquery", BIGQUERY_DRIVER_VERSION),
-            ("postgresql", POSTGRES_DRIVER_VERSION),
-            ("databricks", DATABRICKS_DRIVER_VERSION),
-            ("redshift", REDSHIFT_DRIVER_VERSION),
-            ("duckdb", DUCKDB_DRIVER_VERSION),
-            ("salesforce", SALESFORCE_DRIVER_VERSION),
-            ("spark", SPARK_DRIVER_VERSION),
-            ("mssql", MSSQLSERVER_DRIVER_VERSION),
-        ];
-        debug_assert!(
-            backend_and_versions.len() == INSTALLABLE_DRIVERS.len(),
-            "backend_and_versions must have the same length as INSTALLABLE_DRIVERS"
-        );
         let target_os_and_archs = [
             (LINUX_TARGET_OS, vec!["x86_64", "aarch64"]),
             (MACOS_TARGET_OS, vec!["x86_64", "aarch64"]),
             (WINDOWS_TARGET_OS, vec!["x86_64"]),
         ];
-        for (backend, version) in backend_and_versions.iter() {
-            for (target_os, archs) in target_os_and_archs.iter() {
+        for backend in INSTALLABLE_DRIVERS {
+            let (backend_name, version) = backend_name_and_version(*backend);
+            for (os, archs) in target_os_and_archs.iter() {
                 for arch in archs {
-                    if backend == &"mssql" && target_os == &MACOS_TARGET_OS && arch == &"x86_64" {
-                        // there is no driver available for macos x86_64
-                        continue;
+                    match (backend, *os, *arch) {
+                        // no driver available for Intel Macs connecting to MS SQL
+                        (Backend::SQLServer, MACOS_TARGET_OS, "x86_64") => continue,
+                        _ => {
+                            let triplet = DriverTriplet { os, arch, version };
+                            let checksum = find_expected_checksum(backend_name, triplet);
+                            assert!(
+                                checksum.is_some(),
+                                "Missing checksum for backend: {backend}, version: {version}, os: {os}, arch: {arch}"
+                            );
+                        }
                     }
-
-                    let checksum =
-                        find_expected_checksum_internal(backend, version, target_os, arch);
-                    assert!(
-                        checksum.is_some(),
-                        "Missing checksum for backend: {backend}, version: {version}, target_os: {target_os}, target_arch: {arch}"
-                    );
                 }
             }
         }

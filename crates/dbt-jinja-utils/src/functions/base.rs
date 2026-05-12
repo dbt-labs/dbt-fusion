@@ -6,6 +6,8 @@ use std::{
     sync::Arc,
 };
 
+use indexmap::IndexMap;
+
 use dbt_agate::AgateTable;
 use dbt_common::{
     CodeLocationWithFile, ErrorCode, fs_err,
@@ -14,6 +16,7 @@ use dbt_common::{
     tracing::emit::{
         emit_debug_event, emit_info_event, emit_warn_log_from_fs_error, emit_warn_log_message,
     },
+    warn_error_options::{WarnErrorDecision, WarnErrorOptions},
 };
 use dbt_schemas::schemas::{InternalDbtNode, Nodes};
 use dbt_telemetry::UserLogMessage;
@@ -84,11 +87,18 @@ fn to_json_string_python_style<T: Serialize>(value: &T) -> Result<String, serde_
 pub use dbt_jinja_vars::{LookupFn, SECRET_PLACEHOLDER, Var};
 
 /// Registers all the functions shared across all contexts
-pub fn register_base_functions(env: &mut Environment, io_args: IoArgs) {
+pub fn register_base_functions(
+    env: &mut Environment,
+    io_args: IoArgs,
+    warn_error_options: WarnErrorOptions,
+) {
     env.add_global("dbt_version", Value::from(crate::utils::DBT_VERSION));
     env.add_global(
         "exceptions".to_owned(),
-        Value::from_object(Exceptions { io_args }),
+        Value::from_object(Exceptions {
+            io_args,
+            warn_error_options,
+        }),
     );
     // dbt-core templates commonly use Python-ish constants (capitalized).
     // In Jinja2 the canonical values are `none/true/false`, but many dbt projects
@@ -557,8 +567,11 @@ pub fn diff_of_two_dicts_fn() -> impl Fn(&[Value], Kwargs) -> Result<Value, Erro
         let dict_a = parse_dict_of_lists(&dict_a_arg)?;
         let dict_b = parse_dict_of_lists(&dict_b_arg)?;
 
-        // Convert dict_b to lowercase for case-insensitive comparison
-        let mut dict_b_lowered: HashMap<String, Vec<String>> = HashMap::new();
+        // Convert dict_b to lowercase for case-insensitive comparison.
+        // IndexMap preserves insertion order so `diff_of_two_dicts` matches
+        // Python's dict semantics (iteration follows dict_a's insertion order),
+        // which apply_grants macros rely on for deterministic REVOKE/GRANT order.
+        let mut dict_b_lowered: IndexMap<String, Vec<String>> = IndexMap::new();
         for (key, value_list) in dict_b {
             dict_b_lowered.insert(
                 key.to_lowercase(),
@@ -567,7 +580,7 @@ pub fn diff_of_two_dicts_fn() -> impl Fn(&[Value], Kwargs) -> Result<Value, Erro
         }
 
         // Perform the difference
-        let mut dict_diff: HashMap<String, Vec<String>> = HashMap::new();
+        let mut dict_diff: IndexMap<String, Vec<String>> = IndexMap::new();
         for (key, value_list) in dict_a {
             if let Some(lowered_b_vals) = dict_b_lowered.get(&key.to_lowercase()) {
                 // Filter out values that appear in dict_b, ignoring case
@@ -984,8 +997,8 @@ pub fn local_md5_fn() -> impl Fn(&[Value], Kwargs) -> Result<Value, Error> {
 }
 
 /// Parse a dictionary of lists into a BTreeMap<String, Vec<String>>
-fn parse_dict_of_lists(dict: &Value) -> Result<BTreeMap<String, Vec<String>>, Error> {
-    let mut result = BTreeMap::new();
+fn parse_dict_of_lists(dict: &Value) -> Result<IndexMap<String, Vec<String>>, Error> {
+    let mut result = IndexMap::new();
 
     // Iterate over the keys in the dictionary
     for key in dict.try_iter()? {
@@ -1008,6 +1021,7 @@ fn parse_dict_of_lists(dict: &Value) -> Result<BTreeMap<String, Vec<String>>, Er
 #[derive(Debug)]
 pub struct Exceptions {
     io_args: IoArgs,
+    warn_error_options: WarnErrorOptions,
 }
 
 impl Object for Exceptions {
@@ -1034,12 +1048,31 @@ impl Object for Exceptions {
             "warn" => {
                 let mut args = ArgParser::new(args, None);
                 let warn_string = args.get::<String>("").unwrap_or_else(|_| "".to_string());
-
-                emit_warn_log_message(
-                    ErrorCode::DependencyWarning,
-                    warn_string,
-                    self.io_args.status_reporter.as_ref(),
+                let current_span = state.current_span_of_context();
+                let current_file_path = state.current_path().clone();
+                let warning = fs_err!(ErrorCode::JinjaWarn, "{}", warn_string).with_location(
+                    CodeLocationWithFile::new(
+                        current_span.start_line,
+                        current_span.start_col,
+                        current_span.start_offset,
+                        current_file_path,
+                    ),
                 );
+
+                // Emit through the warn path even when warn-error upgrades it because tracing
+                // handles the event level upgrade for dbt-facing outputs.
+                emit_warn_log_from_fs_error(&warning, self.io_args.status_reporter.as_ref());
+
+                if self
+                    .warn_error_options
+                    .decision_for_error_code(warning.code)
+                    == WarnErrorDecision::UpgradeToError
+                {
+                    return Err(Error::new(
+                        ErrorKind::ExitWithStatus,
+                        "warning upgraded to error via warn-error-options",
+                    ));
+                }
 
                 Ok(Value::UNDEFINED)
             }
@@ -1217,12 +1250,28 @@ impl Object for Exceptions {
                 let updated_at_data_type = args
                     .get::<String>("updated_at_data_type")
                     .unwrap_or_else(|_| "".to_string());
+
+                let metadata = node_metadata_from_state(state);
+                let snapshot_name = state.lookup("model", &[]).and_then(|m| {
+                    m.get_attr("name")
+                        .ok()
+                        .and_then(|v| v.as_str().map(|s| s.to_string()))
+                });
+
+                let name_part = snapshot_name
+                    .as_deref()
+                    .map(|n| format!("snapshot '{n}'"))
+                    .unwrap_or_else(|| "snapshot table".to_string());
+                let location_hint = metadata
+                    .map(|(_, path)| format!("\n  --> {}", path.display()))
+                    .unwrap_or_default();
+
                 let warning = format!(
-                    "Data type of snapshot table timestamp columns ({snapshot_time_data_type}) doesn't match derived column 'updated_at' ({updated_at_data_type}). Please update snapshot config 'updated_at'."
+                    "Data type of {name_part} timestamp columns ({snapshot_time_data_type}) does not match derived column 'updated_at' ({updated_at_data_type}). Please update snapshot config 'updated_at'.{location_hint}"
                 );
 
                 emit_warn_log_message(
-                    ErrorCode::InvalidConfig,
+                    ErrorCode::SnapshotTimestampWarning,
                     warning,
                     self.io_args.status_reporter.as_ref(),
                 );
@@ -1237,9 +1286,64 @@ impl Object for Exceptions {
     }
 }
 
+/// `defer_relation` shape emitted for each deferrable graph node so Jinja
+/// expressions like `node.defer_relation.relation_name` (which dbt-core
+/// supports out of the box) work in fusion. Mirrors the dbt-core manifest
+/// representation. (#1366)
+#[derive(Serialize)]
+struct DeferRelation<'a> {
+    database: Option<&'a str>,
+    schema: &'a str,
+    alias: &'a str,
+    relation_name: Option<&'a str>,
+    resource_type: &'static str,
+    name: &'a str,
+    unique_id: &'a str,
+}
+
+impl<'a> DeferRelation<'a> {
+    fn from_node(node: &'a dyn InternalDbtNode, resource_type: &'static str) -> Self {
+        let common = node.common();
+        let base = node.base();
+        Self {
+            database: if base.database.is_empty() {
+                None
+            } else {
+                Some(base.database.as_str())
+            },
+            schema: base.schema.as_str(),
+            alias: base.alias.as_str(),
+            relation_name: base.relation_name.as_deref(),
+            resource_type,
+            name: common.name.as_str(),
+            unique_id: common.unique_id.as_str(),
+        }
+    }
+}
+
+/// Insert `defer_relation` into a serialized graph node's mapping. When
+/// `defer_nodes` has a matching entry the value is the deferred relation
+/// dict; otherwise it's null. The key is always present so users can do
+/// `node.defer_relation is not none` without hitting "undefined value".
+fn inject_defer_relation<F>(
+    map: &mut dbt_yaml::Mapping,
+    unique_id: &str,
+    defer_nodes: Option<&Nodes>,
+    resource_type: &'static str,
+    lookup: F,
+) where
+    F: Fn(&Nodes, &str) -> Option<Arc<dyn InternalDbtNode>>,
+{
+    let defer_value = defer_nodes
+        .and_then(|dn| lookup(dn, unique_id))
+        .and_then(|d| dbt_yaml::to_value(DeferRelation::from_node(d.as_ref(), resource_type)).ok())
+        .unwrap_or_else(YmlValue::null);
+    map.insert(YmlValue::string("defer_relation".to_string()), defer_value);
+}
+
 /// Builds a flat graph for use in a compile context, using
 /// a serialized manifest and restricting to particular keys
-pub fn build_flat_graph(nodes: &Nodes) -> MutableMap {
+pub fn build_flat_graph(nodes: &Nodes, defer_nodes: Option<&Nodes>) -> MutableMap {
     let mut graph = ValueMap::new();
     let nodes_insert: BTreeMap<String, Value> = nodes
         .models
@@ -1258,13 +1362,21 @@ pub fn build_flat_graph(nodes: &Nodes) -> MutableMap {
                 // dbt-core's manifest stores paths relative to the models folder (e.g., "3-data_vault/...")
                 // not including "models/" prefix. Customer macros like bfs_find_all_downstream_nodes
                 // rely on path.startswith() checks that assume this format.
+                // Normalize to forward slashes first so Windows paths (backslash separators) are handled
+                // consistently with Mac/Linux.
                 let path_key = YmlValue::string("path".to_string());
                 if let Some(path_value) = map.get(&path_key) {
                     if let Some(path_str) = path_value.as_str() {
-                        let stripped = path_str.strip_prefix("models/").unwrap_or(path_str);
+                        let normalized = path_str.replace('\\', "/");
+                        let stripped = normalized.strip_prefix("models/").unwrap_or(&normalized);
                         map.insert(path_key, YmlValue::string(stripped.to_string()));
                     }
                 }
+                inject_defer_relation(map, unique_id, defer_nodes, "model", |dn, uid| {
+                    dn.models
+                        .get(uid)
+                        .map(|m| Arc::clone(m) as Arc<dyn InternalDbtNode>)
+                });
             }
             (unique_id.clone(), Value::from_serialize(serialized))
         })
@@ -1276,10 +1388,16 @@ pub fn build_flat_graph(nodes: &Nodes) -> MutableMap {
                 let path_key = YmlValue::string("path".to_string());
                 if let Some(path_value) = map.get(&path_key) {
                     if let Some(path_str) = path_value.as_str() {
-                        let stripped = path_str.strip_prefix("snapshots/").unwrap_or(path_str);
+                        let normalized = path_str.replace('\\', "/");
+                        let stripped = normalized.strip_prefix("snapshots/").unwrap_or(&normalized);
                         map.insert(path_key, YmlValue::string(stripped.to_string()));
                     }
                 }
+                inject_defer_relation(map, unique_id, defer_nodes, "snapshot", |dn, uid| {
+                    dn.snapshots
+                        .get(uid)
+                        .map(|s| Arc::clone(s) as Arc<dyn InternalDbtNode>)
+                });
             }
             (unique_id.clone(), Value::from_serialize(serialized))
         }))
@@ -1329,10 +1447,16 @@ pub fn build_flat_graph(nodes: &Nodes) -> MutableMap {
                 let path_key = YmlValue::string("path".to_string());
                 if let Some(path_value) = map.get(&path_key) {
                     if let Some(path_str) = path_value.as_str() {
-                        let stripped = path_str.strip_prefix("seeds/").unwrap_or(path_str);
+                        let normalized = path_str.replace('\\', "/");
+                        let stripped = normalized.strip_prefix("seeds/").unwrap_or(&normalized);
                         map.insert(path_key, YmlValue::string(stripped.to_string()));
                     }
                 }
+                inject_defer_relation(map, unique_id, defer_nodes, "seed", |dn, uid| {
+                    dn.seeds
+                        .get(uid)
+                        .map(|s| Arc::clone(s) as Arc<dyn InternalDbtNode>)
+                });
             }
             (unique_id.clone(), Value::from_serialize(serialized))
         }))
@@ -1421,6 +1545,20 @@ pub fn build_flat_graph(nodes: &Nodes) -> MutableMap {
     graph.insert(
         Value::from("saved_queries"),
         Value::from_serialize(saved_queries_insert),
+    );
+    let functions_insert: BTreeMap<String, Value> = nodes
+        .functions
+        .iter()
+        .map(|(unique_id, function)| {
+            (
+                unique_id.clone(),
+                Value::from_serialize((Arc::as_ref(function) as &dyn InternalDbtNode).serialize()),
+            )
+        })
+        .collect();
+    graph.insert(
+        Value::from("functions"),
+        Value::from_serialize(functions_insert),
     );
     MutableMap::from(graph)
 }
@@ -1713,7 +1851,7 @@ mod tests {
             .groups
             .insert("group.pkg.g1".to_string(), Arc::new(DbtGroup::default()));
 
-        let graph = build_flat_graph(&nodes);
+        let graph = build_flat_graph(&nodes, None);
         let graph_val = Value::from_object(graph);
 
         // Each key should contain exactly one entry
@@ -1725,5 +1863,214 @@ mod tests {
                 "expected graph.{key} to be non-empty"
             );
         }
+    }
+
+    /// Regression test for https://github.com/dbt-labs/dbt-fusion/issues/1366:
+    /// Each model/snapshot/seed in `graph.nodes` must carry a `defer_relation`
+    /// key — populated when `defer_nodes` provides a match, otherwise null.
+    #[test]
+    fn build_flat_graph_populates_defer_relation_for_deferrable_nodes() {
+        use dbt_schemas::schemas::nodes::{CommonAttributes, NodeBaseAttributes};
+        use dbt_schemas::schemas::{DbtModel, DbtSeed, DbtSnapshot};
+        use std::path::PathBuf;
+
+        fn make_model(unique_id: &str, name: &str, alias: &str, schema: &str) -> Arc<DbtModel> {
+            Arc::new(DbtModel {
+                __common_attr__: CommonAttributes {
+                    unique_id: unique_id.to_string(),
+                    name: name.to_string(),
+                    package_name: "pkg".to_string(),
+                    fqn: vec!["pkg".to_string(), name.to_string()],
+                    path: PathBuf::from(format!("{name}.sql")),
+                    original_file_path: PathBuf::from(format!("models/{name}.sql")),
+                    ..Default::default()
+                },
+                __base_attr__: NodeBaseAttributes {
+                    database: "prod_db".to_string(),
+                    schema: schema.to_string(),
+                    alias: alias.to_string(),
+                    relation_name: Some(format!("\"prod_db\".\"{schema}\".\"{alias}\"")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+        }
+
+        // Current state: model.pkg.foo, model.pkg.bar
+        let mut nodes = Nodes::default();
+        nodes.models.insert(
+            "model.pkg.foo".to_string(),
+            make_model("model.pkg.foo", "foo", "foo", "dev"),
+        );
+        nodes.models.insert(
+            "model.pkg.bar".to_string(),
+            make_model("model.pkg.bar", "bar", "bar", "dev"),
+        );
+        nodes.snapshots.insert(
+            "snapshot.pkg.snap".to_string(),
+            Arc::new(DbtSnapshot::default()),
+        );
+        nodes
+            .seeds
+            .insert("seed.pkg.seed".to_string(), Arc::new(DbtSeed::default()));
+
+        // Defer state has only model.pkg.foo, with prod schema/alias
+        let mut defer_nodes = Nodes::default();
+        defer_nodes.models.insert(
+            "model.pkg.foo".to_string(),
+            make_model("model.pkg.foo", "foo", "foo", "prod"),
+        );
+
+        let graph = build_flat_graph(&nodes, Some(&defer_nodes));
+        let graph_val = Value::from_object(graph);
+        let nodes_val = graph_val.get_attr("nodes").unwrap();
+
+        // model.pkg.foo: defer_relation populated from defer_nodes
+        let foo = nodes_val.get_attr("model.pkg.foo").unwrap();
+        let foo_defer = foo.get_attr("defer_relation").unwrap();
+        assert!(
+            !foo_defer.is_none(),
+            "model.pkg.foo defer_relation must not be null when present in defer_nodes"
+        );
+        assert_eq!(
+            foo_defer.get_attr("schema").unwrap().to_string(),
+            "prod",
+            "defer_relation.schema should reflect the deferred (prior) schema"
+        );
+        assert_eq!(
+            foo_defer.get_attr("resource_type").unwrap().to_string(),
+            "model",
+        );
+        assert_eq!(
+            foo_defer.get_attr("relation_name").unwrap().to_string(),
+            "\"prod_db\".\"prod\".\"foo\"",
+        );
+
+        // model.pkg.bar: not in defer_nodes, key must still exist as null
+        let bar = nodes_val.get_attr("model.pkg.bar").unwrap();
+        let bar_defer = bar.get_attr("defer_relation").unwrap();
+        assert!(
+            bar_defer.is_none(),
+            "defer_relation must be null (not missing) for nodes absent from defer_nodes"
+        );
+
+        // Snapshots and seeds also get the key (always null when not in defer_nodes)
+        let snap = nodes_val.get_attr("snapshot.pkg.snap").unwrap();
+        assert!(snap.get_attr("defer_relation").unwrap().is_none());
+        let seed = nodes_val.get_attr("seed.pkg.seed").unwrap();
+        assert!(seed.get_attr("defer_relation").unwrap().is_none());
+    }
+
+    /// When called without defer_nodes (parse phase, or non-defer runs),
+    /// defer_relation is still emitted as null on every deferrable node so
+    /// `node.defer_relation is not none` doesn't error.
+    #[test]
+    fn build_flat_graph_emits_null_defer_relation_when_no_defer_nodes() {
+        use dbt_schemas::schemas::DbtModel;
+        use dbt_schemas::schemas::nodes::CommonAttributes;
+
+        let mut nodes = Nodes::default();
+        nodes.models.insert(
+            "model.pkg.foo".to_string(),
+            Arc::new(DbtModel {
+                __common_attr__: CommonAttributes {
+                    unique_id: "model.pkg.foo".to_string(),
+                    name: "foo".to_string(),
+                    package_name: "pkg".to_string(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        );
+
+        let graph = build_flat_graph(&nodes, None);
+        let graph_val = Value::from_object(graph);
+        let foo = graph_val
+            .get_attr("nodes")
+            .unwrap()
+            .get_attr("model.pkg.foo")
+            .unwrap();
+        let defer_rel = foo.get_attr("defer_relation").unwrap();
+        assert!(
+            defer_rel.is_none(),
+            "defer_relation key must be present and null when defer_nodes is None"
+        );
+    }
+
+    #[test]
+    fn diff_of_two_dicts_preserves_insertion_order() {
+        // Regression test: Fusion used to build the diff through a `HashMap`
+        // (and `standardize_grants_dict` through a `BTreeMap`), which scrambled
+        // or sorted iteration order and caused non-deterministic REVOKE/GRANT
+        // statement order in `apply_grants`, producing SQL mismatches against
+        // Python dbt (which uses an insertion-ordered dict). The ten keys and
+        // deliberately non-alphabetical insertion order here mirror the real
+        // `show grants` shape from the fct_directmail SQL-mismatch report:
+        // `SELECT` is inserted first (multiple grantees) and must stay first,
+        // while the remaining privileges follow in their insertion positions.
+        //
+        // dict_a is constructed via `Value::from_serialize(&IndexMap)` to mirror
+        // the production path: `standardize_grants_dict` returns an `IndexMap`
+        // that is handed to Jinja as a `Value` before being passed here.
+        let mut env = Environment::new();
+        env.add_function("diff_of_two_dicts", diff_of_two_dicts_fn());
+        env.add_function("tojson", tojson);
+        env.set_unknown_method_callback(unknown_method_callback);
+
+        let mut dict_a: IndexMap<String, Vec<String>> = IndexMap::new();
+        dict_a.insert(
+            "SELECT".to_string(),
+            vec![
+                "ALATION".to_string(),
+                "DM_APPDBA".to_string(),
+                "MONTECARLO".to_string(),
+            ],
+        );
+        for privilege in [
+            "APPLYBUDGET",
+            "DELETE",
+            "EVOLVE SCHEMA",
+            "INSERT",
+            "REBUILD",
+            "REFERENCES",
+            "SELECT ERROR TABLE",
+            "TRUNCATE",
+            "UPDATE",
+        ] {
+            dict_a.insert(privilege.to_string(), vec!["MONTECARLO".to_string()]);
+        }
+
+        // Iterate like the real `apply_grants` macro does — via Jinja
+        // `.items()` — since `tojson` would reroute through serde_json and sort
+        // keys. This mirrors the production iteration that produces the REVOKE
+        // statement sequence.
+        let template_source = r#"
+{%- set diff = diff_of_two_dicts(dict_a, {}) -%}
+{%- for privilege, grantees in diff.items() -%}
+{{ privilege }}={{ grantees | join(',') }}
+{% endfor -%}
+"#;
+        let tmpl = env.template_from_str(template_source).unwrap();
+        let rendered = tmpl
+            .render(
+                minijinja::context!(dict_a => Value::from_serialize(&dict_a)),
+                &[],
+            )
+            .unwrap();
+
+        let expected = "\
+SELECT=ALATION,DM_APPDBA,MONTECARLO
+APPLYBUDGET=MONTECARLO
+DELETE=MONTECARLO
+EVOLVE SCHEMA=MONTECARLO
+INSERT=MONTECARLO
+REBUILD=MONTECARLO
+REFERENCES=MONTECARLO
+SELECT ERROR TABLE=MONTECARLO
+TRUNCATE=MONTECARLO
+UPDATE=MONTECARLO
+";
+
+        assert_eq!(rendered, expected);
     }
 }

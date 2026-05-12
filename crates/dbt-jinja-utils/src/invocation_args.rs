@@ -1,9 +1,10 @@
 use std::{collections::BTreeMap, env};
 
 use dbt_common::io_args::EvalArgs;
+use dbt_common::io_args::LogLevel;
 use dbt_common::io_args::ReplayMode;
+use dbt_common::warn_error_options::WarnErrorOptions;
 use itertools::Itertools;
-use log::LevelFilter;
 use minijinja::Value;
 
 /// Invocation args is the dictionary of arguments passed into the jinja environment.
@@ -33,7 +34,7 @@ pub struct InvocationArgs {
     /// Flags
     pub warn_error: bool,
     /// Warning error options
-    pub warn_error_options: BTreeMap<String, Value>,
+    pub warn_error_options: WarnErrorOptions,
     /// Version check
     pub version_check: bool,
     /// Introspect
@@ -70,11 +71,16 @@ pub struct InvocationArgs {
     pub full_refresh: bool,
     /// Store test failures in the database
     pub store_failures: bool,
+    /// Favor state over current environment for deferral
+    pub favor_state: bool,
     /// Empty flag
     pub empty: bool,
 
     /// Replay mode (when running against a recording)
     pub replay: Option<ReplayMode>,
+
+    /// Use v2 compatible package downloads when installing from Package Hub
+    pub use_v2_compatible_package_downloads: bool,
 }
 
 impl Default for InvocationArgs {
@@ -90,7 +96,7 @@ impl Default for InvocationArgs {
             num_threads: None,
             invocation_id: uuid::Uuid::nil(),
             warn_error: false,
-            warn_error_options: BTreeMap::new(),
+            warn_error_options: WarnErrorOptions::default(),
             version_check: false,
             introspect: true,
             defer: false,
@@ -109,8 +115,10 @@ impl Default for InvocationArgs {
             write_json: false,
             full_refresh: false,
             store_failures: false,
+            favor_state: false,
             empty: false,
             replay: None,
+            use_v2_compatible_package_downloads: false,
         }
     }
 }
@@ -118,7 +126,7 @@ impl Default for InvocationArgs {
 impl InvocationArgs {
     /// Create an InvocationArgs from an EvalArgs.
     pub fn from_eval_args(arg: &EvalArgs) -> Self {
-        let log_level = arg.log_level.unwrap_or(LevelFilter::Info);
+        let log_level = arg.log_level.unwrap_or(LogLevel::Info);
 
         let log_level_file = arg.log_level_file.unwrap_or(log_level);
 
@@ -149,15 +157,8 @@ impl InvocationArgs {
             // unrestricted multi-threading
             num_threads: arg.num_threads,
             invocation_id: arg.io.invocation_id,
-            warn_error: arg.warn_error,
-            warn_error_options: arg
-                .warn_error_options
-                .iter()
-                .map(|(k, v)| {
-                    let value = Value::from_serialize(v);
-                    (k.clone(), value)
-                })
-                .collect(),
+            warn_error: arg.warn_error.unwrap_or_default(),
+            warn_error_options: arg.warn_error_options.clone(),
             version_check: arg.version_check,
             introspect: arg.introspect,
             defer: arg.defer,
@@ -191,8 +192,10 @@ impl InvocationArgs {
             write_json: arg.write_json,
             full_refresh: arg.full_refresh,
             store_failures: arg.store_failures,
+            favor_state: arg.favor_state,
             empty: arg.empty,
             replay: arg.replay.clone(),
+            use_v2_compatible_package_downloads: arg.io.use_v2_compatible_package_downloads,
         }
     }
 
@@ -229,12 +232,7 @@ impl InvocationArgs {
         dict.insert("warn_error".to_string(), Value::from(self.warn_error));
         dict.insert(
             "warn_error_options".to_string(),
-            Value::from(
-                self.warn_error_options
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.to_string()))
-                    .collect::<BTreeMap<_, _>>(),
-            ),
+            Value::from_serialize(&self.warn_error_options),
         );
         dict.insert("VERSION_CHECK".to_string(), Value::from(self.version_check));
         dict.insert("INTROSPECT".to_string(), Value::from(self.introspect));
@@ -278,8 +276,13 @@ impl InvocationArgs {
             "STORE_FAILURES".to_string(),
             Value::from(self.store_failures),
         );
+        dict.insert("FAVOR_STATE".to_string(), Value::from(self.favor_state));
         dict.insert("EMPTY".to_string(), Value::from(self.empty));
         dict.insert("REPLAY".to_string(), Value::from(self.replay.is_some()));
+        dict.insert(
+            "USE_V2_COMPATIBLE_PACKAGE_DOWNLOADS".to_string(),
+            Value::from(self.use_v2_compatible_package_downloads),
+        );
 
         // !!HACK!!: Inject a lower case version of the upper-case keys, for use
         // in `invocation_args_dict` -- we do this because this method is

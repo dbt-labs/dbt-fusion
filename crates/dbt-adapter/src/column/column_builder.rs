@@ -6,8 +6,8 @@ use crate::column::{BigqueryColumnMode, Column};
 use crate::metadata;
 use crate::sql_types::{self, TypeOps, original_type_string};
 use arrow_schema::{DataType, FieldRef};
-use dbt_common::adapter::AdapterType;
-use dbt_xdbc::{Backend, sql::types::SqlType};
+use dbt_adapter_core::AdapterType;
+use dbt_adapter_sql::types::SqlType;
 use regex::Regex;
 
 pub struct ColumnBuilder {
@@ -26,15 +26,16 @@ impl ColumnBuilder {
             Bigquery => Ok(Self::build_bigquery(field, type_ops)),
             Databricks | Spark => Ok(Self::build_databricks(field, type_ops)),
             Redshift => Ok(Self::build_redshift(field, type_ops)),
-            Postgres | Salesforce | Sidecar => Ok(Self::build_postgres_like(field, type_ops)),
-            DuckDB => Ok(Self::build_postgres_like(field, type_ops)),
+            Postgres | Salesforce | DuckDB => Ok(Self::build_postgres_like(field, type_ops)),
             Fabric => Ok(Self::build_fabric(field, type_ops)),
             ClickHouse => todo!("ClickHouse"),
+            Exasol => Ok(Self::build_postgres_like(field, type_ops)),
             Starburst => todo!("Starburst"),
             Athena => todo!("Athena"),
             Trino => todo!("Trino"),
             Dremio => todo!("Dremio"),
             Oracle => todo!("Oracle"),
+            Datafusion => todo!("Datafusion"),
         }
     }
 
@@ -49,7 +50,7 @@ impl ColumnBuilder {
     ) -> Column {
         use AdapterType::*;
         match self.adapter_type {
-            Postgres | Sidecar => Column::new(
+            Postgres => Column::new(
                 Postgres,
                 name,
                 dtype,
@@ -93,11 +94,20 @@ impl ColumnBuilder {
             ),
             Salesforce => todo!("Salesforce column creation not implemented yet"),
             ClickHouse => todo!("ClickHouse"),
+            Exasol => Column::new(
+                Exasol,
+                name,
+                dtype,
+                char_size,
+                numeric_precision,
+                numeric_scale,
+            ),
             Starburst => todo!("Starburst"),
             Athena => todo!("Athena"),
             Trino => todo!("Trino"),
             Dremio => todo!("Dremio"),
             Oracle => todo!("Oracle"),
+            Datafusion => todo!("Datafusion"),
             Fabric => Column::new(
                 Fabric,
                 name,
@@ -260,7 +270,7 @@ impl ColumnBuilder {
             // FIXME: whats a good fallback here? This should technically never fail unless the
             // warehouse produces a very weird arrow type.
             .unwrap_or_else(|_| Cow::Owned(field.data_type().to_string()));
-        let sql_type = SqlType::parse(Backend::BigQuery, original_type_str.as_ref()).ok();
+        let sql_type = SqlType::parse(AdapterType::Bigquery, original_type_str.as_ref()).ok();
 
         // NOTE: In dbt Core, if a column is both REPEATED and NULLABLE,
         // REPEATED takes precedence.

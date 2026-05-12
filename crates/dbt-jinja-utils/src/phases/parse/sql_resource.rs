@@ -2,14 +2,14 @@
 
 use std::fmt::Debug;
 
-use dbt_schemas::schemas::project::DefaultTo;
+use dbt_schemas::schemas::project::ResolvableConfig;
 
 use dbt_frontend_common::error::CodeLocation;
 use minijinja::{ArgSpec, machinery::Span};
 
 /// Resources that are encountered while rendering sql and macros
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SqlResource<T: DefaultTo<T>> {
+pub enum SqlResource<T: ResolvableConfig<T>> {
     /// A source call (e.g. `{{ source('a', 'b') }}`)
     Source((String, String, CodeLocation)),
     /// A ref call (e.g. `{{ ref('a', 'b') }}`)
@@ -20,13 +20,10 @@ pub enum SqlResource<T: DefaultTo<T>> {
     Function((String, Option<String>, CodeLocation)),
     /// A metric call (e.g. `{{ metric('a', 'b') }}`)
     Metric((String, Option<String>)),
-    // If all can be made numeric it is ordered numerically, if not it is ordered lexicographically
-    /// The initial "base" config pushed into the parse context before evaluating the file.
-    BaseConfig(Box<T>),
     /// An explicit `{{ config(...) }}` call encountered in the SQL.
     ConfigCall(Box<T>),
     /// A test definition (e.g. `{% test foo() %}`)
-    Test(String, Span, Span), // name, span, macro_name_span
+    Test(String, Span, Vec<ArgSpec>, Span), // name, span, args, macro_name_span
     /// A macro definition (e.g. `{% macro my_macro(a, b) %}`)
     Macro(String, Span, Option<String>, Vec<ArgSpec>, Span), // name, span, funcsign, args, macro_name_span
     /// A docs definition (e.g. `{% docs my_docs %}`)
@@ -37,7 +34,7 @@ pub enum SqlResource<T: DefaultTo<T>> {
     Materialization(String, String, Span, Span), // name, adapter, span, macro_name_span
 }
 
-impl<T: DefaultTo<T>> std::fmt::Display for SqlResource<T> {
+impl<T: ResolvableConfig<T>> std::fmt::Display for SqlResource<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SqlResource::Source((a, b, location)) => {
@@ -53,9 +50,8 @@ impl<T: DefaultTo<T>> std::fmt::Display for SqlResource<T> {
             SqlResource::Metric((a, b)) => {
                 write!(f, "Metric({a}, {b:?})")
             }
-            SqlResource::BaseConfig(config) => write!(f, "BaseConfig({config:?})"),
             SqlResource::ConfigCall(config) => write!(f, "ConfigCall({config:?})"),
-            SqlResource::Test(name, span, _) => write!(f, "Test({name} {span:#?})"),
+            SqlResource::Test(name, span, _, _) => write!(f, "Test({name} {span:#?})"),
             SqlResource::Macro(name, span, _, _, _) => write!(f, "Macro({name} {span:#?})"),
             SqlResource::Doc(name, span) => write!(f, "Docs({name} {span:#?})"),
             SqlResource::Materialization(name, adapter, span, _) => {

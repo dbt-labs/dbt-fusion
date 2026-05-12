@@ -13,10 +13,16 @@ edition.workspace = true
 workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
+dbt-adapter = { workspace = true }
+dbt-clap-core = { workspace = true }
 dbt-common = { workspace = true }
+dbt-dag = { workspace = true }
 dbt-fusion-workspace-hack = { version = "0.1" }
+dbt-jinja-utils = { workspace = true }
 dbt-schemas = { workspace = true }
 
+uuid = { workspace = true }
 vortex-events = { workspace = true }
 
 [lib]

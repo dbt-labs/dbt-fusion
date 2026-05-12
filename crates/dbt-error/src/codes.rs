@@ -106,7 +106,7 @@ pub enum ErrorCode {
 
     DisabledModel = 1064,
 
-    DependencyWarning = 1065,
+    PackageParsingCompatibility = 1065,
 
     AccessDenied = 1066,
 
@@ -114,6 +114,38 @@ pub enum ErrorCode {
     LicenseError = 1068,
     MangledRef = 1069,
     BaselineIntrospectionSyntaxWarning = 1070,
+    JinjaWarn = 1071,
+
+    // Warn-error-options: dedicated codes for dbt-core legacy event names.
+    // Each maps 1:1 to a dbt-core event so that `--warn-error-options {error: [EventName]}`
+    // can target individual warning types without affecting unrelated warnings.
+    DeprecatedModel = 1085,
+    DeprecatedReference = 1072,
+    UpcomingReferenceDeprecation = 1073,
+    SnapshotTimestampWarning = 1075,
+    PackageRedirectDeprecation = 1076,
+    DepsUnpinned = 1077,
+    FreshnessConfigProblem = 1078,
+    FreshnessMetadataWarning = 1079,
+    IncompatiblePackageVersion = 1080,
+    SeedColumnMismatch = 1081,
+    CacheInvalidationWarning = 1082,
+    UnexpectedApiResponse = 1083,
+    WarnStateTargetEqual = 1084,
+    WEOIncludeExcludeDeprecation = 1086,
+    NodeNotFoundOrDisabled = 1087,
+    PackageUpdateAvailable = 1088,
+    NoNodeForYamlKey = 1089,
+    MacroNotFoundForPatch = 1090,
+    InvalidConcurrentBatchesConfig = 1091,
+    NoNodesForSelectionCriteria = 1092,
+    MicrobatchModelNoEventTimeInputs = 1093,
+    UnversionedBreakingChange = 1094,
+    UnsupportedConstraintMaterialization = 1095,
+    HubPackageDeprecated = 1096,
+    UnusedResourceConfigPath = 1097,
+    DepsScrubbedPackageName = 1098,
+    DepsFoundDuplicatePackage = 1099,
 
     // --------------------------------------------------------------------------------------------
     // CLI args/config [1100–1149]
@@ -123,19 +155,28 @@ pub enum ErrorCode {
     ProfileInvalid = 1103,
     EnvVarMissing = 1104,
     EnvVarInvalid = 1105,
+    UnsupportedFusionFeature = 1106,
+    UnknownCommand = 1107,
+    UnknownCliOption = 1108,
 
     // Project/manifest/package [1150–1199]
     ManifestLoadFailed = 1150,
     PackageResolutionFailed = 1151,
     PackageDownloadFailed = 1152,
     ProfileLoadFailed = 1153,
-    UnpinnedPackageWarning = 1154,
+    GitError = 1154,
+    DuplicateSourceTableDefinition = 1155,
+    SourceTableDefinitionMissing = 1156,
+    LegacySemanticLayerYaml = 1157,
+    PackageMissingProjectFile = 1158,
+    DbtYamlValidationError = 1159,
 
     // Network/HTTP [1200–1249]
     NetworkError = 1200,
     HttpTimeout = 1201,
     RateLimited = 1202,
     HttpError = 1203,
+    DbtPlatformApiError = 1204,
 
     // Auth/credentials [1250–1279]
     AuthFailed = 1250,
@@ -165,6 +206,7 @@ pub enum ErrorCode {
     TaskCancelled = 1404,
     SqlMismatch = 1405,
     SidecarError = 1406,
+    NoDataToShow = 1407,
 
     // Serialization [1450–1460]
     JsonError = 1450,
@@ -177,11 +219,17 @@ pub enum ErrorCode {
     MacroVarNotFound = 1503,
     InvalidSeedValue = 1504,
     MacroUseIllegal = 1505,
+    /// Emitted when `validate_macro_args` is enabled and a YAML-documented
+    /// macro argument name or type does not match the Jinja macro definition.
+    ValidateMacroArgs = 1506,
+    JinjaTypecheckIssue = 1507,
+    JinjaTopLevelReturn = 1508,
 
     // --------------------------------------------------------------------------------------------
     // Local execution
     SelectorError = 1600,
     NoNodesSelected = 1601,
+    UnsupportedColumnSelector = 1602,
 
     // --------------------------------------------------------------------------------------------
     // CLI errors
@@ -189,6 +237,8 @@ pub enum ErrorCode {
     NotYetSupportedOption = 1701,
     DeprecatedOption = 1702,
     DeprecatedStaticAnalysisValue = 1703,
+    NotSupportedWarnErrorOption = 1704,
+    DocsGenerateWarning = 1705,
 
     // --------------------------------------------------------------------------------------------
     // Local execution
@@ -223,6 +273,7 @@ pub enum ErrorCode {
     InvalidTableNameInCLI = 9004,
     CoalesceHasOnlyNulls = 9005,
     CacheWarning = 9010,
+    NoFilesChangedWarning = 9011,
     // ExitRepl is not really an error, but a special error code that is used to
     // signal the repl to exit gracefully:
     ExitRepl = 9006,
@@ -257,6 +308,27 @@ impl ErrorCode {
 
     pub fn is_frontend(&self) -> bool {
         (*self as u16) < (Self::Generic as u16)
+    }
+
+    /// Returns true if this code represents a database-level error.
+    ///
+    /// Used to distinguish adapter/database errors from other Jinja execution
+    /// errors so they can be formatted in a user-friendly way (similar to
+    /// dbt-core's "Database Error in model X" format).
+    pub fn is_database_error(&self) -> bool {
+        matches!(
+            self,
+            ErrorCode::DbConnectionFailed
+                | ErrorCode::DbAuthFailed
+                | ErrorCode::DbSyntaxError
+                | ErrorCode::DbResourceExceeded
+                | ErrorCode::DbUnavailable
+                | ErrorCode::DbTxnConflict
+                | ErrorCode::DbNotFound
+                | ErrorCode::DbUnsupportedFeature
+                | ErrorCode::DbDriverError
+                | ErrorCode::ExecutorError
+        )
     }
 }
 

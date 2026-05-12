@@ -9,9 +9,14 @@ mod config;
 mod driver_logging;
 
 // Database-specific auth implementations
+mod athena;
 mod bigquery;
+mod clickhouse;
 mod databricks;
 mod duckdb;
+mod exasol;
+#[cfg(test)]
+mod flock;
 mod postgres;
 mod redshift;
 mod salesforce;
@@ -24,13 +29,23 @@ mod test_options;
 pub use config::AdapterConfig;
 pub use duckdb::init::{generate_duckdb_init_sql, is_motherduck_path, motherduck_database_name};
 
+/// The result of configuring an auth backend.
+///
+/// Contains the configured database builder and any warnings emitted during
+/// configuration (e.g. ignored profile fields).
+#[derive(Debug)]
+pub struct AuthOutcome {
+    pub builder: database::Builder,
+    pub warnings: Vec<String>,
+}
+
 /// Authorization trait.
 pub trait Auth: Send + Sync {
     /// Return the XDBC backend this authenticator is for.
     fn backend(&self) -> Backend;
 
     /// Configure the XDBC database builder.
-    fn configure(&self, config: &AdapterConfig) -> Result<database::Builder, AuthError>;
+    fn configure(&self, config: &AdapterConfig) -> Result<AuthOutcome, AuthError>;
 }
 
 /// Macro used to structure the AdapterConfig -> database::Builder pipeline
@@ -43,7 +58,10 @@ macro_rules! auth_configure_pipeline {
         let builder = authentication_args.apply(builder)?;
         let builder = $apply_connection_args($cfg, builder)?;
 
-        Ok(builder)
+        Ok($crate::AuthOutcome {
+            builder,
+            warnings: vec![],
+        })
     }};
 }
 
@@ -57,9 +75,11 @@ pub fn auth_for_backend(backend: Backend) -> Box<dyn Auth> {
         Backend::Redshift | Backend::RedshiftODBC => Box::new(redshift::RedshiftAuth {}),
         Backend::Salesforce => Box::new(salesforce::SalesforceAuth {}),
         Backend::Spark => Box::new(spark::SparkAuth {}),
-        Backend::DuckDB => Box::new(duckdb::DuckDbAuth {}),
+        Backend::DuckDBExtended => Box::new(duckdb::DuckDbAuth {}),
         Backend::SQLServer => Box::new(sqlserver::SQLServerAuth {}),
-        Backend::ClickHouse => unimplemented!("ClickHouse authentication"),
+        Backend::ClickHouse => Box::new(clickhouse::ClickHouseAuth {}),
+        Backend::Athena => Box::new(athena::AthenaAuth {}),
+        Backend::Exasol => Box::new(exasol::ExasolAuth {}),
         Backend::Generic { .. } => unimplemented!("generic backend authentication"),
     }
 }

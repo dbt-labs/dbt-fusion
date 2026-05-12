@@ -15,7 +15,7 @@ mod tests {
     use arrow_array::Array as _;
     use arrow_array::{cast::AsArray, types::*};
     use dbt_xdbc::{
-        Backend, Connection, Database, Driver, Statement, bigquery, connection,
+        Backend, Connection, Database, Driver, Statement, athena, bigquery, connection,
         database::{self, LogLevel},
         databricks, driver, redshift, salesforce, snowflake,
     };
@@ -148,6 +148,22 @@ mod tests {
                     .with_password(token);
                 Ok(builder)
             }
+            Backend::Athena => {
+                let mut builder = database::Builder::new(backend);
+                let region = env::var("ATHENA_REGION").unwrap();
+                let catalog = env::var("ATHENA_CATALOG").unwrap();
+                let schema = env::var("ATHENA_SCHEMA").unwrap();
+                let s3_staging_dir = env::var("ATHENA_S3_STAGING_DIR").unwrap();
+                builder
+                    .with_named_option(athena::REGION, region)?
+                    .with_named_option(athena::CATALOG, catalog)?
+                    .with_named_option(athena::SCHEMA, schema)?
+                    .with_named_option(athena::S3_STAGING_DIR, s3_staging_dir)?;
+                if let Ok(work_group) = env::var("ATHENA_WORK_GROUP") {
+                    builder.with_named_option(athena::WORK_GROUP, work_group)?;
+                }
+                Ok(builder)
+            }
             Backend::Spark => todo!("Spark is WIP"),
             Backend::SQLServer => todo!("SQL Server is WIP"),
             Backend::Salesforce => {
@@ -161,7 +177,7 @@ mod tests {
 
                 Ok(builder)
             }
-            Backend::DuckDB => {
+            Backend::DuckDBExtended => {
                 let mut builder = database::Builder::new(backend);
                 let database_path = ":memory:".to_string();
                 builder.with_named_option("path", database_path)?;
@@ -180,6 +196,30 @@ mod tests {
                     .with_password(password);
                 Ok(builder)
             }
+            Backend::Exasol => {
+                let mut builder = database::Builder::new(backend);
+                let uri = env::var("ADBC_EXASOL_URI")
+                    .unwrap_or_else(|_| "exasol://localhost:8563".to_owned());
+                let username =
+                    env::var("ADBC_EXASOL_USERNAME").unwrap_or_else(|_| "sys".to_owned());
+                let password =
+                    env::var("ADBC_EXASOL_PASSWORD").unwrap_or_else(|_| "exasol".to_owned());
+                let validate_cert =
+                    env::var("ADBC_EXASOL_VALIDATE_CERT").unwrap_or_else(|_| "0".to_owned());
+                // Append certificate validation param if not already in URI
+                let uri = if uri.contains("validateservercertificate") {
+                    uri
+                } else if uri.contains('?') {
+                    format!("{uri}&validateservercertificate={validate_cert}")
+                } else {
+                    format!("{uri}?validateservercertificate={validate_cert}")
+                };
+                builder
+                    .with_parse_uri(uri)?
+                    .with_username(username)
+                    .with_password(password);
+                Ok(builder)
+            }
             Backend::Generic { .. } => unimplemented!("generic backend database builder in tests"),
         }?;
         if backend == Backend::Snowflake {
@@ -190,7 +230,7 @@ mod tests {
     }
 
     fn database_builder_for_duckdb_file(path: &str) -> Result<database::Builder> {
-        let mut builder = database::Builder::new(Backend::DuckDB);
+        let mut builder = database::Builder::new(Backend::DuckDBExtended);
         builder.with_named_option("path", path)?;
         Ok(builder)
     }
@@ -296,13 +336,20 @@ mod tests {
                 Backend::Postgres
                 | Backend::Redshift
                 | Backend::Databricks
-                | Backend::DuckDB
+                | Backend::DuckDBExtended
                 | Backend::DatabricksODBC
                 | Backend::RedshiftODBC => {
                     assert_eq!(batch.column(0).as_primitive::<Int32Type>().value(0), 42);
                 }
                 Backend::ClickHouse => {
                     assert_eq!(batch.column(0).as_primitive::<UInt16Type>().value(0), 42);
+                }
+                Backend::Exasol => {
+                    // Exasol returns DECIMAL for integer arithmetic
+                    assert_eq!(
+                        batch.column(0).as_primitive::<Decimal128Type>().value(0),
+                        42
+                    );
                 }
                 _ => {
                     // BigQuery and others use Int64. We change this function as we expand the set
@@ -346,7 +393,7 @@ mod tests {
 
     #[test]
     fn statement_execute_duckdb() -> Result<()> {
-        execute_statement(Backend::DuckDB)
+        execute_statement(Backend::DuckDBExtended)
     }
 
     #[test]
@@ -362,7 +409,7 @@ mod tests {
 
         // First connection: create table and insert data
         {
-            let mut driver = driver_for(Backend::DuckDB)?;
+            let mut driver = driver_for(Backend::DuckDBExtended)?;
             let builder = database_builder_for_duckdb_file(&db_path_str)?;
             let mut database = builder.build(&mut driver)?;
             let mut conn = connection::Builder::default().build(&mut database)?;
@@ -379,7 +426,7 @@ mod tests {
 
         // Second connection: verify data persisted
         {
-            let mut driver = driver_for(Backend::DuckDB)?;
+            let mut driver = driver_for(Backend::DuckDBExtended)?;
             let builder = database_builder_for_duckdb_file(&db_path_str)?;
             let mut database = builder.build(&mut driver)?;
             let mut conn = connection::Builder::default().build(&mut database)?;
@@ -404,7 +451,7 @@ mod tests {
 
     #[test]
     fn duckdb_data_types_bool() -> Result<()> {
-        with_empty_statement(Backend::DuckDB, |mut statement| {
+        with_empty_statement(Backend::DuckDBExtended, |mut statement| {
             statement.set_sql_query(
                 r#"SELECT * FROM (
                      VALUES
@@ -442,7 +489,7 @@ mod tests {
 
     #[test]
     fn duckdb_data_types_integer() -> Result<()> {
-        with_empty_statement(Backend::DuckDB, |mut statement| {
+        with_empty_statement(Backend::DuckDBExtended, |mut statement| {
             statement.set_sql_query(
                 r#"SELECT * FROM (
                     VALUES
@@ -494,7 +541,7 @@ mod tests {
 
     #[test]
     fn duckdb_data_types_string() -> Result<()> {
-        with_empty_statement(Backend::DuckDB, |mut statement| {
+        with_empty_statement(Backend::DuckDBExtended, |mut statement| {
             // Note: Using CONCAT instead of || operator to avoid Arrow StringViewArray panic
             statement.set_sql_query(
                 r#"SELECT * FROM (
@@ -534,7 +581,7 @@ mod tests {
 
     #[test]
     fn duckdb_null_handling() -> Result<()> {
-        with_empty_statement(Backend::DuckDB, |mut statement| {
+        with_empty_statement(Backend::DuckDBExtended, |mut statement| {
             statement.set_sql_query(
                 r#"SELECT * FROM (
                     VALUES
@@ -568,7 +615,7 @@ mod tests {
 
     #[test]
     fn duckdb_empty_result() -> Result<()> {
-        with_empty_statement(Backend::DuckDB, |mut statement| {
+        with_empty_statement(Backend::DuckDBExtended, |mut statement| {
             statement.set_sql_query("SELECT 1 AS one WHERE 1 = 0")?;
             let mut batch_reader = statement.execute()?;
             let batch = batch_reader.next();
@@ -955,7 +1002,7 @@ mod tests {
 
         // Open database and create a table, then drop everything
         {
-            let mut driver = driver_for(Backend::DuckDB)?;
+            let mut driver = driver_for(Backend::DuckDBExtended)?;
             let builder = database_builder_for_duckdb_file(&db_path_str)?;
             let mut database = builder.build(&mut driver)?;
             let mut conn = connection::Builder::default().build(&mut database)?;
@@ -974,7 +1021,7 @@ mod tests {
         // After dropping, a second process/connection should be able to open
         // the same file for writing (no lingering lock).
         {
-            let mut driver = driver_for(Backend::DuckDB)?;
+            let mut driver = driver_for(Backend::DuckDBExtended)?;
             let builder = database_builder_for_duckdb_file(&db_path_str)?;
             let mut database = builder.build(&mut driver)?;
             let mut conn = connection::Builder::default().build(&mut database)?;
@@ -1017,7 +1064,7 @@ mod tests {
         let _ = fs::remove_file(format!("{}.wal", db_path_str));
 
         // Open database and keep the handle alive (simulates LSP holding the lock)
-        let mut driver = driver_for(Backend::DuckDB)?;
+        let mut driver = driver_for(Backend::DuckDBExtended)?;
         let builder = database_builder_for_duckdb_file(&db_path_str)?;
         let mut database = builder.build(&mut driver)?;
 
@@ -1093,7 +1140,7 @@ mod tests {
         let _ = fs::remove_file(format!("{}.wal", db_path_str));
 
         // Create database and a connection
-        let mut driver = driver_for(Backend::DuckDB)?;
+        let mut driver = driver_for(Backend::DuckDBExtended)?;
         let builder = database_builder_for_duckdb_file(&db_path_str)?;
         let mut database = builder.build(&mut driver)?;
         let mut conn = connection::Builder::default().build(&mut database)?;
@@ -1150,5 +1197,11 @@ mod tests {
     #[test]
     fn statement_execute_clickhouse() -> Result<()> {
         execute_statement(Backend::ClickHouse)
+    }
+
+    #[test_with::env(ADBC_EXASOL_URI)]
+    #[test]
+    fn statement_execute_exasol() -> Result<()> {
+        execute_statement(Backend::Exasol)
     }
 }

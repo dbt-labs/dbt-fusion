@@ -1,16 +1,17 @@
+use crate::adapter::adapter_impl::*;
+use crate::connection::AdapterConnectionFactory;
 use crate::metadata::{CatalogAndSchema, *};
 use crate::record_batch_utils::get_column_values;
 use crate::relation::snowflake::SnowflakeRelation;
 use crate::sql_types::{TypeOps, make_arrow_field};
-use crate::typed_adapter::*;
-use crate::{AdapterEngine, AdapterResult, AdapterType, AdapterTyping};
+use crate::{AdapterEngine, AdapterResult, AdapterType};
 
 use arrow_array::{
     Array, BooleanArray, Decimal128Array, RecordBatch, StringArray, TimestampMillisecondArray,
 };
 use arrow_schema::Schema;
+use dbt_adapter_core::ExecutionPhase;
 use dbt_common::AsyncAdapterResult;
-use dbt_common::adapter::ExecutionPhase;
 use dbt_common::cancellation::Cancellable;
 use dbt_common::cancellation::CancellationToken;
 use dbt_schemas::dbt_types::RelationType;
@@ -25,6 +26,24 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 pub const ARROW_FIELD_SNOWFLAKE_FIELD_WIDTH_METADATA_KEY: &str = "SNOWFLAKE:field_width";
+
+/// Normalize all column names in a RecordBatch to lowercase.
+///
+/// Snowflake may uppercase column aliases (e.g. `table_catalog as "table_database"`) depending
+/// on account-level settings, even when the alias is double-quoted. Lowercasing the schema up
+/// front lets all downstream `get_column_values` calls use their expected lowercase names without
+/// needing per-call case-insensitive logic.
+fn lowercase_column_names(batch: &RecordBatch) -> RecordBatch {
+    let schema = batch.schema();
+    let fields: Vec<_> = schema
+        .fields()
+        .iter()
+        .map(|f| Arc::new(f.as_ref().clone().with_name(f.name().to_lowercase())))
+        .collect();
+    let new_schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
+    RecordBatch::try_new(new_schema, batch.columns().to_vec())
+        .expect("column name normalization preserves schema compatibility")
+}
 
 /// Helper to differentiate between tables and dynamic tables using the is_dynamic flag.
 /// TODO: When we implement iceberg tables, we might want to pass in the is_iceberg flag here.
@@ -139,12 +158,12 @@ pub fn list_relations(
 }
 
 pub struct SnowflakeMetadataAdapter {
-    pub adapter: ConcreteAdapter,
+    pub adapter: AdapterImpl,
 }
 
 impl SnowflakeMetadataAdapter {
     pub fn new(engine: Arc<dyn AdapterEngine>) -> Self {
-        let adapter = ConcreteAdapter::new(engine);
+        let adapter = AdapterImpl::new(engine, None);
         Self { adapter }
     }
 }
@@ -157,6 +176,8 @@ impl MetadataAdapter for SnowflakeMetadataAdapter {
         if stats_sql_result.num_rows() == 0 {
             return Ok(BTreeMap::new());
         }
+
+        let stats_sql_result = lowercase_column_names(&stats_sql_result);
 
         let table_catalogs = get_column_values::<StringArray>(&stats_sql_result, "table_database")?;
         let table_schemas = get_column_values::<StringArray>(&stats_sql_result, "table_schema")?;
@@ -331,6 +352,8 @@ impl MetadataAdapter for SnowflakeMetadataAdapter {
             return Ok(BTreeMap::new());
         }
 
+        let stats_sql_result = lowercase_column_names(&stats_sql_result);
+
         // Can probably zip these into a table metadata tuple array
         let table_catalogs = get_column_values::<StringArray>(&stats_sql_result, "table_database")?;
         let table_schemas = get_column_values::<StringArray>(&stats_sql_result, "table_schema")?;
@@ -394,13 +417,10 @@ impl MetadataAdapter for SnowflakeMetadataAdapter {
             })
             .collect::<Vec<_>>();
 
-        let adapter = self.adapter.clone();
-        let new_connection_f = move || {
-            adapter
-                .engine()
-                .new_connection(None, None)
-                .map_err(Cancellable::Error)
-        };
+        let factory = Box::new(AdapterConnectionFactory::new(
+            self.adapter.engine().clone(),
+            self.adapter.engine().threads(),
+        ));
 
         let adapter = self.adapter.clone();
         let token_clone = token.clone();
@@ -472,12 +492,7 @@ impl MetadataAdapter for SnowflakeMetadataAdapter {
             Ok(())
         };
 
-        let map_reduce = MapReduce::new(
-            Box::new(new_connection_f),
-            Box::new(map_f),
-            Box::new(reduce_f),
-            MAX_CONNECTIONS,
-        );
+        let map_reduce = MapReduce::new(factory, Box::new(map_f), Box::new(reduce_f), None);
         map_reduce.run(Arc::new(queries), token)
     }
 
@@ -496,13 +511,10 @@ impl MetadataAdapter for SnowflakeMetadataAdapter {
             .map(|relation| relation.semantic_fqn())
             .collect::<Vec<_>>();
 
-        let adapter = self.adapter.clone(); // clone needed to move it into lambda
-        let new_connection_f = Box::new(move || {
-            adapter
-                .engine()
-                .new_connection(None, None)
-                .map_err(Cancellable::Error)
-        });
+        let factory = Box::new(AdapterConnectionFactory::new(
+            self.adapter.engine().clone(),
+            self.adapter.engine().threads(),
+        ));
 
         let adapter = self.adapter.clone();
         let token_clone = token.clone();
@@ -529,12 +541,7 @@ impl MetadataAdapter for SnowflakeMetadataAdapter {
             acc.insert(table_name, schema);
             Ok(())
         };
-        let map_reduce = MapReduce::new(
-            Box::new(new_connection_f),
-            Box::new(map_f),
-            Box::new(reduce_f),
-            MAX_CONNECTIONS,
-        );
+        let map_reduce = MapReduce::new(factory, Box::new(map_f), Box::new(reduce_f), None);
         map_reduce.run(Arc::new(table_names), token)
     }
 
@@ -588,13 +595,10 @@ ORDER BY TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION"
                 )
             });
 
-        let adapter = self.adapter.clone();
-        let new_connection_f = move || {
-            adapter
-                .engine()
-                .new_connection(None, None)
-                .map_err(Cancellable::Error)
-        };
+        let factory = Box::new(AdapterConnectionFactory::new(
+            self.adapter.engine().clone(),
+            self.adapter.engine().threads(),
+        ));
 
         // map_f runs the queries, reduce_f decodes the result set and builds the schemas
         let adapter = self.adapter.clone();
@@ -620,12 +624,7 @@ ORDER BY TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION"
             acc.append(&mut schemas_from_batch);
             Ok(())
         };
-        let map_reduce = MapReduce::new(
-            Box::new(new_connection_f),
-            Box::new(map_f),
-            Box::new(reduce_f),
-            MAX_CONNECTIONS,
-        );
+        let map_reduce = MapReduce::new(factory, Box::new(map_f), Box::new(reduce_f), None);
         let keys = queries.collect::<Vec<_>>();
         map_reduce.run(Arc::new(keys), token)
     }
@@ -655,13 +654,10 @@ ORDER BY TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION"
 
         type Acc = BTreeMap<String, MetadataFreshness>;
 
-        let adapter = self.adapter.clone();
-        let new_connection_f = move || {
-            adapter
-                .engine()
-                .new_connection(None, None)
-                .map_err(Cancellable::Error)
-        };
+        let factory = Box::new(AdapterConnectionFactory::new(
+            self.adapter.engine().clone(),
+            self.adapter.engine().threads(),
+        ));
 
         let adapter = self.adapter.clone();
         let token_clone = token.clone();
@@ -718,12 +714,7 @@ ORDER BY TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION"
             Ok(())
         };
 
-        let map_reduce = MapReduce::new(
-            Box::new(new_connection_f),
-            Box::new(map_f),
-            Box::new(reduce_f),
-            MAX_CONNECTIONS,
-        );
+        let map_reduce = MapReduce::new(factory, Box::new(map_f), Box::new(reduce_f), None);
         let keys = where_clauses_by_database.into_iter().collect::<Vec<_>>();
         map_reduce.run(Arc::new(keys), token)
     }
@@ -735,13 +726,10 @@ ORDER BY TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION"
         token: CancellationToken,
     ) -> AsyncAdapterResult<'_, BTreeMap<CatalogAndSchema, AdapterResult<RelationVec>>> {
         type Acc = BTreeMap<CatalogAndSchema, AdapterResult<RelationVec>>;
-        let adapter = self.adapter.clone();
-        let new_connection_f = move || {
-            adapter
-                .engine()
-                .new_connection(None, None)
-                .map_err(Cancellable::Error)
-        };
+        let factory = Box::new(AdapterConnectionFactory::new(
+            self.adapter.engine().clone(),
+            self.adapter.engine().threads(),
+        ));
 
         let adapter = self.adapter.clone();
         let token_clone = token.clone();
@@ -776,12 +764,7 @@ ORDER BY TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION"
             }
         };
 
-        let map_reduce = MapReduce::new(
-            Box::new(new_connection_f),
-            Box::new(map_f),
-            Box::new(reduce_f),
-            MAX_CONNECTIONS,
-        );
+        let map_reduce = MapReduce::new(factory, Box::new(map_f), Box::new(reduce_f), None);
         map_reduce.run(Arc::new(db_schemas.to_vec()), token)
     }
 

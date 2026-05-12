@@ -8,78 +8,81 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use dbt_adapter_core::AdapterType;
 use dbt_agate::AgateTable;
 use dbt_common::ErrorCode;
-use dbt_common::adapter::AdapterType;
-use dbt_common::constants::DBT_COMPILED_DIR_NAME;
 use dbt_common::constants::DBT_RUN_DIR_NAME;
 use dbt_common::io_args::IoArgs;
+use dbt_common::path::get_target_write_path;
 use dbt_common::serde_utils::convert_yml_to_value_map;
 
 use dbt_adapter::load_store::ResultStore;
-use dbt_common::tokiofs;
+use dbt_common::stdfs;
 use dbt_common::tracing::emit::emit_warn_log_message;
-use dbt_schemas::schemas::CommonAttributes;
-use dbt_schemas::schemas::NodeBaseAttributes;
+use dbt_schemas::schemas::InternalDbtNode;
+use dbt_schemas::schemas::NodePathKind;
 use dbt_schemas::schemas::telemetry::NodeType;
 use minijinja::State;
-use minijinja::constants::CURRENT_PATH;
-use minijinja::constants::CURRENT_SPAN;
 use minijinja::listener::RenderingEventListener;
 use minijinja::machinery::Span;
 use minijinja::{Error, ErrorKind, Value as MinijinjaValue, value::Object};
 use serde::Serialize;
 
-use super::lazy_model::LazyModelWrapper;
-use crate::phases::MacroLookupContext;
+use dbt_jinja_ctx::{
+    HookConfig, JinjaObject, LazyModelWrapper, MacroLookupContext, RunNodeCtx, to_jinja_btreemap,
+};
 
 use super::run_config::RunConfig;
 use dbt_schemas::schemas::project::ConfigKeys;
 
 type YmlValue = dbt_yaml::Value;
 
-/// Build model-specific context (model, common_attr, alias, quoting, config, resource_type, sql_header)
+/// Per-node fields computed from the YAML node config and used to construct
+/// the `RunNodeCtx` overlay. Replaces the historical
+/// `extend_with_model_context(&mut base_context, ...)` mutator: returning
+/// the values lets `build_run_node_context` construct a typed `RunNodeCtx`
+/// in one shot rather than incrementally mutating a `BTreeMap`.
+struct ModelContextFields {
+    this: MinijinjaValue,
+    database: String,
+    schema: String,
+    identifier: String,
+    pre_hooks: Option<MinijinjaValue>,
+    post_hooks: Option<MinijinjaValue>,
+    config: MinijinjaValue,
+    model: JinjaObject<LazyModelWrapper>,
+    node: JinjaObject<LazyModelWrapper>,
+}
+
 #[allow(clippy::too_many_arguments)]
-async fn extend_with_model_context<S: Serialize>(
-    base_context: &mut BTreeMap<String, MinijinjaValue>,
-    model: YmlValue,
-    common_attr: &CommonAttributes,
-    base_attr: &NodeBaseAttributes,
+fn build_model_context_fields<S: Serialize>(
+    node: &dyn InternalDbtNode,
     deprecated_config: &S,
     adapter_type: AdapterType,
     io_args: &IoArgs,
-    resource_type: NodeType,
     sql_header: Option<MinijinjaValue>,
-) {
+) -> ModelContextFields {
+    let model = node.serialize();
+    let common_attr = node.common();
+    let base_attr = node.base();
+    let resource_type = node.resource_type();
     // Create a relation for 'this' using config values
-    let this_relation = dbt_adapter::relation::do_create_relation(
-        adapter_type,
-        base_attr.database.clone(),
-        base_attr.schema.clone(),
-        Some(base_attr.alias.clone()),
-        None,
-        base_attr.quoting,
-    )
-    .unwrap()
-    .as_value();
-
-    base_context.insert("this".to_owned(), this_relation);
-    base_context.insert(
-        "database".to_owned(),
-        MinijinjaValue::from(base_attr.database.clone()),
-    );
-    base_context.insert(
-        "schema".to_owned(),
-        MinijinjaValue::from(base_attr.schema.clone()),
-    );
-    base_context.insert(
-        "identifier".to_owned(),
-        MinijinjaValue::from(common_attr.name.clone()),
-    );
+    let this_relation = dbt_adapter::relation::RelationObject::new(Arc::from(
+        dbt_adapter::relation::do_create_relation(
+            adapter_type,
+            base_attr.database.clone(),
+            base_attr.schema.clone(),
+            Some(base_attr.alias.clone()),
+            None,
+            base_attr.quoting,
+        )
+        .unwrap(),
+    ))
+    .into_value();
 
     let config_yml = dbt_yaml::to_value(deprecated_config).expect("Failed to serialize object");
 
-    if let Some(pre_hook) = config_yml.get("pre_hook") {
+    let pre_hooks = config_yml.get("pre_hook").map(|pre_hook| {
         let values: Vec<HookConfig> = match pre_hook {
             YmlValue::String(_, _) | YmlValue::Mapping(_, _) => {
                 parse_hook_item(pre_hook).into_iter().collect()
@@ -88,22 +91,21 @@ async fn extend_with_model_context<S: Serialize>(
             YmlValue::Null(_) => vec![],
             _ => {
                 emit_warn_log_message(
-                    ErrorCode::Generic,
+                    ErrorCode::InvalidConfig,
                     format!("Unknown pre-hook type: {:?}", pre_hook),
                     io_args.status_reporter.as_ref(),
                 );
-
                 vec![]
             }
         };
-        let pre_hooks_vals: MinijinjaValue = values
+        values
             .iter()
             .map(|hook| MinijinjaValue::from_object(hook.clone()))
             .collect::<Vec<MinijinjaValue>>()
-            .into();
-        base_context.insert("pre_hooks".to_owned(), pre_hooks_vals);
-    }
-    if let Some(post_hook) = config_yml.get("post_hook") {
+            .into()
+    });
+
+    let post_hooks = config_yml.get("post_hook").map(|post_hook| {
         let values: Vec<HookConfig> = match post_hook {
             YmlValue::String(_, _) | YmlValue::Mapping(_, _) => {
                 parse_hook_item(post_hook).into_iter().collect()
@@ -112,21 +114,19 @@ async fn extend_with_model_context<S: Serialize>(
             YmlValue::Null(_) => vec![],
             _ => {
                 emit_warn_log_message(
-                    ErrorCode::Generic,
+                    ErrorCode::InvalidConfig,
                     format!("Unknown post-hook type: {:?}", post_hook),
                     io_args.status_reporter.as_ref(),
                 );
-
                 vec![]
             }
         };
-        let post_hooks_vals: MinijinjaValue = values
+        values
             .iter()
             .map(|hook| MinijinjaValue::from_object(hook.clone()))
             .collect::<Vec<MinijinjaValue>>()
-            .into();
-        base_context.insert("post_hooks".to_owned(), post_hooks_vals);
-    }
+            .into()
+    });
 
     let mut config_map = convert_yml_to_value_map(config_yml);
     if let Some(sql_header) = sql_header {
@@ -143,11 +143,11 @@ async fn extend_with_model_context<S: Serialize>(
         _ => None,
     };
     if let Some(raw_sql_path) = raw_sql_path {
-        if let Ok(raw_sql) = tokiofs::read_to_string(&raw_sql_path).await {
+        if let Ok(raw_sql) = stdfs::read_to_string(&raw_sql_path) {
             model_map.insert("raw_sql".to_owned(), MinijinjaValue::from(raw_sql));
         } else {
             emit_warn_log_message(
-                ErrorCode::Generic,
+                ErrorCode::IoError,
                 format!("Failed to read raw_sql: {}", raw_sql_path.display()),
                 io_args.status_reporter.as_ref(),
             );
@@ -175,28 +175,23 @@ async fn extend_with_model_context<S: Serialize>(
         valid_keys,
     };
 
-    base_context.insert(
-        "config".to_owned(),
-        MinijinjaValue::from_object(node_config),
-    );
-
     // Create the lazy wrapper for the model with the compiled path
-    let compiled_path = io_args
-        .out_dir
-        .join(DBT_COMPILED_DIR_NAME)
-        .join(&common_attr.path);
-    let lazy_model = LazyModelWrapper::new(model_map.clone(), compiled_path);
+    let compiled_path =
+        node.get_node_path_abs(NodePathKind::Compiled, &io_args.in_dir, &io_args.out_dir);
+    let lazy_model = LazyModelWrapper::new(model_map.clone(), compiled_path.clone());
+    let lazy_node = LazyModelWrapper::new(model_map, compiled_path);
 
-    base_context.insert("model".to_owned(), MinijinjaValue::from_object(lazy_model));
-    // For "node", we'll use the same lazy model wrapper
-    let node_compiled_path = io_args
-        .out_dir
-        .join(DBT_COMPILED_DIR_NAME)
-        .join(&common_attr.path);
-    let lazy_node = LazyModelWrapper::new(model_map, node_compiled_path);
-
-    base_context.insert("node".to_owned(), MinijinjaValue::from_object(lazy_node));
-    base_context.insert("connection_name".to_owned(), MinijinjaValue::from(""));
+    ModelContextFields {
+        this: this_relation,
+        database: base_attr.database.clone(),
+        schema: base_attr.schema.clone(),
+        identifier: common_attr.name.clone(),
+        pre_hooks,
+        post_hooks,
+        config: MinijinjaValue::from_object(node_config),
+        model: JinjaObject::new(lazy_model),
+        node: JinjaObject::new(lazy_node),
+    }
 }
 
 /// Extend the base context with stateful functions
@@ -240,58 +235,74 @@ pub fn extend_base_context_stateful_fn(
 
 /// Build a run context - parent function that orchestrates the context building
 #[allow(clippy::too_many_arguments)]
-pub async fn build_run_node_context<S: Serialize>(
-    model: YmlValue,
-    common_attr: &CommonAttributes,
-    base_attr: &NodeBaseAttributes,
+pub fn build_run_node_context<S: Serialize>(
+    node: &dyn InternalDbtNode,
     deprecated_config: &S,
     adapter_type: AdapterType,
     agate_table: Option<AgateTable>,
     base_context: &BTreeMap<String, MinijinjaValue>,
     io_args: &IoArgs,
-    resource_type: NodeType,
     sql_header: Option<MinijinjaValue>,
     packages: BTreeSet<String>,
 ) -> BTreeMap<String, MinijinjaValue> {
-    // Build model-specific context
-    let mut context = base_context.clone();
-    extend_base_context_stateful_fn(&mut context, &common_attr.package_name, packages);
+    let common_attr = node.common();
+    let base_attr = node.base();
+    let resource_type = node.resource_type();
 
-    extend_with_model_context(
-        &mut context,
-        model,
-        common_attr,
-        base_attr,
-        deprecated_config,
-        adapter_type,
-        io_args,
-        resource_type,
-        sql_header,
-    )
-    .await;
+    // Stateful fns: store_result/load_result/store_raw_result/submit_python_job + context.
+    // These were `extend_base_context_stateful_fn` mutations into the BTreeMap;
+    // pull the same closures + MacroLookupContext into local bindings so we
+    // can construct the typed overlay below.
+    let result_store = ResultStore::default();
+    let store_result = MinijinjaValue::from_function(result_store.store_result());
+    let load_result = MinijinjaValue::from_function(result_store.load_result());
+    let store_raw_result = MinijinjaValue::from_function(result_store.store_raw_result());
+    let submit_python_job = MinijinjaValue::from_function(submit_python_job_context_fn());
 
-    let model_name = common_attr.name.clone();
-    // Add write function
-    context.insert(
-        "write".to_owned(),
-        MinijinjaValue::from_object(WriteConfig {
-            node_name: model_name,
-            resource_type: resource_type.as_static_ref().to_string(),
-            project_root: io_args.in_dir.clone(),
-            target_path: io_args.out_dir.clone(),
-        }),
-    );
+    let mut packages_with_root = packages;
+    packages_with_root.insert(common_attr.package_name.clone());
+    let context_lookup = JinjaObject::new(MacroLookupContext {
+        root_project_name: common_attr.package_name.clone(),
+        current_project_name: None,
+        packages: packages_with_root,
+    });
 
-    if let Some(agate_table) = agate_table {
-        context.insert(
-            "load_agate_table".to_owned(),
-            MinijinjaValue::from_function(move |_args: &[MinijinjaValue]| {
-                MinijinjaValue::from_object(agate_table.clone())
-            }),
-        );
-    }
+    // Per-node model-specific fields (this/database/schema/identifier, hooks,
+    // config, model, node).
+    let model_fields =
+        build_model_context_fields(node, deprecated_config, adapter_type, io_args, sql_header);
 
-    let mut base_builtins = if let Some(builtins) = context.get("builtins") {
+    // Use alias for the run file path (target/run/<alias>.sql) rather than name.
+    // For most nodes, alias == name. For generic tests with long names, the name is the
+    // full (human-readable) form while alias is the truncated form. Using alias avoids
+    // ENAMETOOLONG (OS error 36) on Linux when the test name exceeds 255 chars.
+    let model_name = if base_attr.alias.is_empty() {
+        common_attr.name.clone()
+    } else {
+        base_attr.alias.clone()
+    };
+
+    let write_value = MinijinjaValue::from_object(WriteConfig {
+        node_name: model_name,
+        resource_type: resource_type.as_static_ref().to_string(),
+        project_root: io_args.in_dir.clone(),
+        target_path: io_args.out_dir.clone(),
+        package_name: common_attr.package_name.clone(),
+        path: common_attr.path.clone(),
+        original_file_path: common_attr.original_file_path.clone(),
+    });
+
+    let load_agate_table = agate_table.map(|agate_table| {
+        MinijinjaValue::from_function(move |_args: &[MinijinjaValue]| {
+            MinijinjaValue::from_object(agate_table.clone())
+        })
+    });
+
+    // Builtins overlay: clone the compile-base map and insert the per-node
+    // RunConfig. The map underlying `builtins` MUST be
+    // `BTreeMap<String, MinijinjaValue>` exactly (downstream macro code
+    // downcasts to that type) — same trap as `MACRO_DISPATCH_ORDER`.
+    let mut base_builtins = if let Some(builtins) = base_context.get("builtins") {
         builtins
             .as_object()
             .unwrap()
@@ -301,37 +312,57 @@ pub async fn build_run_node_context<S: Serialize>(
     } else {
         BTreeMap::new()
     };
-
-    // Get the config from model context to pass to general context
-    let node_config = context
-        .get("config")
-        .unwrap()
+    let node_config = model_fields
+        .config
         .as_object()
         .unwrap()
         .downcast_ref::<RunConfig>()
-        .unwrap();
-
+        .unwrap()
+        .clone();
     base_builtins.insert(
         "config".to_string(),
-        MinijinjaValue::from_object(node_config.clone()),
+        MinijinjaValue::from_object(node_config),
     );
 
-    // Register builtins as a global
-    context.insert(
-        "builtins".to_owned(),
-        MinijinjaValue::from_object(base_builtins),
-    );
+    let abs_compiled =
+        node.get_node_path_abs(NodePathKind::Compiled, &io_args.in_dir, &io_args.out_dir);
+    let relative_path = abs_compiled
+        .strip_prefix(&io_args.out_dir)
+        .map(|p| p.to_path_buf())
+        .unwrap_or(abs_compiled);
 
-    let relative_path = PathBuf::from(DBT_COMPILED_DIR_NAME).join(&common_attr.path);
-    context.insert(
-        CURRENT_PATH.to_string(),
-        MinijinjaValue::from(relative_path.to_string_lossy()),
-    );
-    context.insert(
-        CURRENT_SPAN.to_string(),
-        MinijinjaValue::from_serialize(Span::default()),
-    );
+    let overlay = RunNodeCtx {
+        this: model_fields.this,
+        database: model_fields.database,
+        schema: model_fields.schema,
+        identifier: model_fields.identifier,
+        pre_hooks: model_fields.pre_hooks,
+        post_hooks: model_fields.post_hooks,
+        config: model_fields.config,
+        model: model_fields.model,
+        node: model_fields.node,
+        connection_name: String::new(),
+        store_result,
+        load_result,
+        store_raw_result,
+        submit_python_job,
+        context: context_lookup,
+        write: write_value,
+        load_agate_table,
+        builtins: MinijinjaValue::from_object(base_builtins),
+        target_package_name: common_attr.package_name.clone(),
+        current_path: relative_path.to_string_lossy().into_owned(),
+        current_span: MinijinjaValue::from_serialize(Span::default()),
+    };
 
+    // Today's caller still consumes `BTreeMap<String, MinijinjaValue>`. We
+    // serialize the typed overlay and `.extend(...)` onto a clone of the
+    // base — same last-write-wins shadowing semantic the original
+    // BTreeMap-based code produced. PR 9 (cleanup) flows the typed struct
+    // directly through `render_named_str<S: Serialize>` and drops the
+    // conversion.
+    let mut context = base_context.clone();
+    context.extend(to_jinja_btreemap(&overlay));
     context
 }
 
@@ -356,35 +387,10 @@ fn parse_hook_item(item: &YmlValue) -> Option<HookConfig> {
     }
 }
 
-#[derive(Clone)]
-struct HookConfig {
-    pub sql: String,
-
-    pub transaction: bool,
-}
-impl Object for HookConfig {
-    fn get_value(self: &Arc<Self>, key: &MinijinjaValue) -> Option<MinijinjaValue> {
-        match key.as_str() {
-            Some("sql") => Some(MinijinjaValue::from(self.sql.clone())),
-            Some("transaction") => Some(MinijinjaValue::from(self.transaction)),
-            _ => None,
-        }
-    }
-    fn render(self: &Arc<Self>, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.sql)
-    }
-}
-// iplement std::fmt::Debug for HookConfig
-impl std::fmt::Debug for HookConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "HookConfig {{ sql: {} }}", self.sql)
-    }
-}
-
 /// Context function that writes a payload to file
 #[derive(Debug)]
 pub struct WriteConfig {
-    /// The node ({operation, model}) name
+    /// The node ({operation, model}) name or alias (for ENAMETOOLONG safety on Linux)
     pub node_name: String,
     /// The resource type string (see `fusion::node::NodeType`)
     pub resource_type: String,
@@ -392,6 +398,12 @@ pub struct WriteConfig {
     pub project_root: PathBuf,
     /// The directory to write the file into
     pub target_path: PathBuf,
+    /// The package (project) name, used to mirror dbt-core's target/run/{pkg}/... structure
+    pub package_name: String,
+    /// The node's path relative to the project root (common_attr.path)
+    pub path: PathBuf,
+    /// The node's original source file path (common_attr.original_file_path)
+    pub original_file_path: PathBuf,
 }
 
 impl Object for WriteConfig {
@@ -424,6 +436,9 @@ impl Object for WriteConfig {
             &self.project_root,
             &self.target_path,
             &self.node_name,
+            &self.package_name,
+            &self.path,
+            &self.original_file_path,
             &self.resource_type,
             payload,
         ) {
@@ -442,10 +457,14 @@ impl Object for WriteConfig {
 }
 
 /// Write a file to disk
+#[allow(clippy::too_many_arguments)]
 fn write_file(
     project_root: &Path,
     target_path: &Path,
-    model_name: &str,
+    node_name: &str,
+    package_name: &str,
+    path: &Path,
+    original_file_path: &Path,
     resource_type: &str,
     payload: &str,
 ) -> Result<(), Error> {
@@ -457,15 +476,21 @@ fn write_file(
         ));
     }
 
-    // Construct build path - simple implementation
-    let build_path = target_path
-        .join(DBT_RUN_DIR_NAME)
-        .join(format!("{model_name}.sql"));
-    let full_path = if build_path.is_absolute() {
-        build_path
-    } else {
-        project_root.join(&build_path)
-    };
+    // Mirror dbt-core's target/run/{package_name}/{original_file_path} structure.
+    // The directory comes from get_target_write_path; the filename is the alias (node_name)
+    // to avoid ENAMETOOLONG on Linux for generic tests with very long names.
+    // project_root.join(target_path) handles both absolute and relative target_path correctly.
+    let abs_run_path = get_target_write_path(
+        project_root,
+        &project_root.join(target_path).join(DBT_RUN_DIR_NAME),
+        package_name,
+        path,
+        original_file_path,
+    );
+    let full_path = abs_run_path
+        .parent()
+        .unwrap_or(&abs_run_path)
+        .join(format!("{node_name}.sql"));
 
     // Create parent directories if needed
     if let Some(parent) = full_path.parent()

@@ -1,12 +1,13 @@
 //! https://github.com/databricks/dbt-databricks/blob/main/dbt/adapters/databricks/relation_configs/comment.py
 
-use crate::funcs::none_value;
+use crate::errors::AdapterResult;
 use crate::relation::config_v2::{
-    ComponentConfig, ComponentConfigLoader, SimpleComponentConfigImpl, diff,
+    ComponentConfig, ComponentConfigLoader, SimpleComponentConfigImpl, diff, impl_loader,
 };
 use crate::relation::databricks::config::{
     DatabricksRelationMetadata, DatabricksRelationMetadataKey,
 };
+use crate::value::none_value;
 
 use dbt_schemas::schemas::InternalDbtNodeAttributes;
 use minijinja::value::{Value, ValueMap};
@@ -34,10 +35,10 @@ fn new_component(comment: Option<String>) -> RelationComment {
     }
 }
 
-fn from_remote_state(results: &DatabricksRelationMetadata) -> RelationComment {
+fn from_remote_state(results: &DatabricksRelationMetadata) -> AdapterResult<RelationComment> {
     let Some(describe_extended) = results.get(&DatabricksRelationMetadataKey::DescribeExtended)
     else {
-        return new_component(None);
+        return Ok(new_component(None));
     };
 
     for row in describe_extended.rows() {
@@ -52,14 +53,16 @@ fn from_remote_state(results: &DatabricksRelationMetadata) -> RelationComment {
                 None
             };
 
-            return new_component(comment);
+            return Ok(new_component(comment));
         }
     }
 
-    new_component(None)
+    Ok(new_component(None))
 }
 
-fn from_local_config(relation_config: &dyn InternalDbtNodeAttributes) -> RelationComment {
+fn from_local_config(
+    relation_config: &dyn InternalDbtNodeAttributes,
+) -> AdapterResult<RelationComment> {
     let persist = relation_config
         .base()
         .persist_docs
@@ -73,38 +76,14 @@ fn from_local_config(relation_config: &dyn InternalDbtNodeAttributes) -> Relatio
         None
     };
 
-    new_component(comment_str)
+    Ok(new_component(comment_str))
 }
 
-pub(crate) struct RelationCommentLoader;
+impl_loader!(RelationComment, DatabricksRelationMetadata);
 
 impl RelationCommentLoader {
     pub fn new_component_type_erased(comment: Option<String>) -> Box<dyn ComponentConfig> {
         Box::new(new_component(comment))
-    }
-
-    pub fn type_name() -> &'static str {
-        TYPE_NAME
-    }
-}
-
-impl ComponentConfigLoader<DatabricksRelationMetadata> for RelationCommentLoader {
-    fn type_name(&self) -> &'static str {
-        TYPE_NAME
-    }
-
-    fn from_remote_state(
-        &self,
-        remote_state: &DatabricksRelationMetadata,
-    ) -> Box<dyn ComponentConfig> {
-        Box::new(from_remote_state(remote_state))
-    }
-
-    fn from_local_config(
-        &self,
-        relation_config: &dyn InternalDbtNodeAttributes,
-    ) -> Box<dyn ComponentConfig> {
-        Box::new(from_local_config(relation_config))
     }
 }
 
@@ -138,7 +117,7 @@ mod tests {
     fn test_from_remote_state_with_comment() {
         let table = create_mock_describe_extended_table(Some("DESC"));
         let results = IndexMap::from([(DatabricksRelationMetadataKey::DescribeExtended, table)]);
-        let comment_config = from_remote_state(&results);
+        let comment_config = from_remote_state(&results).unwrap();
 
         assert_eq!(comment_config.value.unwrap(), "DESC");
     }
@@ -147,7 +126,7 @@ mod tests {
     fn test_from_remote_state_no_comment() {
         let table = create_mock_describe_extended_table(None);
         let results = IndexMap::from([(DatabricksRelationMetadataKey::DescribeExtended, table)]);
-        let comment_config = from_remote_state(&results);
+        let comment_config = from_remote_state(&results).unwrap();
 
         assert_eq!(comment_config.value, None);
     }
@@ -155,7 +134,7 @@ mod tests {
     #[test]
     fn test_from_local_config_with_comment_no_persist() {
         let model = create_mock_dbt_model(false, Some("DESC"));
-        let comment_config = from_local_config(&model);
+        let comment_config = from_local_config(&model).unwrap();
 
         assert!(comment_config.value.is_none());
     }
@@ -163,7 +142,7 @@ mod tests {
     #[test]
     fn test_from_local_config_with_comment_persist() {
         let model = create_mock_dbt_model(true, Some("DESC"));
-        let comment_config = from_local_config(&model);
+        let comment_config = from_local_config(&model).unwrap();
 
         assert_eq!(comment_config.value.unwrap(), "DESC");
     }
@@ -171,7 +150,7 @@ mod tests {
     #[test]
     fn test_from_local_config_no_comment_persist() {
         let model = create_mock_dbt_model(true, None);
-        let comment_config = from_local_config(&model);
+        let comment_config = from_local_config(&model).unwrap();
 
         assert_eq!(comment_config.value, None);
     }

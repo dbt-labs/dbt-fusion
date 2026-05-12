@@ -14,9 +14,9 @@ use dbt_common::{
     lease::{self, Lease},
     stdfs,
     tracing::{
+        dbt_metrics::error_count_checkpoint,
         emit::{emit_error_log_from_fs_error, emit_info_progress_message, emit_trace_log_message},
         event_info::store_event_attributes,
-        metrics::error_count_checkpoint,
     },
 };
 use dbt_jinja_utils::{
@@ -51,6 +51,7 @@ pub async fn execute_clean_command(
         dbt_state.dbt_profile.db_config.clone(),
         dbt_state.run_started_at,
         &flags,
+        invocation_args.warn_error_options.clone(),
         arg.io.clone(),
         dbt_state.catalogs,
     )?;

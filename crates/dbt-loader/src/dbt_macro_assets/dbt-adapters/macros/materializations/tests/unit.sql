@@ -1,7 +1,8 @@
 {%- materialization unit, default -%}
 
   {% set relations = [] %}
-  {% set sql_header = config.get('sql_header') %}
+  {# DIVERGENCE: FIXME: support REQUIRE_SQL_HEADER_IN_TEST_CONFIGS flag #}
+  {% set sql_header = config.get('sql_header') if flags.REQUIRE_SQL_HEADER_IN_TEST_CONFIGS else none %}
 
   {% set expected_rows = config.get('expected_rows') %}
   {% set expected_sql = config.get('expected_sql') %}

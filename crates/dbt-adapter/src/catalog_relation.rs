@@ -1,6 +1,7 @@
-use dbt_common::adapter::AdapterType;
+use dbt_adapter_core::AdapterType;
 use dbt_schemas::schemas::dbt_catalogs::CatalogType;
 use dbt_schemas::schemas::dbt_catalogs::DbtCatalogs;
+use dbt_schemas::schemas::dbt_catalogs_v2::V2CatalogType;
 
 use dbt_yaml::{Mapping as YmlMapping, Span, Value as YmlValue};
 use minijinja::{
@@ -13,6 +14,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::errors::{AdapterError, AdapterErrorKind, AdapterResult};
+use crate::load_catalogs;
+
+mod catalog_relation_v2;
+
+/// Keep only ASCII alphanumeric and underscore characters (SQL identifier safety).
+/// Used for DuckDB ATTACH aliases so that the routing database name matches the
+/// attached alias exactly.
+pub(crate) fn sanitize_duckdb_identifier(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect()
+}
 
 const BIGQUERY_INFO_SCHEMA: &str = "INFO_SCHEMA";
 const BIGQUERY_DEFAULT_TABLE_FORMAT: &str = "default";
@@ -53,6 +66,25 @@ const ALLOWED_TABLE_FORMATS_SNOWFLAKE: [&str; 2] = [DEFAULT_TABLE_FORMAT, ICEBER
 const ALLOWED_TABLE_FORMATS_DISPLAY_SNOWFLAKE: &str = "DEFAULT|ICEBERG";
 
 const SNOWFLAKE_ATTR: &str = "snowflake_attr";
+const DUCKDB_ATTR: &str = "duckdb_attr";
+const ADAPTER_PROP_CATALOG_DATABASE: &str = "catalog_database";
+const ADAPTER_PROP_CATALOG_LINKED_DATABASE_TYPE: &str = "catalog_linked_database_type";
+
+#[derive(Debug, Clone, Copy)]
+enum LinkedCatalogProvider {
+    Glue,
+    Unity,
+}
+
+impl LinkedCatalogProvider {
+    fn is_glue(self) -> bool {
+        matches!(self, Self::Glue)
+    }
+
+    fn is_unity(self) -> bool {
+        matches!(self, Self::Unity)
+    }
+}
 
 #[derive(Debug, serde::Serialize)]
 pub struct CatalogRelation {
@@ -86,11 +118,37 @@ pub struct CatalogRelation {
 }
 
 impl CatalogRelation {
+    fn linked_catalog_provider(&self) -> Option<LinkedCatalogProvider> {
+        let catalog_name = self.catalog_name.as_deref()?;
+        let catalogs = load_catalogs::fetch_catalogs()?;
+        let view = catalogs.view_v2().ok()?;
+        let catalog = view
+            .catalogs
+            .iter()
+            .find(|catalog| catalog.name == catalog_name)?;
+
+        match catalog.catalog_type {
+            V2CatalogType::Glue => Some(LinkedCatalogProvider::Glue),
+            V2CatalogType::Unity => Some(LinkedCatalogProvider::Unity),
+            _ => None,
+        }
+    }
+
     pub fn from_model_config_and_catalogs(
-        adapter_type: &AdapterType,
+        adapter_type: AdapterType,
         model: &Value,
         catalogs: Option<Arc<DbtCatalogs>>,
     ) -> AdapterResult<Self> {
+        if load_catalogs::fetch_use_catalogs_v2()
+            && let Some(catalogs) = catalogs.as_ref()
+        {
+            return catalog_relation_v2::from_model_config_and_catalogs_v2(
+                adapter_type,
+                model,
+                catalogs.clone(),
+            );
+        }
+
         match adapter_type {
             AdapterType::Databricks => {
                 Self::from_model_config_and_catalogs_databricks(model, catalogs)
@@ -99,6 +157,7 @@ impl CatalogRelation {
                 Self::from_model_config_and_catalogs_snowflake(model, catalogs)
             }
             AdapterType::Bigquery => Self::from_model_config_and_catalogs_bigquery(model, catalogs),
+            AdapterType::DuckDB => Ok(Self::default_catalog_relation_duckdb()),
             _ => Err(AdapterError::new(
                 AdapterErrorKind::Internal,
                 format!("build_relation_catalog cannot be invoked by an adapter {adapter_type:?}"),
@@ -169,6 +228,21 @@ impl CatalogRelation {
             external_volume: None,
             base_location: None,
             file_format: Some(BIGQUERY_DEFAULT_FILE_FORMAT.to_string()),
+        }
+    }
+
+    pub fn default_catalog_relation_duckdb() -> CatalogRelation {
+        CatalogRelation {
+            adapter_type: AdapterType::DuckDB,
+            catalog_name: None,
+            integration_name: None,
+            catalog_type: "duckdb".to_string(),
+            table_format: "default".to_string(),
+            file_format: None,
+            external_volume: None,
+            base_location: None,
+            adapter_properties: BTreeMap::new(),
+            is_transient: None,
         }
     }
 
@@ -817,6 +891,13 @@ impl CatalogRelation {
                     &identifier,
                 );
 
+                let mut adapter_properties = BTreeMap::new();
+                if let Some(v) =
+                    Self::get_model_config_value(model, "iceberg_version", AdapterType::Snowflake)
+                {
+                    adapter_properties.insert("iceberg_version".to_string(), v);
+                }
+
                 Ok(CatalogRelation {
                     adapter_type: AdapterType::Snowflake,
                     catalog_name: None,
@@ -825,7 +906,7 @@ impl CatalogRelation {
                     catalog_type: ICEBERG_BUILT_IN_CATALOG.to_string(),
                     external_volume,
                     base_location: Some(base_location),
-                    adapter_properties: BTreeMap::new(),
+                    adapter_properties,
                     is_transient: Some(false), // always FALSE for ICEBERG
                     file_format: None,
                 })
@@ -969,8 +1050,15 @@ impl CatalogRelation {
         );
 
         // 4) adapter_properties from YAML write_integration.adapter_properties and model config overrides
-        let adapter_properties =
+        let mut adapter_properties =
             Self::merged_adapter_properties(yaml_adapter_props, model_adapter_props);
+
+        // Model-level iceberg_version takes precedence over catalog adapter_properties
+        if let Some(v) =
+            Self::get_model_config_value(model, "iceberg_version", AdapterType::Snowflake)
+        {
+            adapter_properties.insert("iceberg_version".to_string(), v);
+        }
 
         // 5) transient handling
         let transient_spec =
@@ -1099,6 +1187,7 @@ impl CatalogRelation {
             AdapterType::Bigquery => BIGQUERY_ATTR,
             AdapterType::Databricks => DATABRICKS_ATTR,
             AdapterType::Snowflake => SNOWFLAKE_ATTR,
+            AdapterType::DuckDB => DUCKDB_ATTR,
             _ => return None,
         };
         let model_config = if let Ok(adapter_attr) = model.get_attr(adapter_attr)
@@ -1138,6 +1227,7 @@ impl CatalogRelation {
             AdapterType::Bigquery => BIGQUERY_ATTR,
             AdapterType::Databricks => DATABRICKS_ATTR,
             AdapterType::Snowflake => SNOWFLAKE_ATTR,
+            AdapterType::DuckDB => DUCKDB_ATTR,
             _ => return None,
         };
         let model_config = if let Ok(adapter_attr) = model.get_attr(adapter_attr)
@@ -1376,7 +1466,6 @@ impl Object for CatalogRelation {
             "catalog_name" => Self::map_opt_str(self.catalog_name.clone()),
             "integration_name" => Self::map_opt_str(self.integration_name.clone()),
 
-            // required for any catalog relation
             "catalog_type" => Self::map_str_val(self.catalog_type.as_str()),
             "table_format" => Self::map_str_val(self.table_format.as_str()),
 
@@ -1405,17 +1494,35 @@ impl Object for CatalogRelation {
                 Self::map_properties_str(&self.adapter_properties, "storage_serialization_policy")
             }
 
+            // BUILT_IN + REST
+            "iceberg_version" => {
+                Self::map_properties_u32(&self.adapter_properties, "iceberg_version")
+            }
+
             // REST
             "auto_refresh" => Self::map_properties_bool(&self.adapter_properties, "auto_refresh"),
             "catalog_linked_database" => {
                 Self::map_properties_str(&self.adapter_properties, "catalog_linked_database")
             }
-            "catalog_linked_database_type" => {
-                Self::map_properties_str(&self.adapter_properties, "catalog_linked_database_type")
+            "attached_database" => {
+                Self::map_properties_str(&self.adapter_properties, "attached_database")
             }
+            "catalog_linked_database_type" => Self::map_properties_str(
+                &self.adapter_properties,
+                ADAPTER_PROP_CATALOG_LINKED_DATABASE_TYPE,
+            ),
             "target_file_size" => {
                 Self::map_properties_str(&self.adapter_properties, "target_file_size")
             }
+
+            // v2-only REST surface
+            "catalog_database" => {
+                Self::map_properties_str(&self.adapter_properties, ADAPTER_PROP_CATALOG_DATABASE)
+            }
+            "linked_catalog_provider" => self
+                .linked_catalog_provider()
+                .map(Value::from_object)
+                .unwrap_or_else(|| Value::from(())),
 
             // === Snowflake
             "is_transient" => self.gate_by_adapter(vec![AdapterType::Snowflake], || {
@@ -1432,6 +1539,9 @@ impl Object for CatalogRelation {
                 }),
             "location" => self.gate_by_adapter(vec![AdapterType::Databricks], || {
                 Self::map_opt_str(self.external_volume.clone())
+            }),
+            "use_uniform" => self.gate_by_adapter(vec![AdapterType::Databricks], || {
+                Self::map_properties_bool(&self.adapter_properties, "use_uniform")
             }),
 
             // === Bigquery
@@ -1452,6 +1562,16 @@ impl Object for CatalogRelation {
             self.catalog_type,
             self.table_format
         )
+    }
+}
+
+impl Object for LinkedCatalogProvider {
+    fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
+        Some(match key.as_str()? {
+            "is_glue" => Value::from(self.is_glue()),
+            "is_unity" => Value::from(self.is_unity()),
+            _ => Value::from(()),
+        })
     }
 }
 
@@ -1774,7 +1894,7 @@ mod tests {
         ];
         for m in ms {
             let r =
-                CatalogRelation::from_model_config_and_catalogs(&AdapterType::Snowflake, &m, None)
+                CatalogRelation::from_model_config_and_catalogs(AdapterType::Snowflake, &m, None)
                     .unwrap();
             assert_eq!(r.table_format, DEFAULT_TABLE_FORMAT);
             assert_eq!(r.catalog_type, SNOWFLAKE_RELATION_STORE);
@@ -1790,7 +1910,7 @@ mod tests {
         ];
         for m in ms {
             let err =
-                CatalogRelation::from_model_config_and_catalogs(&AdapterType::Snowflake, &m, None)
+                CatalogRelation::from_model_config_and_catalogs(AdapterType::Snowflake, &m, None)
                     .unwrap_err();
             assert!(format!("{err}").contains("catalog_name 'CAT'"));
             assert!(format!("{err}").contains("catalogs.yml was not found"));
@@ -1807,7 +1927,7 @@ mod tests {
         ];
         for m in ms {
             let r =
-                CatalogRelation::from_model_config_and_catalogs(&AdapterType::Snowflake, &m, None)
+                CatalogRelation::from_model_config_and_catalogs(AdapterType::Snowflake, &m, None)
                     .unwrap();
             assert_eq!(r.table_format, DEFAULT_TABLE_FORMAT);
             assert!(r.catalog_name.is_none());
@@ -2095,7 +2215,7 @@ mod tests {
         ];
         for m in ms {
             let r =
-                CatalogRelation::from_model_config_and_catalogs(&AdapterType::Databricks, &m, None)
+                CatalogRelation::from_model_config_and_catalogs(AdapterType::Databricks, &m, None)
                     .unwrap();
 
             assert_eq!(r.table_format, DBX_DEFAULT_TABLE_FORMAT);
@@ -2117,7 +2237,7 @@ mod tests {
         ];
         for m in ms {
             let err =
-                CatalogRelation::from_model_config_and_catalogs(&AdapterType::Databricks, &m, None)
+                CatalogRelation::from_model_config_and_catalogs(AdapterType::Databricks, &m, None)
                     .unwrap_err();
             let msg = format!("{err}");
             assert!(msg.contains("table_format=iceberg"));
@@ -2141,12 +2261,9 @@ mod tests {
         ];
         for m in ms {
             let r = CatalogRelation::from_model_config_and_catalogs(
-                &AdapterType::Databricks,
+                AdapterType::Databricks,
                 &m,
-                Some(Arc::new(DbtCatalogs {
-                    repr: cats.clone(),
-                    span: Default::default(),
-                })),
+                Some(Arc::new(DbtCatalogs::new(cats.clone(), Default::default()))),
             )
             .unwrap();
 
@@ -2173,12 +2290,9 @@ mod tests {
         ];
         for m in ms {
             let err = CatalogRelation::from_model_config_and_catalogs(
-                &AdapterType::Databricks,
+                AdapterType::Databricks,
                 &m,
-                Some(Arc::new(DbtCatalogs {
-                    repr: cats.clone(),
-                    span: Default::default(),
-                })),
+                Some(Arc::new(DbtCatalogs::new(cats.clone(), Default::default()))),
             )
             .unwrap_err();
             let msg = format!("{err}");
@@ -2210,12 +2324,9 @@ mod tests {
         ];
         for m in ms {
             let r = CatalogRelation::from_model_config_and_catalogs(
-                &AdapterType::Databricks,
+                AdapterType::Databricks,
                 &m,
-                Some(Arc::new(DbtCatalogs {
-                    repr: cats.clone(),
-                    span: Default::default(),
-                })),
+                Some(Arc::new(DbtCatalogs::new(cats.clone(), Default::default()))),
             )
             .unwrap();
 
@@ -2254,12 +2365,9 @@ mod tests {
         ];
         for m in ms {
             let err = CatalogRelation::from_model_config_and_catalogs(
-                &AdapterType::Databricks,
+                AdapterType::Databricks,
                 &m,
-                Some(Arc::new(DbtCatalogs {
-                    repr: cats.clone(),
-                    span: Default::default(),
-                })),
+                Some(Arc::new(DbtCatalogs::new(cats.clone(), Default::default()))),
             )
             .unwrap_err();
 
@@ -2278,12 +2386,9 @@ mod tests {
         ];
         for m in ms {
             let r = CatalogRelation::from_model_config_and_catalogs(
-                &AdapterType::Databricks,
+                AdapterType::Databricks,
                 &m,
-                Some(Arc::new(DbtCatalogs {
-                    repr: cats.clone(),
-                    span: Default::default(),
-                })),
+                Some(Arc::new(DbtCatalogs::new(cats.clone(), Default::default()))),
             )
             .unwrap();
 
@@ -2309,12 +2414,9 @@ mod tests {
         ];
         for m in ms {
             let r = CatalogRelation::from_model_config_and_catalogs(
-                &AdapterType::Databricks,
+                AdapterType::Databricks,
                 &m,
-                Some(Arc::new(DbtCatalogs {
-                    repr: cats.clone(),
-                    span: Default::default(),
-                })),
+                Some(Arc::new(DbtCatalogs::new(cats.clone(), Default::default()))),
             )
             .unwrap();
 
@@ -2349,12 +2451,9 @@ mod tests {
         ];
         for m in ms {
             let err = CatalogRelation::from_model_config_and_catalogs(
-                &AdapterType::Databricks,
+                AdapterType::Databricks,
                 &m,
-                Some(Arc::new(DbtCatalogs {
-                    repr: cats.clone(),
-                    span: Default::default(),
-                })),
+                Some(Arc::new(DbtCatalogs::new(cats.clone(), Default::default()))),
             )
             .unwrap_err();
 
@@ -2379,12 +2478,9 @@ mod tests {
         ];
         for m in ms {
             let r = CatalogRelation::from_model_config_and_catalogs(
-                &AdapterType::Databricks,
+                AdapterType::Databricks,
                 &m,
-                Some(Arc::new(DbtCatalogs {
-                    repr: cats.clone(),
-                    span: Default::default(),
-                })),
+                Some(Arc::new(DbtCatalogs::new(cats.clone(), Default::default()))),
             )
             .unwrap();
 
@@ -2413,12 +2509,9 @@ mod tests {
         ];
         for m in ms {
             let r = CatalogRelation::from_model_config_and_catalogs(
-                &AdapterType::Databricks,
+                AdapterType::Databricks,
                 &m,
-                Some(Arc::new(DbtCatalogs {
-                    repr: cats.clone(),
-                    span: Default::default(),
-                })),
+                Some(Arc::new(DbtCatalogs::new(cats.clone(), Default::default()))),
             )
             .unwrap();
 
@@ -2447,12 +2540,9 @@ mod tests {
         ];
         for m in ms {
             let r = CatalogRelation::from_model_config_and_catalogs(
-                &AdapterType::Databricks,
+                AdapterType::Databricks,
                 &m,
-                Some(Arc::new(DbtCatalogs {
-                    repr: cats.clone(),
-                    span: Default::default(),
-                })),
+                Some(Arc::new(DbtCatalogs::new(cats.clone(), Default::default()))),
             )
             .unwrap();
 
@@ -2479,12 +2569,9 @@ mod tests {
         ];
         for m in ms {
             let r = CatalogRelation::from_model_config_and_catalogs(
-                &AdapterType::Databricks,
+                AdapterType::Databricks,
                 &m,
-                Some(Arc::new(DbtCatalogs {
-                    repr: cats.clone(),
-                    span: Default::default(),
-                })),
+                Some(Arc::new(DbtCatalogs::new(cats.clone(), Default::default()))),
             )
             .unwrap();
 
@@ -2514,12 +2601,9 @@ mod tests {
         ];
         for m in ms {
             let err = CatalogRelation::from_model_config_and_catalogs(
-                &AdapterType::Databricks,
+                AdapterType::Databricks,
                 &m,
-                Some(Arc::new(DbtCatalogs {
-                    repr: cats.clone(),
-                    span: Default::default(),
-                })),
+                Some(Arc::new(DbtCatalogs::new(cats.clone(), Default::default()))),
             )
             .unwrap_err();
 
@@ -2541,7 +2625,7 @@ mod tests {
         ];
         for m in ms {
             let r =
-                CatalogRelation::from_model_config_and_catalogs(&AdapterType::Bigquery, &m, None)
+                CatalogRelation::from_model_config_and_catalogs(AdapterType::Bigquery, &m, None)
                     .unwrap();
 
             assert_eq!(r.table_format, BIGQUERY_DEFAULT_TABLE_FORMAT);
@@ -2568,7 +2652,7 @@ mod tests {
         ];
         for m in ms {
             let err =
-                CatalogRelation::from_model_config_and_catalogs(&AdapterType::Bigquery, &m, None)
+                CatalogRelation::from_model_config_and_catalogs(AdapterType::Bigquery, &m, None)
                     .unwrap_err();
 
             assert!(err.message().contains("Model specifies catalog_name"));
@@ -2595,12 +2679,9 @@ mod tests {
         ];
         for m in ms {
             let r = CatalogRelation::from_model_config_and_catalogs(
-                &AdapterType::Bigquery,
+                AdapterType::Bigquery,
                 &m,
-                Some(Arc::new(DbtCatalogs {
-                    repr: cats.clone(),
-                    span: Default::default(),
-                })),
+                Some(Arc::new(DbtCatalogs::new(cats.clone(), Default::default()))),
             )
             .unwrap();
 
@@ -2638,12 +2719,9 @@ mod tests {
         ];
         for m in ms {
             let err = CatalogRelation::from_model_config_and_catalogs(
-                &AdapterType::Bigquery,
+                AdapterType::Bigquery,
                 &m,
-                Some(Arc::new(DbtCatalogs {
-                    repr: cats.clone(),
-                    span: Default::default(),
-                })),
+                Some(Arc::new(DbtCatalogs::new(cats.clone(), Default::default()))),
             )
             .unwrap_err();
 
@@ -2673,12 +2751,9 @@ mod tests {
         ];
         for m in ms {
             let err = CatalogRelation::from_model_config_and_catalogs(
-                &AdapterType::Bigquery,
+                AdapterType::Bigquery,
                 &m,
-                Some(Arc::new(DbtCatalogs {
-                    repr: cats.clone(),
-                    span: Default::default(),
-                })),
+                Some(Arc::new(DbtCatalogs::new(cats.clone(), Default::default()))),
             )
             .unwrap_err();
 
@@ -2709,12 +2784,9 @@ mod tests {
         ];
         for m in ms {
             let r = CatalogRelation::from_model_config_and_catalogs(
-                &AdapterType::Bigquery,
+                AdapterType::Bigquery,
                 &m,
-                Some(Arc::new(DbtCatalogs {
-                    repr: cats.clone(),
-                    span: Default::default(),
-                })),
+                Some(Arc::new(DbtCatalogs::new(cats.clone(), Default::default()))),
             )
             .unwrap();
 
@@ -2764,12 +2836,9 @@ mod tests {
         ];
         for m in ms {
             let r = CatalogRelation::from_model_config_and_catalogs(
-                &AdapterType::Bigquery,
+                AdapterType::Bigquery,
                 &m,
-                Some(Arc::new(DbtCatalogs {
-                    repr: cats.clone(),
-                    span: Default::default(),
-                })),
+                Some(Arc::new(DbtCatalogs::new(cats.clone(), Default::default()))),
             )
             .unwrap();
 
@@ -2816,12 +2885,9 @@ mod tests {
         ];
         for m in ms {
             let r = CatalogRelation::from_model_config_and_catalogs(
-                &AdapterType::Bigquery,
+                AdapterType::Bigquery,
                 &m,
-                Some(Arc::new(DbtCatalogs {
-                    repr: cats.clone(),
-                    span: Default::default(),
-                })),
+                Some(Arc::new(DbtCatalogs::new(cats.clone(), Default::default()))),
             )
             .unwrap();
 
@@ -2870,12 +2936,9 @@ mod tests {
         ];
         for m in ms {
             let r = CatalogRelation::from_model_config_and_catalogs(
-                &AdapterType::Bigquery,
+                AdapterType::Bigquery,
                 &m,
-                Some(Arc::new(DbtCatalogs {
-                    repr: cats.clone(),
-                    span: Default::default(),
-                })),
+                Some(Arc::new(DbtCatalogs::new(cats.clone(), Default::default()))),
             )
             .unwrap();
 
@@ -2922,12 +2985,9 @@ mod tests {
         ];
         for m in ms {
             let r = CatalogRelation::from_model_config_and_catalogs(
-                &AdapterType::Bigquery,
+                AdapterType::Bigquery,
                 &m,
-                Some(Arc::new(DbtCatalogs {
-                    repr: cats.clone(),
-                    span: Default::default(),
-                })),
+                Some(Arc::new(DbtCatalogs::new(cats.clone(), Default::default()))),
             )
             .unwrap();
 
@@ -2971,12 +3031,9 @@ mod tests {
         ];
         for m in ms {
             let r = CatalogRelation::from_model_config_and_catalogs(
-                &AdapterType::Bigquery,
+                AdapterType::Bigquery,
                 &m,
-                Some(Arc::new(DbtCatalogs {
-                    repr: cats.clone(),
-                    span: Default::default(),
-                })),
+                Some(Arc::new(DbtCatalogs::new(cats.clone(), Default::default()))),
             )
             .unwrap();
 
@@ -3023,12 +3080,9 @@ mod tests {
         ];
         for m in ms {
             let r = CatalogRelation::from_model_config_and_catalogs(
-                &AdapterType::Bigquery,
+                AdapterType::Bigquery,
                 &m,
-                Some(Arc::new(DbtCatalogs {
-                    repr: cats.clone(),
-                    span: Default::default(),
-                })),
+                Some(Arc::new(DbtCatalogs::new(cats.clone(), Default::default()))),
             )
             .unwrap();
 
@@ -3071,18 +3125,125 @@ mod tests {
         ];
         for m in ms {
             let err = CatalogRelation::from_model_config_and_catalogs(
-                &AdapterType::Bigquery,
+                AdapterType::Bigquery,
                 &m,
-                Some(Arc::new(DbtCatalogs {
-                    repr: cats.clone(),
-                    span: Default::default(),
-                })),
+                Some(Arc::new(DbtCatalogs::new(cats.clone(), Default::default()))),
             )
             .unwrap_err();
 
             assert!(err.message().contains(
                 "external_volume may only be specified in write integration entries of catalogs.yml"
             ));
+        }
+    }
+
+    // --- iceberg_version ---
+
+    #[test]
+    fn iceberg_version_from_model_config_legacy_path() {
+        let conf = json!({
+            "table_format": "ICEBERG",
+            "external_volume": "EV",
+            "schema": "S",
+            "identifier": "I",
+            "iceberg_version": 3,
+        });
+        let ms = [
+            model(AdapterType::Snowflake, conf.clone()),
+            model_deprecated_config(conf),
+        ];
+        for m in ms {
+            let r = CatalogRelation::build_without_catalogs_yml(&m).unwrap();
+            assert_eq!(
+                r.adapter_properties
+                    .get("iceberg_version")
+                    .map(|s| s.as_str()),
+                Some("3")
+            );
+        }
+    }
+
+    #[test]
+    fn iceberg_version_absent_from_model_config_legacy_path() {
+        let conf = json!({
+            "table_format": "ICEBERG",
+            "external_volume": "EV",
+            "schema": "S",
+            "identifier": "I",
+        });
+        let ms = [
+            model(AdapterType::Snowflake, conf.clone()),
+            model_deprecated_config(conf),
+        ];
+        for m in ms {
+            let r = CatalogRelation::build_without_catalogs_yml(&m).unwrap();
+            assert!(!r.adapter_properties.contains_key("iceberg_version"));
+        }
+    }
+
+    #[test]
+    fn iceberg_version_model_config_overrides_catalog_adapter_properties() {
+        let cats = catalogs_yaml_one(
+            "CAT",
+            "WIN",
+            "BUILT_IN",
+            "ICEBERG",
+            &[
+                ("external_volume", s("EV")),
+                ("adapter_properties", map(&[("iceberg_version", i64v(1))])),
+            ],
+        );
+        let conf = json!({
+            "catalog_name": "CAT",
+            "schema": "S",
+            "identifier": "I",
+            "iceberg_version": 3,
+        });
+        let ms = [
+            model(AdapterType::Snowflake, conf.clone()),
+            model_deprecated_config(conf),
+        ];
+        for m in ms {
+            let r = CatalogRelation::build_with_catalogs(&m, &cats, "CAT").unwrap();
+            // model-level iceberg_version=3 overrides catalog adapter_properties iceberg_version=1
+            assert_eq!(
+                r.adapter_properties
+                    .get("iceberg_version")
+                    .map(|s| s.as_str()),
+                Some("3")
+            );
+        }
+    }
+
+    #[test]
+    fn iceberg_version_falls_back_to_catalog_adapter_properties() {
+        let cats = catalogs_yaml_one(
+            "CAT",
+            "WIN",
+            "BUILT_IN",
+            "ICEBERG",
+            &[
+                ("external_volume", s("EV")),
+                ("adapter_properties", map(&[("iceberg_version", i64v(3))])),
+            ],
+        );
+        let conf = json!({
+            "catalog_name": "CAT",
+            "schema": "S",
+            "identifier": "I",
+        });
+        let ms = [
+            model(AdapterType::Snowflake, conf.clone()),
+            model_deprecated_config(conf),
+        ];
+        for m in ms {
+            let r = CatalogRelation::build_with_catalogs(&m, &cats, "CAT").unwrap();
+            assert_eq!(
+                r.adapter_properties
+                    .get("iceberg_version")
+                    .map(|s| s.as_str()),
+                Some("3")
+            );
         }
     }
 
@@ -3112,12 +3273,9 @@ mod tests {
         ];
         for m in ms {
             let r = CatalogRelation::from_model_config_and_catalogs(
-                &AdapterType::Bigquery,
+                AdapterType::Bigquery,
                 &m,
-                Some(Arc::new(DbtCatalogs {
-                    repr: cats.clone(),
-                    span: Default::default(),
-                })),
+                Some(Arc::new(DbtCatalogs::new(cats.clone(), Default::default()))),
             )
             .unwrap();
 

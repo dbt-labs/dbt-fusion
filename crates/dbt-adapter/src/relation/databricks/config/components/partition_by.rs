@@ -1,7 +1,8 @@
 // https://github.com/databricks/dbt-databricks/blob/main/dbt/adapters/databricks/relation_configs/partitioning.py
 
+use crate::errors::AdapterResult;
 use crate::relation::config_v2::{
-    ComponentConfig, ComponentConfigLoader, SimpleComponentConfigImpl, diff,
+    ComponentConfig, ComponentConfigLoader, SimpleComponentConfigImpl, diff, impl_loader,
 };
 use crate::relation::databricks::config::{
     DatabricksRelationMetadata, DatabricksRelationMetadataKey,
@@ -35,10 +36,10 @@ fn new_component(partition_by: Vec<String>) -> PartitionBy {
     }
 }
 
-fn from_remote_state(results: &DatabricksRelationMetadata) -> PartitionBy {
+fn from_remote_state(results: &DatabricksRelationMetadata) -> AdapterResult<PartitionBy> {
     let Some(describe_extended) = results.get(&DatabricksRelationMetadataKey::DescribeExtended)
     else {
-        return new_component(Vec::new());
+        return Ok(new_component(Vec::new()));
     };
 
     let mut partition_cols = Vec::new();
@@ -65,11 +66,13 @@ fn from_remote_state(results: &DatabricksRelationMetadata) -> PartitionBy {
         }
     }
 
-    new_component(partition_cols)
+    Ok(new_component(partition_cols))
 }
 
-fn from_local_config(relation_config: &dyn InternalDbtNodeAttributes) -> PartitionBy {
-    new_component(
+fn from_local_config(
+    relation_config: &dyn InternalDbtNodeAttributes,
+) -> AdapterResult<PartitionBy> {
+    Ok(new_component(
         relation_config
             .as_any()
             .downcast_ref::<DbtModel>()
@@ -86,38 +89,14 @@ fn from_local_config(relation_config: &dyn InternalDbtNodeAttributes) -> Partiti
                 }
             })
             .unwrap_or_default(),
-    )
+    ))
 }
 
-pub(crate) struct PartitionByLoader;
+impl_loader!(PartitionBy, DatabricksRelationMetadata);
 
 impl PartitionByLoader {
     pub fn new_component_type_erased(partition_by: Vec<String>) -> Box<dyn ComponentConfig> {
         Box::new(new_component(partition_by))
-    }
-
-    pub fn type_name() -> &'static str {
-        TYPE_NAME
-    }
-}
-
-impl ComponentConfigLoader<DatabricksRelationMetadata> for PartitionByLoader {
-    fn type_name(&self) -> &'static str {
-        TYPE_NAME
-    }
-
-    fn from_remote_state(
-        &self,
-        remote_state: &DatabricksRelationMetadata,
-    ) -> Box<dyn ComponentConfig> {
-        Box::new(from_remote_state(remote_state))
-    }
-
-    fn from_local_config(
-        &self,
-        relation_config: &dyn InternalDbtNodeAttributes,
-    ) -> Box<dyn ComponentConfig> {
-        Box::new(from_local_config(relation_config))
     }
 }
 
@@ -179,7 +158,7 @@ mod tests {
     fn test_from_remote_state_with_partitions() {
         let table = create_mock_describe_extended_table(vec!["event_name", "user_id"]);
         let results = IndexMap::from([(DatabricksRelationMetadataKey::DescribeExtended, table)]);
-        let config = from_remote_state(&results);
+        let config = from_remote_state(&results).unwrap();
 
         assert_eq!(config.value, vec!["event_name", "user_id"]);
     }
@@ -188,7 +167,7 @@ mod tests {
     fn test_from_remote_state_no_partitions() {
         let table = create_mock_describe_extended_table(vec![]);
         let results = IndexMap::from([(DatabricksRelationMetadataKey::DescribeExtended, table)]);
-        let config = from_remote_state(&results);
+        let config = from_remote_state(&results).unwrap();
 
         assert!(config.value.is_empty());
     }
@@ -196,7 +175,7 @@ mod tests {
     #[test]
     fn test_from_local_config() {
         let model = create_mock_dbt_model(&["event_name"]);
-        let config = from_local_config(&model);
+        let config = from_local_config(&model).unwrap();
 
         assert_eq!(config.value, vec!["event_name"]);
     }
@@ -204,7 +183,7 @@ mod tests {
     #[test]
     fn test_from_local_config_none() {
         let model = create_mock_dbt_model(&[]);
-        let config = from_local_config(&model);
+        let config = from_local_config(&model).unwrap();
 
         assert!(config.value.is_empty());
     }

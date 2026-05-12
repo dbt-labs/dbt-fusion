@@ -1,15 +1,16 @@
 use dbt_telemetry::{
-    HookProcessed, Invocation, InvocationMetrics, LogMessage, LogRecordInfo, NodeOutcome,
-    NodeProcessed, NodeSkipReason, SeverityNumber, SpanEndInfo, TestOutcome,
-    node_processed::NodeOutcomeDetail,
+    HookProcessed, Invocation, InvocationMetrics, LogMessage, LogRecordInfo, NodeEvent,
+    NodeOutcome, NodeProcessed, NodeSkipReason, SeverityNumber, SourceFreshnessOutcome,
+    SpanEndInfo, has_node_warning, node_processed::NodeOutcomeDetail,
 };
-
-use crate::tracing::metrics::{OutcomeCountsKey, OutcomeKind};
 
 use super::super::{
     data_provider::DataProvider,
+    dbt_metrics::{
+        FusionMetricKey, InvocationMetricKey, NodeSubOutcome, OutcomeCountsKey, OutcomeKind,
+    },
+    event_classifiers::is_exit_with_status_log,
     layer::TelemetryMiddleware,
-    metrics::{InvocationMetricKey, MetricKey},
 };
 
 /// Middleware that aggregates telemetry metrics from span and log records.
@@ -43,11 +44,11 @@ impl TelemetryMiddleware for TelemetryMetricAggregator {
             let mut canceled = 0u64;
             let mut no_op = 0u64;
 
-            for ((outcome, skip_reason, test_outcome), count) in data_provider
+            for ((outcome, skip_reason, sub_outcome), count) in data_provider
                 .get_all_metrics()
                 .iter()
-                .filter_map(|(key, count)| match key {
-                    MetricKey::OutcomeCounts(outcome_key) if *count > 0 => {
+                .filter_map(|(key, count)| match FusionMetricKey::try_from(*key).ok() {
+                    Some(FusionMetricKey::OutcomeCounts(outcome_key)) if *count > 0 => {
                         Some((outcome_key.into_parts(), *count))
                     }
                     _ => None,
@@ -55,9 +56,17 @@ impl TelemetryMiddleware for TelemetryMetricAggregator {
             {
                 match outcome {
                     OutcomeKind::Node(outcome) => match outcome {
-                        NodeOutcome::Success => match test_outcome {
-                            Some(TestOutcome::Failed) => error += count,
-                            Some(TestOutcome::Warned) => warning += count,
+                        NodeOutcome::Success => match sub_outcome {
+                            // TODO: FreshnessWarned/FreshnessFailed are intentionally left as
+                            // success here. Source freshness outcomes use NodeOutcome::Success
+                            // for all three results (pass/warn/fail), so freshness failures
+                            // are currently undercounted in error/warn totals. Fixing this
+                            // is out of scope for this PR — check with product/DX or wait
+                            // for a user-reported issue before addressing.
+                            Some(NodeSubOutcome::TestFailed) => error += count,
+                            Some(NodeSubOutcome::TestWarned | NodeSubOutcome::NodeWarned) => {
+                                warning += count
+                            }
                             _ => success += count,
                         },
                         NodeOutcome::Error => error += count,
@@ -84,31 +93,31 @@ impl TelemetryMiddleware for TelemetryMetricAggregator {
 
             // Update aggregated metrics
             data_provider.increment_metric(
-                MetricKey::InvocationMetric(InvocationMetricKey::NodeTotalsSuccess),
+                FusionMetricKey::InvocationMetric(InvocationMetricKey::NodeTotalsSuccess),
                 success,
             );
             data_provider.increment_metric(
-                MetricKey::InvocationMetric(InvocationMetricKey::NodeTotalsWarning),
+                FusionMetricKey::InvocationMetric(InvocationMetricKey::NodeTotalsWarning),
                 warning,
             );
             data_provider.increment_metric(
-                MetricKey::InvocationMetric(InvocationMetricKey::NodeTotalsError),
+                FusionMetricKey::InvocationMetric(InvocationMetricKey::NodeTotalsError),
                 error,
             );
             data_provider.increment_metric(
-                MetricKey::InvocationMetric(InvocationMetricKey::NodeTotalsReused),
+                FusionMetricKey::InvocationMetric(InvocationMetricKey::NodeTotalsReused),
                 reused,
             );
             data_provider.increment_metric(
-                MetricKey::InvocationMetric(InvocationMetricKey::NodeTotalsSkipped),
+                FusionMetricKey::InvocationMetric(InvocationMetricKey::NodeTotalsSkipped),
                 skipped,
             );
             data_provider.increment_metric(
-                MetricKey::InvocationMetric(InvocationMetricKey::NodeTotalsCanceled),
+                FusionMetricKey::InvocationMetric(InvocationMetricKey::NodeTotalsCanceled),
                 canceled,
             );
             data_provider.increment_metric(
-                MetricKey::InvocationMetric(InvocationMetricKey::NodeTotalsNoOp),
+                FusionMetricKey::InvocationMetric(InvocationMetricKey::NodeTotalsNoOp),
                 no_op,
             );
 
@@ -117,11 +126,13 @@ impl TelemetryMiddleware for TelemetryMetricAggregator {
             let node_type_counts: std::collections::HashMap<String, u64> = data_provider
                 .get_all_metrics()
                 .iter()
-                .filter_map(|(key, count)| match key {
-                    MetricKey::NodeCounts(node_type) if *count > 0 => {
+                .filter_map(|(key, count)| match FusionMetricKey::try_from(*key).ok() {
+                    Some(FusionMetricKey::NodeCounts(node_type)) if *count > 0 => {
                         Some((node_type.as_static_ref().to_string(), *count))
                     }
-                    MetricKey::HookCounts if *count > 0 => Some(("hook".to_string(), *count)),
+                    Some(FusionMetricKey::HookCounts) if *count > 0 => {
+                        Some(("hook".to_string(), *count))
+                    }
                     _ => None,
                 })
                 .collect();
@@ -148,15 +159,15 @@ impl TelemetryMiddleware for TelemetryMetricAggregator {
 
             // Store totals in invocation attributes
             invocation.metrics = Some(InvocationMetrics {
-                total_errors: Some(data_provider.get_metric(MetricKey::InvocationMetric(
+                total_errors: Some(data_provider.get_metric(FusionMetricKey::InvocationMetric(
                     InvocationMetricKey::TotalErrors,
                 ))),
-                total_warnings: Some(data_provider.get_metric(MetricKey::InvocationMetric(
+                total_warnings: Some(data_provider.get_metric(FusionMetricKey::InvocationMetric(
                     InvocationMetricKey::TotalWarnings,
                 ))),
-                autofix_suggestions: Some(data_provider.get_metric(MetricKey::InvocationMetric(
-                    InvocationMetricKey::AutoFixSuggestions,
-                ))),
+                autofix_suggestions: Some(data_provider.get_metric(
+                    FusionMetricKey::InvocationMetric(InvocationMetricKey::AutoFixSuggestions),
+                )),
                 node_type_counts,
                 status_counts,
             });
@@ -166,29 +177,45 @@ impl TelemetryMiddleware for TelemetryMetricAggregator {
         if let Some(attrs) = span.attributes.downcast_ref::<NodeProcessed>()
             && attrs.in_selection
         {
+            let sub_outcome: Option<NodeSubOutcome> =
+                if let Some(NodeOutcomeDetail::NodeTestDetail(ted)) = &attrs.node_outcome_detail {
+                    NodeSubOutcome::from_test_outcome(ted.test_outcome())
+                } else if let Some(NodeOutcomeDetail::NodeFreshnessOutcome(fd)) =
+                    &attrs.node_outcome_detail
+                {
+                    match fd.node_freshness_outcome() {
+                        SourceFreshnessOutcome::OutcomeWarned => {
+                            Some(NodeSubOutcome::FreshnessWarned)
+                        }
+                        SourceFreshnessOutcome::OutcomeFailed => {
+                            Some(NodeSubOutcome::FreshnessFailed)
+                        }
+                        _ => None,
+                    }
+                } else if has_node_warning(NodeEvent::Processed(attrs)) {
+                    Some(NodeSubOutcome::NodeWarned)
+                } else {
+                    None
+                };
             let key = OutcomeCountsKey::new(
                 OutcomeKind::Node(attrs.node_outcome()),
                 attrs.node_skip_reason(),
-                if let Some(NodeOutcomeDetail::NodeTestDetail(ted)) = &attrs.node_outcome_detail {
-                    Some(ted.test_outcome())
-                } else {
-                    None
-                },
+                sub_outcome,
             );
-            data_provider.increment_metric(MetricKey::OutcomeCounts(key), 1);
+            data_provider.increment_metric(FusionMetricKey::OutcomeCounts(key), 1);
         }
 
         // Count hook processed spans - hooks are always counted regardless of selection
         if let Some(hook_attrs) = span.attributes.downcast_ref::<HookProcessed>() {
             // Count the hook
-            data_provider.increment_metric(MetricKey::HookCounts, 1);
+            data_provider.increment_metric(FusionMetricKey::HookCounts, 1);
 
             let key = OutcomeCountsKey::new(
                 OutcomeKind::Hook(hook_attrs.hook_outcome()),
                 NodeSkipReason::Unspecified,
                 None,
             );
-            data_provider.increment_metric(MetricKey::OutcomeCounts(key), 1);
+            data_provider.increment_metric(FusionMetricKey::OutcomeCounts(key), 1);
         }
 
         Some(span)
@@ -199,17 +226,23 @@ impl TelemetryMiddleware for TelemetryMetricAggregator {
         log_record: LogRecordInfo,
         data_provider: &mut DataProvider<'_>,
     ) -> Option<LogRecordInfo> {
+        // ExitWithStatus is a pseudo error used only to short-circuit execution, so we
+        // filter it from dbt-facing output
+        if is_exit_with_status_log(&log_record) {
+            return Some(log_record);
+        }
+
         if log_record.attributes.is::<LogMessage>() {
             match log_record.severity_number {
                 SeverityNumber::Error => {
                     data_provider.increment_metric(
-                        MetricKey::InvocationMetric(InvocationMetricKey::TotalErrors),
+                        FusionMetricKey::InvocationMetric(InvocationMetricKey::TotalErrors),
                         1,
                     );
                 }
                 SeverityNumber::Warn => {
                     data_provider.increment_metric(
-                        MetricKey::InvocationMetric(InvocationMetricKey::TotalWarnings),
+                        FusionMetricKey::InvocationMetric(InvocationMetricKey::TotalWarnings),
                         1,
                     );
                 }

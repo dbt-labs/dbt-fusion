@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 use std::time::Duration;
 
-use dbt_common::adapter::{AdapterType, quote_char};
+use dbt_adapter_core::{AdapterType, quote_char};
 use dbt_common::{CodeLocationWithFile, ErrorCode, FsError, FsResult, err, fs_err};
 use dbt_telemetry::NodeMaterialization;
 use dbt_yaml::{DbtSchema, Spanned, UntaggedEnumDeserialize, Verbatim};
@@ -23,6 +23,7 @@ use crate::schemas::manifest::BigqueryPartitionConfig;
 use crate::schemas::manifest::common::SourceFileMetadata;
 use crate::schemas::semantic_layer::semantic_manifest::SemanticLayerElementConfig;
 
+use super::relations::base::ComponentName;
 use super::serde::{
     StringOrArrayOfStrings, bool_or_string_bool, bool_or_string_bool_default, i64_or_string_i64,
 };
@@ -74,17 +75,28 @@ impl FromStr for SchemaOrigin {
 
 #[derive(Default, Deserialize, Serialize, Debug, Clone, DbtSchema, PartialEq, Eq)]
 pub struct FreshnessRules {
-    #[serde(deserialize_with = "i64_or_string_i64")]
+    // F1: an empty rule object (`error_after: {}` with no children) must
+    // deserialize successfully — the validator below treats it as
+    // semantically equivalent to omitting the rule. Without `default`, the
+    // custom deserializer on `count` causes serde to reject `{}` with a
+    // "missing field `count`" error before the validator ever runs.
+    #[serde(default, deserialize_with = "i64_or_string_i64")]
     pub count: Option<i64>,
+    #[serde(default)]
     pub period: Option<FreshnessPeriod>,
 }
 
 impl FreshnessRules {
     pub fn validate(rule: Option<&Self>) -> FsResult<()> {
-        if rule.is_none() {
+        let Some(rule) = rule else {
+            return Ok(());
+        };
+        // F1: an empty rule object (`error_after: {}` or all children commented
+        // out) is semantically equivalent to omitting the key. Mantle accepts
+        // it; reject only when the rule is *partially* populated.
+        if rule.is_empty() {
             return Ok(());
         }
-        let rule = rule.expect("rule should be Some now");
         if rule.count.is_none() || rule.period.is_none() {
             return Err(fs_err!(
                 ErrorCode::InvalidArgument,
@@ -476,6 +488,13 @@ impl ResolvedQuoting {
             schema: false,
         }
     }
+    pub fn must_quote(&self, what: ComponentName) -> bool {
+        match what {
+            ComponentName::Database => self.database,
+            ComponentName::Schema => self.schema,
+            ComponentName::Identifier => self.identifier,
+        }
+    }
 }
 
 impl TryFrom<DbtQuoting> for ResolvedQuoting {
@@ -683,6 +702,13 @@ pub enum OnConfigurationChange {
     Unknown,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, DbtSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OnError {
+    SkipChildren,
+    Continue,
+}
+
 impl From<StringOrArrayOfStrings> for DbtUniqueKey {
     fn from(value: StringOrArrayOfStrings) -> Self {
         match value {
@@ -730,7 +756,7 @@ pub struct Constraint {
     pub name: Option<String>,
     // Only ForeignKey constraints accept: a relation input
     // ref(), source() etc
-    pub to: Option<String>,
+    pub to: Option<Spanned<String>>,
     /// Only ForeignKey constraints accept: a list columns in that table
     /// containing the corresponding primary or unique key.
     pub to_columns: Option<Vec<String>>,
@@ -772,8 +798,12 @@ pub struct DbtChecksumObject {
 
 impl Default for DbtChecksum {
     fn default() -> Self {
+        // dbt-core FileHash.empty() → {"name": "none", "checksum": ""}.
+        // Generic tests have no source file and use this as their checksum.
+        // name:"" diverges from Mantle state manifests and causes every
+        // generic test to appear as state:modified on every run.
         Self::Object(DbtChecksumObject {
-            name: "".to_string(),
+            name: "none".to_string(),
             checksum: "".to_string(),
         })
     }
@@ -1151,6 +1181,7 @@ pub enum StoreFailuresAs {
 }
 
 #[derive(Debug, Serialize, Default, Deserialize, Clone, EnumString, Display, DbtSchema)]
+#[schemars(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]
 pub enum Severity {
     #[default]
@@ -1165,7 +1196,24 @@ pub enum Severity {
 pub struct Versions {
     pub v: YmlValue,
     pub deprecation_date: Option<String>,
+    pub defined_in: Option<String>,
+    pub description: Option<String>,
+    pub access: Option<String>,
     pub config: Verbatim<Option<dbt_yaml::Value>>,
+    pub constraints: Option<Vec<crate::schemas::properties::model_properties::ModelConstraint>>,
+    pub data_tests: Option<Vec<crate::schemas::data_tests::DataTests>>,
+    pub tests: Option<Vec<crate::schemas::data_tests::DataTests>>,
+    // Schema-only stub: exposes `columns` as a named typed property so the JSON Schema validator
+    // accepts array values. At runtime serde skips this field and `columns` arrives via
+    // __additional_properties__ as a raw YmlValue.
+    // TODO: remove skip_deserializing and delete the __additional_properties__ path for `columns`
+    // once ColumnInheritanceRules::from_version_columns is refactored to accept
+    // &[VersionColumnProperties] instead of &YmlValue.
+    #[serde(skip_deserializing, default)]
+    pub columns: Option<Vec<crate::schemas::dbt_column::VersionColumnProperties>>,
+    // TODO: promote `docs` to a typed field once we settle on the right struct (dbt-core uses
+    // Docs { show: bool, node_color: Optional[str] } but we only have DocsConfig which may
+    // not match exactly).
     pub __additional_properties__: Verbatim<HashMap<String, YmlValue>>,
 }
 
@@ -1281,13 +1329,37 @@ pub fn merge_tags(
 }
 
 pub fn conform_normalized_snapshot_raw_code_to_mantle_format(normalized_full: &str) -> String {
-    // Strip snapshot tags to match dbt-mantle behavior
-    // Remove everything before and including {%snapshot name%} or {%-snapshot name-%}
-    let sql_without_opening = normalized_full
-        .find("{%-snapshot")
-        .or_else(|| normalized_full.find("{%snapshot"))
+    // Strip snapshot tags to match dbt-mantle behavior.
+    //
+    // This fn runs *after* `normalize_sql`, which collapses every run of
+    // whitespace into a single ASCII space. So an on-disk `{%snapshot foo%}`
+    // (no spaces) and `{%- snapshot foo -%}` (whitespace control) both arrive
+    // here as variants of `{% snapshot foo %}` etc. We must accept all of:
+    //   `{%snapshot`, `{% snapshot`, `{%-snapshot`, `{%- snapshot`
+    // and the corresponding `endsnapshot` forms — otherwise the strip silently
+    // no-ops and Fusion's recalculated checksum diverges from Mantle's
+    // pre-stripped raw_code, breaking `state:modified.body` parity.
+    let find_opening = |s: &str| -> Option<usize> {
+        ["{%-snapshot", "{%- snapshot", "{%snapshot", "{% snapshot"]
+            .iter()
+            .filter_map(|p| s.find(*p))
+            .min()
+    };
+    let rfind_closing = |s: &str| -> Option<usize> {
+        [
+            "{%-endsnapshot",
+            "{%- endsnapshot",
+            "{%endsnapshot",
+            "{% endsnapshot",
+        ]
+        .iter()
+        .filter_map(|p| s.rfind(*p))
+        .max()
+    };
+
+    // Remove everything before and including the opening snapshot tag.
+    let sql_without_opening = find_opening(normalized_full)
         .and_then(|start_pos| {
-            // Found the opening tag, now find where it ends
             let after_tag_start = &normalized_full[start_pos..];
             after_tag_start
                 .find("-%}")
@@ -1303,19 +1375,18 @@ pub fn conform_normalized_snapshot_raw_code_to_mantle_format(normalized_full: &s
         })
         .unwrap_or(normalized_full);
 
-    // Strip the closing endsnapshot tag ({%endsnapshot%} or {%-endsnapshot-%})
+    // Strip the closing endsnapshot tag.
     let normalized_sql = sql_without_opening
         .strip_suffix("-%}")
         .or_else(|| sql_without_opening.strip_suffix("%}"))
-        .and_then(|s| {
-            // Find the start of the closing tag ({%- or {%)
-            s.rfind("{%-endsnapshot")
-                .or_else(|| s.rfind("{%endsnapshot"))
-                .map(|pos| &s[..pos])
-        })
+        .and_then(|s| rfind_closing(s).map(|pos| &s[..pos]))
         .unwrap_or(sql_without_opening);
 
-    normalized_sql.to_string()
+    // Trim boundary whitespace left behind by tag stripping. Without this, on-disk
+    // snapshot SQL (which has a `{% snapshot %}` wrapper to strip) and Mantle's
+    // pre-stripped raw_code produce different leading/trailing whitespace and hash
+    // to different digests, breaking `state:modified.body` parity.
+    normalized_sql.trim().to_string()
 }
 
 /// Schema refresh interval configuration.
@@ -1547,6 +1618,81 @@ mod tests {
 
     use super::*;
     use minijinja::value::Value as MinijinjaValue;
+
+    #[test]
+    fn test_conform_normalized_snapshot_strips_spaced_snapshot_blocks() {
+        // Regression: this fn runs *after* `normalize_sql`, which collapses every
+        // run of whitespace into a single ASCII space. So even input that was
+        // `{%snapshot foo%}` on disk becomes `{% snapshot foo %}` (with spaces)
+        // by the time it reaches this fn. The previous implementation only
+        // matched `{%snapshot` / `{%-snapshot` (no space) and silently no-op'd
+        // on the spaced form, leaving the wrapper in the hashed input. That
+        // produced a different checksum than Mantle's pre-stripped raw_code,
+        // breaking `state:modified` parity for snapshots.
+        //
+        // dbt-core's recorded raw_code already has the wrapper removed, so
+        // when Fusion recalculates checksums on both sides, the inputs should
+        // converge once we correctly strip.
+
+        // Standard form: `{% snapshot name %}` ... `{% endsnapshot %}`
+        let normalized = "{% snapshot ip_location %} {{ config(...) }} body {% endsnapshot %}";
+        let stripped = conform_normalized_snapshot_raw_code_to_mantle_format(normalized);
+        assert!(
+            !stripped.contains("snapshot ip_location"),
+            "opening `{{% snapshot ip_location %}}` should be stripped, got: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains("endsnapshot"),
+            "closing `{{% endsnapshot %}}` should be stripped, got: {stripped:?}"
+        );
+        assert!(
+            stripped.contains("config"),
+            "body should be preserved, got: {stripped:?}"
+        );
+
+        // Whitespace-control form: `{%- snapshot name -%}` ... `{%- endsnapshot -%}`
+        let normalized_ws = "{%- snapshot foo -%} {{ x }} {%- endsnapshot -%}";
+        let stripped_ws = conform_normalized_snapshot_raw_code_to_mantle_format(normalized_ws);
+        assert!(
+            !stripped_ws.contains("snapshot foo"),
+            "opening `{{%- snapshot foo -%}}` should be stripped, got: {stripped_ws:?}"
+        );
+        assert!(
+            !stripped_ws.contains("endsnapshot"),
+            "closing `{{%- endsnapshot -%}}` should be stripped, got: {stripped_ws:?}"
+        );
+
+        // Already-stripped form (e.g. raw_code from Mantle's manifest): no-op.
+        let already = "{{ config(...) }} body";
+        assert_eq!(
+            conform_normalized_snapshot_raw_code_to_mantle_format(already),
+            already,
+            "already-stripped input should be returned unchanged"
+        );
+    }
+
+    #[test]
+    fn test_conform_normalized_snapshot_idempotent_with_normalize_sql() {
+        // End-to-end: a typical on-disk snapshot file run through
+        // `normalize_sql` then `conform_...` should produce the same string
+        // as Mantle's pre-stripped raw_code run through the same pipeline.
+        // This is what makes recalculated-checksum equality work for
+        // `state:modified.body` parity.
+        let on_disk = "{% snapshot ip_location %}\n\n    {{\n        config(\n            target_schema='utils'\n        )\n    }}\n    select 1 as id\n{% endsnapshot %}";
+        let mantle_raw_code = "\n\n    {{\n        config(\n            target_schema='utils'\n        )\n    }}\n    select 1 as id\n";
+
+        let from_disk =
+            conform_normalized_snapshot_raw_code_to_mantle_format(&normalize_sql(on_disk));
+        let from_manifest =
+            conform_normalized_snapshot_raw_code_to_mantle_format(&normalize_sql(mantle_raw_code));
+        // Byte-exact, not trim-equal: this output feeds directly into SHA256 for
+        // the body checksum. Any boundary-whitespace divergence produces different
+        // digests and breaks `state:modified.body` parity.
+        assert_eq!(
+            from_disk, from_manifest,
+            "Conform pipeline must produce byte-equal output for on-disk and Mantle-stored raw_code"
+        );
+    }
 
     #[test]
     fn model_freshness_rules_eq_defaults_updates_on_to_any() {
@@ -1948,6 +2094,59 @@ period: hour
         assert_eq!(rules.period, Some(FreshnessPeriod::hour));
     }
 
+    // MVT for F1+F2: pin the validator's truth table for the three failure modes
+    // reported across multiple projects. See `.agents/...` analysis: a partial
+    // freshness rule must still be rejected (negative regression guards), while
+    // a fully-empty rule must be accepted (`is_empty()` short-circuit).
+    #[test]
+    fn test_freshness_rules_validate_empty_ok() {
+        let rule = FreshnessRules {
+            count: None,
+            period: None,
+        };
+        assert!(rule.is_empty());
+        FreshnessRules::validate(Some(&rule))
+            .expect("an empty freshness rule must validate as OK (variant 3)");
+    }
+
+    #[test]
+    fn test_freshness_rules_validate_count_only_err() {
+        let rule = FreshnessRules {
+            count: Some(25),
+            period: None,
+        };
+        let err = FreshnessRules::validate(Some(&rule))
+            .expect_err("a count-only freshness rule must still be rejected (variant 1)");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("count and period are required when freshness is provided"),
+            "unexpected error message: {msg}"
+        );
+        assert!(
+            msg.contains("count: Some(25)") && msg.contains("period: None"),
+            "expected diagnostic to echo the offending values; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_freshness_rules_validate_period_only_err() {
+        let rule = FreshnessRules {
+            count: None,
+            period: Some(FreshnessPeriod::hour),
+        };
+        let err = FreshnessRules::validate(Some(&rule))
+            .expect_err("a period-only freshness rule must still be rejected (variant 2)");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("count and period are required when freshness is provided"),
+            "unexpected error message: {msg}"
+        );
+        assert!(
+            msg.contains("count: None") && msg.contains("period: Some(hour)"),
+            "expected diagnostic to echo the offending values; got: {msg}"
+        );
+    }
+
     #[test]
     fn test_bigquery_partition_config_legacy_deserialize_from_jinja_values() {
         // Test String variant
@@ -1982,5 +2181,120 @@ period: hour
         } else {
             panic!("Expected BigqueryPartitionConfig variant");
         }
+    }
+
+    #[test]
+    fn test_constraint_to_span_ref_captures_line() {
+        let yaml = "type: foreign_key\nto: ref('orders')\nto_columns: [id]\n";
+        let constraint: Constraint = dbt_yaml::from_str(yaml).unwrap();
+        let spanned = constraint.to.as_ref().expect("to should be Some");
+        assert_eq!(spanned.as_str(), "ref('orders')");
+        assert!(spanned.span().is_valid(), "span should be valid");
+        assert_eq!(spanned.span().start.line, 2, "to: should be on line 2");
+    }
+
+    #[test]
+    fn test_constraint_to_span_source_captures_line() {
+        let yaml = "type: foreign_key\nto: source('raw', 'orders')\nto_columns: [id]\n";
+        let constraint: Constraint = dbt_yaml::from_str(yaml).unwrap();
+        let spanned = constraint.to.as_ref().expect("to should be Some");
+        assert_eq!(spanned.as_str(), "source('raw', 'orders')");
+        assert!(spanned.span().is_valid(), "span should be valid");
+        assert_eq!(spanned.span().start.line, 2, "to: should be on line 2");
+    }
+
+    #[test]
+    fn test_dbt_checksum_default_matches_dbt_core_file_hash_empty() {
+        // dbt-core's FileHash.empty() serializes as {"name": "none", "checksum": ""}.
+        // Generic tests have no source file and use DbtChecksum::default() for their
+        // checksum. If default() emits name:"" instead of name:"none", every generic
+        // test appears as state:modified against a Mantle-recorded state manifest,
+        // causing all-test over-selection and Replay Data Missing errors in conformance.
+        let default = DbtChecksum::default();
+        let json = serde_json::to_value(&default).expect("serializes");
+        assert_eq!(
+            json["name"], "none",
+            "DbtChecksum::default() must serialize name as \"none\" to match dbt-core FileHash.empty()"
+        );
+        assert_eq!(json["checksum"], "", "checksum must be empty string");
+
+        // Must be equal to an explicitly constructed {name:"none", checksum:""} — the
+        // form that appears in Mantle-produced state manifests.
+        let mantle_form = DbtChecksum::Object(DbtChecksumObject {
+            name: "none".to_string(),
+            checksum: "".to_string(),
+        });
+        assert_eq!(
+            default, mantle_form,
+            "DbtChecksum::default() must equal the Mantle state-manifest form {{name:\"none\",checksum:\"\"}}"
+        );
+    }
+
+    // Regression: `columns:` inside a version block must survive deserialization and land in
+    // `__additional_properties__`, where `process_versioned_columns` reads it. The schema-only
+    // stub field (`#[serde(skip_deserializing)]`) must NOT cause serde to silently consume and
+    // discard the value before dbt_yaml's flatten-dunder mechanism can capture it.
+    #[test]
+    fn test_versions_columns_land_in_additional_properties() {
+        let yaml = "v: 2\ncolumns:\n  - name: id\n    description: primary key\n";
+        let value: dbt_yaml::Value = dbt_yaml::from_str(yaml).unwrap();
+        // Use into_typed (the same path as into_typed_with_jinja) so dbt_yaml's
+        // dunder-flatten mechanism is active.
+        let versions: Versions = value
+            .into_typed::<Versions, _, _>(
+                |_, _, _| {},
+                |_| -> Result<
+                    Option<dbt_yaml::Value>,
+                    Box<dyn std::error::Error + 'static + Send + Sync>,
+                > { Ok(None) },
+            )
+            .unwrap();
+
+        assert!(
+            versions.__additional_properties__.contains_key("columns"),
+            "`columns` must reach __additional_properties__, but it was dropped. \
+             Check that serde's skip_deserializing does not prevent the value from \
+             falling through to the dbt_yaml flatten-dunder catch-all."
+        );
+
+        // Also confirm the schema-only `columns` field itself is always None at runtime.
+        assert!(
+            versions.columns.is_none(),
+            "`columns` schema-stub field must always be None after deserialization"
+        );
+    }
+
+    // Regression: the generated JSON Schema for Versions must expose `columns` as a named
+    // array property so YAML language servers do not reject `columns: [...]` with
+    // "Incorrect type. Expected 'object'".
+    #[test]
+    fn test_versions_schema_has_columns_as_array_property() {
+        use crate::man::deny_additional_properties_in_root;
+        use schemars::r#gen::SchemaSettings;
+
+        let generator = SchemaSettings::draft07().into_generator();
+        let mut root =
+            generator.into_root_schema_for::<crate::schemas::properties::DbtPropertiesFile>();
+        deny_additional_properties_in_root(&mut root);
+
+        let schema_json = serde_json::to_value(&root).unwrap();
+        let versions_def = &schema_json["definitions"]["Versions"];
+        let columns_schema = &versions_def["properties"]["columns"];
+
+        assert!(
+            !columns_schema.is_null(),
+            "`columns` must be a named property in the Versions schema definition"
+        );
+
+        let type_field = &columns_schema["type"];
+        let is_array = type_field == "array"
+            || type_field
+                .as_array()
+                .map(|arr| arr.iter().any(|v| v == "array"))
+                .unwrap_or(false);
+        assert!(
+            is_array,
+            "`columns` property must have type 'array' (got {type_field})"
+        );
     }
 }

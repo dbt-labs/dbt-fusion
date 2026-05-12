@@ -1,7 +1,7 @@
 //! Module containing the entrypoint for the resolve phase.
+use dbt_adapter_core::AdapterType;
 #[allow(unused_imports)]
 use dbt_common::FsError;
-use dbt_common::adapter::AdapterType;
 use dbt_common::cancellation::CancellationToken;
 use dbt_common::constants::DBT_GENERIC_TESTS_DIR_NAME;
 use dbt_common::io_args::FsCommand;
@@ -20,19 +20,10 @@ use dbt_jinja_utils::phases::parse::init::initialize_parse_jinja_environment;
 use dbt_jinja_utils::serde::{into_typed_with_error, into_typed_with_jinja};
 use dbt_jinja_utils::utils::dependency_package_name_from_ctx;
 use dbt_schemas::dbt_utils::resolve_package_quoting;
-use dbt_schemas::schemas::common::Access;
-use dbt_schemas::schemas::macros::build_macro_units;
+use dbt_schemas::schemas::common::{Access, DbtIncrementalStrategy};
+use dbt_schemas::schemas::macros::{DbtDocsMacro, build_macro_units};
 use dbt_schemas::schemas::properties::{MetricsProperties, ModelProperties};
 use dbt_schemas::schemas::{InternalDbtNode, Nodes};
-
-use dbt_jinja_utils::jinja_environment::JinjaEnv;
-use dbt_schemas::state::{
-    DbtPackage, GenericTestAsset, GetColumnsInRelationCalls, GetRelationCalls, Macros,
-    PatternedDanglingSources, RenderResults,
-};
-use dbt_schemas::state::{DbtRuntimeConfig, Operations};
-use minijinja::constants::CURRENT_PATH;
-use tracing::Instrument as _;
 
 use crate::args::ResolveArgs;
 use crate::dbt_project_config::{RootProjectConfigs, build_root_project_configs};
@@ -40,10 +31,18 @@ use crate::resolve::resolve_groups::resolve_groups;
 use crate::resolve::resolve_operations::resolve_operations;
 use crate::resolve::resolve_query_comment::resolve_query_comment;
 use crate::utils::{self, clear_package_diagnostics};
+use dbt_jinja_utils::jinja_environment::JinjaEnv;
 use dbt_schemas::schemas::common::DbtQuoting;
 use dbt_schemas::schemas::telemetry::{ExecutionPhase, NodeType, PhaseExecuted};
+use dbt_schemas::state::{
+    DbtPackage, GenericTestAsset, GetColumnsInRelationCalls, GetRelationCalls, Macros,
+    PatternedDanglingSources, RenderResults,
+};
+use dbt_schemas::state::{DbtRuntimeConfig, Operations};
 use dbt_schemas::state::{DbtState, ResolverState};
-use std::collections::{BTreeMap, HashMap};
+use minijinja::constants::CURRENT_PATH;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::resolve::resolve_analyses::resolve_analyses;
@@ -68,7 +67,10 @@ use crate::resolve::primary_key_inference::infer_and_apply_primary_keys;
 use crate::resolve::resolve_selectors::{
     resolve_final_selectors, resolve_manifest_selectors, resolve_selectors_from_yaml,
 };
+use crate::unused_config_paths::check_unused_resource_config_paths;
 use dbt_yaml::Value as YmlValue;
+
+use crate::constants::DEFAULT_OVERVIEW_CONTENTS;
 
 /// Entrypoint for the resolve phase.
 ///
@@ -124,23 +126,26 @@ pub async fn resolve(
         macros.docs_macros.extend(docs_macros);
     }
 
-    let adapter_type = dbt_state
-        .dbt_profile
-        .db_config
-        .adapter_type_if_supported()
-        .ok_or_else(|| {
-            let hint = dbt_state
-                .dbt_profile
-                .db_config
-                .unsupported_adapter_hint()
-                .map(|h| format!(" {h}"))
-                .unwrap_or_default();
-            fs_err!(
-                ErrorCode::InvalidConfig,
-                "Invalid or unsupported adapter type in profile: {}.{hint}",
-                dbt_state.dbt_profile.db_config.adapter_type()
-            )
-        })?;
+    // dbt Core always ships a global project with an overview.md that produces
+    // doc.dbt.__overview__.  The dbt Docs HTML unconditionally reads this entry
+    // (overview controller: `i = n.docs["doc.dbt.__overview__"]`) and crashes
+    // with a TypeError if it is absent.  Inject a default entry whenever the
+    // user's project (and its dependencies) have not defined their own
+    // {% docs __overview__ %} block.
+    let overview_uid = "doc.dbt.__overview__".to_string();
+    macros
+        .docs_macros
+        .entry(overview_uid.clone())
+        .or_insert_with(|| DbtDocsMacro {
+            name: "__overview__".to_string(),
+            package_name: "dbt".to_string(),
+            path: PathBuf::from("overview.md"),
+            original_file_path: PathBuf::from("overview.md"),
+            unique_id: overview_uid,
+            block_contents: DEFAULT_OVERVIEW_CONTENTS.to_string(),
+        });
+
+    let adapter_type = dbt_state.dbt_profile.db_config.adapter_type();
 
     // Build the root project config
     let root_project_quoting =
@@ -150,7 +155,7 @@ pub async fn resolve(
         root_project_name,
         &dbt_state.dbt_profile.profile,
         &dbt_state.dbt_profile.target,
-        adapter_type.as_ref(),
+        adapter_type,
         dbt_state.dbt_profile.db_config.clone(),
         root_project_quoting,
         build_macro_units(&macros.macros),
@@ -179,7 +184,7 @@ pub async fn resolve(
     // let mut nodes = Nodes::default();
     let mut disabled_nodes = Nodes::default();
     let root_project_configs = build_root_project_configs(
-        &arg.io,
+        arg,
         dbt_state.root_project(),
         root_project_quoting,
         adapter_type,
@@ -209,71 +214,43 @@ pub async fn resolve(
         BTreeMap<String, resolve_properties::MinimalPropertiesEntry>,
     >;
 
-    // Use sequential processing if num_threads is 1, otherwise use parallel processing
-    if arg.num_threads == Some(1) {
-        let (
-            resolved_nodes,
-            resolved_disabled_nodes,
-            resolved_collector,
-            resolved_semantic_layer_spec_is_legacy,
-            resolved_test_name_truncations,
-            resolved_macro_properties,
-        ) = resolve_packages_sequentially(
-            package_waves,
-            arg,
-            dbt_state.clone(),
-            root_project_name,
-            root_project_configs.clone(),
-            adapter_type,
-            &macros,
-            jinja_env.clone(),
-            &mut node_resolver,
-            &mut all_runtime_configs,
-            token,
-            jinja_type_checking_event_listener_factory.clone(),
-        )
-        .await?;
-        nodes.extend(resolved_nodes);
-        disabled_nodes.extend(resolved_disabled_nodes);
-        collector
-            .rendering_results
-            .extend(resolved_collector.rendering_results);
-        semantic_layer_spec_is_legacy |= resolved_semantic_layer_spec_is_legacy;
-        test_name_truncations.extend(resolved_test_name_truncations);
-        all_macro_properties = resolved_macro_properties;
-    } else {
-        // Parallel processing (original implementation)
-        let (
-            resolved_nodes,
-            resolved_disabled_nodes,
-            resolved_collector,
-            resolved_semantic_layer_spec_is_legacy,
-            resolved_test_name_truncations,
-            resolved_macro_properties,
-        ) = resolve_packages_parallel(
-            package_waves,
-            arg,
-            dbt_state.clone(),
-            root_project_name,
-            root_project_configs.clone(),
-            adapter_type,
-            &macros,
-            jinja_env.clone(),
-            &mut node_resolver,
-            &mut all_runtime_configs,
-            token,
-            jinja_type_checking_event_listener_factory.clone(),
-        )
-        .await?;
-        nodes.extend(resolved_nodes);
-        disabled_nodes.extend(resolved_disabled_nodes);
-        collector
-            .rendering_results
-            .extend(resolved_collector.rendering_results);
-        semantic_layer_spec_is_legacy |= resolved_semantic_layer_spec_is_legacy;
-        test_name_truncations.extend(resolved_test_name_truncations);
-        all_macro_properties = resolved_macro_properties;
-    }
+    let (
+        resolved_nodes,
+        resolved_disabled_nodes,
+        resolved_collector,
+        resolved_semantic_layer_spec_is_legacy,
+        resolved_test_name_truncations,
+        resolved_macro_properties,
+    ) = resolve_package_waves(
+        package_waves,
+        arg,
+        dbt_state.clone(),
+        root_project_name,
+        root_project_configs.clone(),
+        adapter_type,
+        &macros,
+        jinja_env.clone(),
+        &mut node_resolver,
+        &mut all_runtime_configs,
+        token,
+        jinja_type_checking_event_listener_factory.clone(),
+    )
+    .await?;
+    nodes.extend(resolved_nodes);
+    disabled_nodes.extend(resolved_disabled_nodes);
+    collector
+        .rendering_results
+        .extend(resolved_collector.rendering_results);
+    semantic_layer_spec_is_legacy |= resolved_semantic_layer_spec_is_legacy;
+    test_name_truncations.extend(resolved_test_name_truncations);
+    all_macro_properties = resolved_macro_properties;
+
+    // Read the validate_macro_args flag from dbt_project.yml (defaults to true)
+    let validate_macro_args = dbt_state
+        .root_project_flags()
+        .get("validate_macro_args")
+        .map(|v| v.is_true())
+        .unwrap_or(true);
 
     // Apply macro patches from YAML schema files
     for (package_name, macro_properties) in all_macro_properties {
@@ -302,6 +279,7 @@ pub async fn resolve(
                 &package_name,
                 &jinja_env,
                 &base_ctx,
+                validate_macro_args,
             )?;
         }
     }
@@ -309,7 +287,7 @@ pub async fn resolve(
     // Ensure that there are no duplicate relations
     check_relation_uniqueness(&nodes)?;
 
-    match nodes.warn_on_microbatch() {
+    match nodes.warn_on_microbatch(adapter_type) {
         Ok(_) => {}
         Err(e) => {
             emit_warn_log_from_fs_error(e.as_ref(), arg.io.status_reporter.as_ref());
@@ -374,12 +352,22 @@ pub async fn resolve(
         &mut operations,
         &node_resolver,
     );
+    for warning in microbatch_model_no_event_time_inputs_warnings(&nodes) {
+        emit_warn_log_from_fs_error(&warning, arg.io.status_reporter.as_ref());
+    }
 
     // Check for model deprecation warnings
     check_for_model_deprecations(&arg.io, &nodes);
 
+    check_unused_resource_config_paths(
+        &arg.io,
+        &dbt_state.root_package().package_root_path,
+        &nodes,
+        &disabled_nodes,
+    )?;
+
     // Check access
-    check_access(arg, &nodes, &all_runtime_configs);
+    let nodes_with_access_errors = check_access(arg, &nodes, &all_runtime_configs);
 
     // Set the project name on nodes so that `package:this` selectors can resolve
     nodes.project_name = Some(root_project_name.to_string());
@@ -410,6 +398,7 @@ pub async fn resolve(
             render_results: collector,
             run_started_at: dbt_state.run_started_at,
             nodes_with_resolution_errors,
+            nodes_with_access_errors,
             node_resolver: Arc::new(node_resolver),
             get_relation_calls,
             get_columns_in_relation_calls,
@@ -427,14 +416,17 @@ pub async fn resolve(
 }
 
 // Check that models accessing other models (dependecies) can do so.
+// Returns the set of unique_ids that have access violations.
 fn check_access(
     arg: &ResolveArgs,
     nodes: &Nodes,
     all_runtime_configs: &BTreeMap<String, Arc<DbtRuntimeConfig>>,
-) {
+) -> HashSet<String> {
+    let mut violations = HashSet::new();
+
     // Check access for models
     for (unique_id, node) in nodes.models.iter() {
-        check_node_access(
+        if check_node_access(
             arg,
             unique_id,
             &node.base().depends_on.nodes_with_ref_location,
@@ -445,12 +437,14 @@ fn check_access(
                 // Models can access private models if they're in the same group and same package
                 node.__model_attr__.group != target_node.__model_attr__.group || diffent_packages
             },
-        );
+        ) {
+            violations.insert(unique_id.clone());
+        }
     }
 
     // Check access for exposures
     for (unique_id, node) in nodes.exposures.iter() {
-        check_node_access(
+        if check_node_access(
             arg,
             unique_id,
             &node.base().depends_on.nodes_with_ref_location,
@@ -462,11 +456,50 @@ fn check_access(
                 // unless the private model has no group and they're in the same package
                 target_node.__model_attr__.group.is_some() || diffent_packages
             },
-        );
+        ) {
+            violations.insert(unique_id.clone());
+        }
     }
+
+    violations
 }
 
-/// Helper function to check access for a node referencing other models
+fn microbatch_model_no_event_time_inputs_warnings(nodes: &Nodes) -> Vec<FsError> {
+    nodes
+        .models
+        .values()
+        .filter(|model| {
+            model.__model_attr__.incremental_strategy == Some(DbtIncrementalStrategy::Microbatch)
+                && model.__model_attr__.event_time.is_some()
+                && !has_event_time_input(nodes, model.as_ref())
+        })
+        .map(|model| {
+            FsError::new(
+                ErrorCode::MicrobatchModelNoEventTimeInputs,
+                format!(
+                    "The microbatch model '{}' has no 'ref' or 'source' input with an 'event_time' configuration. \nThis means no filtering can be applied and can result in unexpected duplicate records in the resulting microbatch model.",
+                    model.common().name
+                ),
+            )
+        })
+        .collect()
+}
+
+fn has_event_time_input(nodes: &Nodes, model: &dyn InternalDbtNode) -> bool {
+    model.base().depends_on.nodes.iter().any(|unique_id| {
+        nodes
+            .models
+            .get(unique_id)
+            .is_some_and(|node| node.__model_attr__.event_time.is_some())
+            || nodes
+                .sources
+                .get(unique_id)
+                .is_some_and(|node| node.deprecated_config.event_time.is_some())
+    })
+}
+
+/// Helper function to check access for a node referencing other models.
+/// Returns true if any access violation was found.
 fn check_node_access<F>(
     arg: &ResolveArgs,
     unique_id: &str,
@@ -475,9 +508,11 @@ fn check_node_access<F>(
     nodes: &Nodes,
     all_runtime_configs: &BTreeMap<String, Arc<DbtRuntimeConfig>>,
     should_deny_private_access: F,
-) where
+) -> bool
+where
     F: Fn(&dbt_schemas::schemas::nodes::DbtModel, bool) -> bool,
 {
+    let mut had_violation = false;
     for (target_unique_id, location) in node_dependencies {
         if let Some(target_node) = nodes.models.get(target_unique_id) {
             let restricted_access = all_runtime_configs
@@ -499,6 +534,7 @@ fn check_node_access<F>(
                     target_node.__model_attr__.group.as_deref().unwrap_or(""),
                 );
                 emit_error_log_from_fs_error(&err, arg.io.status_reporter.as_ref());
+                had_violation = true;
             } else if target_node.__model_attr__.access == Access::Protected && diffent_packages {
                 let err = fs_err!(
                     code => ErrorCode::AccessDenied,
@@ -509,9 +545,11 @@ fn check_node_access<F>(
                     target_node.common().package_name,
                 );
                 emit_error_log_from_fs_error(&err, arg.io.status_reporter.as_ref());
+                had_violation = true;
             }
         }
     }
+    had_violation
 }
 
 /// Inner resolve function that resolves a single package.
@@ -564,6 +602,7 @@ pub async fn resolve_inner(
         arg,
         package,
         root_package_name,
+        root_project_configs,
         &jinja_env,
         &base_ctx,
         token,
@@ -642,6 +681,7 @@ pub async fn resolve_inner(
         arg,
         package,
         root_package_name,
+        dbt_state.root_project(),
         root_project_configs,
         min_properties.source_tables,
         database,
@@ -695,11 +735,25 @@ pub async fn resolve_inner(
         &base_ctx,
         runtime_config.clone(),
         &mut node_resolver,
+        &mut collected_generic_tests,
+        test_name_truncations,
         token,
     )
     .await?;
     nodes.snapshots.extend(snapshots);
     disabled_nodes.snapshots.extend(disabled_snapshots);
+
+    let (groups, disabled_groups) = resolve_groups(
+        arg,
+        &mut min_properties.groups,
+        package_name,
+        &jinja_env,
+        &base_ctx,
+    )
+    .await?;
+
+    nodes.groups.extend(groups);
+    disabled_nodes.groups.extend(disabled_groups);
 
     // Resolve SQLs and get nodes and rendered SQLs except refs and sources
     let (models, rendering_results, disabled_models) = resolve_models(
@@ -853,6 +907,7 @@ pub async fn resolve_inner(
         &node_resolver,
         token,
         jinja_type_checking_event_listener_factory.clone(),
+        &nodes.models,
     )
     .await?;
     nodes.tests.extend(data_tests);
@@ -861,8 +916,7 @@ pub async fn resolve_inner(
     infer_and_apply_primary_keys(&mut nodes, &disabled_nodes);
 
     let (unit_tests, disabled_unit_tests) = resolve_unit_tests(
-        &arg.io,
-        arg.static_analysis,
+        arg,
         min_properties.unit_tests,
         package,
         package_quoting,
@@ -880,18 +934,6 @@ pub async fn resolve_inner(
     if let Some(query_comment) = package.dbt_project.query_comment.as_ref() {
         resolve_query_comment(query_comment, &jinja_env, &base_ctx)?;
     }
-
-    let (groups, disabled_groups) = resolve_groups(
-        arg,
-        &mut min_properties.groups,
-        package_name,
-        &jinja_env,
-        &base_ctx,
-    )
-    .await?;
-
-    nodes.groups.extend(groups);
-    disabled_nodes.groups.extend(disabled_groups);
 
     let collector = RenderResults {
         rendering_results: rendering_results
@@ -1035,9 +1077,9 @@ async fn resolve_package(
     ))
 }
 
-/// Resolves packages sequentially (single-threaded).
+/// Resolves packages in waves (inter-wave sequential, intra-wave parallel via `dispatch_maybe_parallel`).
 #[allow(clippy::too_many_arguments)]
-async fn resolve_packages_sequentially(
+async fn resolve_package_waves(
     package_waves: Vec<Vec<String>>,
     arg: &ResolveArgs,
     dbt_state: Arc<DbtState>,
@@ -1058,6 +1100,11 @@ async fn resolve_packages_sequentially(
     HashMap<String, String>,
     BTreeMap<String, BTreeMap<String, resolve_properties::MinimalPropertiesEntry>>,
 )> {
+    let max_concurrency =
+        crate::parallel::effective_parallelism_with(arg.num_threads, arg.no_parallel);
+    let arg = Arc::new(arg.clone());
+    let macros = Arc::new(macros.clone());
+
     let mut nodes = Nodes::default();
     let mut disabled_nodes = Nodes::default();
     let mut collector = RenderResults {
@@ -1069,26 +1116,63 @@ async fn resolve_packages_sequentially(
         String,
         BTreeMap<String, resolve_properties::MinimalPropertiesEntry>,
     > = BTreeMap::new();
+
     for package_wave in package_waves {
         token.check_cancellation()?;
 
-        for package_name in package_wave {
-            let result = resolve_package(
-                package_name.clone(),
-                arg,
-                dbt_state.clone(),
-                root_project_name.to_string(),
-                root_project_configs.clone(),
-                adapter_type,
-                macros,
-                jinja_env.clone(),
-                node_resolver.clone(),
-                all_runtime_configs,
-                token,
-                jinja_type_checking_event_listener_factory.clone(),
-            )
-            .await?;
+        // Snapshot per-wave state for parallel tasks
+        let runtime_configs_snapshot = Arc::new(all_runtime_configs.clone());
+        let node_resolver_snapshot = node_resolver.clone();
 
+        let arg = arg.clone();
+        let dbt_state = dbt_state.clone();
+        let root_project_name = root_project_name.to_string();
+        let root_project_configs = root_project_configs.clone();
+        let macros = macros.clone();
+        let jinja_env = jinja_env.clone();
+        let token = token.clone();
+        let jinja_type_checking_event_listener_factory =
+            jinja_type_checking_event_listener_factory.clone();
+
+        let results = crate::parallel::dispatch_maybe_parallel(
+            package_wave,
+            max_concurrency > 1,
+            move |package_name: String| {
+                let arg = arg.clone();
+                let dbt_state = dbt_state.clone();
+                let root_project_name = root_project_name.clone();
+                let root_project_configs = root_project_configs.clone();
+                let macros = macros.clone();
+                let jinja_env = jinja_env.clone();
+                let node_resolver = node_resolver_snapshot.clone();
+                let runtime_configs = runtime_configs_snapshot.clone();
+                let token = token.clone();
+                let jinja_type_checking_event_listener_factory =
+                    jinja_type_checking_event_listener_factory.clone();
+
+                async move {
+                    resolve_package(
+                        package_name,
+                        &arg,
+                        dbt_state,
+                        root_project_name,
+                        root_project_configs,
+                        adapter_type,
+                        &macros,
+                        jinja_env,
+                        node_resolver,
+                        &runtime_configs,
+                        &token,
+                        jinja_type_checking_event_listener_factory,
+                    )
+                    .await
+                }
+            },
+        )
+        .await?;
+
+        // Merge wave results back into accumulators
+        for result in results {
             let (
                 package_name,
                 runtime_config,
@@ -1103,26 +1187,22 @@ async fn resolve_packages_sequentially(
 
             semantic_layer_spec_is_legacy |= resolved_semantic_layer_spec_is_legacy;
 
-            // Update runtime configs for next wave
             dbt_schemas::state::register_global_runtime_config(
                 package_name.clone(),
                 runtime_config.clone(),
             );
             all_runtime_configs.insert(package_name.clone(), runtime_config);
 
-            // Collect macro properties for patching later
             if !macro_properties.is_empty() {
                 all_macro_properties.insert(package_name.clone(), macro_properties);
             }
 
-            // Merge results
             nodes.extend(new_nodes);
             disabled_nodes.extend(new_disabled_nodes);
             collector
                 .rendering_results
                 .extend(rendering_results.rendering_results);
             test_name_truncations.extend(resolved_test_name_truncations);
-            // Update refs and sources
             node_resolver.merge(updated_node_resolver);
         }
     }
@@ -1137,132 +1217,74 @@ async fn resolve_packages_sequentially(
     ))
 }
 
-/// Resolves packages in parallel using tokio::spawn.
-#[allow(clippy::too_many_arguments)]
-async fn resolve_packages_parallel(
-    package_waves: Vec<Vec<String>>,
-    arg: &ResolveArgs,
-    dbt_state: Arc<DbtState>,
-    root_project_name: &str,
-    root_project_configs: Arc<RootProjectConfigs>,
-    adapter_type: AdapterType,
-    macros: &Macros,
-    jinja_env: Arc<JinjaEnv>,
-    node_resolver: &mut NodeResolver,
-    all_runtime_configs: &mut BTreeMap<String, Arc<DbtRuntimeConfig>>,
-    token: &CancellationToken,
-    jinja_type_checking_event_listener_factory: Arc<dyn JinjaTypeCheckingEventListenerFactory>,
-) -> FsResult<(
-    Nodes,
-    Nodes,
-    RenderResults,
-    bool,
-    HashMap<String, String>,
-    BTreeMap<String, BTreeMap<String, resolve_properties::MinimalPropertiesEntry>>,
-)> {
-    let mut nodes = Nodes::default();
-    let mut disabled_nodes = Nodes::default();
-    let mut collector = RenderResults {
-        rendering_results: BTreeMap::new(),
-    };
-    let mut semantic_layer_spec_is_legacy = false;
-    let mut test_name_truncations: HashMap<String, String> = HashMap::new();
-    let mut all_macro_properties: BTreeMap<
-        String,
-        BTreeMap<String, resolve_properties::MinimalPropertiesEntry>,
-    > = BTreeMap::new();
-    let arg = Arc::new(arg.clone());
-    let macros = Arc::new(macros.clone());
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
 
-    for package_wave in package_waves {
-        let all_runtime_configs_snapshot_arc = Arc::new(all_runtime_configs.clone()); // update snapshot after each wave
-        token.check_cancellation()?;
+    use dbt_schemas::schemas::macros::DbtDocsMacro;
 
-        let mut handles = Vec::new();
-        for package_name in package_wave {
-            let arg = arg.clone();
-            let dbt_state = dbt_state.clone();
-            let root_project_name = root_project_name.to_string();
-            let root_project_configs = root_project_configs.clone();
-            let macros = macros.clone();
-            let jinja_env = jinja_env.clone();
-            let node_resolver = node_resolver.clone();
-            let all_runtime_configs_snapshot = all_runtime_configs_snapshot_arc.clone();
-            let dbt_state = dbt_state.clone();
-            let token = token.clone();
-            let jinja_type_checking_event_listener_factory =
-                jinja_type_checking_event_listener_factory.clone();
-            handles.push(tokio::spawn(
-                async move {
-                    resolve_package(
-                        package_name,
-                        &arg,
-                        dbt_state,
-                        root_project_name,
-                        root_project_configs,
-                        adapter_type,
-                        &macros,
-                        jinja_env,
-                        node_resolver,
-                        &all_runtime_configs_snapshot,
-                        &token,
-                        jinja_type_checking_event_listener_factory,
-                    )
-                    .await
-                    .map_err(|e| *e)
-                }
-                .in_current_span(),
-            ));
-        }
+    use crate::constants::DEFAULT_OVERVIEW_CONTENTS;
 
-        // Wait for all packages in this wave to finish, then merge results and update configs
-        for handle in handles {
-            let result = handle.await;
-            let (
-                package_name,
-                runtime_config,
-                new_nodes,
-                new_disabled_nodes,
-                rendering_results,
-                updated_node_resolver,
-                resolved_semantic_layer_spec_is_legacy,
-                resolved_test_name_truncations,
-                macro_properties,
-            ) = match result {
-                Ok(Ok(val)) => val,
-                Ok(Err(e)) => return Err(Box::new(e)),
-                Err(e) => return Err(fs_err!(ErrorCode::Unexpected, "Join error: {}", e)),
-            };
-            semantic_layer_spec_is_legacy |= resolved_semantic_layer_spec_is_legacy;
-
-            // Update runtime configs for next wave
-            dbt_schemas::state::register_global_runtime_config(
-                package_name.clone(),
-                runtime_config.clone(),
-            );
-            all_runtime_configs.insert(package_name.clone(), runtime_config);
-            // Collect macro properties for patching later
-            if !macro_properties.is_empty() {
-                all_macro_properties.insert(package_name.clone(), macro_properties);
-            }
-            // Merge results in main thread
-            nodes.extend(new_nodes);
-            disabled_nodes.extend(new_disabled_nodes);
-            collector
-                .rendering_results
-                .extend(rendering_results.rendering_results);
-            test_name_truncations.extend(resolved_test_name_truncations);
-            // This could be optimized refs and sources can all be inserted at the end instead of merging
-            node_resolver.merge(updated_node_resolver);
-        }
+    /// Helper that applies the same injection logic as the resolver so tests
+    /// stay in sync with the production code.
+    fn inject_default_overview(docs: &mut BTreeMap<String, DbtDocsMacro>) {
+        let overview_uid = "doc.dbt.__overview__".to_string();
+        docs.entry(overview_uid.clone())
+            .or_insert_with(|| DbtDocsMacro {
+                name: "__overview__".to_string(),
+                package_name: "dbt".to_string(),
+                path: PathBuf::from("overview.md"),
+                original_file_path: PathBuf::from("overview.md"),
+                unique_id: overview_uid,
+                block_contents: DEFAULT_OVERVIEW_CONTENTS.to_string(),
+            });
     }
 
-    Ok((
-        nodes,
-        disabled_nodes,
-        collector,
-        semantic_layer_spec_is_legacy,
-        test_name_truncations,
-        all_macro_properties,
-    ))
+    /// When a project defines no {% docs %} blocks, `doc.dbt.__overview__`
+    /// must be present in the manifest so the dbt Docs HTML doesn't crash.
+    #[test]
+    fn test_default_overview_injected_when_no_docs_defined() {
+        let mut docs: BTreeMap<String, DbtDocsMacro> = BTreeMap::new();
+        inject_default_overview(&mut docs);
+
+        let entry = docs
+            .get("doc.dbt.__overview__")
+            .expect("doc.dbt.__overview__ must be injected");
+
+        assert_eq!(entry.name, "__overview__");
+        assert_eq!(entry.package_name, "dbt");
+        assert_eq!(entry.unique_id, "doc.dbt.__overview__");
+        assert!(
+            !entry.block_contents.is_empty(),
+            "block_contents must not be empty"
+        );
+    }
+
+    /// A user-defined {% docs __overview__ %} (package_name = project) must
+    /// NOT be overwritten by the default injection.
+    #[test]
+    fn test_user_overview_not_overwritten() {
+        let uid = "doc.dbt.__overview__".to_string();
+        let user_doc = DbtDocsMacro {
+            name: "__overview__".to_string(),
+            package_name: "my_project".to_string(),
+            path: PathBuf::from("models/overview.md"),
+            original_file_path: PathBuf::from("models/overview.md"),
+            unique_id: uid.clone(),
+            block_contents: "# My custom overview".to_string(),
+        };
+
+        let mut docs: BTreeMap<String, DbtDocsMacro> = BTreeMap::new();
+        docs.insert(uid, user_doc);
+        inject_default_overview(&mut docs);
+
+        let entry = docs
+            .get("doc.dbt.__overview__")
+            .expect("entry must still exist");
+        assert_eq!(
+            entry.block_contents, "# My custom overview",
+            "user-defined overview must not be replaced by the default"
+        );
+    }
 }

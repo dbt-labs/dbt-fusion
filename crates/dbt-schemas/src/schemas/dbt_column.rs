@@ -123,6 +123,31 @@ pub struct ColumnProperties {
     pub dimension: Option<ColumnPropertiesDimension>,
 }
 
+/// Column entry inside a model version block.
+///
+/// Unlike `ColumnProperties`, `name` is optional here because version column lists can contain
+/// include/exclude directives (e.g. `include: all, exclude: [col]`) that have no name.
+#[skip_serializing_none]
+#[derive(Default, Deserialize, Serialize, Debug, Clone, DbtSchema)]
+pub struct VersionColumnProperties {
+    pub name: Option<String>,
+    pub include: Option<StringOrArrayOfStrings>,
+    pub exclude: Option<Vec<String>>,
+    pub data_type: Option<String>,
+    pub description: Option<String>,
+    pub constraints: Option<Vec<Constraint>>,
+    pub tests: Option<Vec<DataTests>>,
+    pub data_tests: Option<Vec<DataTests>>,
+    pub granularity: Option<Granularity>,
+    pub policy_tags: Option<Vec<String>>,
+    pub databricks_tags: Option<BTreeMap<String, YmlValue>>,
+    pub column_mask: Option<ColumnMask>,
+    pub quote: Option<bool>,
+    pub config: Option<ColumnConfig>,
+    pub entity: Option<Entity>,
+    pub dimension: Option<ColumnPropertiesDimension>,
+}
+
 #[derive(Debug, Default, Deserialize, Serialize, Clone, DbtSchema, Eq, PartialEq)]
 pub struct ColumnMask {
     pub function: String,
@@ -153,6 +178,7 @@ pub struct ColumnConfig {
     pub tags: Option<StringOrArrayOfStrings>,
     pub meta: Option<IndexMap<String, YmlValue>>,
     pub databricks_tags: Option<BTreeMap<String, YmlValue>>,
+    pub policy_tags: Option<Vec<String>>,
 }
 
 /// Represents column inheritance rules for a model version
@@ -236,35 +262,88 @@ pub fn process_columns(
 ) -> FsResult<Vec<DbtColumnRef>> {
     Ok(columns
         .map(|cols| {
-            cols.iter()
-                .map(|cp| {
-                    let (cp_meta, cp_tags, cp_databricks_tags) = cp
-                        .config
-                        .clone()
-                        .map(|c| (c.meta, c.tags, c.databricks_tags))
-                        .unwrap_or_default();
+            // Deduplicate by column name, keeping the last definition for each name.
+            // This matches dbt-core/Mantle behaviour where columns are stored in a dict
+            // and a later definition silently overwrites an earlier one.
+            let mut by_name: IndexMap<String, DbtColumnRef> = IndexMap::new();
+            for cp in cols.iter() {
+                let (cp_meta, cp_tags, cp_databricks_tags, cp_policy_tags) = cp
+                    .config
+                    .clone()
+                    .map(|c| (c.meta, c.tags, c.databricks_tags, c.policy_tags))
+                    .unwrap_or_default();
 
-                    Ok(Arc::new(DbtColumn {
-                        name: cp.name.clone(),
-                        data_type: cp.data_type.clone(),
-                        description: cp.description.clone(),
-                        constraints: cp.constraints.clone().unwrap_or_default(),
-                        meta: cp_meta.or_else(|| meta.clone()).unwrap_or_default(),
-                        tags: cp_tags
-                            .map(|t| t.into())
-                            .or_else(|| tags.clone())
-                            .unwrap_or_default(),
-                        policy_tags: cp.policy_tags.clone(),
-                        databricks_tags: cp.databricks_tags.clone().or(cp_databricks_tags),
-                        column_mask: cp.column_mask.clone(),
-                        quote: cp.quote,
-                        deprecated_config: cp.config.clone().unwrap_or_default(),
-                    }))
-                })
-                .collect::<Result<Vec<DbtColumnRef>, Box<dyn std::error::Error>>>()
+                let col = Arc::new(DbtColumn {
+                    name: cp.name.clone(),
+                    data_type: cp.data_type.clone(),
+                    description: cp.description.clone(),
+                    constraints: cp.constraints.clone().unwrap_or_default(),
+                    meta: cp_meta.or_else(|| meta.clone()).unwrap_or_default(),
+                    tags: cp_tags
+                        .map(|t| t.into())
+                        .or_else(|| tags.clone())
+                        .unwrap_or_default(),
+                    // Top-level policy_tags takes precedence over config.policy_tags
+                    policy_tags: cp.policy_tags.clone().or(cp_policy_tags),
+                    databricks_tags: cp.databricks_tags.clone().or(cp_databricks_tags),
+                    column_mask: cp.column_mask.clone(),
+                    quote: cp.quote,
+                    deprecated_config: cp.config.clone().unwrap_or_default(),
+                });
+                by_name.insert(cp.name.clone(), col);
+            }
+            Ok::<Vec<DbtColumnRef>, Box<dyn std::error::Error>>(by_name.into_values().collect())
         })
         .transpose()?
         .unwrap_or_default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_col(name: &str, description: &str) -> ColumnProperties {
+        ColumnProperties {
+            name: name.to_string(),
+            description: Some(description.to_string()),
+            data_type: None,
+            constraints: None,
+            tests: None,
+            data_tests: None,
+            granularity: None,
+            policy_tags: None,
+            databricks_tags: None,
+            column_mask: None,
+            quote: None,
+            config: None,
+            entity: None,
+            dimension: None,
+        }
+    }
+
+    /// Regression: when the same column name appears multiple times in a YAML schema,
+    /// process_columns must deduplicate by name keeping the last definition (matching
+    /// dbt-core/Mantle dict semantics). Previously Fusion kept all occurrences, producing
+    /// a Vec with duplicate names that caused false state:modified detections.
+    #[test]
+    fn test_process_columns_deduplicates_by_name_last_wins() {
+        let cols = vec![
+            make_col("id", "First definition."),
+            make_col("name", "The name."),
+            make_col("id", "Second definition (last wins)."),
+        ];
+
+        let result = process_columns(Some(&cols), None, None).unwrap();
+
+        assert_eq!(result.len(), 2, "duplicate 'id' should be collapsed to one");
+
+        let id_col = result.iter().find(|c| c.name == "id").unwrap();
+        assert_eq!(
+            id_col.description.as_deref(),
+            Some("Second definition (last wins)."),
+            "last definition should win"
+        );
+    }
 }
 
 #[derive(UntaggedEnumDeserialize, Serialize, Debug, Clone, DbtSchema, Eq, PartialEq)]

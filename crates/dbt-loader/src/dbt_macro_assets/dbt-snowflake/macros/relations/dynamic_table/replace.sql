@@ -54,13 +54,20 @@
     {%- endif -%}
     {%- set transient_keyword = 'transient ' if is_transient else '' -%}
 create or replace {{ transient_keyword }}dynamic table {{ relation }}
-    target_lag = '{{ dynamic_table.target_lag }}'
+    {% if dynamic_table.target_lag is not none %}target_lag = '{{ dynamic_table.target_lag }}'{% endif %}
     warehouse = {{ dynamic_table.snowflake_warehouse }}
+    {{ optional('initialization_warehouse', dynamic_table.snowflake_initialization_warehouse) }}
     {{ optional('refresh_mode', dynamic_table.refresh_mode) }}
     {{ optional('initialize', dynamic_table.initialize) }}
+    {% if dynamic_table.scheduler is not none %}
+    scheduler = '{{ dynamic_table.scheduler }}'
+    {% elif dynamic_table.target_lag is none %}
+    scheduler = 'DISABLE'
+    {% endif %}
     {{ optional('with row access policy', dynamic_table.row_access_policy, equals_char='') }}
     {{ optional('with tag', dynamic_table.table_tag, quote_char='(', equals_char='') }}
     {{ optional('cluster by', dynamic_table.cluster_by, quote_char='(', equals_char='') }}
+    {{ optional('immutable where', dynamic_table.immutable_where, quote_char='(', equals_char='') }}
     as (
         {{ sql }}
     )
@@ -88,16 +95,24 @@ create or replace {{ transient_keyword }}dynamic table {{ relation }}
 {%- set catalog_relation = adapter.build_catalog_relation(config.model) -%}
 
 create or replace dynamic iceberg table {{ relation }}
-    target_lag = '{{ dynamic_table.target_lag }}'
+    {% if dynamic_table.target_lag is not none %}target_lag = '{{ dynamic_table.target_lag }}'{% endif %}
     warehouse = {{ dynamic_table.snowflake_warehouse }}
+    {{ optional('initialization_warehouse', dynamic_table.snowflake_initialization_warehouse) }}
     {{ optional('external_volume', catalog_relation.external_volume, "'") }}
     catalog = 'snowflake'
     base_location = '{{ catalog_relation.base_location }}'
+    {{ optional('iceberg_version', catalog_relation.iceberg_version) }}
     {{ optional('refresh_mode', dynamic_table.refresh_mode) }}
     {{ optional('initialize', dynamic_table.initialize) }}
+    {% if dynamic_table.scheduler is not none %}
+    scheduler = '{{ dynamic_table.scheduler }}'
+    {% elif dynamic_table.target_lag is none %}
+    scheduler = 'DISABLE'
+    {% endif %}
     {{ optional('row_access_policy', dynamic_table.row_access_policy) }}
     {{ optional('table_tag', dynamic_table.table_tag) }}
     {{ optional('cluster by', dynamic_table.cluster_by, quote_char='(', equals_char='') }}
+    {{ optional('immutable where', dynamic_table.immutable_where, quote_char='(', equals_char='') }}
     as (
         {{ sql }}
     )

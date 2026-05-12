@@ -1,4 +1,3 @@
-use crate::DbtCloudConfigGuard;
 use crate::task::TestError;
 use crate::task::env::TracingReloadHandle;
 
@@ -9,8 +8,8 @@ use super::{ProjectEnv, Task, TestEnv, TestResult};
 
 use dbt_common::error::FsResult;
 use dbt_common::string_utils::split_into_whitespace_and_brackets;
-use dbt_common::tracing::init_tracing_with_consumer_layer;
 use dbt_common::tracing::reload::create_data_layer_for_tests;
+use dbt_common::tracing::{TracingConfigProvider, init_tracing_with_consumer_layer};
 use dbt_features::feature_stack::FeatureStack;
 use once_cell::sync::OnceCell;
 use std::future::Future;
@@ -19,8 +18,11 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
-/// Global [Arc] of a [FeatureStack] to be shared across tests.
-pub static G_DBT_TEST_UTILS_FEATURE_STACK: OnceCell<Arc<FeatureStack>> = OnceCell::new();
+pub type FeatureStackFactory =
+    dyn Fn(Box<dyn TracingConfigProvider>) -> Arc<FeatureStack> + Send + Sync;
+
+/// Global [Arc] of a [FeatureStackFactory] to be shared across tests.
+pub static G_DBT_TEST_UTILS_FEATURE_STACK: OnceCell<Arc<FeatureStackFactory>> = OnceCell::new();
 
 pub type BoxedSendFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 pub type CommandFn = dyn Fn(
@@ -155,7 +157,7 @@ impl TaskSeq {
     pub async fn execute_in_with_env(
         &self,
         project_env: &ProjectEnv,
-        set_env: &[(&'static str, &'static str)],
+        set_env: &[(&str, &str)],
     ) -> TestResult<()> {
         // Try initializing tracing. It will succeed only once per process, because it
         // sets global subscriber. We initialize with a special reloadable data layer
@@ -207,14 +209,25 @@ async fn run_test_tasks(
     tasks: &[Box<dyn Task + '_>],
     project_env: &ProjectEnv,
     test_env: &TestEnv,
-    set_env: &[(&'static str, &'static str)],
+    set_env: &[(&str, &str)],
 ) -> TestResult<()> {
     use crate::test_env_guard::TestEnvGuard;
 
     // Create environment guard to isolate tests from external environment variables
     let _env_guard = TestEnvGuard::default();
-    // Create cloud config guard to isolate tests from dbt_cloud.yml file
-    let _cloud_guard = DbtCloudConfigGuard::new();
+
+    // Isolate tests from the developer's `~/.dbt/dbt_cloud.yml` by pointing
+    // the cloud-config loader at a non-existent per-process directory. The
+    // loader's NotFound branch returns `Ok(None)`, so any lookup sees "no
+    // dbt_cloud.yml". Nextest runs each test in its own process, so no
+    // restore is needed.
+    unsafe {
+        #[allow(clippy::disallowed_methods)]
+        std::env::set_var(
+            dbt_cloud_config::TEST_CLOUD_CONFIG_DIR_ENV,
+            std::env::temp_dir().join(format!("dbt-test-no-cloud-config-{}", std::process::id())),
+        );
+    }
 
     // Set provided environment variables (may be empty)
     for (key, value) in set_env {

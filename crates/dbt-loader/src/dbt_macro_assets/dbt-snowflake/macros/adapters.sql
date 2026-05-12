@@ -106,7 +106,7 @@
         {%- set relation_type = relation.type -%}
     {%- endif -%}
 
-    {%- if relation.is_iceberg_format() -%} {# DIVERGENCE: in core is_iceberg_format is an attribute of the relation object, not a method #}
+    {%- if relation.is_iceberg_format -%}
         alter iceberg table {{ relation.render() }} set comment = $${{ relation_comment | replace('$', '[$]') }}$$;
     {%- else -%}
         comment on {{ relation_type }} {{ relation.render() }} IS $${{ relation_comment | replace('$', '[$]') }}$$;
@@ -184,7 +184,7 @@
     This fixes the bug where dbt generates VARCHAR(16777216) for new columns which
     is not supported by Snowflake Iceberg tables.
   #}
-  {% if relation.is_iceberg_format() and column.is_string() %} {# DIVERGENCE: in core is_iceberg_format is an attribute of the relation object, not a method #}
+  {% if relation.is_iceberg_format and column.is_string() %}
     {% set data_type = column.data_type.upper() %}
     {% if data_type.startswith('CHARACTER VARYING') or data_type.startswith('VARCHAR') %}
       {#
@@ -200,7 +200,7 @@
       {{ column.data_type }}
     {% endif %}
   {% else %}
-    {{ column.expanded_data_type }}
+    {{ column.data_type }}
   {% endif %}
 {% endmacro %}
 
@@ -245,23 +245,28 @@
 
 {% macro snowflake__is_catalog_linked_database(relation=none, catalog_relation=none) -%}
     {#-- Helper macro to detect if we're in a catalog-linked database context --#}
-    {#-- CORE DISCREPANCY: there's supposed to be a relation.catalog based arm here. This is a core
-      -- hack that won't work in Fusion. #}
+    {# DIVERGENCE BEGIN: there is supposed to be a relation.catalog based arm here. This is a core hack that does not work in Fusion. #}
     {%- if catalog_relation is not none -%}
         {#-- Direct catalog_relation object provided --#}
-        {%- if catalog_relation|attr('catalog_linked_database') -%}
+        {%- if adapter.behavior.use_catalogs_v2.no_warn and catalog_relation|attr('catalog_database') -%}
+            {{ return(true) }}
+        {%- elif catalog_relation|attr('catalog_linked_database') -%}
             {{ return(true) }}
         {%- else -%}
             {{ return(false) }}
         {%- endif -%}
     {%- elif relation and relation.config -%}
         {%- set catalog_relation = adapter.build_catalog_relation(relation) -%}
-        {%- if catalog_relation is not none and catalog_relation|attr('catalog_linked_database') -%}
+        {%- if catalog_relation is not none and (
+            (adapter.behavior.use_catalogs_v2.no_warn and catalog_relation|attr('catalog_database'))
+            or catalog_relation|attr('catalog_linked_database')
+        ) -%}
             {{ return(true) }}
         {%- else -%}
             {{ return(false) }}
         {%- endif -%}
     {%- endif -%}
+    {# DIVERGENCE END #}
 {%- endmacro %}
 
 -- funcsign: (string) -> string
@@ -334,21 +339,6 @@ select
 where 1 = 0
 {% endif %}
 {% endmacro %}
-
-
-{# DIVERGENCE #}
--- funcsign: () -> bool
-{% macro is_glue_catalog_linked_database() -%}
-  {#- Check if the current model is using a Glue catalog-linked database -#}
-  {% if config and config.model %}
-    {%- set catalog_relation = adapter.build_catalog_relation(config.model) -%}
-    {% if catalog_relation and (catalog_relation|attr('catalog_linked_database_type') | lower == 'glue') %}
-      {{ return(true) }}
-    {% endif %}
-  {% endif %}
-  {{ return(false) }}
-{%- endmacro %}
-
 
 {# DIVERGENCE #}
 -- funcsign: (relation) -> relation

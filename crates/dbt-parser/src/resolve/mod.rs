@@ -34,7 +34,11 @@ pub(crate) mod resolve_snapshots;
 pub(crate) mod resolve_sources;
 /// Functions for resolving tests
 pub(crate) mod resolve_tests;
+/// Shared utilities for resolve passes
+pub(crate) mod resolve_utils;
 /// Functions for validating metrics
 pub(crate) mod validate_metrics;
 /// Functions for validating models
 pub(crate) mod validate_models;
+/// Utilities for pre-processing raw `yaml::Value` before Jinja rendering
+pub(crate) mod yaml_field_utils;

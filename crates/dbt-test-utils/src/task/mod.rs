@@ -1,13 +1,16 @@
 mod artifact_validation;
 mod assertions;
 mod check_compiled;
+mod check_publication;
 mod dbt;
 pub mod dir_manifest;
 mod env;
+pub mod file_golden;
 mod io;
 mod log_capture;
 mod manifest_capture;
 mod profiles;
+mod project;
 mod record_and_replay;
 mod run_results_capture;
 mod task_seq;
@@ -90,20 +93,27 @@ pub use task_seq::{CommandFn, TaskSeq, fs_cmd_vec};
 pub use artifact_validation::ArtifactComparisonTask;
 pub use assertions::{AssertDirExistsTask, AssertFileContainsTask, AssertFileExistsTask};
 pub use check_compiled::CheckCompiledFiles;
+pub use check_publication::CheckPublicationArtifact;
 pub use dbt::DbtRecordTask;
 pub use io::{CpFromTargetTask, FileWriteTask, RmDirTask, RmTask, SedTask};
 pub use log_capture::{ExecuteAndCaptureLogs, JsonLogEvent};
 pub use manifest_capture::CaptureDbtManifest;
 pub use manifest_capture::CompareDbtManifest;
 pub use profiles::HydrateProfilesTask;
+pub use project::OverrideFileTask;
 pub use record_and_replay::RrTask;
 pub use run_results_capture::CaptureRunResults;
 pub use run_results_capture::CompareRunResults;
 pub use tasks::prepare_command_vec;
-pub use tasks::{CompareStdoutStderr, ExecuteAndCompare, ExecuteAndCompareTelemetry, FnTask};
+pub use tasks::{
+    CompareStdoutStderr, ExecuteAndCompare, ExecuteAndCompareTelemetry, ExecuteOnly, FnTask,
+};
 
 // Dir manifest utilities
 pub use dir_manifest::{CompareDirManifest, assert_golden_manifest, compute_dir_manifest};
+
+// File golden comparison
+pub use file_golden::CompareFileGolden;
 
 use async_trait::async_trait;
 

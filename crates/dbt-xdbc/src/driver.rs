@@ -7,20 +7,17 @@ use crate::database::AdbcDatabase;
 #[cfg(feature = "odbc")]
 use crate::database::OdbcDatabase;
 use crate::driver_manager::ManagedDriver as ManagedAdbcDriver;
-use crate::install;
+use crate::install::{self, DriverTriplet, build_http_agent};
 use crate::semaphore::Semaphore;
 use adbc_core::{
-    Driver as _, LOAD_FLAG_ALLOW_RELATIVE_PATHS, LOAD_FLAG_SEARCH_ENV, LOAD_FLAG_SEARCH_SYSTEM,
-    LOAD_FLAG_SEARCH_USER,
+    Driver as _, LOAD_FLAG_ALLOW_RELATIVE_PATHS, LOAD_FLAG_DEFAULT, LOAD_FLAG_SEARCH_ENV,
+    LOAD_FLAG_SEARCH_SYSTEM, LOAD_FLAG_SEARCH_USER,
     error::{Error, Result, Status},
     options::{AdbcVersion, OptionDatabase, OptionValue},
 };
 use parking_lot::RwLockUpgradableReadGuard;
-use std::sync::Arc;
-use std::{
-    collections::HashMap, env, ffi::c_int, fmt, fmt::Display, hash::Hash, path::Path,
-    path::PathBuf, sync::LazyLock,
-};
+use std::{collections::HashMap, env, ffi::c_int, fmt, path::Path, path::PathBuf, sync::LazyLock};
+use std::{hash, sync::Arc};
 
 #[cfg(debug_assertions)]
 use {crate::env_var::env_var_bool, std::io::ErrorKind, std::process::Command};
@@ -44,6 +41,14 @@ pub enum LoadStrategy {
     System(Option<String>),
     /// Try loading from system paths first; if not found, fall back to CDN cache.
     SystemThenCdnCache,
+    /// Load the driver from the sibling lib/ folder.
+    Bundled,
+    /// Load the `flock` driver that proxies all ADBC calls to a service multiplexing
+    /// different ADBC drivers.
+    ///
+    /// In this strategy, we load the "adbc_driver_flock" driver and configure it
+    /// to make calls to the server that loads the actual drivers.
+    Remote,
 }
 
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
@@ -62,12 +67,16 @@ pub enum Backend {
     Salesforce,
     /// Spark driver implementation (ADBC).
     Spark,
-    /// DuckDB driver implementation (ADBC).
-    DuckDB,
+    /// DuckDB driver implementation (ADBC) + a set of extensions.
+    DuckDBExtended,
     /// Microsoft SQL Server implementation (ADBC).
     SQLServer,
+    /// Athena driver implementation (ADBC).
+    Athena,
     /// ClickHouse driver implementation (ADBC).
     ClickHouse,
+    /// Exasol driver implementation (ADBC).
+    Exasol,
     /// Databricks driver implementation (ODBC).
     DatabricksODBC,
     /// Redshift driver implementation (ODBC).
@@ -88,7 +97,7 @@ pub enum Backend {
     },
 }
 
-impl Display for Backend {
+impl fmt::Display for Backend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Backend::Snowflake => write!(f, "Snowflake"),
@@ -96,13 +105,15 @@ impl Display for Backend {
             Backend::Postgres => write!(f, "PostgreSQL"),
             Backend::Databricks => write!(f, "Databricks"),
             Backend::Redshift => write!(f, "Redshift"),
-            Backend::DuckDB => write!(f, "DuckDB"),
+            Backend::DuckDBExtended => write!(f, "DuckDB"),
             Backend::DatabricksODBC => write!(f, "Databricks"),
             Backend::RedshiftODBC => write!(f, "Redshift"),
             Backend::Salesforce => write!(f, "Salesforce"),
             Backend::Spark => write!(f, "Spark"),
             Backend::SQLServer => write!(f, "SQL Server"),
+            Backend::Athena => write!(f, "Athena"),
             Backend::ClickHouse => write!(f, "ClickHouse"),
+            Backend::Exasol => write!(f, "Exasol"),
             Backend::Generic { library_name, .. } => write!(f, "Generic({library_name})"),
         }
     }
@@ -118,10 +129,12 @@ impl Backend {
             Backend::Salesforce => Some("adbc_driver_salesforce"),
             Backend::Spark => Some("adbc_driver_spark"),
             Backend::Redshift => Some("adbc_driver_redshift"),
-            Backend::DuckDB => Some("duckdb"),
+            Backend::DuckDBExtended => Some("duckdb"),
             Backend::SQLServer => Some("adbc_driver_mssql"),
             Backend::DatabricksODBC | Backend::RedshiftODBC => None, // these use ODBC
+            Backend::Athena => Some("adbc_driver_athena"),
             Backend::ClickHouse => Some("adbc_clickhouse"),
+            Backend::Exasol => Some("adbc_driver_exasol"),
             Backend::Generic { library_name, .. } => Some(library_name),
         }
     }
@@ -129,7 +142,7 @@ impl Backend {
     pub fn adbc_driver_entrypoint(&self) -> Option<&'static [u8]> {
         match self {
             Backend::Snowflake => Some(b"SnowflakeDriverInit"),
-            Backend::DuckDB => Some(b"duckdb_adbc_init"),
+            Backend::DuckDBExtended => Some(b"duckdb_adbc_init"),
             Backend::Generic {
                 library_name: _,
                 entrypoint,
@@ -147,9 +160,11 @@ impl Backend {
             | Backend::Redshift
             | Backend::Salesforce
             | Backend::Spark
-            | Backend::DuckDB
+            | Backend::DuckDBExtended
             | Backend::SQLServer
+            | Backend::Athena
             | Backend::ClickHouse
+            | Backend::Exasol
             | Backend::Generic { .. } => FFIProtocol::Adbc,
             Backend::DatabricksODBC | Backend::RedshiftODBC => FFIProtocol::Odbc,
         }
@@ -186,12 +201,34 @@ pub trait Driver {
 struct AdbcDriverKey {
     backend: Backend,
     adbc_version: AdbcVersion,
+    // TODO: include load strategy
 }
 
-impl Hash for AdbcDriverKey {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+impl hash::Hash for AdbcDriverKey {
+    fn hash<H: hash::Hasher>(&self, state: &mut H) {
         self.backend.hash(state);
         c_int::from(self.adbc_version).hash(state);
+    }
+}
+
+pub struct DriverFilenameDisplay<'a> {
+    pub name: &'a str,
+    /// OS, arch, and version (all optional).
+    pub triplet: DriverTriplet<'a>,
+}
+
+impl<'a> fmt::Display for DriverFilenameDisplay<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let prefix = self.triplet.dll_prefix();
+        let suffix = self.triplet.dll_suffix();
+        match self.triplet.version {
+            "" => write!(f, "{}adbc_driver_{}{}", prefix, self.name, suffix),
+            version => write!(
+                f,
+                "{}adbc_driver_{}-{}{}",
+                prefix, self.name, version, suffix
+            ),
+        }
     }
 }
 
@@ -366,7 +403,7 @@ impl AdbcDriver {
             // CDN strategy for drivers published to the dbt Labs CDN.
             (
                 load_strategy @ (CdnCache | SystemThenCdnCache),
-                Snowflake | BigQuery | Postgres | Databricks | Redshift | Spark | DuckDB
+                Snowflake | BigQuery | Postgres | Databricks | Redshift | Spark | DuckDBExtended
                 | Salesforce | SQLServer,
             ) => {
                 #[cfg(debug_assertions)]
@@ -382,7 +419,7 @@ impl AdbcDriver {
                             backend,
                             ADBC_LIBS_DIRECTORY.as_ref().unwrap().display()
                         );
-                        System(None)
+                        Bundled
                     } else {
                         load_strategy
                     }
@@ -402,13 +439,21 @@ impl AdbcDriver {
                 ));
             }
             // CDN strategy for non-CDN drivers: just fall back to the system strategy.
-            (CdnCache | SystemThenCdnCache, ClickHouse) => System(None),
+            (CdnCache | SystemThenCdnCache | Remote, Athena | ClickHouse | Exasol) => System(None),
             // Generic drivers can only be loaded from a file, so fallback to the System strategy.
-            (CdnCache | SystemThenCdnCache, Generic { library_name, .. }) => {
+            (CdnCache | SystemThenCdnCache | Remote, Generic { library_name, .. }) => {
                 System(Some(library_name.to_string()))
             }
             // System strategy: load from a provided library name (e.g. "adbc_driver_snowflake").
             (load_strategy @ System(_), _) => load_strategy,
+            // Bundled strategy doesn't change for any backend.
+            (Bundled, _) => Bundled,
+            // Remote drivers are used via the "adbc_driver_flock" library
+            (
+                load_strategy @ Remote,
+                Snowflake | BigQuery | Postgres | Databricks | Redshift | Spark | DuckDBExtended
+                | Salesforce | SQLServer,
+            ) => load_strategy,
         };
 
         debug_assert!(backend.ffi_protocol() == FFIProtocol::Adbc);
@@ -420,13 +465,13 @@ impl AdbcDriver {
                     // Safe to unwrap because it's an ADBC backend
                     None => backend.adbc_library_name().unwrap(),
                 };
-                Self::try_load_driver_from_name(backend, name, adbc_version)
+                Self::try_load_driver_from_name(backend, name, LOAD_FLAG_DEFAULT, adbc_version)
             }
             SystemThenCdnCache => {
                 // Safe to unwrap because it's an ADBC backend and non-CDN backends were already
                 // redirected to System(_) above.
                 let name = backend.adbc_library_name().unwrap();
-                Self::try_load_driver_from_name(backend, name, adbc_version)
+                Self::try_load_driver_from_name(backend, name, LOAD_FLAG_DEFAULT, adbc_version)
                     .or_else(|e1| {
                         Self::try_load_driver_through_cdn_cache(backend, adbc_version)
                             .map_err(|e2| {
@@ -443,13 +488,22 @@ Second error:\n\
                             })
                     })
             }
+            Remote => Self::prepare_for_remote_driver(backend, adbc_version),
+            Bundled => {
+                let name = backend.adbc_library_name().unwrap();
+                // don't search system paths, only the provided
+                // additional paths (e.g. sibling lib/ directory)
+                let load_flags = 0;
+                Self::try_load_driver_from_name(backend, name, load_flags, adbc_version)
+            }
         }
     }
 
-    /// Load the driver using the [LoadStrategy::System] strategy.
+    /// Load the driver using the [LoadStrategy::System] or [LoadStrategy::Bundled] strategies.
     fn try_load_driver_from_name(
         backend: Backend,
         name: &str,
+        load_flags: u32,
         adbc_version: AdbcVersion,
     ) -> Result<ManagedAdbcDriver> {
         let entrypoint = backend.adbc_driver_entrypoint();
@@ -466,11 +520,6 @@ Second error:\n\
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         additional_search_paths.push(PathBuf::from("/opt/homebrew/lib"));
 
-        // Rely on the OS to find the library in the system path or something like LD_LIBRARY_PATH.
-        let load_flags = LOAD_FLAG_SEARCH_ENV
-            | LOAD_FLAG_SEARCH_USER
-            | LOAD_FLAG_SEARCH_SYSTEM
-            | LOAD_FLAG_ALLOW_RELATIVE_PATHS;
         ManagedAdbcDriver::load_from_name(
             backend,
             name,
@@ -486,10 +535,11 @@ Second error:\n\
         backend: Backend,
         adbc_version: AdbcVersion,
     ) -> Result<ManagedAdbcDriver> {
+        let http_agent = build_http_agent();
         let entrypoint = backend.adbc_driver_entrypoint();
-        let (backend_name, version, target_os) = install::driver_parameters(backend);
-        let full_driver_path = install::format_driver_path(backend_name, version, target_os)
-            .map_err(|e| e.to_adbc_error())?;
+        let (backend_name, triplet) = install::driver_parameters(backend);
+        let full_driver_path =
+            install::format_driver_path(backend_name, triplet).map_err(|e| e.to_adbc_error())?;
         ManagedAdbcDriver::load_dynamic_from_filename(
             backend,
             &full_driver_path,
@@ -497,7 +547,7 @@ Second error:\n\
             adbc_version,
         )
         .or_else(|_| {
-            install::install_driver_internal(backend_name, version, target_os)
+            install::install_driver_internal(&http_agent, backend_name, triplet)
                 .map_err(|e| Error::with_message_and_status(e.to_string(), Status::IO))?;
 
             let driver = ManagedAdbcDriver::load_dynamic_from_filename(
@@ -508,6 +558,37 @@ Second error:\n\
             )?;
             Ok(driver)
         })
+    }
+
+    /// Load the driver virtually using the [LoadStrategy::Remote] strategy.
+    fn prepare_for_remote_driver(
+        backend: Backend,
+        adbc_version: AdbcVersion,
+    ) -> Result<ManagedAdbcDriver> {
+        let mut additional_search_paths: Vec<PathBuf> = Vec::new();
+        if let Some(libs_dir) = ADBC_LIBS_DIRECTORY.as_ref() {
+            additional_search_paths.push(libs_dir.clone());
+            let load_flags = LOAD_FLAG_SEARCH_ENV
+                | LOAD_FLAG_SEARCH_USER
+                | LOAD_FLAG_SEARCH_SYSTEM
+                | LOAD_FLAG_ALLOW_RELATIVE_PATHS;
+            return ManagedAdbcDriver::load_from_name(
+                backend,
+                "adbc_driver_flock",
+                None, // entrypoint
+                adbc_version,
+                load_flags,
+                Some(additional_search_paths),
+            );
+        }
+
+        Err(Error::with_message_and_status(
+            "Remote driver strategy requires the `adbc_driver_flock` driver to be \
+located in a `lib/` directory next to the executable, but no such directory could \
+be found."
+                .to_string(),
+            Status::Internal,
+        ))
     }
 }
 
@@ -589,11 +670,12 @@ mod tests {
         try_load_with_builder(Backend::BigQuery, AdbcVersion::V100)?;
         try_load_with_builder(Backend::Postgres, AdbcVersion::V100)?;
         try_load_with_builder(Backend::Databricks, AdbcVersion::V100)?;
-        try_load_with_builder(Backend::DuckDB, AdbcVersion::V100)?;
+        try_load_with_builder(Backend::DuckDBExtended, AdbcVersion::V100)?;
         try_load_with_builder(Backend::Salesforce, AdbcVersion::V100)?;
         // try_load_with_builder(Backend::Spark, AdbcVersion::V100)?;
         // try_load_with_builder(Backend::SQLServer, AdbcVersion::V100)?;
         // try_load_with_builder(Backend::ClickHouse, AdbcVersion::V100)?;
+        // try_load_with_builder(Backend::Exasol, AdbcVersion::V100)?;
         Ok(())
     }
 
@@ -604,11 +686,12 @@ mod tests {
         try_load_with_builder(Backend::BigQuery, AdbcVersion::V110)?;
         try_load_with_builder(Backend::Postgres, AdbcVersion::V110)?;
         try_load_with_builder(Backend::Databricks, AdbcVersion::V110)?;
-        try_load_with_builder(Backend::DuckDB, AdbcVersion::V110)?;
+        try_load_with_builder(Backend::DuckDBExtended, AdbcVersion::V110)?;
         try_load_with_builder(Backend::Salesforce, AdbcVersion::V110)?;
         // try_load_with_builder(Backend::Spark, AdbcVersion::V110)?;
         // try_load_with_builder(Backend::SQLServer, AdbcVersion::V110)?;
         // try_load_with_builder(Backend::ClickHouse, AdbcVersion::V110)?;
+        // try_load_with_builder(Backend::Exasol, AdbcVersion::V110)?;
         Ok(())
     }
 
@@ -620,11 +703,12 @@ mod tests {
             Backend::BigQuery,
             Backend::Postgres,
             Backend::Databricks,
-            Backend::DuckDB,
+            Backend::DuckDBExtended,
             Backend::Salesforce,
             // Backend::Spark,
             // Backend::SQLServer,
             // Backend::ClickHouse,
+            // Backend::Exasol,
         ]
         .iter()
         .copied()
@@ -640,6 +724,30 @@ mod tests {
                 AdbcVersion::default(),
                 None,
                 LoadStrategy::CdnCache,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test_with::env(FLOCK_DRIVER_TESTS)]
+    #[test]
+    fn load_flock_driver() -> Result<()> {
+        for backend in [
+            Backend::Snowflake,
+            Backend::BigQuery,
+            Backend::Postgres,
+            Backend::Databricks,
+            Backend::Redshift,
+            Backend::Spark,
+            Backend::DuckDBExtended,
+            Backend::Salesforce,
+            Backend::SQLServer,
+        ] {
+            AdbcDriver::try_load_dynamic(
+                backend,
+                AdbcVersion::default(),
+                None,
+                LoadStrategy::Remote,
             )?;
         }
         Ok(())

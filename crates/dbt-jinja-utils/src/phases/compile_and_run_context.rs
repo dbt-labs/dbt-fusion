@@ -8,16 +8,16 @@ use chrono::{DateTime, Utc};
 
 use crate::functions::build_flat_graph;
 use crate::jinja_environment::JinjaEnv;
-use dbt_adapter::BaseAdapter;
+use crate::phases::compile::DependencyValidationConfig;
+use dbt_adapter::Adapter;
 use dbt_adapter::load_store::ResultStore;
 use dbt_adapter::relation::RelationObject;
 use dbt_common::once_cell_vars::DISPATCH_CONFIG;
 use dbt_schemas::filter::{RunFilter, Sample};
 use dbt_schemas::schemas::Nodes;
 use dbt_schemas::state::{DbtRuntimeConfig, NodeResolverTracker};
-use minijinja::arg_utils::{ArgParser, ArgsIter};
-use minijinja::constants::MACRO_DISPATCH_ORDER;
-use minijinja::dispatch_object::DispatchObject;
+use dbt_telemetry::NodeType;
+use minijinja::arg_utils::ArgParser;
 use minijinja::listener::RenderingEventListener;
 use minijinja::value::Object;
 use minijinja::{
@@ -26,73 +26,48 @@ use minijinja::{
 use minijinja::{State, UndefinedBehavior};
 use std::rc::Rc;
 
+use dbt_jinja_ctx::{CompileBaseCtx, JinjaObject, to_jinja_btreemap};
+
 /// Configure the Jinja environment for the compile phase.
-pub fn configure_compile_and_run_jinja_environment(
-    env: &mut JinjaEnv,
-    adapter: Arc<dyn BaseAdapter>,
-) {
+pub fn configure_compile_and_run_jinja_environment(env: &mut JinjaEnv, adapter: Arc<Adapter>) {
     env.set_adapter(adapter);
     env.set_undefined_behavior(UndefinedBehavior::Lenient);
 }
 
-#[derive(Debug)]
-struct DummyConfig;
-
-impl Object for DummyConfig {
-    fn call(
-        self: &Arc<Self>,
-        _: &State,
-        _: &[MinijinjaValue],
-        _: &[Rc<dyn RenderingEventListener>],
-    ) -> Result<MinijinjaValue, MinijinjaError> {
-        Ok(MinijinjaValue::from(""))
-    }
-
-    fn call_method(
-        self: &Arc<Self>,
-        _state: &State<'_, '_>,
-        name: &str,
-        _args: &[MinijinjaValue],
-        _listeners: &[Rc<dyn RenderingEventListener>],
-    ) -> Result<MinijinjaValue, MinijinjaError> {
-        match name {
-            "get" => Ok(MinijinjaValue::from(None::<Option<String>>)),
-            _ => Err(MinijinjaError::new(
-                MinijinjaErrorKind::UnknownMethod,
-                format!("Unknown method on config: {name}"),
-            )),
-        }
-    }
-}
+// `DummyConfig` moved to `dbt_jinja_ctx::objects::compile`. Re-exported
+// here so existing call sites that imported it from this crate keep
+// working unchanged. Removed once every consumer migrates to
+// `dbt-jinja-ctx` directly.
+pub use dbt_jinja_ctx::DummyConfig;
 
 /// Configure the Jinja environment for the compile phase.
+///
+/// `defer_nodes`, when supplied (compile/run with `--defer --state`), drives
+/// the `defer_relation` field on each deferrable graph node. (#1366)
 pub fn build_compile_and_run_base_context(
     node_resolver: Arc<dyn NodeResolverTracker>,
     package_name: &str,
     nodes: &Nodes,
+    defer_nodes: Option<&Nodes>,
     runtime_config: Arc<DbtRuntimeConfig>,
     namespace_keys: Vec<String>,
 ) -> BTreeMap<String, MinijinjaValue> {
-    let mut ctx = BTreeMap::new();
-    let config = DummyConfig {};
-    ctx.insert("config".to_string(), MinijinjaValue::from_object(config));
-
-    let macro_dispatch_order = DISPATCH_CONFIG
+    // Wrap each per-namespace search order as `Value::from(Vec<String>)` —
+    // dispatch lookup downcasts to `Vec<String>` so the underlying Object
+    // type must be exactly that, not the `MutableVec<Value>` that
+    // serde-serializing a `Vec<String>` produces. Same downcast contract as
+    // `ResolveBaseCtx::macro_dispatch_order`.
+    let macro_dispatch_order: BTreeMap<String, MinijinjaValue> = DISPATCH_CONFIG
         .get()
         .map(|macro_dispatch_order| {
             macro_dispatch_order
                 .read()
                 .unwrap()
                 .iter()
-                .map(|(k, v)| (MinijinjaValue::from(k), MinijinjaValue::from(v.clone())))
-                .collect::<BTreeMap<_, _>>()
+                .map(|(k, v)| (k.clone(), MinijinjaValue::from(v.clone())))
+                .collect()
         })
         .unwrap_or_default();
-
-    ctx.insert(
-        MACRO_DISPATCH_ORDER.to_string(),
-        MinijinjaValue::from_object(macro_dispatch_order),
-    );
 
     // Create a BTreeMap for builtins
     let mut builtins = BTreeMap::new();
@@ -104,14 +79,13 @@ pub fn build_compile_and_run_base_context(
         runtime_config.clone(),
     );
     let ref_value = MinijinjaValue::from_object(ref_function);
-    ctx.insert("ref".to_string(), ref_value.clone());
-    builtins.insert("ref".to_string(), ref_value);
+    builtins.insert("ref".to_string(), ref_value.clone());
 
     // Create source function
-    let source_function = SourceFunction::new(node_resolver.clone(), package_name.to_owned());
+    let source_function =
+        SourceFunction::new_unvalidated(node_resolver.clone(), package_name.to_owned());
     let source_value = MinijinjaValue::from_object(source_function);
-    ctx.insert("source".to_string(), source_value.clone());
-    builtins.insert("source".to_string(), source_value);
+    builtins.insert("source".to_string(), source_value.clone());
 
     // Create function function
     let function_function = FunctionFunction::new_unvalidated(
@@ -120,152 +94,63 @@ pub fn build_compile_and_run_base_context(
         runtime_config.clone(),
     );
     let function_value = MinijinjaValue::from_object(function_function);
-    ctx.insert("function".to_string(), function_value.clone());
-    builtins.insert("function".to_string(), function_value);
+    builtins.insert("function".to_string(), function_value.clone());
 
-    // This is used in macros to gate the sql execution (set to true only after parse stage)
-    // for example dbt_macro_assets/dbt-adapters/macros/etc/statement.sql
-    ctx.insert("execute".to_string(), MinijinjaValue::from(true));
-
-    // Register builtins as a global
-    ctx.insert(
-        "builtins".to_string(),
-        MinijinjaValue::from_object(builtins),
-    );
-
-    // Populate dbt_metadata_envs from OS env vars with prefix DBT_ENV_CUSTOM_ENV_
-    // Mirrors dbt-core behavior so packages can safely iterate .items()
-    {
-        let mut meta_envs: BTreeMap<String, MinijinjaValue> = BTreeMap::new();
-        const PREFIX: &str = "DBT_ENV_CUSTOM_ENV_";
-        for (k, v) in std::env::vars() {
-            if let Some(suffix) = k.strip_prefix(PREFIX) {
-                meta_envs.insert(suffix.to_string(), MinijinjaValue::from(v));
-            }
-        }
-        ctx.insert(
-            "dbt_metadata_envs".to_string(),
-            MinijinjaValue::from_object(meta_envs),
-        );
-    }
+    // Populate dbt_metadata_envs from OS env vars with prefix DBT_ENV_CUSTOM_ENV_.
+    // Mirrors dbt-core behavior so packages can safely iterate .items().
+    let meta_envs: BTreeMap<String, MinijinjaValue> =
+        dbt_common::constants::collect_dbt_custom_envs()
+            .into_iter()
+            .map(|(k, v)| (k, MinijinjaValue::from(v)))
+            .collect();
 
     let mut packages: BTreeSet<String> = runtime_config.dependencies.keys().cloned().collect();
     packages.insert(package_name.to_string());
-    ctx.insert(
-        "context".to_owned(),
-        MinijinjaValue::from_object(MacroLookupContext {
+
+    let result_store = ResultStore::default();
+
+    let dbt_namespaces: BTreeMap<String, JinjaObject<DbtNamespace>> = namespace_keys
+        .into_iter()
+        .map(|key| {
+            let value = JinjaObject::new(DbtNamespace::new(&key));
+            (key, value)
+        })
+        .collect();
+
+    let ctx = CompileBaseCtx {
+        config: JinjaObject::new(DummyConfig {}),
+        macro_dispatch_order,
+        ref_fn: ref_value,
+        source: source_value,
+        function: function_value,
+        // Used in macros to gate the sql execution (set to true only after
+        // parse stage); e.g. dbt_macro_assets/dbt-adapters/macros/etc/statement.sql.
+        execute: true,
+        builtins: MinijinjaValue::from_object(builtins),
+        dbt_metadata_envs: MinijinjaValue::from_object(meta_envs),
+        context: JinjaObject::new(MacroLookupContext {
             root_project_name: package_name.to_string(),
             current_project_name: None,
             packages,
         }),
-    );
+        graph: MinijinjaValue::from_object(LazyFlatGraph::new(nodes, defer_nodes)),
+        store_result: MinijinjaValue::from_function(result_store.store_result()),
+        load_result: MinijinjaValue::from_function(result_store.load_result()),
+        target_package_name: package_name.to_string(),
+        node: MinijinjaValue::NONE,
+        connection_name: String::new(),
+        dbt_namespaces,
+    };
 
-    // Register graph as a global
-    ctx.insert(
-        "graph".to_string(),
-        MinijinjaValue::from_object(LazyFlatGraph::new(nodes)),
-    );
-    let result_store = ResultStore::default();
-    ctx.insert(
-        "store_result".to_owned(),
-        MinijinjaValue::from_function(result_store.store_result()),
-    );
-    ctx.insert(
-        "load_result".to_owned(),
-        MinijinjaValue::from_function(result_store.load_result()),
-    );
-
-    ctx.insert("node".to_owned(), MinijinjaValue::NONE);
-    ctx.insert("connection_name".to_owned(), MinijinjaValue::from(""));
-    for key in namespace_keys {
-        ctx.insert(
-            key.clone(),
-            MinijinjaValue::from_object(DbtNamespace::new(&key)),
-        );
-    }
-    ctx
+    to_jinja_btreemap(&ctx)
 }
 
-#[derive(Debug)]
-pub struct DbtNamespace {
-    pub name: String,
-}
-
-impl Object for DbtNamespace {
-    fn get_property(
-        self: &Arc<Self>,
-        state: &State<'_, '_>,
-        name: &str,
-        _listeners: &[Rc<dyn RenderingEventListener>],
-    ) -> Result<MinijinjaValue, MinijinjaError> {
-        let ns_name = MinijinjaValue::from(self.name.clone());
-        let namespace_registry = state
-            .env()
-            .get_macro_namespace_registry()
-            .unwrap_or_default();
-        let template_registry = state.env().get_macro_template_registry();
-        // a could be a package name, we need to check if there's a macro in the namespace
-        if namespace_registry.get(&ns_name).is_some_and(|val| {
-            val.try_iter()
-                .map(|mut iter| iter.any(|v| v.as_str() == Some(name)))
-                .unwrap_or(false)
-        }) {
-            let template_registry_entry = template_registry.get(&ns_name);
-            let path = template_registry_entry
-                .and_then(|entry| entry.get_attr("path").ok())
-                .unwrap_or(ns_name);
-            let span = template_registry_entry
-                .and_then(|entry| entry.get_attr("span").ok())
-                .unwrap_or_else(|| {
-                    MinijinjaValue::from_serialize(minijinja::machinery::Span::default())
-                });
-
-            let context = state.get_base_context_with_path_and_span(&path, &span);
-            Ok(MinijinjaValue::from_object(DispatchObject {
-                macro_name: (*name).to_string(),
-                package_name: Some(self.name.clone()),
-                strict: true,
-                auto_execute: false,
-                context: Some(context),
-            }))
-        } else if self.name == "dbt" {
-            let dbt_and_adapters = state.env().get_dbt_and_adapters_namespace();
-            if let Some(package) = dbt_and_adapters.get(&MinijinjaValue::from(name)) {
-                let package_name = package.as_str().map(|s| s.to_string());
-                let template_registry_entry = template_registry.get(&ns_name);
-                let path = template_registry_entry
-                    .and_then(|entry| entry.get_attr("path").ok())
-                    .unwrap_or(ns_name);
-                let span = template_registry_entry
-                    .and_then(|entry| entry.get_attr("span").ok())
-                    .unwrap_or_else(|| {
-                        MinijinjaValue::from_serialize(minijinja::machinery::Span::default())
-                    });
-
-                let context = state.get_base_context_with_path_and_span(&path, &span);
-                Ok(MinijinjaValue::from_object(DispatchObject {
-                    macro_name: (*name).to_string(),
-                    package_name,
-                    strict: true,
-                    auto_execute: false,
-                    context: Some(context),
-                }))
-            } else {
-                Ok(MinijinjaValue::UNDEFINED)
-            }
-        } else {
-            Ok(MinijinjaValue::UNDEFINED)
-        }
-    }
-}
-
-impl DbtNamespace {
-    pub fn new(name: &str) -> Self {
-        Self {
-            name: name.to_string(),
-        }
-    }
-}
+// `DbtNamespace` moved to `dbt_jinja_ctx::objects::lookup`. Re-exported here
+// so existing call sites in this crate (`build_resolve_context`,
+// `build_compile_and_run_base_context`, etc.) keep importing the type from
+// the path they always have. The transitional re-export is removed once
+// every call site has been migrated to consume `dbt-jinja-ctx` directly.
+pub use dbt_jinja_ctx::DbtNamespace;
 
 /// Context for microbatch ref filtering.
 ///
@@ -324,21 +209,13 @@ pub struct RefFunction {
     node_resolver: Arc<dyn NodeResolverTracker>,
     package_name: String,
     runtime_config: Arc<DbtRuntimeConfig>,
-    /// Optional validation configuration - None means no validation
-    validation_config: Option<RefValidationConfig>,
+    /// Validation configuration
+    validation_config: DependencyValidationConfig,
     /// Optional microbatch context for filtering refs during batch execution
     microbatch_context: Option<MicrobatchRefContext>,
     /// The unique_id of the node that owns this ref context.
     /// Used for O(1) defer decisions via `NodeResolver::prefers_deferred`.
     current_node_unique_id: String,
-}
-
-#[derive(Debug)]
-pub struct RefValidationConfig {
-    /// The set of allowed node dependencies for this specific node
-    pub allowed_dependencies: Arc<BTreeSet<String>>,
-    /// Whether to skip dependency validation used for REPL and inline queries
-    pub skip_validation: bool,
 }
 
 impl RefFunction {
@@ -352,7 +229,8 @@ impl RefFunction {
             node_resolver,
             package_name,
             runtime_config,
-            validation_config: None,
+            // Default; no validation
+            validation_config: DependencyValidationConfig::default(),
             microbatch_context: None,
             current_node_unique_id: String::new(),
         }
@@ -363,18 +241,14 @@ impl RefFunction {
         node_resolver: Arc<dyn NodeResolverTracker>,
         package_name: String,
         runtime_config: Arc<DbtRuntimeConfig>,
-        allowed_dependencies: Arc<BTreeSet<String>>,
-        skip_validation: bool,
+        validation_config: DependencyValidationConfig,
         current_node_unique_id: String,
     ) -> Self {
         Self {
             node_resolver,
             package_name,
             runtime_config,
-            validation_config: Some(RefValidationConfig {
-                allowed_dependencies,
-                skip_validation,
-            }),
+            validation_config,
             microbatch_context: None,
             current_node_unique_id,
         }
@@ -389,8 +263,7 @@ impl RefFunction {
         node_resolver: Arc<dyn NodeResolverTracker>,
         package_name: String,
         runtime_config: Arc<DbtRuntimeConfig>,
-        allowed_dependencies: Arc<BTreeSet<String>>,
-        skip_validation: bool,
+        validation_config: DependencyValidationConfig,
         microbatch_context: MicrobatchRefContext,
         current_node_unique_id: String,
     ) -> Self {
@@ -398,10 +271,7 @@ impl RefFunction {
             node_resolver,
             package_name,
             runtime_config,
-            validation_config: Some(RefValidationConfig {
-                allowed_dependencies,
-                skip_validation,
-            }),
+            validation_config,
             microbatch_context: Some(microbatch_context),
             current_node_unique_id,
         }
@@ -453,16 +323,15 @@ impl RefFunction {
         package_name: &Option<String>,
         model_name: &str,
     ) -> Result<(), MinijinjaError> {
-        let Some(validation_config) = &self.validation_config else {
-            // No validation config means no validation needed
-            return Ok(());
-        };
-
-        if validation_config.skip_validation {
+        if self.validation_config.skip_validation {
             return Ok(());
         }
 
-        if validation_config.allowed_dependencies.contains(unique_id) {
+        if self
+            .validation_config
+            .allowed_dependencies
+            .contains(unique_id)
+        {
             Ok(())
         } else {
             // Construct the ref string for the error message
@@ -472,14 +341,39 @@ impl RefFunction {
                 format!("{{{{ ref('{model_name}') }}}}")
             };
 
-            Err(MinijinjaError::new(
-                MinijinjaErrorKind::InvalidOperation,
-                format!(
-                    "dbt was unable to infer all dependencies for the model \"{model_name}\". This typically happens when ref() is placed within a conditional block.
+            if self.validation_config.node_type == NodeType::UnitTest {
+                let unit_test_name = self
+                    .validation_config
+                    .current_node_unique_id
+                    .as_deref()
+                    .and_then(|uid| uid.rsplit('.').next())
+                    .unwrap_or("<unknown>");
+                let ref_call = if let Some(pkg) = package_name {
+                    format!("ref('{pkg}', '{model_name}')")
+                } else {
+                    format!("ref('{model_name}')")
+                };
+                Err(MinijinjaError::new(
+                    MinijinjaErrorKind::InvalidOperation,
+                    format!(
+                        "Unit test '{unit_test_name}' references {{{{ {ref_call} }}}}, \
+but this dependency was not mocked.\n\n\
+Add it to the unit test's `given` block:\n  \
+- input: {ref_call}\n    \
+rows: [...]\n\n\
+Or remove the ref() from the model if it's unused."
+                    ),
+                ))
+            } else {
+                Err(MinijinjaError::new(
+                    MinijinjaErrorKind::InvalidOperation,
+                    format!(
+                        "dbt was unable to infer all dependencies for the model \"{model_name}\". This typically happens when ref() is placed within a conditional block.
 To fix this, add the following hint to the top of the model \"{model_name}\":
 -- depends_on: {ref_string}"
-                ),
-            ))
+                    ),
+                ))
+            }
         }
     }
 }
@@ -489,7 +383,7 @@ impl Object for RefFunction {
         self: &Arc<Self>,
         _state: &State<'_, '_>,
         args: &[MinijinjaValue],
-        _listeners: &[Rc<dyn RenderingEventListener>],
+        listeners: &[Rc<dyn RenderingEventListener>],
     ) -> Result<MinijinjaValue, MinijinjaError> {
         let (package_name, model_name, version) = self.resolve_args(args)?;
 
@@ -512,6 +406,10 @@ impl Object for RefFunction {
                     (true, Some(deferred)) => deferred,
                     _ => relation,
                 };
+
+                for listener in listeners {
+                    listener.on_ref_or_source_resolved(&unique_id);
+                }
 
                 // Apply microbatch filtering if we have a microbatch context and
                 // the referenced model has event_time configured
@@ -597,6 +495,7 @@ pub struct SourceFunction {
     node_resolver: Arc<dyn NodeResolverTracker>,
     package_name: String,
     microbatch_context: Option<MicrobatchRefContext>,
+    validation_config: DependencyValidationConfig,
 }
 
 impl SourceFunction {
@@ -613,18 +512,74 @@ impl SourceFunction {
             node_resolver,
             package_name,
             microbatch_context: Some(microbatch_context),
+            validation_config: DependencyValidationConfig::default(),
         }
     }
 }
 
 impl SourceFunction {
-    /// Construct a new `SourceFunction` from a `NodeResolver` and package name.
-    pub fn new(node_resolver: Arc<dyn NodeResolverTracker>, package_name: String) -> Self {
+    /// Construct a new `SourceFunction` from a `NodeResolver` and package name, with
+    /// no ref validation
+    pub fn new_unvalidated(
+        node_resolver: Arc<dyn NodeResolverTracker>,
+        package_name: String,
+    ) -> Self {
         Self {
             node_resolver,
             package_name,
             microbatch_context: None,
+            validation_config: DependencyValidationConfig::default(),
         }
+    }
+
+    /// Construct a `SourceFunction` with dependency validation (used for unit tests).
+    pub fn new_with_validation(
+        node_resolver: Arc<dyn NodeResolverTracker>,
+        package_name: String,
+        validation_config: DependencyValidationConfig,
+    ) -> Self {
+        Self {
+            node_resolver,
+            package_name,
+            microbatch_context: None,
+            validation_config,
+        }
+    }
+
+    /// Validate that the referenced source is in the allowed dependencies.
+    fn validate_dependency(
+        &self,
+        unique_id: &str,
+        source_name: &str,
+        table_name: &str,
+    ) -> Result<(), MinijinjaError> {
+        if self.validation_config.skip_validation
+            || self.validation_config.node_type != NodeType::UnitTest
+            || self
+                .validation_config
+                .allowed_dependencies
+                .contains(unique_id)
+        {
+            return Ok(());
+        }
+
+        let unit_test_name = self
+            .validation_config
+            .current_node_unique_id
+            .as_deref()
+            .and_then(|uid| uid.rsplit('.').next())
+            .unwrap_or("<unknown>");
+        Err(MinijinjaError::new(
+            MinijinjaErrorKind::InvalidOperation,
+            format!(
+                "Unit test '{unit_test_name}' references \
+{{{{ source('{source_name}', '{table_name}') }}}}, but this dependency was not mocked.\n\n\
+Add it to the unit test's `given` block:\n  \
+- input: source('{source_name}', '{table_name}')\n    \
+rows: [...]\n\n\
+Or remove the source() from the model if it's unused."
+            ),
+        ))
     }
 }
 
@@ -633,7 +588,7 @@ impl Object for SourceFunction {
         self: &Arc<Self>,
         _state: &State<'_, '_>,
         args: &[MinijinjaValue],
-        _listeners: &[Rc<dyn RenderingEventListener>],
+        listeners: &[Rc<dyn RenderingEventListener>],
     ) -> Result<MinijinjaValue, MinijinjaError> {
         let parser = ArgParser::new(args, None);
         let num_args = parser.positional_len();
@@ -656,6 +611,12 @@ impl Object for SourceFunction {
             .lookup_source(&self.package_name, &source_name, &table_name)
         {
             Ok((unique_id, relation, _)) => {
+                for listener in listeners {
+                    listener.on_ref_or_source_resolved(&unique_id);
+                }
+
+                self.validate_dependency(&unique_id, &source_name, &table_name)?;
+
                 // Apply microbatch filtering if we have a microbatch context and
                 // the referenced source has event_time configured
                 if let Some(ref microbatch_ctx) = self.microbatch_context {
@@ -691,16 +652,7 @@ pub struct FunctionFunction {
     node_resolver: Arc<dyn NodeResolverTracker>,
     package_name: String,
     runtime_config: Arc<DbtRuntimeConfig>,
-    /// Optional validation configuration - None means no validation
-    validation_config: Option<FunctionValidationConfig>,
-}
-
-#[derive(Debug)]
-pub struct FunctionValidationConfig {
-    /// The set of allowed function dependencies for this specific node
-    pub allowed_dependencies: Arc<BTreeSet<String>>,
-    /// Whether to skip dependency validation used for REPL and inline queries
-    pub skip_validation: bool,
+    validation_config: DependencyValidationConfig,
 }
 
 impl FunctionFunction {
@@ -714,7 +666,7 @@ impl FunctionFunction {
             node_resolver,
             package_name,
             runtime_config,
-            validation_config: None,
+            validation_config: DependencyValidationConfig::default(),
         }
     }
 
@@ -723,17 +675,13 @@ impl FunctionFunction {
         node_resolver: Arc<dyn NodeResolverTracker>,
         package_name: String,
         runtime_config: Arc<DbtRuntimeConfig>,
-        allowed_dependencies: Arc<BTreeSet<String>>,
-        skip_validation: bool,
+        validation_config: DependencyValidationConfig,
     ) -> Self {
         Self {
             node_resolver,
             package_name,
             runtime_config,
-            validation_config: Some(FunctionValidationConfig {
-                allowed_dependencies,
-                skip_validation,
-            }),
+            validation_config,
         }
     }
 
@@ -768,16 +716,15 @@ impl FunctionFunction {
         package_name: &Option<String>,
         function_name: &str,
     ) -> Result<(), MinijinjaError> {
-        let Some(validation_config) = &self.validation_config else {
-            // No validation config means no validation needed
-            return Ok(());
-        };
-
-        if validation_config.skip_validation {
+        if self.validation_config.skip_validation {
             return Ok(());
         }
 
-        if validation_config.allowed_dependencies.contains(unique_id) {
+        if self
+            .validation_config
+            .allowed_dependencies
+            .contains(unique_id)
+        {
             Ok(())
         } else {
             // Construct the function string for the error message
@@ -873,119 +820,38 @@ impl Object for FunctionFunction {
     }
 }
 
-/// This is a special context object that is available during the compile or run phase.
-/// It allows users to lookup macros by string and returns a DispatchObject, which when called
-/// executes the macro. Users can also lookup macro namespaces by string, and this returns a Context
-/// object, which when called with a macro name returns a DispatchObject.
-#[derive(Debug)]
-pub struct MacroLookupContext {
-    /// The root project name.
-    pub root_project_name: String,
-    /// The current project name, when no current project specified, we search from the root project.
-    pub current_project_name: Option<String>,
-    /// The packages in the project.
-    pub packages: BTreeSet<String>,
-}
-
-impl Object for MacroLookupContext {
-    fn get_value(self: &Arc<Self>, key: &MinijinjaValue) -> Option<MinijinjaValue> {
-        match key.as_str()? {
-            // NOTE(serramatutu): In Core, the following non-macro keys are all members of `MacroLookupContext`.
-            // They can all technically be used, though the usage is undocumented and not encouraged by dbt:
-            // - dbt_version
-            // - project_name
-            // - schema
-            // - run_started_at
-            //
-            // We added `project_name` because some naughty famous macro uses it and was
-            // breaking lots of projects, but I prefer to avoid polluting this scope and sticking
-            // as faithfully as possible to the "intended" behavior (only looking up macros)
-            "project_name" => Some(MinijinjaValue::from(self.root_project_name.clone())),
-
-            lookup_macro => {
-                if self.packages.contains(lookup_macro) {
-                    Some(MinijinjaValue::from_object(MacroLookupContext {
-                        root_project_name: self.root_project_name.clone(),
-                        current_project_name: Some(lookup_macro.to_string()),
-                        packages: BTreeSet::new(),
-                    }))
-                } else {
-                    Some(MinijinjaValue::from_object(DispatchObject {
-                        macro_name: lookup_macro.to_string(),
-                        package_name: self.current_project_name.clone(),
-                        strict: self.current_project_name.is_some(),
-                        auto_execute: false,
-                        // TODO: If the macro uses a recursive context (i.e. context['self']) we will stack overflow
-                        // but there is no way to conjure up a context object here without access to State
-                        context: None,
-                    }))
-                }
-            }
-        }
-    }
-
-    fn render(self: &Arc<Self>, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
-    where
-        Self: Sized + 'static,
-    {
-        self.fmt(f)
-    }
-
-    fn call_method(
-        self: &Arc<Self>,
-        state: &State<'_, '_>,
-        method: &str,
-        args: &[MinijinjaValue],
-        listeners: &[Rc<dyn RenderingEventListener>],
-    ) -> Result<MinijinjaValue, MinijinjaError> {
-        // TODO(serramatutu): should this behave fully like a dict, with values, keys, items,
-        // enumerate etc?
-        match method {
-            "get" => {
-                let iter = ArgsIter::new("MacroLookupContext.get", &["key"], args);
-                let key = iter.next_arg::<&MinijinjaValue>()?;
-                let default = iter.next_kwarg::<Option<&MinijinjaValue>>("default")?;
-                iter.finish()?;
-
-                Ok(self
-                    .get_value(key)
-                    .or_else(|| default.cloned())
-                    .unwrap_or(MinijinjaValue::from(None::<MinijinjaValue>)))
-            }
-            _ => {
-                if let Some(value) = self.get_value(&MinijinjaValue::from(method)) {
-                    return value.call(state, args, listeners);
-                }
-                Err(MinijinjaError::new(
-                    MinijinjaErrorKind::UnknownMethod,
-                    format!("MacroLookupContext has no method named {method}"),
-                ))
-            }
-        }
-    }
-}
+// `MacroLookupContext` moved to `dbt_jinja_ctx::objects::lookup`. Re-exported
+// here so existing call sites in this crate (`build_compile_and_run_base_context`,
+// the parse-phase resolve-model context, etc.) keep importing from the path
+// they always have. The transitional re-export is removed once every call
+// site has been migrated to consume `dbt-jinja-ctx` directly.
+pub use dbt_jinja_ctx::MacroLookupContext;
 
 /// This is a lazy-loaded flat graph object that builds the flat graph from
-/// `nodes` on first access.
+/// `nodes` on first access. `defer_nodes`, when present, is used to populate
+/// each deferrable node's `defer_relation` key (#1366).
 #[derive(Debug)]
 struct LazyFlatGraph {
     nodes: Nodes,
+    defer_nodes: Option<Nodes>,
     graph: OnceLock<MinijinjaValue>,
 }
 
 impl LazyFlatGraph {
-    pub fn new(nodes: &Nodes) -> Self {
+    pub fn new(nodes: &Nodes, defer_nodes: Option<&Nodes>) -> Self {
         // TODO: We don't want to clone the top level maps either -- make the
         // caller pass in Arc<Nodes> instead
         Self {
             nodes: nodes.clone(),
+            defer_nodes: defer_nodes.cloned(),
             graph: OnceLock::new(),
         }
     }
 
     fn get_graph(&self) -> &MinijinjaValue {
-        self.graph
-            .get_or_init(|| MinijinjaValue::from(build_flat_graph(&self.nodes)))
+        self.graph.get_or_init(|| {
+            MinijinjaValue::from(build_flat_graph(&self.nodes, self.defer_nodes.as_ref()))
+        })
     }
 }
 
@@ -1078,6 +944,7 @@ mod tests {
             node_resolver,
             "test_pkg",
             &nodes,
+            None,
             runtime_config,
             vec![],
         );

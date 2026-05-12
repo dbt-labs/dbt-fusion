@@ -114,8 +114,8 @@ create or replace {{ transient }} table {{ relation }}
     {% if row_access_policy -%} with row access policy {{ row_access_policy }} {%- endif %}
     {% if table_tag -%} with tag ({{ table_tag }}) {%- endif %}
     as (
-    {#- TODO: when we store this under the Catalog Relation, we can change this back to how it is in Core -#}
-	{%- if cluster_by_string -%} {# DIVERGENCE #}
+    {#- DIVERGENCE: when we store this under the Catalog Relation, we can change this back to how it is in Core -#}
+	{%- if cluster_by_string -%}
         select * from (
             {{ compiled_code }}
         )
@@ -208,6 +208,7 @@ create or replace iceberg table {{ relation }}
     {{ optional('max_data_extension_time_in_days', catalog_relation.max_data_extension_time_in_days)}}
     {{ optional('data_retention_time_in_days', catalog_relation.data_retention_time_in_days)}}
     {{ optional('change_tracking', catalog_relation.change_tracking)}}
+    {{ optional('iceberg_version', catalog_relation.iceberg_version)}}
     {% if row_access_policy -%} with row access policy {{ row_access_policy }} {%- endif %}
     {% if table_tag -%} with tag ({{ table_tag }}) {%- endif %}
     {% if copy_grants -%} copy grants {%- endif %}
@@ -296,6 +297,7 @@ create iceberg table {{ glue_relation }} (
 )
 {% if partition_by_string -%} partition by ({{ partition_by_string }}) {%- endif %}
 {{ optional('external_volume', catalog_relation.external_volume, "'") }}
+{{ optional('iceberg_version', catalog_relation.iceberg_version)}}
 {{ optional('target_file_size', catalog_relation.target_file_size, "'") }}
 {{ optional('auto_refresh', catalog_relation.auto_refresh) }}
 {{ optional('max_data_extension_time_in_days', catalog_relation.max_data_extension_time_in_days)}}
@@ -328,6 +330,17 @@ insert into {{ glue_relation }}
     - For existing tables, we must DROP the table first before creating the new one
 -#}
 
+{% macro is_glue_catalog_linked_database(catalog_relation) -%}
+  {% if adapter.behavior.use_catalogs_v2.no_warn %}
+    {{ return(catalog_relation.linked_catalog_provider.is_glue) }}
+  {% elif catalog_relation.catalog_linked_database_type is defined %}
+    {# -- v1 fallback: use the legacy catalog_linked_database_type surface -- #}
+    {{ return(catalog_relation.catalog_linked_database_type | lower == 'glue') }}
+  {% else %}
+    {% do exceptions.raise_compiler_error('unreachable: catalog linked database provider must be derivable for this branch') %}
+  {% endif %}
+{%- endmacro %}
+
 {%- set catalog_relation = adapter.build_catalog_relation(config.model) -%}
 
 {%- set copy_grants = config.get('copy_grants', default=false) -%}
@@ -352,7 +365,7 @@ insert into {{ glue_relation }}
 {{ sql_header if sql_header }}
 
 {# Check if this is a Glue catalog-linked database - Glue doesn't support CTAS #}
-{%- set is_glue_cld = (catalog_relation|attr('catalog_linked_database_type') | lower == 'glue') -%}
+{%- set is_glue_cld = is_glue_catalog_linked_database(catalog_relation) -%}
 
 {%- if is_glue_cld -%}
     {# Delegate to Glue-specific macro (handles its own drop logic) #}
@@ -371,12 +384,16 @@ insert into {{ glue_relation }}
         {%- if contract_config.enforced %}
         {{ get_table_columns_and_constraints() }}
         {%- endif %}
-        {%- if not catalog_relation|attr('catalog_linked_database') -%}
+        {%- if not (
+            (adapter.behavior.use_catalogs_v2.no_warn and catalog_relation|attr('catalog_database'))
+            or catalog_relation|attr('catalog_linked_database')
+        ) -%}
         {{ optional('external_volume', catalog_relation.external_volume, "'") }}
         catalog = '{{ catalog_relation.catalog_name }}'  -- external REST catalog name
         {{ optional('base_location', catalog_relation.base_location, "'") }}
         {%- endif %}
         {% if partition_by_string -%} partition by ({{ partition_by_string }}) {%- endif %}
+        {{ optional('iceberg_version', catalog_relation.iceberg_version)}}
         {{ optional('target_file_size', catalog_relation.target_file_size, "'") }}
         {{ optional('auto_refresh', catalog_relation.auto_refresh) }}
         {{ optional('max_data_extension_time_in_days', catalog_relation.max_data_extension_time_in_days)}}

@@ -33,7 +33,7 @@ pub enum SemanticCategory {
 }
 
 impl SemanticCategory {
-    /// Classify a BridgeAdapter method by its semantic category.
+    /// Classify a Adapter method by its semantic category.
     ///
     /// This is derived from analyzing what each method does:
     /// - MetadataRead: DB queries (SELECT/SHOW), no mutations
@@ -132,7 +132,8 @@ impl SemanticCategory {
             | "external_root"
             | "external_write_options"
             | "external_read_location"
-            | "get_temp_relation_path" => SemanticCategory::Pure,
+            | "get_temp_relation_path"
+            | "table_format" => SemanticCategory::Pure,
 
             _ => {
                 debug_assert!(

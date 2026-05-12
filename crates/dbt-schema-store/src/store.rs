@@ -25,7 +25,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
+    sync::{Arc, OnceLock, RwLock},
     time::{Duration, SystemTime},
 };
 
@@ -42,6 +42,8 @@ const DATA_DIR_NAME: &str = "data";
 const SCHEMA_DIR_NAME: &str = "schemas";
 const DBT_ORIGINAL_SCHEMA_KEY: &str = "DBT:original_schema";
 const DBT_SCHEMA_ORIGIN_KEY: &str = "DBT:schema_origin";
+// Keep in sync with `dbt_frontend_common::error::DBT_CACHED_PARQUET_PATH_KEY`.
+const DBT_CACHED_PARQUET_PATH_KEY: &str = "DBT:cached_parquet_path";
 
 /// Lookup key representing the origin of a schema entry.
 ///
@@ -400,11 +402,11 @@ pub enum StoreFormat {
 }
 
 /// Primary filesystem-backed implementation of [`SchemaStoreTrait`].
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SchemaStore {
     selected: BiMap<CanonicalFqn, UniqueId>,
     frontier: BiMap<CanonicalFqn, UniqueId>,
-    deferred: OnceLock<BiMap<CanonicalFqn, UniqueId>>,
+    deferred: RwLock<BiMap<CanonicalFqn, UniqueId>>,
     external: SccHashSet<CanonicalFqn>,
     local: BiMap<CanonicalFqn, UniqueId>,
     state: SchemaStoreState,
@@ -454,7 +456,7 @@ impl SchemaStore {
         let store = Self {
             selected: selected.into_iter().collect(),
             frontier: frontier.into_iter().collect(),
-            deferred: OnceLock::new(),
+            deferred: RwLock::new(BiMap::new()),
             external: SccHashSet::new(),
             local: local.into_iter().collect(),
             state,
@@ -483,8 +485,9 @@ impl SchemaStore {
             Some(LookupEntry::Frontier(cfqn.clone()))
         } else if self
             .deferred
-            .get()
-            .and_then(|d| d.get_by_left(cfqn))
+            .read()
+            .expect("deferred lock poisoned")
+            .get_by_left(cfqn)
             .is_some()
         {
             Some(LookupEntry::Deferred(cfqn.clone()))
@@ -505,8 +508,9 @@ impl SchemaStore {
             Some(LookupEntry::Frontier(cfqn.clone()))
         } else if self
             .deferred
-            .get()
-            .and_then(|d| d.get_by_right(unique_id))
+            .read()
+            .expect("deferred lock poisoned")
+            .get_by_right(unique_id)
             .is_some()
         {
             debug_assert!(
@@ -520,16 +524,20 @@ impl SchemaStore {
     }
 
     /// Registers deferred nodes whose schemas must be sourced from remote storage.
+    ///
+    /// Merges `deferred` into the existing set so that successive defer phases
+    /// can expand the deferred entries instead of being limited to a single write.
     pub fn set_deferred(&self, deferred: HashMap<CanonicalFqn, UniqueId>) -> bool {
-        let canonical_fqns = deferred.keys().cloned().collect::<Vec<_>>();
-        if self.deferred.set(deferred.into_iter().collect()).is_ok() {
-            canonical_fqns.into_iter().for_each(|cfqn| {
+        let mut guard = self.deferred.write().expect("deferred lock poisoned");
+        let mut changed = false;
+        for (cfqn, uid) in deferred {
+            if !guard.contains_left(&cfqn) {
+                guard.insert(cfqn.clone(), uid);
                 self.state.try_register_entry(&LookupEntry::Deferred(cfqn));
-            });
-            true
-        } else {
-            false
+                changed = true;
+            }
         }
+        changed
     }
 
     /// Evicts stale entries from the schema store cache.
@@ -578,10 +586,8 @@ impl SchemaStore {
         for (cfqn, _) in self.frontier.iter() {
             f(cfqn);
         }
-        if let Some(deferred) = self.deferred.get() {
-            for (cfqn, _) in deferred.iter() {
-                f(cfqn);
-            }
+        for (cfqn, _) in self.deferred.read().expect("deferred lock poisoned").iter() {
+            f(cfqn);
         }
         self.external.iter_sync(|cfqn| {
             f(cfqn);
@@ -808,19 +814,20 @@ pub fn read_cached_schema_from_parquet(
         })
         .transpose()?;
 
-    let arrow_schema = if arrow_schema
-        .metadata()
-        .contains_key(DBT_ORIGINAL_SCHEMA_KEY)
-    {
-        // Remove the original schema metadata key to avoid confusion
+    let arrow_schema = {
         let mut metadata = arrow_schema.metadata().clone();
+        // Remove the embedded original-schema blob to avoid confusion.
         metadata.remove(DBT_ORIGINAL_SCHEMA_KEY);
+        // Record the file path so the binder can surface a more actionable
+        // error message when a column is not found in this cached schema.
+        metadata.insert(
+            DBT_CACHED_PARQUET_PATH_KEY.to_string(),
+            table_path.display().to_string(),
+        );
         Arc::new(Schema::new_with_metadata(
             arrow_schema.fields().clone(),
             metadata,
         ))
-    } else {
-        Arc::clone(arrow_schema)
     };
     Ok((
         SchemaEntry::from_sdf_arrow_schema(original_schema, arrow_schema),

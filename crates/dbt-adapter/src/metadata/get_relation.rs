@@ -2,35 +2,40 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::array::{Array as _, StringArray};
-use dbt_common::adapter::AdapterType;
+use dbt_adapter_core::AdapterType;
 use dbt_common::{AdapterError, AdapterErrorKind, AdapterResult};
 use dbt_schemas::dbt_types::RelationType;
-use dbt_schemas::schemas::relations::base::{BaseRelation, TableFormat};
+use dbt_schemas::schemas::relations::base::{BaseRelation, Policy, RelationPath, TableFormat};
 use dbt_xdbc::{Connection, QueryCtx};
 use minijinja::State;
 
-use crate::AdapterTyping;
+use crate::adapter::adapter_impl::AdapterImpl;
 use crate::formatter::SqlLiteralFormatter;
 use crate::metadata::databricks::describe_table::DatabricksTableMetadata;
 use crate::metadata::{snowflake, try_canonicalize_bool_column_field};
 use crate::record_batch_utils::get_column_values;
+use crate::relation::Relation;
 use crate::relation::bigquery::BigqueryRelation;
-use crate::relation::databricks::DatabricksRelation;
 use crate::relation::do_create_relation;
-use crate::relation::fabric::FabricRelation;
-use crate::relation::postgres::PostgresRelation;
-use crate::relation::redshift::RedshiftRelation;
-use crate::relation::salesforce::SalesforceRelation;
 use crate::relation::snowflake::SnowflakeRelation;
-use crate::typed_adapter::ConcreteAdapter;
 use dbt_common::cancellation::CancellationToken;
+
+macro_rules! invalid_value {
+    ($msg:expr) => {
+        Err(AdapterError::new(AdapterErrorKind::UnexpectedResult, $msg))
+    };
+
+    ($($arg:tt)*) => {
+        Err(AdapterError::new(AdapterErrorKind::UnexpectedResult, format!($($arg)*)))
+    };
+}
 
 // TODO: turn this into a struct and collapse all the common code from X_get_relation functions
 
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 pub fn get_relation(
-    adapter: &ConcreteAdapter,
+    adapter: &AdapterImpl,
     state: &State,
     ctx: &QueryCtx,
     conn: &'_ mut dyn Connection,
@@ -67,26 +72,23 @@ pub fn get_relation(
         AdapterType::Fabric => fabric_get_relation(
             adapter, state, ctx, conn, database, schema, identifier, token,
         ),
-        AdapterType::Sidecar => {
-            // This branch should not be reached - sidecar adapters override get_relation()
-            Err(AdapterError::new(
-                AdapterErrorKind::Internal,
-                "get_relation called on Sidecar adapter type without override",
-            ))
-        }
         AdapterType::ClickHouse => todo!("ClickHouse"),
+        AdapterType::Exasol => exasol_get_relation(
+            adapter, state, ctx, conn, database, schema, identifier, token,
+        ),
         AdapterType::Starburst => todo!("Starburst"),
         AdapterType::Athena => todo!("Athena"),
         AdapterType::Trino => todo!("Trino"),
         AdapterType::Dremio => todo!("Dremio"),
         AdapterType::Oracle => todo!("Oracle"),
+        AdapterType::Datafusion => todo!("Datafusion"),
     }
 }
 
 // https://github.com/dbt-labs/dbt-adapters/blob/ace1709df001df4232a66f9d5f331a5fda4d3389/dbt-snowflake/src/dbt/include/snowflake/macros/adapters.sql#L138
 #[allow(clippy::too_many_arguments)]
 fn snowflake_get_relation(
-    adapter: &ConcreteAdapter,
+    adapter: &AdapterImpl,
     state: &State,
     ctx: &QueryCtx,
     conn: &'_ mut dyn Connection,
@@ -206,7 +208,7 @@ fn snowflake_get_relation(
 
 #[allow(clippy::too_many_arguments)]
 fn bigquery_get_relation(
-    adapter: &ConcreteAdapter,
+    adapter: &AdapterImpl,
     state: &State,
     ctx: &QueryCtx,
     conn: &'_ mut dyn Connection,
@@ -281,7 +283,7 @@ fn bigquery_get_relation(
 }
 
 fn spark_get_relation(
-    adapter: &ConcreteAdapter,
+    adapter: &AdapterImpl,
     state: &State,
     ctx: &QueryCtx,
     conn: &mut dyn Connection,
@@ -307,7 +309,8 @@ fn spark_get_relation(
         .execute(Some(state), conn, ctx, &sql, token);
     if let Err(e) = &batch
         && (e.to_string().contains("cannot be found")
-            || e.to_string().contains("TABLE_OR_VIEW_NOT_FOUND"))
+            || e.to_string().contains("TABLE_OR_VIEW_NOT_FOUND")
+            || e.to_string().contains("UnresolvedTableOrView"))
     {
         return Ok(None);
     }
@@ -318,7 +321,7 @@ fn spark_get_relation(
     // TODO(serramatutu): populate table metadata.
     let json_metadata = BTreeMap::new();
 
-    Ok(Some(Box::new(DatabricksRelation::new(
+    Ok(Some(Box::new(Relation::new(
         AdapterType::Spark,
         Some("".to_string()),
         Some(schema.to_string()),
@@ -334,7 +337,7 @@ fn spark_get_relation(
 
 #[allow(clippy::too_many_arguments)]
 fn databricks_get_relation(
-    adapter: &ConcreteAdapter,
+    adapter: &AdapterImpl,
     state: &State,
     ctx: &QueryCtx,
     conn: &mut dyn Connection,
@@ -477,7 +480,7 @@ fn databricks_get_relation(
         Some(database.to_string())
     };
 
-    Ok(Some(Box::new(DatabricksRelation::new(
+    Ok(Some(Box::new(Relation::new(
         adapter.adapter_type(),
         db,
         Some(schema.to_string()),
@@ -493,7 +496,7 @@ fn databricks_get_relation(
 
 #[allow(clippy::too_many_arguments)]
 fn redshift_get_relation(
-    adapter: &ConcreteAdapter,
+    adapter: &AdapterImpl,
     state: &State,
     ctx: &QueryCtx,
     conn: &mut dyn Connection,
@@ -562,20 +565,28 @@ LEFT JOIN materialized_views mv
         _ => None,
     };
 
-    Ok(Some(Box::new(RedshiftRelation::new(
-        Some(database.to_string()),
-        Some(schema.to_string()),
-        Some(identifier.to_string()),
+    let relation = Relation::new_with_policy(
+        AdapterType::Redshift,
+        RelationPath {
+            database: Some(database.to_string()).filter(|s| !s.is_empty()),
+            schema: Some(schema.to_string()),
+            identifier: Some(identifier.to_string()),
+        },
         relation_type,
-        None,
+        Policy::trues(),
         adapter.quoting(),
-    ))))
+        None,
+        false,
+        false,
+    )
+    .map_err(|e| AdapterError::new(AdapterErrorKind::UnexpectedResult, e.to_string()))?;
+    Ok(Some(Box::new(relation)))
 }
 
 // reference: https://github.com/dbt-labs/dbt-adapters/blob/main/dbt-postgres/src/dbt/include/postgres/macros/adapters.sql#L85
 #[allow(clippy::too_many_arguments)]
 fn postgres_get_relation(
-    adapter: &ConcreteAdapter,
+    adapter: &AdapterImpl,
     state: &State,
     ctx: &QueryCtx,
     conn: &'_ mut dyn Connection,
@@ -639,18 +650,76 @@ fn postgres_get_relation(
         _ => return invalid_value!("Unsupported relation type {}", string_array.value(0)),
     };
 
-    let relation = PostgresRelation::try_new(
-        Some(database.to_string()),
-        Some(schema.to_string()),
-        Some(identifier.to_string()),
+    let relation = Relation::new_with_policy(
+        AdapterType::Postgres,
+        RelationPath {
+            database: Some(database.to_string()).filter(|s| !s.is_empty()),
+            schema: Some(schema.to_string()),
+            identifier: Some(identifier.to_string()),
+        },
         relation_type,
+        Policy::trues(),
         adapter.quoting(),
+        None,
+        false,
+        false,
     )?;
     Ok(Some(Box::new(relation)))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn exasol_get_relation(
+    adapter: &AdapterImpl,
+    state: &State,
+    ctx: &QueryCtx,
+    conn: &mut dyn Connection,
+    database: &str,
+    schema: &str,
+    identifier: &str,
+    token: CancellationToken,
+) -> AdapterResult<Option<Box<dyn BaseRelation>>> {
+    let q_schema = schema.to_uppercase();
+    let q_ident = identifier.to_uppercase();
+
+    let sql = format!(
+        "select 'table' as \"type\" from sys.exa_all_tables \
+         where table_schema = '{q_schema}' and table_name = '{q_ident}' \
+         union all \
+         select 'view' from sys.exa_all_views \
+         where view_schema = '{q_schema}' and view_name = '{q_ident}'"
+    );
+    let batch = adapter
+        .engine()
+        .execute(Some(state), conn, ctx, &sql, token)?;
+    if batch.num_rows() == 0 {
+        return Ok(None);
+    }
+
+    let column = batch.column_by_name("type").unwrap();
+    let arr = column.as_any().downcast_ref::<StringArray>().unwrap();
+    let relation_type = match arr.value(0) {
+        "table" => Some(RelationType::Table),
+        "view" => Some(RelationType::View),
+        other => {
+            return Err(AdapterError::new(
+                AdapterErrorKind::Internal,
+                format!("Unexpected relation type: {other}"),
+            ));
+        }
+    };
+    let relation = do_create_relation(
+        AdapterType::Exasol,
+        database.to_string(),
+        schema.to_string(),
+        Some(identifier.to_string()),
+        relation_type,
+        adapter.quoting(),
+    )?;
+    Ok(Some(relation))
+}
+
 fn salesforce_get_relation(
-    _adapter: &ConcreteAdapter,
+    _adapter: &AdapterImpl,
     _state: &State,
     _query_ctx: &QueryCtx,
     conn: &'_ mut dyn Connection,
@@ -660,19 +729,30 @@ fn salesforce_get_relation(
 ) -> AdapterResult<Option<Box<dyn BaseRelation>>> {
     // TODO: resolves relation_table based on the metadata to be returned in schema
     match conn.get_table_schema(Some(database), None, identifier) {
-        Ok(_) => Ok(Some(Box::new(SalesforceRelation::new(
-            Some(database.to_string()),
-            None,
-            Some(identifier.to_string()),
-            Some(RelationType::Table),
-        )))),
+        Ok(_) => Ok(Some(Box::new(
+            Relation::new_with_policy(
+                AdapterType::Salesforce,
+                RelationPath {
+                    database: Some(database.to_string()).filter(|s| !s.is_empty()),
+                    schema: None,
+                    identifier: Some(identifier.to_string()),
+                },
+                Some(RelationType::Table),
+                Policy::new(false, false, true),
+                Policy::enabled(),
+                None,
+                false,
+                false,
+            )
+            .map_err(|e| AdapterError::new(AdapterErrorKind::UnexpectedResult, e.to_string()))?,
+        ))),
         Err(_) => Ok(None),
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn duckdb_get_relation(
-    adapter: &ConcreteAdapter,
+    adapter: &AdapterImpl,
     state: &State,
     ctx: &QueryCtx,
     conn: &'_ mut dyn Connection,
@@ -747,7 +827,7 @@ fn duckdb_get_relation(
 
 #[allow(clippy::too_many_arguments)]
 fn fabric_get_relation(
-    adapter: &ConcreteAdapter,
+    adapter: &AdapterImpl,
     state: &State,
     ctx: &QueryCtx,
     conn: &'_ mut dyn Connection,
@@ -808,7 +888,7 @@ fn fabric_get_relation(
         _ => None,
     };
 
-    Ok(Some(Box::new(FabricRelation::new(
+    Ok(Some(Box::new(Relation::new_fabric(
         Some(database.to_string()),
         Some(schema.to_string()),
         Some(identifier.to_string()),

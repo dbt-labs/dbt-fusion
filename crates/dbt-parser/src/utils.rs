@@ -1,7 +1,7 @@
 //! Utility functions for the resolver
 use crate::dbt_project_config::strip_resource_paths_from_ref_path;
 use crate::resolve::resolve_properties::MinimalPropertiesEntry;
-use dbt_common::adapter::AdapterType;
+use dbt_adapter_core::AdapterType;
 use dbt_common::io_args::IoArgs;
 use dbt_common::path::DbtPath;
 use dbt_common::tracing::emit::emit_error_log_from_fs_error;
@@ -11,7 +11,7 @@ use dbt_jinja_utils::phases::parse::sql_resource::SqlResource;
 use dbt_jinja_utils::utils::{generate_component_name, generate_relation_name};
 use dbt_schemas::schemas::InternalDbtNodeAttributes;
 use dbt_schemas::schemas::common::{DbtMaterialization, ResolvedQuoting, normalize_quoting};
-use dbt_schemas::schemas::project::DefaultTo;
+use dbt_schemas::schemas::project::{ResolvableConfig, ResolvedConfig};
 use dbt_schemas::schemas::properties::ModelProperties;
 use dbt_schemas::schemas::telemetry::NodeType;
 use dbt_schemas::state::DbtPackage;
@@ -22,7 +22,6 @@ use minijinja::machinery::{Span, WhitespaceConfig};
 use minijinja::syntax::SyntaxConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use tokio::fs;
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -125,15 +124,6 @@ pub fn get_original_file_contents(in_dir: &Path, original_file_path: &PathBuf) -
     stdfs::read_to_string(&absolute_path).ok()
 }
 
-/// Returns the contents of a file given an original_file_path and in_dir, async
-pub async fn get_original_file_contents_async(
-    in_dir: &Path,
-    original_file_path: &PathBuf,
-) -> Option<String> {
-    let absolute_path = in_dir.join(original_file_path);
-    fs::read_to_string(&absolute_path).await.ok()
-}
-
 /// Prepares package dependencies for resolution and sets thread local dependencies.
 ///
 /// This function:
@@ -161,6 +151,7 @@ pub fn prepare_package_dependency_levels(
     // Return packages in topological order
     dbt_dag::deps_mgmt::topological_levels(&dependency_map)
 }
+
 /// Register a resource definition for a model
 pub fn prepare_package_dependencies(dbt_state: Arc<dbt_schemas::state::DbtState>) -> Vec<String> {
     // Build dependency map (similar to dbt's load_dependencies)
@@ -529,9 +520,29 @@ pub fn update_node_relation_components(
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
 pub struct NoOpConfig {}
 
-impl DefaultTo<NoOpConfig> for NoOpConfig {
-    fn default_to(&mut self, _other: &Self) {
-        // no-op
+impl ResolvedConfig for NoOpConfig {
+    fn enabled(&self) -> bool {
+        true
+    }
+}
+
+impl ResolvableConfig<NoOpConfig> for NoOpConfig {
+    type Resolved = Self;
+    type PackageDefaults = ();
+    type ResolveDefaults = ();
+
+    fn default_to(&mut self, _other: &Self) {}
+
+    fn get_enabled_with_default(&self) -> bool {
+        true
+    }
+
+    fn disable(&mut self) {}
+
+    fn apply_package_defaults(&mut self, _: ()) {}
+
+    fn finalize(self) -> Self {
+        self
     }
 }
 
@@ -562,7 +573,7 @@ pub fn parse_macro_statements(
     Ok(sql_resources)
 }
 
-fn extract_sql_resources_from_ast<T: DefaultTo<T>>(
+fn extract_sql_resources_from_ast<T: ResolvableConfig<T>>(
     ast: &Stmt,
     sql_resources: &mut Vec<SqlResource<T>>,
     last_func_sign: &mut Option<(Span, String)>,
@@ -606,6 +617,7 @@ fn extract_sql_resources_from_ast<T: DefaultTo<T>>(
                     sql_resources.push(SqlResource::Test(
                         macro_name.to_string(),
                         span,
+                        args,
                         macro_node.name_span,
                     ));
                 }

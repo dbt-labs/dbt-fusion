@@ -1,9 +1,11 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::OnceLock;
 
 use minijinja::Environment;
 use minijinja::listener::RenderingEventListener;
+use regex::Regex;
 use serde::Serialize;
 
 use crate::error::{ProfileError, Result};
@@ -44,9 +46,8 @@ pub struct ResolveArgs {
     /// Searched first; if unset falls back to `project_dir` then `~/.dbt/`.
     pub profiles_dir: Option<PathBuf>,
 
-    /// Path to the dbt project directory. Used to:
-    /// 1. Find a `profiles.yml` in the project root (second search location).
-    /// 2. Read `dbt_project.yml` for the default profile name (standalone mode only).
+    /// Path to the dbt project directory.
+    /// Used to read `dbt_project.yml` for the default profile name (standalone mode only).
     pub project_dir: Option<PathBuf>,
 
     /// Explicit profile name (equivalent to `--profile`).
@@ -120,8 +121,7 @@ impl ResolvedProfile {
 /// [`render_target`].
 pub fn resolve(args: &ResolveArgs) -> Result<ResolvedProfile> {
     let penv = ProfileEnvironment::new(args.vars.clone());
-    let profile_path =
-        find_profiles_path(args.profiles_dir.as_deref(), args.project_dir.as_deref())?;
+    let profile_path = find_profiles_path(args.profiles_dir.as_deref())?;
     let profile_name = resolve_profile_name(args)?;
 
     resolve_with_env(&penv, &profile_path, &profile_name, args.target.as_deref())
@@ -136,7 +136,12 @@ pub fn resolve_with_env(
 ) -> Result<ResolvedProfile> {
     let raw_yaml = std::fs::read_to_string(profile_path)?;
     let sanitized = sanitize_yml(&raw_yaml);
-    let doc: dbt_yaml::Value = dbt_yaml::from_str(sanitized).map_err(|e| ProfileError::Yaml {
+    let mut doc: dbt_yaml::Value =
+        dbt_yaml::from_str(sanitized).map_err(|e| ProfileError::Yaml {
+            path: profile_path.to_path_buf(),
+            source: e,
+        })?;
+    doc.apply_merge().map_err(|e| ProfileError::Yaml {
         path: profile_path.to_path_buf(),
         source: e,
     })?;
@@ -196,13 +201,15 @@ const PROFILES_YML: &str = "profiles.yml";
 
 /// Find the `profiles.yml` file by searching standard locations.
 ///
-/// When `profiles_dir` is set (e.g. from `--profiles-dir`), only that directory
-/// is searched — no fallback to project_dir or ~/.dbt. This matches dbt semantics
-/// where an explicit `--profiles-dir` that lacks profiles.yml must error.
-pub fn find_profiles_path(
-    profiles_dir: Option<&Path>,
-    project_dir: Option<&Path>,
-) -> Result<PathBuf> {
+/// Search order:
+/// 1. `profiles_dir` (e.g. from `--profiles-dir`) — exclusive, no fallback.
+/// 2. Current working directory.
+/// 3. `~/.dbt/`.
+///
+/// When `profiles_dir` is set, only that directory is searched. This matches
+/// dbt semantics where an explicit `--profiles-dir` that lacks profiles.yml
+/// must error.
+pub fn find_profiles_path(profiles_dir: Option<&Path>) -> Result<PathBuf> {
     let mut searched = Vec::new();
 
     if let Some(dir) = profiles_dir {
@@ -218,8 +225,8 @@ pub fn find_profiles_path(
         });
     }
 
-    if let Some(dir) = project_dir {
-        let p = dir.join(PROFILES_YML);
+    if let Ok(cwd) = std::env::current_dir() {
+        let p = cwd.join(PROFILES_YML);
         if p.exists() {
             return Ok(p);
         }
@@ -324,21 +331,26 @@ fn render_value_recursive<S: Serialize>(
 
     match value {
         dbt_yaml::Value::String(s, span) => {
-            if s.contains("{{") || s.contains("{%") {
-                let rendered = env
-                    .render_str(s, ctx, listeners)
-                    .map_err(ProfileError::Jinja)?;
-                match dbt_yaml::from_str::<dbt_yaml::Value>(&rendered) {
+            let has_jinja = s.contains("{{") || s.contains("{%");
+            let rendered = if has_jinja {
+                env.render_str(s, ctx, listeners)
+                    .map_err(ProfileError::Jinja)?
+            } else {
+                s.clone()
+            };
+            let resolved = render_secrets(&rendered)?;
+            if !has_jinja && resolved == rendered {
+                Ok(value.clone())
+            } else {
+                match dbt_yaml::from_str::<dbt_yaml::Value>(&resolved) {
                     Ok(parsed) => match &parsed {
                         dbt_yaml::Value::String(_, _) => {
-                            Ok(dbt_yaml::Value::String(rendered, span.clone()))
+                            Ok(dbt_yaml::Value::String(resolved, span.clone()))
                         }
                         _ => Ok(parsed),
                     },
-                    Err(_) => Ok(dbt_yaml::Value::String(rendered, span.clone())),
+                    Err(_) => Ok(dbt_yaml::Value::String(resolved, span.clone())),
                 }
-            } else {
-                Ok(value.clone())
             }
         }
         dbt_yaml::Value::Mapping(map, span) => {
@@ -362,6 +374,41 @@ fn render_value_recursive<S: Serialize>(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Resolve `DBT_ENV_SECRET_*` sentinel placeholders inserted by the Jinja
+/// `env_var` function (when `placeholder_on_secret_access = true`) to their
+/// real environment variable values.
+///
+/// Mirrors `dbt_jinja_utils::phases::load::secret_renderer::render_secrets`
+/// but is duplicated here to keep `dbt-profile` free of `dbt-jinja-utils`.
+fn render_secrets(s: &str) -> Result<String> {
+    use dbt_jinja_vars::{SECRET_ENV_VAR_PREFIX, SECRET_PLACEHOLDER};
+
+    if !s.contains(SECRET_ENV_VAR_PREFIX) {
+        return Ok(s.to_owned());
+    }
+
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let pattern = SECRET_PLACEHOLDER
+        .replace("{}", &format!("({SECRET_ENV_VAR_PREFIX}(.*))"))
+        .replace("$", r"\$");
+    let re = RE.get_or_init(|| Regex::new(&pattern).expect("valid secret placeholder regex"));
+
+    let mut result = s.to_owned();
+    for caps in re.captures_iter(s) {
+        let var_name = &caps[1];
+        let full_match = &caps[0];
+        match std::env::var(var_name) {
+            Ok(value) => result = result.replace(full_match, &value),
+            Err(_) => {
+                return Err(ProfileError::Other(format!(
+                    "Secret environment variable '{var_name}' not found"
+                )));
+            }
+        }
+    }
+    Ok(result)
+}
 
 // FIXME(jason): Duplicated from dbt_jinja_utils::serde::dbt_sanitize_yml because
 // IoArgs poisons that module's public API.

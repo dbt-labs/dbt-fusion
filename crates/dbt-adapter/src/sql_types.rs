@@ -3,13 +3,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::AdapterResult;
-use crate::base_adapter::backend_of;
 use crate::errors::{AdapterError, AdapterErrorKind};
 use crate::metadata::snowflake::ARROW_FIELD_SNOWFLAKE_FIELD_WIDTH_METADATA_KEY;
 use crate::metadata::*;
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
-use dbt_common::adapter::AdapterType;
-use dbt_xdbc::sql::types::{SqlType, metadata_sql_type_key};
+use dbt_adapter_core::AdapterType;
+use dbt_adapter_sql::types::{SqlType, metadata_sql_type_key};
 
 // TODO: Add keys here as necessary
 pub const REDSHIFT_METADATA_SQL_TYPE_KEY: &str = "Type";
@@ -100,12 +99,11 @@ pub trait TypeOps: Send + Sync {
 }
 
 /// Source-available [TypeOps] implementation.
-pub struct SATypeOpsImpl(AdapterType, dbt_xdbc::Backend);
+pub struct SATypeOpsImpl(AdapterType);
 
 impl SATypeOpsImpl {
     pub fn new(adapter_type: AdapterType) -> Self {
-        let backend = backend_of(adapter_type);
-        Self(adapter_type, backend)
+        Self(adapter_type)
     }
 }
 
@@ -136,8 +134,8 @@ impl TypeOps for SATypeOpsImpl {
     }
 
     fn format_sql_type(&self, sql_type: SqlType, out: &mut String) -> AdapterResult<()> {
-        let backend = self.1;
-        sql_type.write(backend, out).map_err(|e| {
+        let adapter_type = self.0;
+        sql_type.write(adapter_type, out).map_err(|e| {
             AdapterError::new(
                 AdapterErrorKind::NotSupported,
                 format!("Failed to convert SQL type {sql_type:?}. Error: {e}"),
@@ -146,10 +144,10 @@ impl TypeOps for SATypeOpsImpl {
     }
 
     fn parse_into_nullable_arrow_type(&self, s: &str) -> AdapterResult<(DataType, bool)> {
-        let backend = backend_of(self.0);
-        SqlType::parse(backend, s)
+        let adapter_type = self.0;
+        SqlType::parse(adapter_type, s)
             .map(|(sql_type, nullable)| {
-                let arrow_type = sql_type.pick_best_arrow_type(backend);
+                let arrow_type = sql_type.pick_best_arrow_type(adapter_type);
                 (arrow_type, nullable)
             })
             .map_err(|e| AdapterError::new(AdapterErrorKind::UnexpectedResult, e))
@@ -165,11 +163,12 @@ impl TypeOps for SATypeOpsImpl {
                 );
                 None
             }
-            Sidecar => None,
             // No type transformations have been necessary for the seed operation against
             // these data platforms so far, but this may need to be updated if that changes.
             Postgres | Salesforce | Spark | DuckDB | Fabric => None,
-            ClickHouse | Starburst | Athena | Trino | Dremio | Oracle => todo!("not yet"),
+            ClickHouse | Exasol | Starburst | Athena | Trino | Dremio | Oracle | Datafusion => {
+                todo!("not yet")
+            }
         }
     }
 }
@@ -213,7 +212,7 @@ pub fn make_arrow_field_v1(
     // Special handling for Snowflake char width fields
     // because these are given to the user as separate types
     if adapter_type == AdapterType::Snowflake {
-        let sql_type_res = SqlType::parse(backend_of(adapter_type), sql_type_str).map(|(ty, _)| ty);
+        let sql_type_res = SqlType::parse(adapter_type, sql_type_str).map(|(ty, _)| ty);
         match sql_type_res {
             Ok(Binary(Some(max_len))) | Ok(Varchar(Some(max_len), _)) => {
                 metadata.insert(
@@ -242,16 +241,15 @@ pub fn make_arrow_field_v2(
     use AdapterType::*;
     use SqlType::*;
     let adapter_type = type_ops.adapter_type();
-    let backend = backend_of(adapter_type);
-    let (sql_type, nullable) = SqlType::parse(backend, sql_type_str)
+    let (sql_type, nullable) = SqlType::parse(adapter_type, sql_type_str)
         .map_err(|e| AdapterError::new(AdapterErrorKind::UnexpectedResult, e))?;
-    let data_type = sql_type.pick_best_arrow_type(backend);
+    let data_type = sql_type.pick_best_arrow_type(adapter_type);
 
     let field = Field::new(col_name, data_type, nullable_override.unwrap_or(nullable));
 
     let mut metadata = HashMap::new();
     metadata.insert(
-        metadata_sql_type_key(backend).to_string(),
+        metadata_sql_type_key(adapter_type).to_string(),
         sql_type_str.to_string(),
     );
     if let Some(comment) = comment {
@@ -282,15 +280,16 @@ pub const fn get_field_sql_type_metadata_key(adapter_type: AdapterType) -> &'sta
         AdapterType::Postgres => todo!(),
         AdapterType::Salesforce => todo!(),
         AdapterType::Spark => todo!(),
-        AdapterType::Sidecar => todo!(),
         AdapterType::DuckDB => todo!(),
         AdapterType::Fabric => FABRIC_METADATA_SQL_TYPE_KEY,
         AdapterType::ClickHouse => todo!(),
+        AdapterType::Exasol => "DATA_TYPE",
         AdapterType::Starburst => todo!(),
         AdapterType::Athena => todo!(),
         AdapterType::Trino => todo!(),
         AdapterType::Dremio => todo!(),
         AdapterType::Oracle => todo!(),
+        AdapterType::Datafusion => todo!(),
     }
 }
 
@@ -298,12 +297,11 @@ pub fn original_type_string<'a>(
     adapter_type: AdapterType,
     field: &'a Field,
 ) -> Option<Cow<'a, str>> {
-    let backend = backend_of(adapter_type);
     // The first step is trying to the original SQL type from the `Field` by
     // probing the `<VENDOR>::type` metadata key as proposed in [1].
     //
     // [1]: https://github.com/apache/arrow-adbc/issues/3449
-    let sql_type_string = dbt_xdbc::sql::types::original_type_string(backend, field)
+    let sql_type_string = dbt_adapter_sql::types::original_type_string(adapter_type, field)
         .map(|s| Cow::Borrowed(s.as_str()));
 
     match (adapter_type, sql_type_string) {
@@ -338,8 +336,10 @@ impl SdfSchemaBuilder {
                 metadata.get(ARROW_FIELD_COMMENT_METADATA_KEY)
             }
             // no evidence that these drivers store comments in metadata, but just in case
-            Postgres | Snowflake | Salesforce | Sidecar | Fabric | ClickHouse | Starburst
-            | Athena | Trino | Dremio | Oracle => metadata.get(ARROW_FIELD_COMMENT_METADATA_KEY),
+            Postgres | Snowflake | Salesforce | Fabric | ClickHouse | Exasol | Starburst
+            | Athena | Trino | Dremio | Oracle | Datafusion => {
+                metadata.get(ARROW_FIELD_COMMENT_METADATA_KEY)
+            }
         };
         comment
     }
@@ -373,8 +373,8 @@ impl SdfSchemaBuilder {
     pub fn build_sdf_schema(self, type_ops: &dyn TypeOps) -> AdapterResult<SdfSchema> {
         use AdapterType::*;
         match self.adapter_type {
-            Bigquery | Redshift | Databricks | Spark | Sidecar | DuckDB | Fabric | ClickHouse
-            | Starburst | Athena | Trino | Dremio | Oracle => {
+            Bigquery | Redshift | Databricks | Spark | DuckDB | Fabric | ClickHouse | Exasol
+            | Starburst | Athena | Trino | Dremio | Oracle | Datafusion => {
                 let original_fields = self.original.fields();
                 let mut sdf_fields = Vec::with_capacity(original_fields.len());
                 for field in original_fields {
@@ -485,7 +485,7 @@ pub fn sql_type_hint_to_str<'a>(
     adapter_type: AdapterType,
 ) -> Cow<'a, str> {
     use SqlTypeHint::*;
-    use dbt_common::adapter::AdapterType::*;
+    use dbt_adapter_core::AdapterType::*;
     let str = match (adapter_type, hint) {
         // ## convert_integer_type()
         (Bigquery, Integer) => "int64",
@@ -538,7 +538,7 @@ pub mod bigquery {
 
     // XXX: make private once all tests are moved to here
     use arrow_schema::{DataType, Field};
-    use dbt_common::adapter::AdapterType;
+    use dbt_adapter_core::AdapterType;
 
     use crate::sql_types::get_field_sql_type_metadata_key;
 
@@ -737,8 +737,8 @@ pub const fn max_varchar_size(adapter_type: AdapterType) -> Option<usize> {
         // FIXME: Actual MAX is 134_217_728 - 16_777_216 is the default value
         Snowflake => Some(16_777_216),
         Redshift => Some(256),
-        Postgres | Bigquery | Databricks | Salesforce | Spark | Sidecar | DuckDB | Fabric
-        | ClickHouse | Starburst | Athena | Trino | Dremio | Oracle => None,
+        Postgres | Bigquery | Databricks | Salesforce | Spark | DuckDB | Fabric | ClickHouse
+        | Exasol | Starburst | Athena | Trino | Dremio | Oracle | Datafusion => None,
     }
 }
 
@@ -748,8 +748,8 @@ pub const fn max_varbinary_size(adapter_type: AdapterType) -> Option<usize> {
         Snowflake => Some(16_777_216),
         Redshift => Some(65_535),
         // TODO: define limits for more systems
-        Postgres | Bigquery | Databricks | Salesforce | Spark | Sidecar | DuckDB | Fabric
-        | ClickHouse | Starburst | Athena | Trino | Dremio | Oracle => None,
+        Postgres | Bigquery | Databricks | Salesforce | Spark | DuckDB | Fabric | ClickHouse
+        | Exasol | Starburst | Athena | Trino | Dremio | Oracle | Datafusion => None,
     }
 }
 
@@ -759,7 +759,7 @@ pub mod snowflake {
     // TODO: move away from this when we move away from the FixedSizeList hack
     // Additionally, it's a completely wrong assumption that drivers return types
     // like this. Drivers can't return these types. We should be using proper
-    // SQL types and parsing them with [dbt_xdbc::sql::types] instead.
+    // SQL types and parsing them with [dbt_adapter_sql::types] instead.
 
     #[derive(Clone, Copy)]
     pub struct TimePrecision(u8);
@@ -1024,7 +1024,7 @@ pub fn numeric_precision_scale(
 mod tests {
     use super::*;
     use SqlTypeHint::*;
-    use dbt_common::adapter::AdapterType::*;
+    use dbt_adapter_core::AdapterType::*;
 
     #[test]
     fn test_convert_integer_type() {

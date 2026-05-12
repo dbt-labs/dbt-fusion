@@ -1,23 +1,26 @@
+use super::resolve_properties::MinimalPropertiesEntry;
 use crate::args::ResolveArgs;
 use crate::dbt_project_config::{
-    RootProjectConfigs, init_project_config, strip_resource_paths_from_ref_path,
+    ProjectConfigResolver, RootProjectConfigs, init_project_config,
+    strip_resource_paths_from_ref_path,
 };
 use crate::renderer::{
     RenderCtx, RenderCtxInner, SqlFileRenderResult, collect_adapter_identifiers_detect_unsafe,
     render_unresolved_sql_files,
 };
+use crate::resolve::resolve_tests::persist_generic_data_tests::TestableNodeTrait;
+use crate::resolve::resolve_utils::{err_resource_name_has_spaces, validate_compute};
+use crate::resolve::yaml_field_utils;
 use crate::sql_file_info::SqlFileInfo;
 use crate::utils::{
     RelationComponents, get_node_fqn, get_original_file_path, update_node_relation_components,
 };
-use dbt_common::adapter::AdapterType;
+use crate::validation::check_node_static_analysis;
+use dbt_adapter_core::AdapterType;
 use dbt_common::cancellation::CancellationToken;
 use dbt_common::constants::DBT_SNAPSHOTS_DIR_NAME;
 use dbt_common::error::AbstractLocation;
 use dbt_common::io_args::{StaticAnalysisKind, StaticAnalysisOffReason};
-use dbt_common::static_analysis::{
-    StaticAnalysisDeprecationOrigin, check_deprecated_static_analysis_kind,
-};
 use dbt_common::tokiofs;
 use dbt_common::tracing::emit::{emit_error_log_from_fs_error, emit_warn_log_from_fs_error};
 use dbt_common::{ErrorCode, FsResult, fs_err, stdfs, unexpected_fs_err};
@@ -26,8 +29,8 @@ use dbt_jinja_utils::listener::DefaultJinjaTypeCheckEventListenerFactory;
 use dbt_jinja_utils::node_resolver::NodeResolver;
 use dbt_jinja_utils::serde::into_typed_with_jinja;
 use dbt_schemas::schemas::common::{
-    DbtChecksum, DbtMaterialization, DbtQuoting, NodeDependsOn,
-    conform_normalized_snapshot_raw_code_to_mantle_format, normalize_sql,
+    DbtChecksum, DbtQuoting, NodeDependsOn, conform_normalized_snapshot_raw_code_to_mantle_format,
+    normalize_sql,
 };
 use dbt_schemas::schemas::dbt_column::process_columns;
 use dbt_schemas::schemas::macros::DbtMacro;
@@ -39,15 +42,13 @@ use dbt_schemas::schemas::{
     CommonAttributes, DbtSnapshot, DbtSnapshotAttr, IntrospectionKind, NodeBaseAttributes,
 };
 use dbt_schemas::state::{
-    DbtAsset, DbtPackage, DbtRuntimeConfig, ModelStatus, NodeResolverTracker,
+    DbtAsset, DbtPackage, DbtRuntimeConfig, GenericTestAsset, ModelStatus, NodeResolverTracker,
 };
 use minijinja::Value as MinijinjaValue;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-
-use super::resolve_properties::MinimalPropertiesEntry;
 
 #[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
 pub async fn resolve_snapshots(
@@ -65,6 +66,8 @@ pub async fn resolve_snapshots(
     base_ctx: &BTreeMap<String, MinijinjaValue>,
     runtime_config: Arc<DbtRuntimeConfig>,
     node_resolver: &mut NodeResolver,
+    collected_generic_tests: &mut Vec<GenericTestAsset>,
+    test_name_truncations: &mut HashMap<String, String>,
     token: &CancellationToken,
 ) -> FsResult<(
     HashMap<String, Arc<DbtSnapshot>>,
@@ -80,21 +83,6 @@ pub async fn resolve_snapshots(
         Some(package.dbt_project.name.as_str())
     } else {
         None
-    };
-
-    let local_project_config = if package.dbt_project.name == root_project.name {
-        root_project_configs.snapshots.clone()
-    } else {
-        init_project_config(
-            &arg.io,
-            &package.dbt_project.snapshots,
-            SnapshotConfig {
-                enabled: Some(true),
-                quoting: Some(package_quoting),
-                ..Default::default()
-            },
-            dependency_package_name,
-        )?
     };
 
     let package_name = package.dbt_project.name.to_owned();
@@ -157,8 +145,18 @@ pub async fn resolve_snapshots(
     for (snapshot_name, mpe) in snapshot_properties.iter_mut() {
         // if mpe.schema_value
         if !mpe.schema_value.is_null() {
-            let schema_value = std::mem::replace(&mut mpe.schema_value, dbt_yaml::Value::null());
-            let snapshot: SnapshotProperties = into_typed_with_jinja(
+            let mut schema_value =
+                std::mem::replace(&mut mpe.schema_value, dbt_yaml::Value::null());
+            // `description:` is documentation text and may contain Jinja-like
+            // doc snippets the renderer cannot evaluate at parse time
+            // (e.g. `{% raw %}{{ ref('x') }}{% endraw %}`). dbt-core never
+            // renders descriptions; detach before `into_typed_with_jinja`
+            // so the renderer doesn't see the string, then reattach the raw
+            // value to the typed struct. Other fields (config, meta, …)
+            // still go through Jinja as before.
+            let raw_description =
+                yaml_field_utils::detach_field_from_mapping(&mut schema_value, "description");
+            let mut snapshot: SnapshotProperties = into_typed_with_jinja(
                 &arg.io,
                 schema_value,
                 false,
@@ -168,6 +166,11 @@ pub async fn resolve_snapshots(
                 dependency_package_name,
                 true,
             )?;
+            if let Some(desc_value) = raw_description
+                && let Some(s) = desc_value.as_str()
+            {
+                snapshot.description = Some(s.to_string());
+            }
 
             if let Some(relation) = &snapshot.relation {
                 // check if the relation matches the pattern of ref(...)
@@ -227,18 +230,34 @@ pub async fn resolve_snapshots(
         }
     }
 
+    let config_resolver = ProjectConfigResolver::build(
+        root_project_configs.snapshots.clone(),
+        dependency_package_name.is_some(),
+        || {
+            init_project_config(
+                &arg.io,
+                &package.dbt_project.snapshots,
+                package_quoting,
+                dependency_package_name,
+            )
+        },
+    )?
+    .with_resolve_defaults((
+        arg.static_analysis.unwrap_or_default(),
+        root_project.sync.clone(),
+    ));
+
     let render_ctx = RenderCtx {
         inner: Arc::new(RenderCtxInner {
             args: arg.clone(),
             root_project_name: root_project.name.clone(),
-            root_project_config: root_project_configs.snapshots.clone(),
+            config_resolver,
             package_quoting,
             base_ctx: base_ctx.clone(),
             package_name: package_name.to_string(),
             adapter_type,
             database: database.to_string(),
             schema: schema.to_string(),
-            local_project_config,
             resource_paths: package
                 .dbt_project
                 .snapshot_paths
@@ -277,6 +296,7 @@ pub async fn resolve_snapshots(
     for SqlFileRenderResult {
         asset: dbt_asset,
         sql_file_info,
+        config: snapshot_config,
         macro_spans: _macro_spans,
         properties: maybe_properties,
         status,
@@ -286,6 +306,9 @@ pub async fn resolve_snapshots(
     {
         {
             let snapshot_name = dbt_asset.path.file_stem().unwrap().to_str().unwrap();
+            if snapshot_name.contains(' ') {
+                return Err(err_resource_name_has_spaces(snapshot_name, &dbt_asset.path));
+            }
 
             // Recalculate checksum from original snapshot file.
             // Without doing this, the checksum will be different from the one from mantle since fusion
@@ -299,8 +322,6 @@ pub async fn resolve_snapshots(
                     sql_file_info.checksum.clone()
                 };
 
-            let mut final_config = *sql_file_info.config;
-
             let properties = if let Some(properties) = maybe_properties {
                 properties
             } else {
@@ -309,17 +330,11 @@ pub async fn resolve_snapshots(
 
             let unique_id = format!("snapshot.{package_name}.{snapshot_name}");
 
-            final_config.enabled = Some(!(status == ModelStatus::Disabled));
-
             let columns = process_columns(
                 properties.columns.as_ref(),
-                final_config.meta.clone(),
-                final_config.tags.clone().map(|tags| tags.into()),
+                snapshot_config.meta.clone(),
+                snapshot_config.tags.clone().map(|tags| tags.into()),
             )?;
-
-            if final_config.materialized.is_none() {
-                final_config.materialized = Some(DbtMaterialization::Table);
-            }
 
             let fqn = get_node_fqn(
                 &package_name,
@@ -332,21 +347,15 @@ pub async fn resolve_snapshots(
                     .unwrap_or(&vec![]),
             );
 
-            let static_analysis =
-                if let Some(static_analysis) = final_config.static_analysis.clone() {
-                    check_deprecated_static_analysis_kind(
-                        static_analysis.clone().into_inner(),
-                        StaticAnalysisDeprecationOrigin::NodeConfig {
-                            unique_id: unique_id.as_str(),
-                        },
-                        dependency_package_name,
-                        arg.io.status_reporter.as_ref(),
-                    );
-                    static_analysis
-                } else {
-                    // If global override is set, use it. Otherwise default
-                    arg.static_analysis.unwrap_or_default().into()
-                };
+            let static_analysis = snapshot_config.static_analysis.clone();
+            check_node_static_analysis(
+                &snapshot_config,
+                arg.static_analysis,
+                &unique_id,
+                dependency_package_name,
+                arg.io.status_reporter.as_ref(),
+            );
+            validate_compute(snapshot_config.compute, &dbt_asset.path)?;
 
             let macro_depends_on = all_depends_on
                 .get(&format!("{package_name}.{snapshot_name}"))
@@ -371,15 +380,15 @@ pub async fn resolve_snapshots(
                     unique_id: unique_id.clone(),
                     fqn,
                     description: properties.description.to_owned(),
-                    patch_path,
+                    patch_path: patch_path.clone(),
                     checksum: recalculated_checksum,
                     language: Some("sql".to_string()),
-                    tags: final_config
+                    tags: snapshot_config
                         .tags
                         .clone()
                         .map(|tags| tags.into())
                         .unwrap_or_default(),
-                    meta: final_config.meta.clone().unwrap_or_default(),
+                    meta: snapshot_config.meta.clone().unwrap_or_default(),
                 },
                 __base_attr__: NodeBaseAttributes {
                     database: "".to_owned(), // will be updated below
@@ -392,25 +401,20 @@ pub async fn resolve_snapshots(
                         nodes: vec![],
                         nodes_with_ref_location: vec![],
                     },
-                    enabled: final_config.enabled.unwrap_or(true),
+                    compute: snapshot_config.compute,
+                    enabled: snapshot_config.enabled,
                     extended_model: false,
-                    persist_docs: final_config.persist_docs.clone(),
-                    materialized: final_config
-                        .materialized
-                        .clone()
-                        .expect("materialized is required"),
-                    quoting: final_config
+                    persist_docs: snapshot_config.persist_docs.clone(),
+                    materialized: snapshot_config.materialized.clone(),
+                    quoting: snapshot_config
                         .quoting
-                        .expect("quoting is required")
                         .try_into()
-                        .expect("quoting is required"),
-                    quoting_ignore_case: final_config
+                        .expect("DbtQuoting -> ResolvedQuoting conversion"),
+                    quoting_ignore_case: snapshot_config
                         .quoting
-                        .unwrap_or_default()
                         .snowflake_ignore_case
                         .unwrap_or(false),
-                    static_analysis_off_reason: (static_analysis.clone().into_inner()
-                        == StaticAnalysisKind::Off)
+                    static_analysis_off_reason: (*static_analysis == StaticAnalysisKind::Off)
                         .then_some(StaticAnalysisOffReason::ConfiguredOff),
                     static_analysis,
                     refs: sql_file_info
@@ -445,7 +449,7 @@ pub async fn resolve_snapshots(
                     metrics: vec![],
                 },
                 __snapshot_attr__: DbtSnapshotAttr {
-                    snapshot_meta_column_names: final_config
+                    snapshot_meta_column_names: snapshot_config
                         .snapshot_meta_column_names
                         .clone()
                         .unwrap_or_default(),
@@ -454,13 +458,13 @@ pub async fn resolve_snapshots(
                     } else {
                         IntrospectionKind::None
                     },
-                    sync: final_config.sync.clone(),
+                    sync: snapshot_config.sync.clone(),
                 },
                 __adapter_attr__: AdapterAttr::from_config_and_dialect(
-                    &final_config.__warehouse_specific_config__,
+                    &snapshot_config.__warehouse_specific_config__,
                     adapter_type,
                 ),
-                deprecated_config: final_config.clone(),
+                deprecated_config: snapshot_config.clone().into(),
                 compiled: None,
                 compiled_code: None,
                 __other__: BTreeMap::new(),
@@ -468,17 +472,17 @@ pub async fn resolve_snapshots(
 
             let components = RelationComponents {
                 // For backwards compatibility with target_schema and target_database configs
-                database: if final_config.target_database.is_some() {
-                    final_config.target_database.clone()
+                database: if snapshot_config.target_database.is_some() {
+                    snapshot_config.target_database.clone()
                 } else {
-                    final_config.database.clone()
+                    snapshot_config.database.clone()
                 },
-                schema: if final_config.target_schema.is_some() {
-                    final_config.target_schema.clone()
+                schema: if snapshot_config.target_schema.is_some() {
+                    snapshot_config.target_schema.clone()
                 } else {
-                    final_config.schema.clone()
+                    snapshot_config.schema.clone()
                 },
-                alias: final_config.alias.clone(),
+                alias: snapshot_config.alias.clone(),
                 store_failures: None,
             };
 
@@ -503,7 +507,7 @@ pub async fn resolve_snapshots(
 
             match status {
                 ModelStatus::Enabled => {
-                    if final_config.unique_key.is_none() || final_config.strategy.is_none() {
+                    if snapshot_config.unique_key.is_none() || snapshot_config.strategy.is_none() {
                         let e = fs_err!(
                             code => ErrorCode::InvalidConfig,
                             loc => dbt_asset.path.clone(),
@@ -516,6 +520,18 @@ pub async fn resolve_snapshots(
                         snapshots_with_execute.insert(unique_id.to_owned(), dbt_snapshot);
                     } else {
                         snapshots.insert(unique_id, Arc::new(dbt_snapshot));
+                    }
+
+                    if !arg.skip_creating_generic_tests {
+                        properties.as_testable().persist(
+                            package_name.as_str(),
+                            &root_project.name,
+                            collected_generic_tests,
+                            test_name_truncations,
+                            adapter_type,
+                            &arg.io,
+                            patch_path.as_ref().unwrap_or(&dbt_asset.path),
+                        )?;
                     }
                 }
                 ModelStatus::Disabled => {
@@ -533,7 +549,7 @@ pub async fn resolve_snapshots(
         if !mpe.schema_value.is_null() {
             // Validate that the model is not latest and flattened
             let err = fs_err!(
-                code => ErrorCode::InvalidConfig,
+                code => ErrorCode::NoNodeForYamlKey,
                 loc => mpe.relative_path.clone(),
                 "Unused schema.yml entry for snapshot '{}'",
                 snapshot_name,

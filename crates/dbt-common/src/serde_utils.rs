@@ -4,6 +4,7 @@ use std::{fmt, marker::PhantomData};
 use crate::dashmap::DashMap;
 use indexmap::IndexMap;
 use minijinja::value::ValueMap;
+use minijinja::value::mutable_vec::MutableVec;
 use serde::{
     Deserialize, Deserializer, Serialize,
     de::{Visitor, value::UnitDeserializer},
@@ -15,17 +16,19 @@ type YmlValue = dbt_yaml::Value;
 fn convert_yml_value(yml: YmlValue) -> minijinja::Value {
     match yml {
         YmlValue::Mapping(map, _) => {
-            let mut value_map = BTreeMap::new();
+            let mut value_map = ValueMap::new();
             for (k, v) in map {
                 value_map.insert(
-                    k.as_str().expect("key is not a string").to_string(),
+                    minijinja::Value::from(k.as_str().expect("key is not a string").to_string()),
                     convert_yml_value(v),
                 );
             }
-            minijinja::Value::from(value_map)
+            minijinja::Value::from_object(value_map)
         }
         YmlValue::Sequence(arr, _) => {
-            minijinja::Value::from_iter(arr.into_iter().map(convert_yml_value))
+            let items: MutableVec<minijinja::Value> =
+                arr.into_iter().map(convert_yml_value).collect();
+            minijinja::Value::from_object(items)
         }
         YmlValue::Null(_) => minijinja::Value::from(None::<()>),
         _ => minijinja::Value::from_serialize(yml),
@@ -92,7 +95,9 @@ fn convert_yml_value_ordered(yml: YmlValue) -> minijinja::Value {
             minijinja::Value::from_object(value_map)
         }
         YmlValue::Sequence(arr, _) => {
-            minijinja::Value::from_iter(arr.into_iter().map(convert_yml_value))
+            let items: MutableVec<minijinja::Value> =
+                arr.into_iter().map(convert_yml_value).collect();
+            minijinja::Value::from_object(items)
         }
         YmlValue::Null(_) => minijinja::Value::from(None::<()>),
         _ => minijinja::Value::from_serialize(yml),
@@ -378,6 +383,37 @@ impl<T> From<Option<T>> for Omissible<T> {
     }
 }
 
+/// Read an optional boolean from a YAML mapping.
+///
+/// Accepts a YAML `Bool` literal or a string parseable by
+/// [`crate::string_utils::try_parse_bool_str`]. Missing keys return
+/// `Ok(None)`; other YAML shapes or unparseable strings return an
+/// `InvalidConfig` error.
+pub fn try_get_bool(m: &dbt_yaml::Mapping, k: &str) -> crate::FsResult<Option<bool>> {
+    use crate::string_utils::try_parse_bool_str;
+    use crate::{ErrorCode, fs_err};
+    match m.get(dbt_yaml::Value::from(k)) {
+        None => Ok(None),
+        Some(v) => match v {
+            dbt_yaml::Value::Bool(b, _) => Ok(Some(*b)),
+            dbt_yaml::Value::String(s, _) => try_parse_bool_str(Some(s.as_str()), k).map_err(|e| {
+                fs_err!(
+                    code => ErrorCode::InvalidConfig,
+                    hacky_yml_loc => Some(v.span().clone()),
+                    "{}",
+                    e.message()
+                )
+            }),
+            _ => Err(fs_err!(
+                code => ErrorCode::InvalidConfig,
+                hacky_yml_loc => Some(v.span().clone()),
+                "Key '{}' must be a boolean",
+                k
+            )),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,5 +537,86 @@ properties:
     type: string
 "}
         );
+    }
+
+    #[test]
+    fn test_convert_yml_mapping_preserves_insertion_order() {
+        // Regression test: YAML mappings must render with keys in insertion order,
+        // not sorted alphabetically, when embedded in compiled Python models
+        // (e.g. lifetime/days/score dicts in config_dict / meta_dict).
+        //
+        // Keys here are deliberately NOT in alphabetical order:
+        //   insertion: ID, TH, PH
+        //   alphabetical (BTreeMap): ID, PH, TH  ← P sorts before T
+        let yaml = "ID: 30\nTH: 30\nPH: 30\n";
+        let yml_value: YmlValue = dbt_yaml::from_str(yaml).unwrap();
+
+        let mj_value = convert_yml_value(yml_value);
+        let rendered = mj_value.to_string();
+
+        assert_eq!(
+            rendered, "{'ID': 30, 'TH': 30, 'PH': 30}",
+            "expected insertion order but got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_convert_yml_sequence_renders_as_list_not_tuple() {
+        // Regression test: YAML sequences must render as Python lists `[...]`,
+        // not as Python tuples `(...)`, when embedded in compiled Python models
+        // (e.g. config_dict / meta_dict in the py_script_postfix template).
+        let yaml = "- ID\n- TH\n- PH\n- SG\n";
+        let yml_value: YmlValue = dbt_yaml::from_str(yaml).unwrap();
+
+        let mj_value = convert_yml_value(yml_value);
+        let rendered = mj_value.to_string();
+
+        assert!(
+            rendered.starts_with('['),
+            "expected list syntax `[...]` but got: {rendered}"
+        );
+        assert!(
+            rendered.ends_with(']'),
+            "expected list syntax `[...]` but got: {rendered}"
+        );
+        assert_eq!(rendered, "['ID', 'TH', 'PH', 'SG']");
+    }
+
+    #[test]
+    fn try_get_bool_missing_key_yields_none() {
+        let m: dbt_yaml::Mapping = dbt_yaml::from_str("other_key: true").unwrap();
+        assert_eq!(try_get_bool(&m, "use_uniform").unwrap(), None);
+    }
+
+    #[test]
+    fn try_get_bool_yaml_bool_literal() {
+        let m: dbt_yaml::Mapping = dbt_yaml::from_str("k: true").unwrap();
+        assert_eq!(try_get_bool(&m, "k").unwrap(), Some(true));
+        let m: dbt_yaml::Mapping = dbt_yaml::from_str("k: false").unwrap();
+        assert_eq!(try_get_bool(&m, "k").unwrap(), Some(false));
+    }
+
+    #[test]
+    fn try_get_bool_yaml_string_with_casing_and_whitespace() {
+        let m: dbt_yaml::Mapping = dbt_yaml::from_str(r#"k: "True""#).unwrap();
+        assert_eq!(try_get_bool(&m, "k").unwrap(), Some(true));
+        let m: dbt_yaml::Mapping = dbt_yaml::from_str(r#"k: "  TRUE  ""#).unwrap();
+        assert_eq!(try_get_bool(&m, "k").unwrap(), Some(true));
+        let m: dbt_yaml::Mapping = dbt_yaml::from_str(r#"k: "false""#).unwrap();
+        assert_eq!(try_get_bool(&m, "k").unwrap(), Some(false));
+    }
+
+    #[test]
+    fn try_get_bool_unparseable_string_errors() {
+        let m: dbt_yaml::Mapping = dbt_yaml::from_str(r#"k: "yes""#).unwrap();
+        let err = try_get_bool(&m, "k").unwrap_err();
+        assert!(err.to_string().contains(r#"expected "true" or "false""#));
+    }
+
+    #[test]
+    fn try_get_bool_wrong_yaml_type_errors() {
+        let m: dbt_yaml::Mapping = dbt_yaml::from_str("k: 42").unwrap();
+        let err = try_get_bool(&m, "k").unwrap_err();
+        assert!(err.to_string().contains("must be a boolean"));
     }
 }

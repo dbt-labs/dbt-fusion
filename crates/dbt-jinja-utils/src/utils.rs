@@ -1,15 +1,16 @@
+use dbt_adapter::Adapter;
 use dbt_adapter::relation::create_relation;
-use dbt_adapter::{AdapterTyping, BridgeAdapter};
 use dbt_common::io_utils::StatusReporter;
 use dbt_common::{ErrorCode, FsError, fs_err};
-use dbt_common::{FsResult, constants::DBT_CTE_PREFIX, error::MacroSpan, tokiofs};
+use dbt_common::{FsResult, constants::DBT_CTE_PREFIX, error::MacroSpan, stdfs};
 use dbt_frontend_common::{error::CodeLocation, span::Span};
 use dbt_schemas::schemas::common::ResolvedQuoting;
-use dbt_schemas::schemas::project::DefaultTo;
+use dbt_schemas::schemas::project::ResolvableConfig;
+use dbt_schemas::schemas::telemetry::NodeType;
 use dbt_schemas::schemas::{
     CommonAttributes, DbtModel, DbtSeed, DbtSnapshot, DbtTest, DbtUnitTest, InternalDbtNode,
 };
-use dbt_yaml::Spanned;
+use dbt_yaml::{Spanned, Value as YmlValue};
 use minijinja::Environment;
 use minijinja::arg_utils::ArgParser;
 use minijinja::constants::{ROOT_PACKAGE_NAME, TARGET_PACKAGE_NAME, TARGET_UNIQUE_ID, THREAD_ID};
@@ -18,6 +19,7 @@ use minijinja::{
     functions::debug,
     value::{Rest, Value as MinijinjaValue, ValueKind},
 };
+use regex::Regex;
 use serde::Deserialize;
 use std::any::Any;
 use std::collections::BTreeMap;
@@ -47,6 +49,17 @@ pub static ENV_VARS: LazyLock<Mutex<HashMap<String, String>>> =
 /// Cache for template lookups per (current_project, root_project, component)
 static TEMPLATE_CACHE: LazyLock<Mutex<HashMap<(String, String), String>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Matches local quoted or unquoted CTE definitions that use dbt's ephemeral CTE
+/// prefix, such as `with __dbt__cte__model as (...)` or
+/// `with "__dbt__cte__model" as (...)`, so they can be distinguished from refs.
+static LOCAL_EPHEMERAL_CTE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    let prefix = regex::escape(DBT_CTE_PREFIX);
+    Regex::new(&format!(
+        r#"(?i)(?:"{prefix}([[:alnum:]_]+)"|{prefix}([[:alnum:]_]+))\s*(?:\([^)]*\)\s*)?as\s*(?:(?:not\s+)?materialized\s+)?\("#
+    ))
+    .expect("valid local ephemeral CTE regex")
+});
 
 /// Converts a value to a boolean
 pub fn as_bool(args: Value) -> Result<Value, Error> {
@@ -147,7 +160,7 @@ pub fn unescape(html: &str) -> String {
 /// This function processes SQL that contains DBT CTE prefixes, extracts model names,
 /// reads the corresponding SQL files from the ephemeral directory, and incorporates them
 /// as CTEs in the final SQL. It also adjusts macro spans to account for the added lines.
-pub async fn inject_and_persist_ephemeral_models(
+pub fn inject_and_persist_ephemeral_models(
     sql: String,
     macro_spans: &mut MacroSpans,
     model_name: &str,
@@ -158,17 +171,17 @@ pub async fn inject_and_persist_ephemeral_models(
         // Write the ephemeral model to the ephemeral directory
         if is_current_model_ephemeral {
             let ephemeral_path = ephemeral_dir.join(format!("{model_name}.sql"));
-            tokiofs::create_dir_all(ephemeral_path.parent().unwrap()).await?;
-            tokiofs::write(
+            stdfs::create_dir_all(ephemeral_path.parent().unwrap())?;
+            stdfs::write(
                 ephemeral_path,
                 format!("{DBT_CTE_PREFIX}{model_name} as (\n{sql}\n)"),
-            )
-            .await?;
+            )?;
         }
         return Ok(sql);
     }
 
     let mut final_sql = sql;
+    let local_ephemeral_cte_names = extract_local_ephemeral_cte_names(&final_sql);
     let ephemeral_model_names = extract_ephemeral_model_names(&final_sql);
 
     // Read ephemeral SQL from ephemeral dir and build cumulative CTEs
@@ -177,8 +190,18 @@ pub async fn inject_and_persist_ephemeral_models(
     let mut all_ctes = Vec::new();
 
     for model_name in ephemeral_model_names {
-        let path = format!("{}/{}.sql", ephemeral_dir.to_str().unwrap(), model_name);
-        let ephemeral_sql = tokiofs::read_to_string(&path).await?;
+        let ephemeral_path = ephemeral_dir.join(format!("{model_name}.sql"));
+        let ephemeral_sql = match stdfs::read_to_string(&ephemeral_path) {
+            Ok(ephemeral_sql) => ephemeral_sql,
+            Err(err) if local_ephemeral_cte_names.contains(model_name) => {
+                match stdfs::exists(&ephemeral_path) {
+                    Ok(false) => continue,
+                    Ok(true) => return Err(err),
+                    Err(err) => return Err(err),
+                }
+            }
+            Err(err) => return Err(err),
+        };
 
         // Split existing CTEs and add any new ones
         let existing_ctes: Vec<String> = ephemeral_sql.split(sep).map(|s| s.to_string()).collect();
@@ -193,11 +216,15 @@ pub async fn inject_and_persist_ephemeral_models(
     // this avoid graph walk for ephemeral models
     if is_current_model_ephemeral {
         let ephemeral_path = ephemeral_dir.join(format!("{model_name}.sql"));
-        tokiofs::create_dir_all(ephemeral_path.parent().unwrap()).await?;
+        stdfs::create_dir_all(ephemeral_path.parent().unwrap())?;
         let cte_line = format!("{DBT_CTE_PREFIX}{model_name} as (\n{final_sql}\n)");
-        all_ctes.push(cte_line.clone());
-        tokiofs::write(ephemeral_path, &all_ctes.join(sep)).await?;
+        all_ctes.push(cte_line);
+        stdfs::write(ephemeral_path, all_ctes.join(sep))?;
         all_ctes.pop();
+    }
+
+    if all_ctes.is_empty() {
+        return Ok(final_sql);
     }
 
     // Wrap the current SQL in a subquery and prepend CTEs
@@ -237,6 +264,20 @@ fn extract_ephemeral_model_names(sql: &str) -> Vec<&str> {
                 .next()
         })
         .filter(|&name| seen.insert(name)) // Deduplicate the extracted names
+        .collect()
+}
+
+/// Extract model names from locally defined `__dbt__cte__` CTEs.
+fn extract_local_ephemeral_cte_names(sql: &str) -> HashSet<&str> {
+    LOCAL_EPHEMERAL_CTE_RE
+        .captures_iter(sql)
+        .filter_map(|captures| {
+            // Capture 1 is the quoted CTE branch; capture 2 is the unquoted branch.
+            captures
+                .get(1)
+                .or_else(|| captures.get(2))
+                .map(|match_| match_.as_str())
+        })
         .collect()
 }
 
@@ -446,7 +487,33 @@ pub fn generate_component_name(
         .map(|name| vec![Value::from(name)])
         .unwrap_or_else(|| vec![Value::from(())]); // If no custom name, pass in none so the macro reads from the target context
     if let Some(node) = node {
-        args.push(Value::from_serialize(node.serialize()));
+        let mut serialized = node.serialize();
+        // Strip resource-type prefix from path so node.path inside macros like
+        // generate_schema_name matches dbt-core convention ("staging/model.sql"
+        // not "models/staging/model.sql"). build_flat_graph does the same for
+        // graph.nodes.
+        let prefix = match node.resource_type() {
+            NodeType::Model => "models",
+            NodeType::Snapshot => "snapshots",
+            NodeType::Seed => "seeds",
+            NodeType::Analysis => "analyses",
+            _ => "",
+        };
+        if !prefix.is_empty() {
+            if let YmlValue::Mapping(ref mut map, _) = serialized {
+                let path_key = YmlValue::string("path".to_string());
+                if let Some(path_value) = map.get(&path_key) {
+                    if let Some(path_str) = path_value.as_str() {
+                        let stripped = Path::new(path_str)
+                            .strip_prefix(prefix)
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .unwrap_or_else(|_| path_str.to_string());
+                        map.insert(path_key, YmlValue::string(stripped));
+                    }
+                }
+            }
+        }
+        args.push(Value::from_serialize(serialized));
     }
 
     // Call the macro
@@ -475,7 +542,7 @@ pub fn clear_template_cache() {
 
 /// Generate a relation name from database, schema, alias
 pub fn generate_relation_name(
-    parse_adapter: Arc<BridgeAdapter>,
+    parse_adapter: Arc<Adapter>,
     database: &str,
     schema: &str,
     identifier: &str,
@@ -526,7 +593,17 @@ pub fn node_metadata_from_state(state: &State) -> Option<(NodeId, PathBuf)> {
                     unit_test.__common_attr__.original_file_path,
                 ))
             } else {
-                None
+                // Fallback: direct attribute extraction for Object types
+                // (e.g. LazyModelWrapper) where full deserialization fails
+                let unique_id = node
+                    .get_attr("unique_id")
+                    .ok()
+                    .and_then(|v| v.as_str().map(|s| s.to_string()));
+                let file_path = node
+                    .get_attr("original_file_path")
+                    .ok()
+                    .and_then(|v| v.as_str().map(PathBuf::from));
+                unique_id.zip(file_path)
             }
         }
         None => None,
@@ -534,7 +611,7 @@ pub fn node_metadata_from_state(state: &State) -> Option<(NodeId, PathBuf)> {
 }
 
 /// Render a reference or source string and return the corresponding SqlResource
-pub fn render_extract_ref_or_source_expr<T: DefaultTo<T>>(
+pub fn render_extract_ref_or_source_expr<T: ResolvableConfig<T>>(
     jinja_env: &JinjaEnv,
     resolve_model_context: &BTreeMap<String, Value>,
     sql_resources: Arc<Mutex<Vec<SqlResource<T>>>>,

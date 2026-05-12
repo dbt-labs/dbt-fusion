@@ -1,10 +1,11 @@
 use indexmap::IndexMap;
 use std::{collections::BTreeMap, path::PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::Deserializer};
 use serde_with::skip_serializing_none;
 
 use crate::schemas::serde::OmissibleGrantConfig;
+use dbt_common::io_args::ComputeArg;
 use dbt_common::serde_utils::Omissible;
 use dbt_yaml::DbtSchema;
 use dbt_yaml::Spanned;
@@ -13,7 +14,7 @@ use dbt_yaml::Verbatim;
 use crate::schemas::common::DbtBatchSize;
 use crate::schemas::common::DbtIncrementalStrategy;
 use crate::schemas::common::DbtUniqueKey;
-use crate::schemas::common::{DocsConfig, HardDeletes, OnConfigurationChange};
+use crate::schemas::common::{DocsConfig, HardDeletes, OnConfigurationChange, OnError};
 use crate::schemas::common::{HookConfig, Hooks, OnSchemaChange};
 use crate::schemas::dbt_column::Granularity;
 use crate::schemas::project::configs::common::WarehouseSpecificNodeConfig;
@@ -53,7 +54,9 @@ use crate::schemas::{
         metrics_properties::{AggregationType, MetricType},
         model_properties::ModelPropertiesTimeSpine,
     },
-    ref_and_source::{DbtRef, DbtSourceWrapper},
+    ref_and_source::{
+        DbtRef, DbtSourceWrapper, deserialize_dbt_function_refs, serialize_dbt_function_refs,
+    },
     semantic_layer::semantic_manifest::SemanticLayerElementConfig,
     serde::{StringOrArrayOfStrings, StringOrInteger},
 };
@@ -149,7 +152,11 @@ pub struct ManifestNodeBaseAttributes {
     pub refs: Vec<DbtRef>,
     #[serde(default)]
     pub sources: Vec<DbtSourceWrapper>,
-    #[serde(default)]
+    #[serde(
+        default,
+        serialize_with = "serialize_dbt_function_refs",
+        deserialize_with = "deserialize_dbt_function_refs"
+    )]
     pub functions: Vec<DbtRef>,
 
     // Code
@@ -222,7 +229,7 @@ impl From<DbtSeed> for ManifestSeed {
                 compiled_code: None,
                 checksum: seed.__common_attr__.checksum,
                 language: seed.__common_attr__.language,
-                unrendered_config: Default::default(),
+                unrendered_config: seed.__base_attr__.unrendered_config,
                 doc_blocks: Default::default(),
                 extra_ctes_injected: Default::default(),
                 extra_ctes: Default::default(),
@@ -403,6 +410,8 @@ impl From<DbtTest> for ManifestDataTest {
 #[skip_serializing_none]
 #[derive(Deserialize, Serialize, Debug, Clone, Default, PartialEq)]
 pub struct ManifestSnapshotConfig {
+    #[serde(default)]
+    pub compute: Option<ComputeArg>,
     #[serde(alias = "project", alias = "data_space")]
     pub database: Option<String>,
     #[serde(alias = "dataset")]
@@ -447,6 +456,7 @@ pub struct ManifestSnapshotConfig {
 impl From<SnapshotConfig> for ManifestSnapshotConfig {
     fn from(config: SnapshotConfig) -> Self {
         Self {
+            compute: config.compute,
             database: config.database,
             schema: config.schema,
             alias: config.alias,
@@ -490,6 +500,7 @@ impl From<SnapshotConfig> for ManifestSnapshotConfig {
 impl From<ManifestSnapshotConfig> for SnapshotConfig {
     fn from(config: ManifestSnapshotConfig) -> Self {
         Self {
+            compute: config.compute,
             database: config.database,
             schema: config.schema,
             alias: config.alias,
@@ -757,6 +768,8 @@ pub struct ManifestModel {
 pub struct ManifestModelConfig {
     #[serde(default, deserialize_with = "bool_or_string_bool")]
     pub enabled: Option<bool>,
+    #[serde(default)]
+    pub compute: Option<ComputeArg>,
     pub alias: Option<String>,
     #[serde(alias = "project", alias = "data_space")]
     pub database: Omissible<Option<String>>,
@@ -786,7 +799,8 @@ pub struct ManifestModelConfig {
     pub unique_key: Option<DbtUniqueKey>,
     pub on_schema_change: Option<OnSchemaChange>,
     pub on_configuration_change: Option<OnConfigurationChange>,
-    #[serde(rename = "+grants", alias = "grants")]
+    pub on_error: Option<OnError>,
+    #[serde(rename = "grants", alias = "+grants")]
     pub grants: OmissibleGrantConfig,
     pub packages: Option<StringOrArrayOfStrings>,
     pub python_version: Option<String>,
@@ -935,6 +949,7 @@ impl From<ModelConfig> for ManifestModelConfig {
     fn from(config: ModelConfig) -> Self {
         Self {
             enabled: config.enabled,
+            compute: config.compute,
             alias: config.alias,
             database: config.database,
             schema: config.schema,
@@ -963,6 +978,7 @@ impl From<ModelConfig> for ManifestModelConfig {
             unique_key: config.unique_key,
             on_schema_change: config.on_schema_change,
             on_configuration_change: config.on_configuration_change,
+            on_error: config.on_error,
             grants: config.grants,
             packages: config.packages,
             python_version: config.python_version,
@@ -1007,6 +1023,7 @@ impl From<ManifestModelConfig> for ModelConfig {
             schema: config.schema,
             tags: config.tags,
             catalog_name: config.catalog_name,
+            compute: config.compute,
             meta: config.meta,
             group: config.group,
             materialized: config.materialized,
@@ -1032,6 +1049,7 @@ impl From<ManifestModelConfig> for ModelConfig {
             unique_key: config.unique_key,
             on_schema_change: config.on_schema_change,
             on_configuration_change: config.on_configuration_change,
+            on_error: config.on_error,
             grants: config.grants,
             packages: config.packages,
             python_version: config.python_version,
@@ -1140,7 +1158,7 @@ pub struct ManifestAnalysis {
     pub __common_attr__: ManifestMaterializableCommonAttributes,
 
     pub __base_attr__: ManifestNodeBaseAttributes,
-
+    // TODO: remove top level materialized, static_analysis, and enabled and move to config along with defaults?
     #[serde(default = "default_analysis_materialized")]
     pub materialized: DbtMaterialization,
     #[serde(default = "default_analysis_static_analysis")]
@@ -1262,7 +1280,7 @@ impl From<DbtOperation> for ManifestOperation {
 }
 
 #[skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub struct ManifestFunction {
     pub __common_attr__: ManifestMaterializableCommonAttributes,
@@ -1279,6 +1297,52 @@ pub struct ManifestFunction {
     pub arguments: Option<Vec<crate::schemas::properties::FunctionArgument>>,
 
     pub __other__: BTreeMap<String, YmlValue>,
+}
+
+#[skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+struct ManifestFunctionCompat {
+    pub __common_attr__: ManifestMaterializableCommonAttributes,
+
+    pub __base_attr__: ManifestNodeBaseAttributes,
+
+    pub config: FunctionConfig,
+    pub access: Option<Access>,
+    pub group: Option<String>,
+    pub language: Option<String>,
+    pub on_configuration_change: Option<String>,
+    pub returns: Option<crate::schemas::properties::FunctionReturnType>,
+    pub arguments: Option<Vec<crate::schemas::properties::FunctionArgument>>,
+
+    pub __other__: BTreeMap<String, YmlValue>,
+}
+
+impl<'de> Deserialize<'de> for ManifestFunction {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let function = ManifestFunctionCompat::deserialize(deserializer)?;
+        let access = function
+            .access
+            .clone()
+            .or_else(|| function.config.access.clone())
+            .unwrap_or(Access::Private);
+
+        Ok(Self {
+            __common_attr__: function.__common_attr__,
+            __base_attr__: function.__base_attr__,
+            config: function.config,
+            access,
+            group: function.group,
+            language: function.language,
+            on_configuration_change: function.on_configuration_change,
+            returns: function.returns,
+            arguments: function.arguments,
+            __other__: function.__other__,
+        })
+    }
 }
 
 impl From<DbtFunction> for ManifestFunction {

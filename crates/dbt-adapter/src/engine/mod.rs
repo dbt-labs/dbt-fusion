@@ -1,11 +1,10 @@
-use crate::typed_adapter::{DEFAULT_BASE_BEHAVIOR_FLAGS, adapter_specific_behavior_flags};
+use crate::adapter::adapter_impl::{DEFAULT_BASE_BEHAVIOR_FLAGS, adapter_specific_behavior_flags};
 
 use arrow::array::RecordBatch;
-use dbt_common::adapter::AdapterType;
+use dbt_adapter_core::AdapterType;
+use dbt_common::AdapterResult;
 use dbt_common::behavior_flags::Behavior;
 use dbt_common::cancellation::CancellationToken;
-use dbt_common::tracing::emit::emit_warn_log_message;
-use dbt_common::{AdapterResult, ErrorCode};
 use dbt_xdbc::*;
 use minijinja::State;
 
@@ -13,14 +12,21 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::{thread, time::Duration};
 
-mod noop_connection;
-
 mod adapter_engine;
 pub use adapter_engine::AdapterEngine;
 pub use adapter_engine::Options;
 
+pub mod query_comment;
+pub mod retry;
+
 mod xdbc;
 pub use xdbc::XdbcEngine;
+
+mod noop_connection;
+pub use noop_connection::NoopConnection;
+
+mod record_replay;
+pub use record_replay::RecordReplayEngine;
 
 mod sidecar;
 pub use sidecar::SidecarEngine;
@@ -33,6 +39,8 @@ pub use sidecar_client::SidecarClient;
 /// The new behavior is always enabled; these flags are accepted but ignored.
 /// See: https://docs.getdbt.com/reference/global-configs/behavior-changes
 const REMOVED_IN_FUSION: &[&str] = &[
+    // dbt-core flags
+    // ---
     "use_info_schema_for_columns",
     "require_explicit_package_overrides_for_builtin_materializations",
     "require_resource_names_without_spaces",
@@ -40,6 +48,23 @@ const REMOVED_IN_FUSION: &[&str] = &[
     "skip_nodes_if_on_run_start_fails",
     "state_modified_compare_more_unrendered_values",
     "require_yaml_configuration_for_mf_time_spines",
+    "require_nested_cumulative_type_params",
+    "require_generic_test_arguments_property",
+    "require_unique_project_resource_names",
+    "require_ref_searches_node_package_before_root",
+    "require_valid_schema_from_generate_schema_name",
+    "require_sql_header_in_test_configs",
+    "require_batched_execution_for_custom_microbatch_strategy",
+    // dbt-redshift flags
+    // ---
+    // metadata adapter already uses SVV views
+    "restrict_direct_pg_catalog_access",
+    // transactions handled at driver level
+    "redshift_skip_autocommit_transaction_statements",
+    // dbt-bigquery flags
+    // ---
+    // metadata adapter already uses batched __TABLES__ queries for freshness.
+    "bigquery_use_batch_source_freshness",
 ];
 
 pub(crate) fn make_behavior(
@@ -54,14 +79,17 @@ pub(crate) fn make_behavior(
         if !behavior_flags.iter().any(|f| f.name == key)
             && REMOVED_IN_FUSION.contains(&key.as_str())
         {
-            emit_warn_log_message(
-                ErrorCode::InvalidConfig,
-                format!(
-                    "Behavior flag '{key}' has been removed in dbt Fusion. \
-                     This flag can be safely removed from your dbt_project.yml."
-                ),
-                None,
-            );
+            // Suppressed until dbt Core v1.12 ships support for Fusion warning names in
+            // warn_error_options, so users running both engines can silence cross-engine
+            // warnings without breaking Core.
+            // emit_warn_log_message(
+            //     ErrorCode::InvalidConfig,
+            //     format!(
+            //         "Behavior flag '{key}' has been removed in dbt Fusion. \
+            //          This flag can be safely removed from your dbt_project.yml."
+            //     ),
+            //     None,
+            // );
         }
     }
     Arc::new(Behavior::new(behavior_flags, behavior_flag_overrides))

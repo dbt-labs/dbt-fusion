@@ -7,8 +7,7 @@ use adbc_core::{
 };
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
-use dbt_common::io_args::DisplayFormat;
-use dbt_common::pretty_table::pretty_data_table;
+use dbt_pretty_table::pretty_data_table;
 use dialoguer::{BasicHistory, Input, theme::ColorfulTheme};
 
 use crate::{
@@ -30,7 +29,7 @@ pub struct ReplState {
 impl ReplState {
     pub fn new(backend: Backend, version: AdbcVersion) -> Result<Self> {
         let load_strategy = match backend {
-            Backend::DuckDB => driver::LoadStrategy::SystemThenCdnCache,
+            Backend::DuckDBExtended => driver::LoadStrategy::SystemThenCdnCache,
             _ => driver::LoadStrategy::CdnCache,
         };
         let mut driver = driver::Builder::new(backend, load_strategy)
@@ -356,7 +355,7 @@ pub async fn run_repl(backend_str: &str) -> Result<()> {
                         "",
                         &column_names,
                         slice::from_ref(&batch),
-                        DisplayFormat::Table,
+                        dbt_pretty_table::DisplayFormat::Table,
                         Some(10),
                         true,
                         Some(batch.num_rows()),

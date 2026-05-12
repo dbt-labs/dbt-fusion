@@ -1,3 +1,4 @@
+use dbt_common::io_args::ComputeArg;
 use dbt_common::io_args::StaticAnalysisKind;
 use dbt_yaml::{DbtSchema, ShouldBe, Spanned};
 use serde::{Deserialize, Serialize};
@@ -17,7 +18,9 @@ use crate::schemas::manifest::GrantAccessToTarget;
 use crate::schemas::project::configs::common::{
     WarehouseSpecificNodeConfig, default_meta_and_tags, default_quoting,
 };
-use crate::schemas::project::{DefaultTo, TypedRecursiveConfig};
+use dbt_proc_macros::Resolvable;
+
+use crate::schemas::project::{ResolvableConfig, TypedRecursiveConfig};
 use crate::schemas::serde::{
     IndexesConfig, PrimaryKeyConfig, QueryTag, StringOrArrayOfStrings, bool_or_string_bool,
     f64_or_string_f64, u64_or_string_u64,
@@ -28,6 +31,8 @@ use crate::schemas::serde::{
 pub struct ProjectDataTestConfig {
     #[serde(rename = "+alias")]
     pub alias: Option<String>,
+    #[serde(rename = "+compute")]
+    pub compute: Option<ComputeArg>,
     #[serde(rename = "+database", alias = "+project", alias = "+data_space")]
     pub database: Option<String>,
     #[serde(default, rename = "+enabled", deserialize_with = "bool_or_string_bool")]
@@ -84,12 +89,18 @@ pub struct ProjectDataTestConfig {
     pub base_location_subpath: Option<String>,
     #[serde(rename = "+target_lag")]
     pub target_lag: Option<String>,
+    #[serde(rename = "+snowflake_initialization_warehouse")]
+    pub snowflake_initialization_warehouse: Option<String>,
     #[serde(rename = "+snowflake_warehouse")]
     pub snowflake_warehouse: Option<String>,
+    #[serde(rename = "+immutable_where")]
+    pub immutable_where: Option<String>,
     #[serde(rename = "+refresh_mode")]
     pub refresh_mode: Option<String>,
     #[serde(rename = "+initialize")]
     pub initialize: Option<String>,
+    #[serde(rename = "+scheduler")]
+    pub scheduler: Option<String>,
     #[serde(rename = "+tmp_relation_type")]
     pub tmp_relation_type: Option<String>,
     #[serde(rename = "+query_tag")]
@@ -295,16 +306,21 @@ impl TypedRecursiveConfig for ProjectDataTestConfig {
 }
 
 // NOTE: No #[skip_serializing_none] - we handle None serialization in serialize_with_mode
-#[derive(Deserialize, Serialize, Debug, Clone, Default, DbtSchema)]
+#[derive(Resolvable, Deserialize, Serialize, Debug, Clone, Default, DbtSchema)]
 pub struct DataTestConfig {
     pub alias: Option<String>,
+    pub compute: Option<ComputeArg>,
     #[serde(alias = "project", alias = "data_space")]
     pub database: Option<String>,
+    #[resolved(or_else = Some(minijinja::constants::DEFAULT_TEST_SCHEMA.to_string()))]
     #[serde(alias = "dataset")]
     pub schema: Option<String>,
+    #[resolved(promote, method = get_enabled_with_default)]
     #[serde(default, deserialize_with = "bool_or_string_bool")]
     pub enabled: Option<bool>,
+    #[resolved(promote, default = "!= 0".to_string())]
     pub error_if: Option<String>,
+    #[resolved(promote, default = "count(*)".to_string())]
     pub fail_calc: Option<String>,
     #[serde(default, deserialize_with = "bool_or_string_bool")]
     pub full_refresh: Option<bool>,
@@ -321,11 +337,15 @@ pub struct DataTestConfig {
         serialize_with = "crate::schemas::nodes::serialize_none_as_empty_list"
     )]
     pub tags: Option<StringOrArrayOfStrings>,
+    #[resolved(promote, default = "!= 0".to_string())]
     pub warn_if: Option<String>,
+    #[resolved(promote, expect = "quoting set by apply_package_defaults")]
     pub quoting: Option<DbtQuoting>,
+    #[resolved(promote, expect = "static_analysis set by apply_resolve_defaults")]
     pub static_analysis: Option<Spanned<StaticAnalysisKind>>,
     #[serde(rename = "where")]
     pub where_: Option<String>,
+    #[resolved(promote, default = DbtMaterialization::Test)]
     pub materialized: Option<DbtMaterialization>,
     // Adapter specific configs
     pub __warehouse_specific_config__: WarehouseSpecificNodeConfig,
@@ -335,6 +355,7 @@ impl From<ProjectDataTestConfig> for DataTestConfig {
     fn from(config: ProjectDataTestConfig) -> Self {
         Self {
             alias: config.alias,
+            compute: config.compute,
             database: config.database,
             enabled: config.enabled,
             error_if: config.error_if,
@@ -353,7 +374,7 @@ impl From<ProjectDataTestConfig> for DataTestConfig {
             quoting: config.quoting,
             where_: config.where_,
             static_analysis: config.static_analysis,
-            materialized: Some(DbtMaterialization::Test),
+            materialized: Some(DataTestConfig::default_materialized()), // TODO: config.materialized?
             // Initialize adapter specific configs with values from flattened fields
             __warehouse_specific_config__: WarehouseSpecificNodeConfig {
                 description: None, // Not applicable for data tests
@@ -361,10 +382,18 @@ impl From<ProjectDataTestConfig> for DataTestConfig {
                 external_volume: config.external_volume,
                 base_location_root: config.base_location_root,
                 base_location_subpath: config.base_location_subpath,
+                change_tracking: None,
+                data_retention_time_in_days: None,
+                max_data_extension_time_in_days: None,
+                storage_serialization_policy: None,
+                target_file_size: None,
                 target_lag: config.target_lag,
+                snowflake_initialization_warehouse: config.snowflake_initialization_warehouse,
                 snowflake_warehouse: config.snowflake_warehouse,
+                immutable_where: config.immutable_where,
                 refresh_mode: config.refresh_mode,
                 initialize: config.initialize,
+                scheduler: config.scheduler,
                 tmp_relation_type: config.tmp_relation_type,
                 query_tag: config.query_tag,
                 table_tag: config.table_tag,
@@ -373,6 +402,7 @@ impl From<ProjectDataTestConfig> for DataTestConfig {
                 copy_grants: config.copy_grants,
                 secure: config.secure,
                 transient: config.transient,
+                iceberg_version: None,
 
                 partition_by: config.partition_by,
                 cluster_by: config.cluster_by,
@@ -396,10 +426,12 @@ impl From<ProjectDataTestConfig> for DataTestConfig {
                 notebook_template_id: None,
                 enable_list_inference: None,
                 intermediate_format: None,
+                storage_uri: None,
 
                 file_format: config.file_format,
                 catalog_name: config.catalog_name,
                 location_root: config.location_root,
+                use_uniform: None,
                 tblproperties: config.tblproperties,
                 include_full_name_in_path: config.include_full_name_in_path,
                 liquid_clustered_by: config.liquid_clustered_by,
@@ -446,6 +478,7 @@ impl From<DataTestConfig> for ProjectDataTestConfig {
     fn from(config: DataTestConfig) -> Self {
         Self {
             alias: config.alias,
+            compute: config.compute,
             database: config.database,
             enabled: config.enabled,
             error_if: config.error_if,
@@ -471,9 +504,14 @@ impl From<DataTestConfig> for ProjectDataTestConfig {
             base_location_root: config.__warehouse_specific_config__.base_location_root,
             base_location_subpath: config.__warehouse_specific_config__.base_location_subpath,
             target_lag: config.__warehouse_specific_config__.target_lag,
+            snowflake_initialization_warehouse: config
+                .__warehouse_specific_config__
+                .snowflake_initialization_warehouse,
             snowflake_warehouse: config.__warehouse_specific_config__.snowflake_warehouse,
+            immutable_where: config.__warehouse_specific_config__.immutable_where,
             refresh_mode: config.__warehouse_specific_config__.refresh_mode,
             initialize: config.__warehouse_specific_config__.initialize,
+            scheduler: config.__warehouse_specific_config__.scheduler,
             tmp_relation_type: config.__warehouse_specific_config__.tmp_relation_type,
             query_tag: config.__warehouse_specific_config__.query_tag,
             table_tag: config.__warehouse_specific_config__.table_tag,
@@ -555,14 +593,45 @@ impl From<DataTestConfig> for ProjectDataTestConfig {
     }
 }
 
-impl DefaultTo<DataTestConfig> for DataTestConfig {
-    fn get_enabled(&self) -> Option<bool> {
-        self.enabled
+impl ResolvableConfig<DataTestConfig> for DataTestConfig {
+    type Resolved = ResolvedDataTestConfig;
+    type PackageDefaults = DbtQuoting;
+    type ResolveDefaults = (StaticAnalysisKind, bool);
+
+    fn get_enabled_with_default(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+
+    fn disable(&mut self) {
+        self.enabled = Some(false);
+    }
+
+    fn apply_package_defaults(&mut self, quoting: DbtQuoting) {
+        if self.quoting.is_none() {
+            self.quoting = Some(quoting);
+        }
+    }
+
+    fn apply_resolve_defaults(
+        &mut self,
+        (static_analysis, store_failures): (StaticAnalysisKind, bool),
+    ) {
+        if self.static_analysis.is_none() {
+            self.static_analysis = Some(Spanned::new(static_analysis));
+        }
+        if store_failures && self.store_failures.is_none() {
+            self.store_failures = Some(store_failures);
+        }
+    }
+
+    fn finalize(self) -> ResolvedDataTestConfig {
+        self.finalize_resolved()
     }
 
     fn default_to(&mut self, parent: &DataTestConfig) {
         let DataTestConfig {
             alias,
+            compute,
             database,
             enabled,
             error_if,
@@ -602,6 +671,7 @@ impl DefaultTo<DataTestConfig> for DataTestConfig {
             parent,
             [
                 enabled,
+                compute,
                 store_failures,
                 store_failures_as,
                 sql_header,
@@ -620,18 +690,6 @@ impl DefaultTo<DataTestConfig> for DataTestConfig {
                 materialized,
             ]
         );
-    }
-
-    fn database(&self) -> Option<String> {
-        self.database.clone()
-    }
-
-    fn schema(&self) -> Option<String> {
-        self.schema.clone()
-    }
-
-    fn alias(&self) -> Option<String> {
-        self.alias.clone()
     }
 }
 

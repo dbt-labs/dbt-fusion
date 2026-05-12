@@ -5,6 +5,8 @@ pub mod feature_stack;
 pub mod sa;
 
 // All features:
-pub mod formatter;
-pub mod linter;
+pub mod adapter;
+pub mod antlr_parser;
+pub mod compilation;
+pub mod tracing;
 // add more features here...

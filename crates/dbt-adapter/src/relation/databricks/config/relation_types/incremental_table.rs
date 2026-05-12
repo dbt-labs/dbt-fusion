@@ -11,7 +11,7 @@ fn requires_full_refresh(components: &IndexMap<&'static str, ComponentConfigChan
 }
 
 /// Create a `RelationConfigLoader` for Databricks incremental tables
-pub(crate) fn new_loader() -> RelationConfigLoader<DatabricksRelationMetadata> {
+pub(crate) fn new_loader() -> RelationConfigLoader<'static, DatabricksRelationMetadata> {
     // TODO: missing from Python dbt-databricks:
     // - liquid clustering
     let loaders: [Box<dyn ComponentConfigLoader<DatabricksRelationMetadata>>; 7] = [
@@ -33,7 +33,9 @@ pub(crate) fn new_loader() -> RelationConfigLoader<DatabricksRelationMetadata> {
 mod tests {
     use super::{new_loader, requires_full_refresh};
     use crate::AdapterType;
-    use crate::relation::config_v2::{ComponentConfigChange, RelationComponentConfigChangeSet};
+    use crate::relation::config_v2::{
+        ComponentConfigChange, ComponentConfigLoader, RelationComponentConfigChangeSet,
+    };
     use crate::relation::databricks::config::{
         DatabricksRelationMetadata, components,
         test_helpers::{TestModelColumn, TestModelConfig, run_test_cases},
@@ -136,7 +138,7 @@ mod tests {
                 [
                     // TODO: add liquid clustering to changeset here once that gets implemented
                     (
-                        components::ColumnCommentsLoader::type_name(),
+                        components::ColumnCommentsLoader.type_name(),
                         ComponentConfigChange::Some(
                             components::ColumnCommentsLoader::new_component_type_erased(
                                 IndexMap::from_iter([(
@@ -147,7 +149,7 @@ mod tests {
                         ),
                     ),
                     (
-                        components::ColumnTagsLoader::type_name(),
+                        components::ColumnTagsLoader.type_name(),
                         ComponentConfigChange::Some(
                             components::ColumnTagsLoader::new_component_type_erased(
                                 IndexMap::from_iter([(
@@ -161,7 +163,7 @@ mod tests {
                         ),
                     ),
                     (
-                        components::ConstraintsLoader::type_name(),
+                        components::ConstraintsLoader.type_name(),
                         ComponentConfigChange::Some(
                             components::ConstraintsLoader::new_component_type_erased(
                                 // set non-nulls
@@ -174,7 +176,7 @@ mod tests {
                         ),
                     ),
                     (
-                        components::RelationCommentLoader::type_name(),
+                        components::RelationCommentLoader.type_name(),
                         ComponentConfigChange::Some(
                             components::RelationCommentLoader::new_component_type_erased(Some(
                                 "new comment".to_string(),
@@ -182,7 +184,7 @@ mod tests {
                         ),
                     ),
                     (
-                        components::RelationTagsLoader::type_name(),
+                        components::RelationTagsLoader.type_name(),
                         ComponentConfigChange::Some(
                             components::RelationTagsLoader::new_component_type_erased(
                                 IndexMap::from_iter([
@@ -193,7 +195,7 @@ mod tests {
                         ),
                     ),
                     (
-                        components::TblPropertiesLoader::type_name(),
+                        components::TblPropertiesLoader.type_name(),
                         ComponentConfigChange::Some(
                             components::TblPropertiesLoader::new_component_type_erased(
                                 IndexMap::from_iter([
@@ -204,7 +206,7 @@ mod tests {
                         ),
                     ),
                     (
-                        components::ColumnMasksLoader::type_name(),
+                        components::ColumnMasksLoader.type_name(),
                         ComponentConfigChange::Some(
                             components::ColumnMasksLoader::new_component_type_erased(
                                 IndexMap::from_iter([(
@@ -221,6 +223,88 @@ mod tests {
                 ],
                 requires_full_refresh,
             ),
+            changeset_jinja: "
+<column_comments>
+    <comments>
+        <a_column>
+            new comment
+        </a_column>
+    </comments>
+    <persist>
+        True
+    </persist>
+</column_comments>
+<column_tags>
+    <tags>
+        <b_column>
+            <col_tag>
+                new
+            </col_tag>
+        </b_column>
+    </tags>
+</column_tags>
+<comment>
+    <comment>
+        new comment
+    </comment>
+    <persist>
+        True
+    </persist>
+</comment>
+<constraints>
+    <set_non_nulls>
+        a_column
+    </set_non_nulls>
+    <unset_non_nulls>
+        b_column
+    </unset_non_nulls>
+    <set_constraints>
+    </set_constraints>
+    <unset_constraints>
+    </unset_constraints>
+</constraints>
+<tags>
+    <set_tags>
+        <a_tag>
+            new
+        </a_tag>
+        <b_tag>
+            old
+        </b_tag>
+    </set_tags>
+</tags>
+<tblproperties>
+    <tblproperties>
+        <customKey>
+            new
+        </customKey>
+        <customKey2>
+            value
+        </customKey2>
+        <delta.enableRowTracking>
+            true
+        </delta.enableRowTracking>
+    </tblproperties>
+    <pipeline_id>
+        my_new_pipeline
+    </pipeline_id>
+</tblproperties>
+<column_masks>
+    <set_column_masks>
+        <a_column>
+            <function>
+                other function
+            </function>
+            <using_columns>
+                None
+            </using_columns>
+        </a_column>
+    </set_column_masks>
+    <unset_column_masks>
+        b_column
+    </unset_column_masks>
+</column_masks>
+                ",
             requires_full_refresh: false,
         }]
     }

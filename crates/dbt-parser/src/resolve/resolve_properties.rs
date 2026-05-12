@@ -1,4 +1,5 @@
 use crate::args::ResolveArgs;
+use crate::dbt_project_config::{ProjectConfigResolver, RootProjectConfigs, init_project_config};
 use dbt_common::cancellation::CancellationToken;
 use dbt_common::io_args::IoArgs;
 use dbt_common::io_utils::try_read_yml_to_str;
@@ -15,7 +16,7 @@ use dbt_schemas::schemas::properties::{
 use dbt_schemas::schemas::serde::FloatOrString;
 use dbt_schemas::state::DbtPackage;
 use dbt_telemetry::AssetParsed;
-use dbt_yaml::{ShouldBe, Span, Verbatim};
+use dbt_yaml::{Span, Verbatim};
 use itertools::Itertools;
 use minijinja::Value as MinijinjaValue;
 use std::collections::BTreeMap;
@@ -186,7 +187,7 @@ impl MinimalProperties {
                                 .push(properties_path.to_path_buf());
 
                             emit_warn_log_message(
-                                ErrorCode::SchemaError,
+                                ErrorCode::DuplicateSourceTableDefinition,
                                 format!(
                                     "Duplicate definition for table '{}' in source '{}' found in file '{}'. Using definition from '{}'.",
                                     minimum_table_value.name.clone().into_inner(),
@@ -213,7 +214,7 @@ impl MinimalProperties {
                     }
                 } else {
                     emit_warn_log_message(
-                        ErrorCode::SchemaError,
+                        ErrorCode::SourceTableDefinitionMissing,
                         format!(
                             "No tables defined for source '{}' in file '{}'.",
                             source.name,
@@ -422,16 +423,16 @@ impl MinimalProperties {
                     dependency_package_name_from_ctx(jinja_env, base_ctx),
                     true,
                 )?;
-                if let Some(existing_unit_test) = self.unit_tests.get_mut(&unit_test.name) {
+                if let Some(existing_unit_test) = self.unit_tests.get_mut(unit_test.name.as_ref()) {
                     existing_unit_test
                         .duplicate_paths
                         .push(properties_path.to_path_buf());
                 } else {
                     self.unit_tests.insert(
-                        unit_test.name.clone(),
+                        unit_test.name.clone().into_inner(),
                         MinimalPropertiesEntry {
-                            name: validate_resource_name(&unit_test.name)?,
-                            name_span: Span::default(),
+                            name: validate_resource_name(unit_test.name.as_ref())?,
+                            name_span: unit_test.name.span().clone(),
                             relative_path: properties_path.to_path_buf(),
                             schema_value: unit_test_value,
                             table_value: None,
@@ -580,7 +581,7 @@ fn validate_resource_name(name: &str) -> FsResult<String> {
     // more of special characters like !@#%$":'
     if name.chars().any(|c| matches!(c, ' ')) {
         let err = fs_err!(
-            ErrorCode::SchemaError,
+            ErrorCode::DbtYamlValidationError,
             "Resource name '{}' contains forbidden characters",
             name
         );
@@ -595,6 +596,7 @@ pub fn resolve_minimal_properties(
     arg: &ResolveArgs,
     package: &DbtPackage,
     root_package_name: &str,
+    root_project_configs: &RootProjectConfigs,
     jinja_env: &JinjaEnv,
     base_ctx: &BTreeMap<String, MinijinjaValue>,
     token: &CancellationToken,
@@ -603,6 +605,20 @@ pub fn resolve_minimal_properties(
         semantic_layer_spec_is_legacy: false,
         ..Default::default()
     };
+
+    let is_dependency = package.dbt_project.name != root_package_name;
+    let semantic_model_config_resolver = ProjectConfigResolver::build(
+        root_project_configs.semantic_models.clone(),
+        is_dependency,
+        || {
+            init_project_config(
+                &arg.io,
+                &package.dbt_project.semantic_models,
+                (),
+                Some(package.dbt_project.name.as_str()),
+            )
+        },
+    )?;
 
     for dbt_asset in package.dbt_properties.iter().dedup() {
         token.check_cancellation()?;
@@ -651,26 +667,18 @@ pub fn resolve_minimal_properties(
                     if !minimal_resolved_properties.semantic_layer_spec_is_legacy
                         && let Some(_semantic_models) = properties_file_values.semantic_models
                     {
-                        let has_enabled_package_semantic_models =
-                            if let Some(semantic_models) = &package.dbt_project.semantic_models {
-                                if let Some(props) = semantic_models
-                                    .__additional_properties__
-                                    .get(&package.dbt_project.name)
-                                    && let ShouldBe::AndIs(props) = props
-                                {
-                                    props.enabled.unwrap_or(true)
-                                } else {
-                                    true
-                                }
-                            } else {
-                                true
-                            };
+                        // Check whether the root project has explicitly disabled this package's
+                        // semantic models. If so, suppress the legacy warning and skip them.
+                        let has_enabled_package_semantic_models = !semantic_model_config_resolver
+                            .is_disabled_by_root_overlay(std::slice::from_ref(
+                                &package.dbt_project.name,
+                            ));
 
                         if has_enabled_package_semantic_models {
                             // Top level semantic models are not allowed anymore
                             // TODO: edit copy to encourage user to use auto-fix.
                             emit_warn_log_message(
-                                ErrorCode::SchemaError,
+                                ErrorCode::LegacySemanticLayerYaml,
                                 format!(
                                     "The package '{}' defines semantic models and metrics using the legacy YAML. Please migrate to the new YAML to use the semantic layer with dbt Fusion.",
                                     &package.dbt_project.name,
@@ -728,15 +736,10 @@ pub fn collect_model_version_info(
 
                 let versioned_name = format!("{}_v{}", model.name, version);
 
-                let defined_in = v.__additional_properties__.get("defined_in").and_then(|d| {
-                    d.as_str().map(|s| {
-                        if s.ends_with(".sql") {
-                            s.strip_suffix(".sql").unwrap().to_string()
-                        } else {
-                            s.to_string()
-                        }
-                    })
-                });
+                let defined_in = v
+                    .defined_in
+                    .as_deref()
+                    .map(|s| s.strip_suffix(".sql").unwrap_or(s).to_string());
 
                 let version_config = v.config.clone();
 

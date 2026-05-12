@@ -18,7 +18,7 @@
 //! write operations create ordering constraints (barriers) while read operations
 //! within a segment can be matched in any order.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, BufRead, BufReader};
 use std::path::Path;
 
@@ -33,6 +33,7 @@ use super::event::{
 };
 use super::semantic::SemanticCategory;
 use super::serde::values_match;
+use crate::AdapterType;
 use crate::sql::diff::compare_sql;
 
 /// Extract the SQL string from args (first string in array, or the string itself).
@@ -91,6 +92,91 @@ fn metadata_args_match(recorded: &MetadataCallArgs, actual: &MetadataCallArgs) -
                 }
             }
         }
+    }
+}
+
+pub(crate) fn adapter_args_match(
+    method: &str,
+    recorded: &serde_json::Value,
+    actual: &serde_json::Value,
+) -> bool {
+    match method {
+        "get_relation" => match (
+            GetRelationArgs::try_from(recorded),
+            GetRelationArgs::try_from(actual),
+        ) {
+            (Ok(recorded), Ok(actual)) => recorded == actual,
+            _ => values_match(recorded, actual),
+        },
+        _ => values_match(recorded, actual),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct GetRelationArgs {
+    database: String,
+    schema: String,
+    identifier: String,
+    needs_information: bool,
+}
+
+impl TryFrom<&serde_json::Value> for GetRelationArgs {
+    type Error = ();
+
+    fn try_from(args: &serde_json::Value) -> Result<Self, Self::Error> {
+        let args = args.as_array().ok_or(())?;
+
+        if args.len() == 1
+            && let Some(kwargs) = args[0].as_object()
+        {
+            return Self::try_from_kwargs(kwargs);
+        }
+
+        let database = args.first().and_then(|arg| arg.as_str()).ok_or(())?;
+        let schema = args.get(1).and_then(|arg| arg.as_str()).ok_or(())?;
+        let identifier = args.get(2).and_then(|arg| arg.as_str()).ok_or(())?;
+        let needs_information = args
+            .get(3)
+            .and_then(|arg| arg.as_bool())
+            .or_else(|| {
+                args.iter()
+                    .filter_map(|arg| arg.as_object())
+                    .find_map(|obj| obj.get("needs_information").and_then(|v| v.as_bool()))
+            })
+            .unwrap_or(false);
+
+        Ok(Self {
+            database: database.to_string(),
+            schema: schema.to_string(),
+            identifier: identifier.to_string(),
+            needs_information,
+        })
+    }
+}
+
+impl GetRelationArgs {
+    fn try_from_kwargs(kwargs: &serde_json::Map<String, serde_json::Value>) -> Result<Self, ()> {
+        Ok(Self {
+            database: kwargs
+                .get("database")
+                .and_then(|value| value.as_str())
+                .ok_or(())?
+                .to_string(),
+            schema: kwargs
+                .get("schema")
+                .and_then(|value| value.as_str())
+                .ok_or(())?
+                .to_string(),
+            identifier: kwargs
+                .get("identifier")
+                .and_then(|value| value.as_str())
+                .ok_or(())?
+                .to_string(),
+            needs_information: kwargs
+                .get("needs_information")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        })
     }
 }
 
@@ -215,11 +301,11 @@ pub struct Recording {
     /// Recording metadata
     pub header: RecordingHeader,
     /// Adapter call events indexed by node_id, sorted by seq
-    adapter_events_by_node: HashMap<String, Vec<AdapterCallEvent>>,
+    adapter_events_by_node: BTreeMap<String, Vec<AdapterCallEvent>>,
     /// Metadata call events indexed by caller_id, sorted by seq
-    metadata_events_by_caller: HashMap<String, Vec<MetadataCallEvent>>,
+    metadata_events_by_caller: BTreeMap<String, Vec<MetadataCallEvent>>,
     /// SAO skip events indexed by node_id
-    sao_events: HashMap<String, SaoEvent>,
+    sao_events: BTreeMap<String, SaoEvent>,
     /// Run-remote-adhoc events in order
     run_remote_adhoc_events: Vec<RunRemoteAdhocEvent>,
     /// Cache invalidation events in order
@@ -286,9 +372,10 @@ impl Recording {
         };
 
         // Index events by node_id/caller_id
-        let mut adapter_events_by_node: HashMap<String, Vec<AdapterCallEvent>> = HashMap::new();
-        let mut metadata_events_by_caller: HashMap<String, Vec<MetadataCallEvent>> = HashMap::new();
-        let mut sao_events: HashMap<String, SaoEvent> = HashMap::new();
+        let mut adapter_events_by_node: BTreeMap<String, Vec<AdapterCallEvent>> = BTreeMap::new();
+        let mut metadata_events_by_caller: BTreeMap<String, Vec<MetadataCallEvent>> =
+            BTreeMap::new();
+        let mut sao_events: BTreeMap<String, SaoEvent> = BTreeMap::new();
         let mut run_remote_adhoc_events: Vec<RunRemoteAdhocEvent> = Vec::new();
         let mut cache_invalidation_events: Vec<CacheInvalidationEvent> = Vec::new();
 
@@ -418,7 +505,7 @@ impl Recording {
     /// For MetadataRead operations: Can match any read in the current segment with matching args.
     ///     Reads are NOT tracked - the same read can be matched multiple times.
     ///
-    /// PRECONDITION: Pure/Cache operations are filtered at the bridge_adapter level and should never reach here.
+    /// PRECONDITION: Pure/Cache operations are filtered at the adapter level and should never reach here.
     ///
     /// Returns the matched event if found.
     pub fn take_semantic_match(
@@ -515,7 +602,7 @@ impl Recording {
         // Search within the segment for a matching read (method + args)
         events[search_start..segment_end]
             .iter()
-            .find(|event| event.method == method && values_match(&event.args, args))
+            .find(|event| event.method == method && adapter_args_match(method, &event.args, args))
     }
 
     /// Peek at the next event in semantic mode without consuming it.
@@ -947,6 +1034,7 @@ pub fn validate_replay(
     recorded: &AdapterCallEvent,
     method: &str,
     args: &serde_json::Value,
+    adapter_type: AdapterType,
 ) -> ReplayResult {
     let mut differences = Vec::new();
 
@@ -966,7 +1054,7 @@ pub fn validate_replay(
 
         match (recorded_sql, actual_sql) {
             (Some(exp_sql), Some(act_sql)) => {
-                match compare_sql(exp_sql, act_sql) {
+                match compare_sql(exp_sql, act_sql, adapter_type) {
                     Ok(()) => {
                         // SQL is semantically equivalent, no difference to report
                     }
@@ -1026,12 +1114,16 @@ mod tests {
     use crate::sql::diff::compare_sql;
 
     /// Compare SQL args for execute/run_query methods.
-    fn sql_args_match(recorded: &serde_json::Value, actual: &serde_json::Value) -> bool {
+    fn sql_args_match(
+        recorded: &serde_json::Value,
+        actual: &serde_json::Value,
+        adapter_type: AdapterType,
+    ) -> bool {
         let recorded_sql = extract_sql_from_args(recorded);
         let actual_sql = extract_sql_from_args(actual);
 
         match (recorded_sql, actual_sql) {
-            (Some(r), Some(a)) => compare_sql(r, a).is_ok(),
+            (Some(r), Some(a)) => compare_sql(r, a, adapter_type).is_ok(),
             (None, None) => true,
             _ => false,
         }
@@ -1064,7 +1156,7 @@ mod tests {
 
     /// Helper to create a test Recording from events
     fn make_recording(events: Vec<AdapterCallEvent>) -> Recording {
-        let mut adapter_events_by_node: HashMap<String, Vec<AdapterCallEvent>> = HashMap::new();
+        let mut adapter_events_by_node: BTreeMap<String, Vec<AdapterCallEvent>> = BTreeMap::new();
         for event in events {
             adapter_events_by_node
                 .entry(event.node_id.clone())
@@ -1086,8 +1178,8 @@ mod tests {
                 metadata: serde_json::Map::new(),
             },
             adapter_events_by_node,
-            metadata_events_by_caller: HashMap::new(),
-            sao_events: HashMap::new(),
+            metadata_events_by_caller: BTreeMap::new(),
+            sao_events: BTreeMap::new(),
             run_remote_adhoc_events: Vec::new(),
             cache_invalidation_events: Vec::new(),
             adapter_positions: RwLock::new(HashMap::new()),
@@ -1609,7 +1701,7 @@ mod tests {
             ),
         ];
 
-        let mut adapter_events_by_node: HashMap<String, Vec<AdapterCallEvent>> = HashMap::new();
+        let mut adapter_events_by_node: BTreeMap<String, Vec<AdapterCallEvent>> = BTreeMap::new();
         for event in events {
             adapter_events_by_node
                 .entry(event.node_id.clone())
@@ -1628,8 +1720,8 @@ mod tests {
                 invocation_command: None,
             },
             adapter_events_by_node,
-            metadata_events_by_caller: HashMap::new(),
-            sao_events: HashMap::new(),
+            metadata_events_by_caller: BTreeMap::new(),
+            sao_events: BTreeMap::new(),
             run_remote_adhoc_events: Vec::new(),
             cache_invalidation_events: Vec::new(),
             adapter_positions: RwLock::new(HashMap::new()),
@@ -1678,12 +1770,138 @@ mod tests {
     }
 
     #[test]
+    fn test_get_relation_args_match_positional_and_kwargs() {
+        let positional = serde_json::json!(["rioter_dbt", "dbt_artifacts", "model_executions"]);
+        let kwargs = serde_json::json!([
+            {
+                "__type__": "minijinja::value::argtypes::KwargsMutableMap",
+                "database": "rioter_dbt",
+                "schema": "dbt_artifacts",
+                "identifier": "model_executions"
+            }
+        ]);
+
+        assert!(adapter_args_match("get_relation", &kwargs, &positional));
+        assert!(adapter_args_match("get_relation", &positional, &kwargs));
+    }
+
+    #[test]
+    fn test_semantic_mode_read_does_not_advance_over_skipped_write() {
+        let events = vec![
+            AdapterCallEvent {
+                node_id: "node1".to_string(),
+                seq: 0,
+                method: "get_relation".to_string(),
+                semantic_category: SemanticCategory::MetadataRead,
+                args: serde_json::json!(["DB", "SCHEMA", "model_executions"]),
+                result: serde_json::json!({"seq": 0}),
+                success: true,
+                error: None,
+                timestamp_ns: 0,
+            },
+            AdapterCallEvent {
+                node_id: "node1".to_string(),
+                seq: 1,
+                method: "execute".to_string(),
+                semantic_category: SemanticCategory::Write,
+                args: serde_json::json!(["insert model_executions"]),
+                result: serde_json::json!({"seq": 1}),
+                success: true,
+                error: None,
+                timestamp_ns: 1,
+            },
+            AdapterCallEvent {
+                node_id: "node1".to_string(),
+                seq: 2,
+                method: "get_relation".to_string(),
+                semantic_category: SemanticCategory::MetadataRead,
+                args: serde_json::json!(["DB", "SCHEMA", "test_executions"]),
+                result: serde_json::json!({"seq": 2}),
+                success: true,
+                error: None,
+                timestamp_ns: 2,
+            },
+            AdapterCallEvent {
+                node_id: "node1".to_string(),
+                seq: 3,
+                method: "execute".to_string(),
+                semantic_category: SemanticCategory::Write,
+                args: serde_json::json!(["insert test_executions"]),
+                result: serde_json::json!({"seq": 3}),
+                success: true,
+                error: None,
+                timestamp_ns: 3,
+            },
+        ];
+        let recording = make_recording(events);
+
+        let test_args = serde_json::json!(["DB", "SCHEMA", "test_executions"]);
+        let read = recording.take_semantic_match(
+            "node1",
+            "get_relation",
+            &test_args,
+            SemanticCategory::MetadataRead,
+        );
+        assert!(
+            read.is_none(),
+            "Should not match a future read across a skipped write"
+        );
+    }
+
+    #[test]
+    fn test_get_relation_args_match_needs_information() {
+        let default_needs_information =
+            serde_json::json!(["rioter_dbt", "dbt_artifacts", "model_executions"]);
+        let explicit_false = serde_json::json!([
+            "rioter_dbt",
+            "dbt_artifacts",
+            "model_executions",
+            {
+                "__type__": "minijinja::value::argtypes::KwargsMutableMap",
+                "needs_information": false
+            }
+        ]);
+        let explicit_true = serde_json::json!([
+            {
+                "__type__": "minijinja::value::argtypes::KwargsMutableMap",
+                "database": "rioter_dbt",
+                "schema": "dbt_artifacts",
+                "identifier": "model_executions",
+                "needs_information": true
+            }
+        ]);
+        let positional_true =
+            serde_json::json!(["rioter_dbt", "dbt_artifacts", "model_executions", true]);
+
+        assert!(adapter_args_match(
+            "get_relation",
+            &default_needs_information,
+            &explicit_false
+        ));
+        assert!(!adapter_args_match(
+            "get_relation",
+            &default_needs_information,
+            &explicit_true
+        ));
+        assert!(!adapter_args_match(
+            "get_relation",
+            &default_needs_information,
+            &positional_true
+        ));
+        assert!(adapter_args_match(
+            "get_relation",
+            &explicit_true,
+            &positional_true
+        ));
+    }
+
+    #[test]
     fn test_sql_args_match_handles_whitespace_differences() {
         // Test that SQL values are matched using fuzzy comparison
         let sql1 = serde_json::json!(["SELECT   *\nFROM    users"]);
         let sql2 = serde_json::json!(["SELECT*FROMusers"]);
         assert!(
-            sql_args_match(&sql1, &sql2),
+            sql_args_match(&sql1, &sql2, AdapterType::Snowflake),
             "SQL strings should match ignoring whitespace"
         );
     }
@@ -1694,7 +1912,7 @@ mod tests {
         let sql1 = serde_json::json!([r#"alter session set query_tag = '{"model": "a"}'"#]);
         let sql2 = serde_json::json!([r#"alter session set query_tag = '{"model": "b"}'"#]);
         assert!(
-            sql_args_match(&sql1, &sql2),
+            sql_args_match(&sql1, &sql2, AdapterType::Snowflake),
             "Query tag payloads should be canonicalized"
         );
     }
@@ -1705,7 +1923,7 @@ mod tests {
         let sql1 = serde_json::json!(["SELECT '8f439b7e-752f-460a-8d1a-f469231d169c' AS id"]);
         let sql2 = serde_json::json!(["SELECT '019a71ca-e5ad-7ca3-99d8-49b58a470d82' AS id"]);
         assert!(
-            sql_args_match(&sql1, &sql2),
+            sql_args_match(&sql1, &sql2, AdapterType::Snowflake),
             "UUID literals should be canonicalized"
         );
     }
@@ -1716,7 +1934,7 @@ mod tests {
         let sql1 = serde_json::json!(["WHERE created_at >= '2025-09-10T18:07:45'"]);
         let sql2 = serde_json::json!(["WHERE created_at >= '2025-09-10T14:16:52'"]);
         assert!(
-            sql_args_match(&sql1, &sql2),
+            sql_args_match(&sql1, &sql2, AdapterType::Snowflake),
             "Timestamp literals should be matched flexibly"
         );
     }
@@ -1727,7 +1945,7 @@ mod tests {
         let sql1 = serde_json::json!(["SELECT * FROM users"]);
         let sql2 = serde_json::json!(["SELECT * FROM orders"]);
         assert!(
-            !sql_args_match(&sql1, &sql2),
+            !sql_args_match(&sql1, &sql2, AdapterType::Snowflake),
             "Different table names should not match"
         );
     }
@@ -1738,7 +1956,7 @@ mod tests {
         let sql1 = serde_json::json!("SELECT   *  FROM  users");
         let sql2 = serde_json::json!("SELECT * FROM users");
         assert!(
-            sql_args_match(&sql1, &sql2),
+            sql_args_match(&sql1, &sql2, AdapterType::Snowflake),
             "Direct SQL strings should be matched with fuzzy comparison"
         );
     }
@@ -1795,7 +2013,7 @@ mod tests {
         adapter_events: Vec<AdapterCallEvent>,
         sao_events: Vec<SaoEvent>,
     ) -> Recording {
-        let mut adapter_events_by_node: HashMap<String, Vec<AdapterCallEvent>> = HashMap::new();
+        let mut adapter_events_by_node: BTreeMap<String, Vec<AdapterCallEvent>> = BTreeMap::new();
         for event in adapter_events {
             adapter_events_by_node
                 .entry(event.node_id.clone())
@@ -1806,7 +2024,7 @@ mod tests {
             events.sort_by_key(|e| e.seq);
         }
 
-        let mut sao_events_map: HashMap<String, SaoEvent> = HashMap::new();
+        let mut sao_events_map: BTreeMap<String, SaoEvent> = BTreeMap::new();
         for event in sao_events {
             sao_events_map.insert(event.node_id.clone(), event);
         }
@@ -1822,7 +2040,7 @@ mod tests {
                 metadata: serde_json::Map::new(),
             },
             adapter_events_by_node,
-            metadata_events_by_caller: HashMap::new(),
+            metadata_events_by_caller: BTreeMap::new(),
             sao_events: sao_events_map,
             run_remote_adhoc_events: Vec::new(),
             cache_invalidation_events: Vec::new(),

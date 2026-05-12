@@ -1,7 +1,7 @@
 use std::{
     io::{self, Write},
     sync::{
-        Arc, OnceLock,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -22,12 +22,11 @@ use dbt_error::ErrorCode;
 use tracing::level_filters::LevelFilter;
 
 use crate::{
-    constants::DBT_GENERIC_TESTS_DIR_NAME,
+    constants::DBT_GENERIC_TESTS_DIR_NAME, tracing::event_classifiers::is_exit_with_status_log,
     tracing::formatters::node::format_node_evaluated_start_legacy,
 };
 use crate::{
-    io_args::{FsCommand, ShowOptions},
-    logging::LogFormat,
+    io_args::{FsCommand, LogFormat, ShowOptions},
     tracing::{
         data_provider::DataProvider,
         formatters::{
@@ -61,37 +60,6 @@ use crate::{
         private_events::print_event::{StderrMessage, StdoutMessage},
     },
 };
-
-// -------------------------------------------------------------------------------------------------
-// TEMPORARY: Global suspension hook for legacy log-based output.
-// This exists only until the show_progress! macro is fully migrated to tracing.
-// Once all legacy log-based progress messages are removed, delete this entire section.
-// -------------------------------------------------------------------------------------------------
-
-/// Type alias for the hook function that suspends progress bars.
-type SuspendHook = Box<dyn Fn(&mut dyn FnMut()) + Send + Sync>;
-
-/// Global hook for suspending progress bars during log emission.
-/// TEMPORARY: See module-level comment above.
-static PROGRESS_BAR_SUSPEND_HOOK: OnceLock<SuspendHook> = OnceLock::new();
-
-/// Register a callback that will be invoked to suspend progress bars during log emission.
-/// Called by TuiLayer when it creates a ProgressController in interactive mode.
-/// TEMPORARY: See module-level comment above.
-fn register_progress_bar_suspend_hook(hook: impl Fn(&mut dyn FnMut()) + Send + Sync + 'static) {
-    let _ = PROGRESS_BAR_SUSPEND_HOOK.set(Box::new(hook));
-}
-
-/// Suspend progress bars while executing the provided closure.
-/// If no hook is registered, the closure is executed immediately.
-/// TEMPORARY: See module-level comment above.
-pub fn with_suspended_progress_bars<F: FnMut()>(mut f: F) {
-    if let Some(hook) = PROGRESS_BAR_SUSPEND_HOOK.get() {
-        hook(&mut f);
-    } else {
-        f()
-    }
-}
 
 /// Build TUI layer that handles all terminal user interface on stdout and stderr, including progress bars
 pub fn build_tui_layer(
@@ -310,16 +278,7 @@ impl TuiLayer {
         let progress = if is_interactive {
             let mut ctrl = ProgressController::new();
             ctrl.start_ticker();
-            let progress = Arc::new(ctrl);
-
-            // TEMPORARY: Register global hook for legacy show_progress! macro.
-            // Remove this once all show_progress! calls are migrated to tracing.
-            let progress_for_hook = Arc::clone(&progress);
-            register_progress_bar_suspend_hook(move |f| {
-                progress_for_hook.with_suspended(f);
-            });
-
-            Some(progress)
+            Some(Arc::new(ctrl))
         } else {
             None
         };
@@ -401,6 +360,9 @@ impl TelemetryConsumer for TuiLayer {
             .output_flags()
             .contains(TelemetryOutputFlags::OUTPUT_CONSOLE)
             && log_record.severity_number <= self.max_log_verbosity
+            // ExitWithStatus is a pseudo error used only to short-circuit execution, so we
+            // filter it from dbt-facing output
+            && !is_exit_with_status_log(log_record)
     }
 
     fn on_span_start(&self, span: &SpanStartInfo, data_provider: &mut DataProvider<'_>) {
@@ -851,8 +813,6 @@ impl TuiLayer {
                 // For render, keep legacy filtering: hide seed/unit test and generic YAML tests.
                 // Singular SQL tests should still emit render lines.
                 // TODO: This legacy path should be phase-based only and not command-dependent.
-                // Keep command handling here only to preserve legacy text output during migration
-                // until show_progress! macro is fully eliminated.
                 && ((phase == ExecutionPhase::Render
                     && !(node_type == NodeType::Seed
                         || is_yaml_defined_generic_test))
@@ -870,6 +830,17 @@ impl TuiLayer {
                 // Avoid double-printing in text mode if this is also debug level
                 return;
             }
+        }
+
+        // Run/Compare NodeEvaluated spans were upgraded from Debug to Info level so they
+        // appear in dbt.log and structured telemetry (JSONL, Parquet, OTLP). However, in
+        // the TUI they should only render when debug verbosity is explicitly requested,
+        // preserving their previous behavior as Debug-level spans. In interactive mode,
+        // progress bars already provide per-node feedback for these phases.
+        if matches!(phase, ExecutionPhase::Run | ExecutionPhase::Compare)
+            && self.max_log_verbosity < LevelFilter::DEBUG
+        {
+            return;
         }
 
         // Print line in debug mode using new format (also used by file log & json)
@@ -921,6 +892,17 @@ impl TuiLayer {
                 let formatted_item = format_unique_id_as_progress_item(ne.unique_id.as_str());
                 progress.finish_bar_context(&ProgressId::Phase(phase), &formatted_item, status);
             }
+        }
+
+        // Run/Compare NodeEvaluated spans were upgraded from Debug to Info level so they
+        // appear in dbt.log and structured telemetry (JSONL, Parquet, OTLP). However, in
+        // the TUI they should only render when debug verbosity is explicitly requested,
+        // preserving their previous behavior as Debug-level spans. In interactive mode,
+        // progress bars already provide per-node feedback for these phases.
+        if matches!(phase, ExecutionPhase::Run | ExecutionPhase::Compare)
+            && self.max_log_verbosity < LevelFilter::DEBUG
+        {
+            return;
         }
 
         // Do not emit anything for skipped node phases even in debug
@@ -1132,8 +1114,13 @@ impl TuiLayer {
             self.write_suspended(|| {
                 let mut stdout = io::stdout().lock();
 
-                // Emit header once before first list item
-                if !self.list_header_emitted.swap(true, Ordering::Relaxed) {
+                // Only emit the decorative header when show_options is non-empty (i.e. not quiet).
+                // In quiet mode show_options is cleared, so the header is suppressed while list
+                // item content (the result payload) continues to be printed — matching dbt-core's
+                // PrintEvent behaviour where only decorative chrome is stripped.
+                if !self.show_options.is_empty()
+                    && !self.list_header_emitted.swap(true, Ordering::Relaxed)
+                {
                     let header =
                         format_delimiter(SELECTED_NODES_TITLE, self.max_term_line_width, true);
                     stdout
@@ -1141,7 +1128,7 @@ impl TuiLayer {
                         .expect("failed to write header to stdout");
                 }
 
-                // Print list item content
+                // Print list item content (always — result payload survives quiet)
                 stdout
                     .write_all(format!("{}\n", list_item.content).as_bytes())
                     .expect("failed to write to stdout");
@@ -1163,12 +1150,19 @@ impl TuiLayer {
         self.write_suspended(|| {
             let mut stdout = io::stdout().lock();
 
-            // Apply blue coloring to title
-            let colored_title = BLUE.apply_to(&show_result.title);
-
-            stdout
-                .write_all(format!("\n{}\n{}\n", colored_title, show_result.content).as_bytes())
-                .expect("failed to write show result to stdout");
+            if self.show_options.is_empty() {
+                // Quiet mode: suppress decorative title, emit raw content only.
+                // Mirrors dbt-core's ShowNode quiet=True behaviour where the
+                // "Previewing node 'X':" header is dropped but the data is kept.
+                stdout
+                    .write_all(format!("{}\n", show_result.content).as_bytes())
+                    .expect("failed to write show result to stdout");
+            } else {
+                let colored_title = BLUE.apply_to(&show_result.title);
+                stdout
+                    .write_all(format!("\n{}\n{}\n", colored_title, show_result.content).as_bytes())
+                    .expect("failed to write show result to stdout");
+            }
         });
     }
 

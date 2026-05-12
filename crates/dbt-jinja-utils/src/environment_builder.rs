@@ -1,8 +1,11 @@
 use crate::{
     functions::register_base_functions, jinja_environment::JinjaEnv, utils::set_status_reporter,
 };
-use dbt_adapter::BaseAdapter;
-use dbt_common::{ErrorCode, FsError, FsResult, fs_err, io_args::IoArgs, unexpected_fs_err};
+use dbt_adapter::Adapter;
+use dbt_common::{
+    ErrorCode, FsError, FsResult, fs_err, io_args::IoArgs, unexpected_fs_err,
+    warn_error_options::WarnErrorOptions,
+};
 use minijinja::{
     AdapterDispatchFunction, Argument, DynTypeObject, Environment, UndefinedFunctionType,
     UserDefinedFunctionType, Value,
@@ -41,11 +44,12 @@ impl MacroUnitsWrapper {
 // Default Jinja Env Behaves differently than Envirornment::new()
 pub struct JinjaEnvBuilder {
     env: Environment<'static>,
-    adapter: Option<Arc<dyn BaseAdapter>>,
+    adapter: Option<Arc<Adapter>>,
     globals: BTreeMap<String, Value>,
     root_package: Option<String>,
     undefined_behavior: minijinja::UndefinedBehavior,
     io_args: IoArgs,
+    warn_error_options: WarnErrorOptions,
     function_registry: Arc<FunctionRegistry>,
 }
 
@@ -59,6 +63,7 @@ impl JinjaEnvBuilder {
             root_package: None,
             undefined_behavior: Default::default(),
             io_args: IoArgs::default(),
+            warn_error_options: WarnErrorOptions::default(),
             function_registry: Arc::new(FunctionRegistry::new()),
         }
     }
@@ -83,7 +88,7 @@ impl JinjaEnvBuilder {
     }
 
     /// Specify an adapter type (e.g. "parse", "compile") or other distinguishing feature.
-    pub fn with_adapter(mut self, adapter: Arc<dyn BaseAdapter>) -> Self {
+    pub fn with_adapter(mut self, adapter: Arc<Adapter>) -> Self {
         self.adapter = Some(adapter);
         self
     }
@@ -98,6 +103,12 @@ impl JinjaEnvBuilder {
     /// Add IoArgs
     pub fn with_io_args(mut self, io_args: IoArgs) -> Self {
         self.io_args = io_args;
+        self
+    }
+
+    /// Add WarnErrorOptions
+    pub fn with_warn_error_options(mut self, warn_error_options: WarnErrorOptions) -> Self {
+        self.warn_error_options = warn_error_options;
         self
     }
 
@@ -390,7 +401,7 @@ impl JinjaEnvBuilder {
         let function_registry = self.register_filter_types();
 
         // Register "base" dbt style functions.
-        register_base_functions(&mut self.env, self.io_args);
+        register_base_functions(&mut self.env, self.io_args, self.warn_error_options);
 
         // Register all configured global values.
         // TODO (Ani) type the globals struct to validate we recieve all the globals we need
@@ -448,9 +459,9 @@ impl Default for JinjaEnvBuilder {
 mod tests {
     use std::{collections::BTreeSet, path::PathBuf, sync::Mutex};
 
-    use dbt_adapter::BridgeAdapter;
+    use dbt_adapter::Adapter;
     use dbt_adapter::sql_types::SATypeOpsImpl;
-    use dbt_common::adapter::AdapterType;
+    use dbt_adapter_core::AdapterType;
     use dbt_schemas::schemas::relations::DEFAULT_DBT_QUOTING;
     use minijinja::{
         constants::MACRO_DISPATCH_ORDER, context, dispatch_object::THREAD_LOCAL_DEPENDENCIES,
@@ -581,7 +592,7 @@ all okay!");
                 "{% macro default__one() %}test_package one{% endmacro %}",
             )],
         );
-        let adapter = BridgeAdapter::new_parse_phase_adapter(
+        let adapter = Adapter::new_parse_phase_adapter(
             AdapterType::Postgres,
             dbt_yaml::Mapping::default(),
             DEFAULT_DBT_QUOTING,
@@ -589,7 +600,7 @@ all okay!");
             None,
         );
         let builder: JinjaEnvBuilder = JinjaEnvBuilder::new()
-            .with_adapter(Arc::new(adapter) as Arc<dyn BaseAdapter>)
+            .with_adapter(Arc::new(adapter) as Arc<Adapter>)
             .with_root_package("test_package".to_string())
             .try_with_macros(macro_units)
             .expect("Failed to register macros");
@@ -668,7 +679,7 @@ all okay!");
                 ),
             ],
         );
-        let adapter = BridgeAdapter::new_parse_phase_adapter(
+        let adapter = Adapter::new_parse_phase_adapter(
             AdapterType::Postgres,
             dbt_yaml::Mapping::default(),
             DEFAULT_DBT_QUOTING,
@@ -676,7 +687,7 @@ all okay!");
             None,
         );
         let builder: JinjaEnvBuilder = JinjaEnvBuilder::new()
-            .with_adapter(Arc::new(adapter) as Arc<dyn BaseAdapter>)
+            .with_adapter(Arc::new(adapter) as Arc<Adapter>)
             .with_root_package("test_package".to_string())
             .try_with_macros(macro_units)
             .expect("Failed to register macros");
@@ -730,7 +741,7 @@ all okay!");
 
     #[test]
     fn test_macro_assignment() {
-        let adapter = BridgeAdapter::new_parse_phase_adapter(
+        let adapter = Adapter::new_parse_phase_adapter(
             AdapterType::Postgres,
             dbt_yaml::Mapping::default(),
             DEFAULT_DBT_QUOTING,
@@ -739,7 +750,7 @@ all okay!");
         );
         let env = JinjaEnvBuilder::new()
             .with_root_package("test_package".to_string())
-            .with_adapter(Arc::new(adapter) as Arc<dyn BaseAdapter>)
+            .with_adapter(Arc::new(adapter) as Arc<Adapter>)
             .try_with_macros(MacroUnitsWrapper::new(BTreeMap::from([(
                 "test_package".to_string(),
                 vec![
@@ -850,7 +861,7 @@ all okay!");
             )],
         );
 
-        let adapter = BridgeAdapter::new_parse_phase_adapter(
+        let adapter = Adapter::new_parse_phase_adapter(
             AdapterType::Postgres,
             dbt_yaml::Mapping::default(),
             DEFAULT_DBT_QUOTING,
@@ -862,7 +873,7 @@ all okay!");
 
         // Build environment with the empty root package
         let builder: JinjaEnvBuilder = JinjaEnvBuilder::new()
-            .with_adapter(Arc::new(adapter) as Arc<dyn BaseAdapter>)
+            .with_adapter(Arc::new(adapter) as Arc<Adapter>)
             .with_root_package("empty_root".to_string())
             .try_with_macros(macro_units)
             .expect("Failed to register macros");
@@ -901,7 +912,7 @@ all okay!");
             )],
         );
 
-        let adapter = BridgeAdapter::new_parse_phase_adapter(
+        let adapter = Adapter::new_parse_phase_adapter(
             AdapterType::Postgres,
             dbt_yaml::Mapping::default(),
             DEFAULT_DBT_QUOTING,
@@ -915,7 +926,7 @@ all okay!");
         )]);
 
         let env = JinjaEnvBuilder::new()
-            .with_adapter(Arc::new(adapter) as Arc<dyn BaseAdapter>)
+            .with_adapter(Arc::new(adapter) as Arc<Adapter>)
             .with_root_package("test_package".to_string())
             .with_globals(globals)
             .try_with_macros(macro_units)
@@ -946,7 +957,7 @@ all okay!");
             )],
         );
 
-        let adapter = BridgeAdapter::new_parse_phase_adapter(
+        let adapter = Adapter::new_parse_phase_adapter(
             AdapterType::Postgres,
             dbt_yaml::Mapping::default(),
             DEFAULT_DBT_QUOTING,
@@ -960,7 +971,7 @@ all okay!");
         )]);
 
         let env = JinjaEnvBuilder::new()
-            .with_adapter(Arc::new(adapter) as Arc<dyn BaseAdapter>)
+            .with_adapter(Arc::new(adapter) as Arc<Adapter>)
             .with_root_package("test_package".to_string())
             .with_globals(globals)
             .try_with_macros(macro_units)

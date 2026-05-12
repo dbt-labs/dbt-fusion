@@ -11,7 +11,6 @@ pub mod hashing;
 pub mod io_utils;
 pub mod node_selector;
 pub mod pretty_string;
-pub mod pretty_table;
 pub mod static_analysis;
 pub mod stats;
 pub mod stdfs;
@@ -29,7 +28,6 @@ pub mod embedded_install_scripts;
 pub mod fail_fast;
 pub mod io_args;
 pub mod lease;
-pub mod logging;
 pub mod once_cell_vars;
 pub mod path;
 pub mod row_limit;
@@ -37,6 +35,7 @@ pub mod serde_utils;
 pub mod status_reporter;
 pub mod time;
 pub mod tracing;
+pub mod warn_error_options;
 
 // Re-export span creation functions that were previously exported as macros
 pub use tracing::{

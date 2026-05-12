@@ -1,19 +1,17 @@
 #[cfg(test)]
 mod tests {
+    use crate::adapter::adapter_impl::AdapterImpl;
     use crate::sql_types::SATypeOpsImpl;
-    use crate::typed_adapter::ConcreteAdapter;
-    use dbt_common::adapter::AdapterType;
+    use dbt_adapter_core::AdapterType;
 
     use dbt_schemas::schemas::relations::SNOWFLAKE_RESOLVED_QUOTING;
 
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
-    use crate::AdapterTyping;
-
     #[test]
     fn test_adapter_type() {
-        let adapter = ConcreteAdapter::new_mock(
+        let adapter = AdapterImpl::new_mock(
             AdapterType::Snowflake,
             BTreeMap::new(),
             SNOWFLAKE_RESOLVED_QUOTING,
@@ -25,7 +23,7 @@ mod tests {
 
     #[test]
     fn test_quote() {
-        let adapter = ConcreteAdapter::new_mock(
+        let adapter = AdapterImpl::new_mock(
             AdapterType::Snowflake,
             BTreeMap::new(),
             SNOWFLAKE_RESOLVED_QUOTING,

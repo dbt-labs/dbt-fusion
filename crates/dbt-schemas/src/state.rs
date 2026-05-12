@@ -1,4 +1,5 @@
 use chrono_tz::Tz;
+use dbt_adapter_core::AdapterType;
 use dbt_yaml::Spanned;
 use indexmap::IndexMap;
 use std::{
@@ -10,7 +11,7 @@ use std::{
 };
 
 use crate::schemas::{
-    DbtSource, InternalDbtNodeAttributes, Nodes,
+    DbtSource, InternalDbtNodeAttributes, Nodes, ResolvedCloudConfig,
     common::{DbtQuoting, ResolvedQuoting},
     dbt_catalogs::DbtCatalogs,
     macros::{DbtDocsMacro, DbtMacro},
@@ -27,7 +28,8 @@ use crate::schemas::{
 use blake3::Hasher;
 use chrono::{DateTime, Local, Utc};
 use dbt_common::{
-    ErrorCode, FsResult, adapter::AdapterType, fs_err, io_args::FsCommand, path::DbtPath,
+    ErrorCode, FsResult, fs_err, io_args::FsCommand, path::DbtPath,
+    warn_error_options::WarnErrorOptions,
 };
 use minijinja::{MacroSpans, Value as MinijinjaValue, value::Object};
 use serde::Deserialize;
@@ -85,6 +87,10 @@ pub struct DbtAsset {
 }
 
 impl DbtAsset {
+    pub fn is_python(&self) -> bool {
+        self.path.extension().and_then(|ext| ext.to_str()) == Some("py")
+    }
+
     /// Assumes all paths used are canonicalized
     pub fn to_display_path(&self, project_root: &Path) -> PathBuf {
         let absolute_path = self.base_path.join(&self.path);
@@ -125,10 +131,16 @@ pub struct GenericTestAsset {
     pub test_metadata_combination_of_columns: Option<Vec<String>>,
     /// The model kwarg for generic tests, e.g. "{{ get_where_subquery(ref('foo')) }}"
     pub test_metadata_model: Option<String>,
+    /// Full kwargs map for test_metadata, including all user-provided macro arguments.
+    /// Excludes dbt config keys ("config", "_config_raw"). Empty for singular tests.
+    pub test_metadata_kwargs: BTreeMap<String, dbt_yaml::Value>,
     /// The original (untruncated) test name, if truncation occurred.
     /// When test names exceed 63 characters, dbt truncates to `<first 30 chars>_<md5 hash>`.
     /// This field stores the original name for selector matching purposes.
     pub original_name: Option<String>,
+    /// Pre-computed unique_id hash suffix (last 10 hex chars of md5(fqn_name + metadata_repr)).
+    /// Computed in persist_generic_data_tests using full kwargs, matching dbt-core/Mantle's algorithm.
+    pub unique_id_hash: Option<String>,
 }
 
 impl fmt::Display for GenericTestAsset {
@@ -218,6 +230,9 @@ pub struct DbtState {
     pub vars: BTreeMap<String, IndexMap<String, DbtVars>>,
     pub cli_vars: BTreeMap<String, dbt_yaml::Value>,
     pub catalogs: Option<Arc<DbtCatalogs>>,
+    pub cloud_config: Option<ResolvedCloudConfig>,
+    pub warn_error: bool,
+    pub warn_error_options: WarnErrorOptions,
 }
 
 impl DbtState {
@@ -486,6 +501,8 @@ pub struct ResolverState {
     pub defer_nodes: Option<Nodes>,
     /// Nodes that had resolution errors (e.g., unresolved refs/sources)
     pub nodes_with_resolution_errors: HashSet<String>,
+    /// Nodes whose SQL references models they are not permitted to access (group/access violations)
+    pub nodes_with_access_errors: HashSet<String>,
     pub semantic_layer_spec_is_legacy: bool,
     /// Mapping from truncated/hashed generic test names to their original pre-hash full names.
     ///
@@ -540,23 +557,26 @@ pub struct ResolvedNodes {
 // files are represented by their relative path to the project root
 #[derive(Debug, Clone, Default)]
 pub struct FileChanges {
-    pub unchanged_files: HashSet<String>,
-    // updated files
-    pub changed_files: HashSet<String>,
+    // changed files
+    pub changed_files: HashSet<DbtPath>,
+    // unimpacted files
+    pub unimpacted_files: HashSet<DbtPath>,
+    // impacted files
+    pub impacted_files: HashSet<DbtPath>,
     // deleted files
-    pub deleted_files: HashSet<String>,
+    pub deleted_files: HashSet<DbtPath>,
     // new files
-    pub new_files: HashSet<String>,
+    pub new_files: HashSet<DbtPath>,
 }
 impl FileChanges {
     pub fn no_change(&self) -> bool {
-        self.changed_files.is_empty()
+        self.impacted_files.is_empty()
             && self.deleted_files.is_empty()
             && self.new_files.is_empty()
-            && !self.unchanged_files.is_empty()
+            && !self.unimpacted_files.is_empty()
     }
     pub fn has_changes(&self) -> bool {
-        !self.changed_files.is_empty() || !self.new_files.is_empty()
+        !self.impacted_files.is_empty() || !self.new_files.is_empty()
     }
 }
 /// Represents the execution state of a node in the dbt project.

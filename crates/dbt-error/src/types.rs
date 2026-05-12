@@ -24,6 +24,24 @@ pub type FsResult<T, E = Box<FsError>> = Result<T, E>;
 // TODO(jasonlin45): Report stack trace on CodeLocation
 struct StackTraceFormatter<'a>(&'a minijinja::Error);
 
+/// Walk the error source chain of a minijinja error looking for an `AdapterError`.
+///
+/// This is needed because adapter errors can surface under different Jinja error
+/// kinds (`Execution`, `InvalidOperation`, etc.) depending on where they are raised
+/// in the macro call chain.
+fn find_adapter_error_in_chain(
+    err: &minijinja::Error,
+) -> Option<&super::adapter_errors::AdapterError> {
+    let mut current: Option<&(dyn Error + 'static)> = err.source();
+    while let Some(source) = current {
+        if let Some(adapter_err) = source.downcast_ref::<super::adapter_errors::AdapterError>() {
+            return Some(adapter_err);
+        }
+        current = source.source();
+    }
+    None
+}
+
 impl<'a> Display for StackTraceFormatter<'a> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         self.0.stack_trace(f)
@@ -36,6 +54,12 @@ pub struct FsError {
     pub context: String,
     cause: Option<WrappedError>,
     backtrace: Backtrace,
+
+    // Jinja call stack frames (innermost first) captured from a minijinja::Error.
+    // This is only used by the LSP layer.
+    // TODO: should this become the new basis for `context`?
+    // TODO: Should we make these Spans instead to store end locations?
+    pub jinja_frames: Vec<super::CodeLocationWithFile>,
 
     // Chain of errors, to allow returning multiple errors in a single
     // [FsResult]:
@@ -123,6 +147,7 @@ impl FsError {
             context: context.into(),
             cause: None,
             backtrace: Backtrace::capture(),
+            jinja_frames: vec![],
             next: None,
         }
     }
@@ -134,6 +159,7 @@ impl FsError {
             context: context.into(),
             cause: None,
             backtrace: Backtrace::force_capture(),
+            jinja_frames: vec![],
             next: None,
         }
     }
@@ -149,6 +175,7 @@ impl FsError {
             context: context.into(),
             cause: None,
             backtrace,
+            jinja_frames: vec![],
             next: None,
         }
     }
@@ -175,9 +202,11 @@ impl FsError {
                     .with_macro_spans(macro_spans, expanded_file.map(|x| Arc::new(x.into())));
                 let cause = err.cause.map(|e| (*e).into());
                 let context = match &cause {
-                    // Make sure the "Available are.." message gets formatted
-                    // into the error context:
-                    Some(WrappedError::NameError(ne)) => format!("{}. {}", err.context, ne),
+                    // Delegate full message assembly to NameError so it can
+                    // choose the right separator and suffix (e.g. cached-parquet
+                    // schemas get a "refresh your cache" hint instead of
+                    // "Available are ...").
+                    Some(WrappedError::NameError(ne)) => ne.format_with_context(&err.context),
                     _ => err.context,
                 };
                 FsError {
@@ -186,6 +215,7 @@ impl FsError {
                     context,
                     cause,
                     backtrace: err.backtrace,
+                    jinja_frames: vec![],
                     next: None,
                 }
             })
@@ -194,27 +224,59 @@ impl FsError {
     }
 
     pub fn from_jinja_err(err: minijinja::Error, context: impl Display) -> Self {
+        if err.kind() == minijinja::ErrorKind::ExitWithStatus {
+            return *FsError::exit_with_status(1);
+        }
+
+        let jinja_frames: Vec<super::CodeLocationWithFile> = err
+            .stack()
+            .iter()
+            .map(|frame| {
+                super::CodeLocationWithFile::new_with_arc(
+                    frame.span.start_line,
+                    frame.span.start_col,
+                    frame.span.start_offset,
+                    Arc::new(PathBuf::from(&frame.filename)),
+                )
+            })
+            .collect();
+
+        // Check for AdapterError as source regardless of Jinja error kind.
+        // Previously this was limited to ErrorKind::Execution, but adapter errors
+        // can also surface as ErrorKind::InvalidOperation (e.g. from run_query calls),
+        // so we check unconditionally by walking the source chain.
+        if let Some(adapter_err) = find_adapter_error_in_chain(&err) {
+            let mut fs_err = Box::<FsError>::from(adapter_err.clone());
+            if !err.is_stack_empty() {
+                let stack_trace = format!("{}", StackTraceFormatter(&err));
+                let mut frames = stack_trace.lines().filter(|s| !s.is_empty());
+                // Always show the first frame (points to user code / compiled SQL)
+                if let Some(first_frame) = frames.next() {
+                    fs_err.context.push('\n');
+                    fs_err.context.push_str(first_frame);
+                }
+                // Only include remaining internal macro frames in debug mode
+                if is_sdf_debug() {
+                    for frame in frames {
+                        fs_err.context.push('\n');
+                        fs_err.context.push_str(frame);
+                    }
+                }
+            }
+            let mut result = fs_err.with_location(MiniJinjaErrorWrapper(err));
+            result.jinja_frames = jinja_frames;
+            return result;
+        }
         let err_code = match err.kind() {
             minijinja::ErrorKind::SyntaxError => ErrorCode::MacroSyntaxError,
             minijinja::ErrorKind::DisabledModel => ErrorCode::DisabledModel,
-            minijinja::ErrorKind::Execution => {
-                if let Some(adapter_err) = err.source().and_then(|err_source| {
-                    err_source.downcast_ref::<super::adapter_errors::AdapterError>()
-                }) {
-                    // Grab stack trace from the Jinja error and append it to the adapter error context
-                    let mut fs_err = Box::<FsError>::from(adapter_err.clone());
-                    if !err.is_stack_empty() {
-                        let stack_trace = format!("{}", StackTraceFormatter(&err));
-                        fs_err.context.push_str(&stack_trace);
-                    }
-                    return fs_err.with_location(MiniJinjaErrorWrapper(err));
-                } else {
-                    ErrorCode::ExecutionError
-                }
-            }
+            minijinja::ErrorKind::Execution => ErrorCode::ExecutionError,
             _ => ErrorCode::JinjaError,
         };
-        FsError::new(err_code, format!("{context} {err}")).with_location(MiniJinjaErrorWrapper(err))
+        let mut result = FsError::new(err_code, format!("{context} {err}"))
+            .with_location(MiniJinjaErrorWrapper(err));
+        result.jinja_frames = jinja_frames;
+        result
     }
 
     /// True if this error contains a backtrace.
@@ -434,6 +496,11 @@ impl FsError {
         *head
     }
 
+    /// Removes and returns the next error in a chain built with [`Self::with_chained_errors`].
+    pub fn pop_next(&mut self) -> Option<Box<FsError>> {
+        self.next.take()
+    }
+
     /// Flattens multiple errors into a single vector.
     ///
     /// If this error is a single error, the result will be a vector with a
@@ -515,6 +582,7 @@ impl FsError {
             context: String::new(),
             cause: Some(WrappedError::ExitCode(status)),
             backtrace: Backtrace::capture(),
+            jinja_frames: vec![],
             next: None,
         };
         Box::new(err)
@@ -620,6 +688,37 @@ impl Display for NameError {
             ),
         };
         write!(f, "{msg}")
+    }
+}
+
+impl NameError {
+    /// Produces the full display string by combining the `FrontendError`
+    /// context (e.g. "No column X found") with the appropriate suffix.
+    ///
+    /// For a cached-parquet schema error the suffix is joined directly (no
+    /// period), yielding:
+    ///   "No column X found in the locally cached schema for the source in
+    ///     <path>
+    ///    It is likely that this cache needs to be refreshe by running: dbt clean"
+    ///
+    /// For all other cases the existing ". Available are ..." suffix is used.
+    pub fn format_with_context(&self, context: &str) -> String {
+        match self {
+            NameError::Schema(e) if e.parquet_path.is_some() => {
+                let path = e.parquet_path.as_deref().unwrap();
+                format!(
+                    "{context} in the locally cached schema for the source in\n  {path}\n   It is likely that this cache needs to be refreshed by running: dbt clean"
+                )
+            }
+            _ => {
+                let suffix = self.to_string();
+                if suffix.is_empty() {
+                    context.to_string()
+                } else {
+                    format!("{context}. {suffix}")
+                }
+            }
+        }
     }
 }
 

@@ -30,6 +30,8 @@ pub struct ResolveArgs {
     pub exclude: Option<SelectExpression>,
     /// Number of tHreads to use
     pub num_threads: Option<usize>,
+    /// Force sequential rendering/resolution, independent of `num_threads`.
+    pub no_parallel: bool,
     /// replay mode
     pub replay: Option<dbt_common::io_args::ReplayMode>,
     /// Sample config
@@ -40,6 +42,8 @@ pub struct ResolveArgs {
     pub static_analysis: Option<StaticAnalysisKind>,
     /// Store failures?
     pub store_failures: bool,
+    /// Whether to skip creating generic tests
+    pub skip_creating_generic_tests: bool,
 }
 
 impl ResolveArgs {
@@ -54,12 +58,14 @@ impl ResolveArgs {
             select: arg.select.clone(),
             exclude: arg.exclude.clone(),
             num_threads: arg.num_threads,
+            no_parallel: arg.no_parallel,
             indirect_selection: arg.indirect_selection,
             replay: arg.replay.clone(),
             sample_config: RunFilter::try_from(arg.empty, arg.sample.clone())?,
             sample_renaming: arg.sample_renaming.clone(),
             static_analysis: arg.static_analysis,
             store_failures: arg.store_failures,
+            skip_creating_generic_tests: arg.skip_creating_generic_tests,
         })
     }
 }

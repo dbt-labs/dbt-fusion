@@ -4,12 +4,13 @@ use std::{
     sync::{Arc, Mutex, atomic::AtomicBool},
 };
 
-use crate::utils::get_original_file_path;
+use crate::utils::{NoOpConfig, get_original_file_path};
+use dbt_adapter_core::AdapterType;
+use dbt_common::tracing::emit::emit_warn_log_from_fs_error;
 use dbt_common::{
     CodeLocationWithFile, ErrorCode, FsResult, fs_err,
     io_args::{IoArgs, StaticAnalysisKind},
 };
-use dbt_common::{adapter::AdapterType, tracing::emit::emit_warn_log_from_fs_error};
 use dbt_jinja_utils::{
     jinja_environment::JinjaEnv,
     listener::DefaultRenderingEventListenerFactory,
@@ -28,14 +29,6 @@ use dbt_schemas::{
 };
 use dbt_yaml::Spanned;
 use minijinja::constants::TARGET_PACKAGE_NAME;
-
-/// Empty config type used for operations (they don't have traditional config)
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-struct OperationEmptyConfig;
-
-impl dbt_schemas::schemas::project::DefaultTo<OperationEmptyConfig> for OperationEmptyConfig {
-    fn default_to(&mut self, _other: &OperationEmptyConfig) {}
-}
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn resolve_operations(
@@ -146,14 +139,14 @@ fn new_operation(
         // Skip empty operations
         if !operation_sql.trim().is_empty() {
             // Render and extract dependencies
-            let sql_resources: Arc<Mutex<Vec<SqlResource<OperationEmptyConfig>>>> =
+            let sql_resources: Arc<Mutex<Vec<SqlResource<NoOpConfig>>>> =
                 Arc::new(Mutex::new(Vec::new()));
             let execute_exists = Arc::new(AtomicBool::new(false));
 
             // Build operation context with tracking functions
             let mut operation_ctx = BTreeMap::new();
             operation_ctx.extend(build_resolve_model_context(
-                &OperationEmptyConfig,
+                &NoOpConfig {},
                 adapter_type,
                 database,
                 schema,

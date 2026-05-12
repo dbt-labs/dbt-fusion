@@ -25,9 +25,11 @@ pub fn try_load_valid_dbt_packages_lock(
     dbt_packages: &DbtPackages,
     jinja_env: &JinjaEnv,
     vars: &BTreeMap<String, dbt_yaml::Value>,
+    use_v2_compatible_package_downloads: bool,
 ) -> FsResult<Option<DbtPackagesLock>> {
     let packages_lock_path = io.in_dir.join(DBT_PACKAGES_LOCK_FILE);
-    let sha1_hash = fusion_sha1_hash_packages(&dbt_packages.packages);
+    let sha1_hash =
+        fusion_sha1_hash_packages(&dbt_packages.packages, use_v2_compatible_package_downloads);
     if packages_lock_path.exists() {
         let yml_str = try_read_yml_to_str(&packages_lock_path)?;
         let rendered_yml: DbtPackagesLock =
@@ -302,16 +304,15 @@ fn try_load_from_deprecated_dbt_packages_lock(
             // HACK: This is a temporary hack to ensure the old package lock format is invalidated (i.e. not loaded)
             // when it conflicts with the packages.yml spec (ex. a version constraint conflicts)
             // We only validate hub packages for now to aid the most common autofix upgrade scenario
-            if let Some(dbt_packages) = dbt_packages {
-                if let Err(e) = validate_deprecated_hub_lock_hack(dbt_packages, &dbt_packages_lock)
-                {
-                    emit_warn_log_message(
-                        ErrorCode::InvalidConfig,
-                        e.to_string(),
-                        io.status_reporter.as_ref(),
-                    );
-                    return Ok(None);
-                }
+            if let Some(dbt_packages) = dbt_packages
+                && let Err(e) = validate_deprecated_hub_lock_hack(dbt_packages, &dbt_packages_lock)
+            {
+                emit_warn_log_message(
+                    ErrorCode::InvalidConfig,
+                    e.to_string(),
+                    io.status_reporter.as_ref(),
+                );
+                return Ok(None);
             }
 
             Ok(Some(dbt_packages_lock))

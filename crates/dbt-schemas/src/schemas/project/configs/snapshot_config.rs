@@ -1,6 +1,7 @@
 use crate::schemas::common::ClusterConfig;
 use crate::schemas::serde::OmissibleGrantConfig;
 use crate::schemas::serde::QueryTag;
+use dbt_common::io_args::ComputeArg;
 use dbt_common::io_args::StaticAnalysisKind;
 use dbt_yaml::DbtSchema;
 use dbt_yaml::ShouldBe;
@@ -27,7 +28,7 @@ use crate::schemas::common::PersistDocsConfig;
 use crate::schemas::common::Schedule;
 use crate::schemas::common::SyncConfig;
 use crate::schemas::manifest::GrantAccessToTarget;
-use crate::schemas::project::DefaultTo;
+use crate::schemas::project::ResolvableConfig;
 use crate::schemas::project::TypedRecursiveConfig;
 use crate::schemas::project::configs::common::WarehouseSpecificNodeConfig;
 use crate::schemas::project::configs::common::default_hooks;
@@ -39,6 +40,7 @@ use crate::schemas::serde::bool_or_string_bool;
 use crate::schemas::serde::{
     IndexesConfig, PrimaryKeyConfig, f64_or_string_f64, u64_or_string_u64,
 };
+use dbt_proc_macros::Resolvable;
 
 // NOTE: No #[skip_serializing_none] - we handle None serialization in serialize_with_mode
 #[derive(Deserialize, Serialize, Debug, Clone, DbtSchema)]
@@ -146,6 +148,8 @@ pub struct ProjectSnapshotConfig {
     pub external_volume: Option<String>,
     #[serde(rename = "+initialize")]
     pub initialize: Option<String>,
+    #[serde(rename = "+scheduler")]
+    pub scheduler: Option<String>,
     #[serde(rename = "+query_tag")]
     pub query_tag: Option<QueryTag>,
     #[serde(rename = "+table_tag")]
@@ -156,6 +160,10 @@ pub struct ProjectSnapshotConfig {
     pub refresh_mode: Option<String>,
     #[serde(default, rename = "+secure", deserialize_with = "bool_or_string_bool")]
     pub secure: Option<bool>,
+    #[serde(rename = "+snowflake_initialization_warehouse")]
+    pub snowflake_initialization_warehouse: Option<String>,
+    #[serde(rename = "+immutable_where")]
+    pub immutable_where: Option<String>,
     #[serde(rename = "+snowflake_warehouse")]
     pub snowflake_warehouse: Option<String>,
     #[serde(rename = "+target_lag")]
@@ -238,6 +246,8 @@ pub struct ProjectSnapshotConfig {
     pub catalog: Option<String>,
     #[serde(rename = "+clustered_by")]
     pub clustered_by: Option<StringOrArrayOfStrings>,
+    #[serde(rename = "+compute")]
+    pub compute: Option<ComputeArg>,
     #[serde(rename = "+compression")]
     pub compression: Option<String>,
     #[serde(rename = "+databricks_compute")]
@@ -337,7 +347,7 @@ impl TypedRecursiveConfig for ProjectSnapshotConfig {
 }
 
 // NOTE: No #[skip_serializing_none] - we handle None serialization in serialize_with_mode
-#[derive(Deserialize, Serialize, Debug, Clone, DbtSchema, Default, PartialEq)]
+#[derive(Resolvable, Deserialize, Serialize, Debug, Clone, DbtSchema, Default, PartialEq)]
 pub struct SnapshotConfig {
     // Snapshot-specific Configuration
     #[serde(alias = "project", alias = "data_space")]
@@ -345,6 +355,7 @@ pub struct SnapshotConfig {
     #[serde(alias = "dataset")]
     pub schema: Option<String>,
     pub alias: Option<String>,
+    #[resolved(promote, default = DbtMaterialization::Table)]
     pub materialized: Option<DbtMaterialization>,
     pub strategy: Option<String>,
     pub unique_key: Option<StringOrArrayOfStrings>,
@@ -357,7 +368,9 @@ pub struct SnapshotConfig {
     // they're not not just aliases)
     pub target_database: Option<String>,
     pub target_schema: Option<String>,
+    pub compute: Option<ComputeArg>,
     // General Configuration
+    #[resolved(promote, method = get_enabled_with_default)]
     #[serde(default, deserialize_with = "bool_or_string_bool")]
     pub enabled: Option<bool>,
     #[serde(default, deserialize_with = "bool_or_string_bool")]
@@ -375,7 +388,9 @@ pub struct SnapshotConfig {
     #[serde(default)]
     pub grants: OmissibleGrantConfig,
     pub event_time: Option<String>,
+    #[resolved(promote, expect = "quoting set by apply_package_defaults")]
     pub quoting: Option<DbtQuoting>,
+    #[resolved(promote, expect = "static_analysis set by apply_resolve_defaults")]
     pub static_analysis: Option<Spanned<StaticAnalysisKind>>,
     pub meta: Option<IndexMap<String, YmlValue>>,
     pub group: Option<String>,
@@ -504,6 +519,7 @@ impl From<ProjectSnapshotConfig> for SnapshotConfig {
             hard_deletes: config.hard_deletes,
             target_database: config.target_database,
             target_schema: config.target_schema,
+            compute: config.compute,
             enabled: config.enabled,
             full_refresh: config.full_refresh,
             tags: config.tags,
@@ -526,10 +542,18 @@ impl From<ProjectSnapshotConfig> for SnapshotConfig {
                 external_volume: config.external_volume,
                 base_location_root: config.base_location_root,
                 base_location_subpath: config.base_location_subpath,
+                change_tracking: None,
+                data_retention_time_in_days: None,
+                max_data_extension_time_in_days: None,
+                storage_serialization_policy: None,
+                target_file_size: None,
                 target_lag: config.target_lag,
+                snowflake_initialization_warehouse: config.snowflake_initialization_warehouse,
+                immutable_where: config.immutable_where,
                 snowflake_warehouse: config.snowflake_warehouse,
                 refresh_mode: config.refresh_mode,
                 initialize: config.initialize,
+                scheduler: config.scheduler,
                 tmp_relation_type: config.tmp_relation_type,
                 query_tag: config.query_tag,
                 table_tag: config.table_tag,
@@ -538,6 +562,7 @@ impl From<ProjectSnapshotConfig> for SnapshotConfig {
                 copy_grants: config.copy_grants,
                 secure: config.secure,
                 transient: config.transient,
+                iceberg_version: None,
 
                 partition_by: config.partition_by,
                 cluster_by: config.cluster_by,
@@ -561,10 +586,12 @@ impl From<ProjectSnapshotConfig> for SnapshotConfig {
                 notebook_template_id: None,
                 enable_list_inference: None,
                 intermediate_format: None,
+                storage_uri: None,
 
                 file_format: config.file_format,
                 catalog_name: config.catalog_name,
                 location_root: config.location_root,
+                use_uniform: None,
                 tblproperties: config.tblproperties,
                 include_full_name_in_path: config.include_full_name_in_path,
                 liquid_clustered_by: config.liquid_clustered_by,
@@ -623,6 +650,7 @@ impl From<SnapshotConfig> for ProjectSnapshotConfig {
             hard_deletes: config.hard_deletes,
             target_database: config.target_database,
             target_schema: config.target_schema,
+            compute: config.compute,
             enabled: config.enabled,
             full_refresh: config.full_refresh,
             tags: config.tags,
@@ -644,9 +672,14 @@ impl From<SnapshotConfig> for ProjectSnapshotConfig {
             base_location_root: config.__warehouse_specific_config__.base_location_root,
             base_location_subpath: config.__warehouse_specific_config__.base_location_subpath,
             target_lag: config.__warehouse_specific_config__.target_lag,
+            snowflake_initialization_warehouse: config
+                .__warehouse_specific_config__
+                .snowflake_initialization_warehouse,
+            immutable_where: config.__warehouse_specific_config__.immutable_where,
             snowflake_warehouse: config.__warehouse_specific_config__.snowflake_warehouse,
             refresh_mode: config.__warehouse_specific_config__.refresh_mode,
             initialize: config.__warehouse_specific_config__.initialize,
+            scheduler: config.__warehouse_specific_config__.scheduler,
             tmp_relation_type: config.__warehouse_specific_config__.tmp_relation_type,
             query_tag: config.__warehouse_specific_config__.query_tag,
             table_tag: config.__warehouse_specific_config__.table_tag,
@@ -730,19 +763,42 @@ impl From<SnapshotConfig> for ProjectSnapshotConfig {
     }
 }
 
-impl DefaultTo<SnapshotConfig> for SnapshotConfig {
-    fn get_enabled(&self) -> Option<bool> {
-        self.enabled
+impl ResolvableConfig<SnapshotConfig> for SnapshotConfig {
+    type Resolved = ResolvedSnapshotConfig;
+    type PackageDefaults = DbtQuoting;
+    type ResolveDefaults = (StaticAnalysisKind, Option<SyncConfig>);
+
+    fn get_enabled_with_default(&self) -> bool {
+        self.enabled.unwrap_or(true)
     }
 
-    fn get_pre_hook(&self) -> Option<&Hooks> {
-        (*self.pre_hook).as_ref()
+    fn disable(&mut self) {
+        self.enabled = Some(false);
     }
 
-    fn get_post_hook(&self) -> Option<&Hooks> {
-        (*self.post_hook).as_ref()
+    fn apply_package_defaults(&mut self, quoting: DbtQuoting) {
+        if self.quoting.is_none() {
+            self.quoting = Some(quoting);
+        }
     }
 
+    fn apply_resolve_defaults(
+        &mut self,
+        (static_analysis, sync): (StaticAnalysisKind, Option<SyncConfig>),
+    ) {
+        if self.static_analysis.is_none() {
+            self.static_analysis = Some(Spanned::new(static_analysis));
+        }
+        if self.sync.is_none() {
+            self.sync = sync;
+        }
+    }
+
+    fn finalize(self) -> ResolvedSnapshotConfig {
+        self.finalize_resolved()
+    }
+
+    #[allow(clippy::cognitive_complexity)]
     fn default_to(&mut self, parent: &SnapshotConfig) {
         let SnapshotConfig {
             database,
@@ -758,6 +814,7 @@ impl DefaultTo<SnapshotConfig> for SnapshotConfig {
             hard_deletes,
             target_database,
             target_schema,
+            compute,
             enabled,
             full_refresh,
             tags,
@@ -801,6 +858,7 @@ impl DefaultTo<SnapshotConfig> for SnapshotConfig {
             parent,
             [
                 enabled,
+                compute,
                 full_refresh,
                 alias,
                 schema,
@@ -826,18 +884,6 @@ impl DefaultTo<SnapshotConfig> for SnapshotConfig {
                 sync,
             ]
         );
-    }
-
-    fn database(&self) -> Option<String> {
-        self.database.clone()
-    }
-
-    fn schema(&self) -> Option<String> {
-        self.schema.clone()
-    }
-
-    fn alias(&self) -> Option<String> {
-        self.alias.clone()
     }
 }
 

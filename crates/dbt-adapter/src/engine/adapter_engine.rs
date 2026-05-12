@@ -1,6 +1,5 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::path::Path;
 use std::sync::Arc;
 
 use adbc_core::options::{OptionStatement, OptionValue};
@@ -11,7 +10,9 @@ use dbt_auth::AdapterConfig;
 use dbt_common::behavior_flags::Behavior;
 use dbt_common::cancellation::CancellationToken;
 use dbt_common::hashing::code_hash;
-use dbt_common::tracing::span_info::record_current_span_status_from_attrs;
+use dbt_common::tracing::span_info::{
+    read_current_span_start_info, record_current_span_status_from_attrs,
+};
 use dbt_common::{AdapterError, AdapterErrorKind, AdapterResult, Cancellable, create_debug_span};
 use dbt_schemas::schemas::common::ResolvedQuoting;
 use dbt_telemetry::{QueryExecuted, QueryOutcome};
@@ -22,10 +23,10 @@ use minijinja::State;
 use tracy_client::span;
 
 use crate::cache::RelationCache;
+use crate::engine::query_comment::QueryCommentConfig;
 use crate::engine::sidecar_client::SidecarClient;
 use crate::errors::{adbc_error_to_adapter_error, arrow_error_to_adapter_error};
 use crate::query_cache::QueryCache;
-use crate::query_comment::QueryCommentConfig;
 use crate::sql_types::TypeOps;
 use crate::statement::*;
 use crate::stmt_splitter::StmtSplitter;
@@ -109,6 +110,14 @@ pub trait AdapterEngine: Send + Sync {
 
     // -- Methods with default implementations ---------------------------------
 
+    /// The `threads` configuration value from the dbt profile.
+    ///
+    /// Used to derive connection concurrency limits in metadata adapters.
+    /// Returns `None` when the setting is not available (mock, sidecar, etc.).
+    fn threads(&self) -> Option<usize> {
+        None
+    }
+
     /// Whether this is a mock engine
     fn is_mock(&self) -> bool {
         false
@@ -124,9 +133,14 @@ pub trait AdapterEngine: Send + Sync {
         false
     }
 
-    /// Returns the recordings directory for record/replay engines.
-    fn recordings_dir(&self) -> Option<&Path> {
-        None
+    /// Returns a generation counter identifying this engine instance.
+    ///
+    /// The connection pool uses this to detect stale connections when the
+    /// engine changes between sequential runs (e.g. different recording
+    /// directories). Override this in engines that create stateful
+    /// connections that become invalid across configuration changes.
+    fn generation(&self) -> u64 {
+        0
     }
 
     /// Get the physical execution backend for sidecar engines.
@@ -259,6 +273,16 @@ pub(crate) fn adbc_execute_with_options(
             OptionStatement::Other(DBT_FETCH.to_string()),
             OptionValue::Int(fetch as i64),
         )?;
+        if engine.adapter_type() == AdapterType::Snowflake
+            && let Some(traceparent) = read_current_span_start_info(|info| {
+                format!("00-{:032x}-{:016x}-01", info.trace_id, info.span_id)
+            })
+        {
+            stmt.set_option(
+                OptionStatement::Other("adbc.telemetry.trace_parent".to_string()),
+                OptionValue::String(traceparent),
+            )?;
+        }
         options
             .into_iter()
             .try_for_each(|(key, value)| stmt.set_option(OptionStatement::Other(key), value))?;

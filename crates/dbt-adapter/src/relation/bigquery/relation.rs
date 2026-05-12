@@ -1,10 +1,12 @@
 use crate::information_schema::InformationSchema;
 use crate::need_quotes::need_quotes;
+use crate::relation::config_v2::RelationConfig;
 use crate::relation::{RelationObject, StaticBaseRelation};
+use crate::value::none_value;
 
 use arrow::array::RecordBatch;
-use dbt_common::adapter::AdapterType;
-use dbt_common::{ErrorCode, FsResult, current_function_name, fs_err};
+use dbt_adapter_core::AdapterType;
+use dbt_common::{ErrorCode, FsResult, fs_err};
 use dbt_frontend_common::ident::Identifier;
 use dbt_schema_store::CanonicalFqn;
 use dbt_schemas::dbt_types::RelationType;
@@ -14,15 +16,11 @@ use dbt_schemas::schemas::relations::base::{
     BaseRelation, BaseRelationProperties, Policy, RelationPath,
 };
 use dbt_schemas::schemas::serde::minijinja_value_to_typed_struct;
-use dbt_xdbc::Backend;
-use minijinja::arg_utils::{ArgParser, ArgsIter};
-use minijinja::{State, Value};
+use minijinja::Value;
 
 use std::any::Any;
 // use std::ops::Deref;
 use std::sync::Arc;
-
-use crate::relation::bigquery::*;
 
 const INFORMATION_SCHEMA_SCHEMA: &str = "information_schema";
 
@@ -81,11 +79,6 @@ impl BaseRelationProperties for BigqueryRelation {
 
     fn quote_policy(&self) -> Policy {
         self.quote_policy
-    }
-
-    /// See [reference](https://github.com/dbt-labs/dbt-adapters/blob/2a94cc75dba1f98fa5caff1f396f5af7ee444598/dbt-bigquery/src/dbt/adapters/bigquery/relation.py#L30)
-    fn quote_character(&self) -> char {
-        '`'
     }
 
     fn get_database(&self) -> FsResult<String> {
@@ -183,20 +176,20 @@ impl BaseRelation for BigqueryRelation {
         // no-op
     }
 
-    fn create_from(&self, _: &State, _: &[Value]) -> Result<Value, minijinja::Error> {
+    fn create_from(&self) -> Result<Arc<dyn BaseRelation>, minijinja::Error> {
         unimplemented!("BigQuery relation creation from Jinja values")
     }
 
-    fn database(&self) -> Value {
-        Value::from(self.path.database.clone())
+    fn database(&self) -> Option<&str> {
+        self.path.database.as_deref()
     }
 
-    fn schema(&self) -> Value {
-        Value::from(self.path.schema.clone())
+    fn schema(&self) -> Option<&str> {
+        self.path.schema.as_deref()
     }
 
-    fn identifier(&self) -> Value {
-        Value::from(self.path.identifier.clone())
+    fn identifier(&self) -> Option<&str> {
+        self.path.identifier.as_deref()
     }
 
     fn quoted(&self, s: &str) -> String {
@@ -212,15 +205,11 @@ impl BaseRelation for BigqueryRelation {
         matches!(self.relation_type(), Some(RelationType::Table))
     }
 
-    fn as_value(&self) -> Value {
-        RelationObject::new(Arc::new(self.clone())).into_value()
-    }
-
     fn adapter_type(&self) -> AdapterType {
         AdapterType::Bigquery
     }
 
-    fn include_inner(&self, policy: Policy) -> Result<Value, minijinja::Error> {
+    fn include_inner(&self, policy: Policy) -> Result<Arc<dyn BaseRelation>, minijinja::Error> {
         let relation = Self::new_with_policy(
             self.path.clone(),
             self.relation_type,
@@ -228,10 +217,10 @@ impl BaseRelation for BigqueryRelation {
             self.quote_policy,
         );
 
-        Ok(relation.as_value())
+        Ok(Arc::new(relation))
     }
 
-    fn quote_inner(&self, policy: Policy) -> Result<Value, minijinja::Error> {
+    fn quote_inner(&self, policy: Policy) -> Result<Arc<dyn BaseRelation>, minijinja::Error> {
         let relation = Self::new_with_policy(
             self.path.clone(),
             self.relation_type,
@@ -239,18 +228,19 @@ impl BaseRelation for BigqueryRelation {
             policy,
         );
 
-        Ok(relation.as_value())
+        Ok(Arc::new(relation))
     }
 
-    fn post_incorporate(&self, mut args: ArgParser) -> Result<Value, minijinja::Error> {
-        // Extract and consume 'location' kwarg (consistent with base consume approach)
-        let loc_opt: Option<String> = args.consume_optional_only_from_kwargs("location");
-        if let Some(loc) = loc_opt {
+    fn post_incorporate(
+        &self,
+        location: Option<String>,
+    ) -> Result<Arc<dyn BaseRelation>, minijinja::Error> {
+        if let Some(loc) = location {
             let mut cloned = self.clone();
             cloned.location = Some(loc);
-            return Ok(cloned.as_value());
+            return Ok(Arc::new(cloned));
         }
-        Ok(self.as_value())
+        Ok(Arc::new(self.clone()))
     }
 
     /// In BigQuery, we don't normalize since quoting doesn't decide case sensitivity
@@ -282,12 +272,12 @@ impl BaseRelation for BigqueryRelation {
         &self,
         database: Option<String>,
         view_name: Option<&str>,
-    ) -> Result<Value, minijinja::Error> {
+    ) -> Result<Arc<dyn BaseRelation>, minijinja::Error> {
         let mut info_schema =
             InformationSchema::try_from_relation(self.adapter_type(), database.clone(), view_name)?;
 
         let quote_if_needed = |identifier: &str| -> String {
-            if need_quotes(Backend::BigQuery, identifier) {
+            if need_quotes(AdapterType::Bigquery, identifier) {
                 self.quoted(identifier)
             } else {
                 identifier.to_string()
@@ -343,52 +333,41 @@ impl BaseRelation for BigqueryRelation {
                 _ => {}
             }
         }
-        Ok(RelationObject::new(Arc::new(info_schema)).into_value())
+        Ok(Arc::new(info_schema))
     }
 
     fn materialized_view_config_changeset(
         &self,
-        args: &[Value],
+        remote_state_value: &Value,
+        local_config_value: &Value,
     ) -> Result<Value, minijinja::Error> {
-        let iter = ArgsIter::new(
-            current_function_name!(),
-            &["relation_results", "relation_config"],
-            args,
-        );
-
-        let relation_results_value = iter.next_arg::<&Value>()?;
-        let new_config_value = iter.next_arg::<&Value>()?;
-        iter.finish()?;
-
-        let existing_mv = relation_results_value
+        let current_state = remote_state_value
             .as_object()
             .ok_or_else(|| {
                 minijinja::Error::new(
                     minijinja::ErrorKind::InvalidArgument,
-                    "relation_results must be Object",
+                    "remote_state must be Object",
                 )
             })?
-            .downcast_ref::<BigqueryMaterializedViewConfigObject>()
+            .downcast_ref::<RelationConfig>()
             .ok_or_else(|| {
                 minijinja::Error::new(
                     minijinja::ErrorKind::InvalidArgument,
-                    "relation_results must be BigqueryMaterializedViewConfigObject",
+                    "remote_state must be RelationConfig",
                 )
-            })?
-            .inner();
+            })?;
 
         // TODO(serramatutu): minijinja_value_to_typed_struct does not work with references, so we
         // have to clone the value here...
-        let new_config_node =
-            minijinja_value_to_typed_struct::<InternalDbtNodeWrapper>(new_config_value.clone())
+        let local_config =
+            minijinja_value_to_typed_struct::<InternalDbtNodeWrapper>(local_config_value.clone())
                 .map_err(|e| {
-                    minijinja::Error::new(
-                        minijinja::ErrorKind::SerdeDeserializeError,
-                        format!("Failed to deserialize InternalDbtNodeWrapper: {e}"),
-                    )
-                })?;
-
-        let new_config_model = match new_config_node {
+                minijinja::Error::new(
+                    minijinja::ErrorKind::SerdeDeserializeError,
+                    format!("Failed to deserialize InternalDbtNodeWrapper: {e}"),
+                )
+            })?;
+        let local_config = match local_config {
             InternalDbtNodeWrapper::Model(model) => model,
             _ => {
                 return Err(minijinja::Error::new(
@@ -397,18 +376,16 @@ impl BaseRelation for BigqueryRelation {
                 ));
             }
         };
+        let desired_state =
+            crate::relation::bigquery::config::relation_types::materialized_view::new_loader()
+                .from_local_config(local_config.as_ref())?;
 
-        let new_mv_config =
-            <dyn BigqueryMaterializedViewConfig>::try_from_model(Arc::from(new_config_model))
-                .map_err(|e| minijinja::Error::new(minijinja::ErrorKind::InvalidArgument, e))?;
+        let changeset = RelationConfig::diff(&desired_state, current_state);
 
-        let changeset =
-            BigqueryMaterializedViewConfigChangesetObject::new(existing_mv, new_mv_config);
-
-        if changeset.has_changes() {
-            Ok(Value::from_object(changeset))
+        if changeset.is_empty() {
+            Ok(none_value())
         } else {
-            Ok(Value::from(None::<()>))
+            Ok(Value::from_object(changeset))
         }
     }
 }
@@ -432,10 +409,7 @@ mod tests {
             .unwrap();
 
         let relation = relation.downcast_object::<RelationObject>().unwrap();
-        assert_eq!(
-            relation.inner().render_self().unwrap().as_str().unwrap(),
-            "`d`.`s`.`i`"
-        );
+        assert_eq!(relation.inner().render_self_as_str(), "`d`.`s`.`i`");
         assert_eq!(relation.relation_type().unwrap(), RelationType::Table);
     }
 
@@ -456,36 +430,24 @@ mod tests {
             .information_schema_inner(Some("other_db".to_string()), Some("TABLES"))
             .unwrap();
 
-        let info_relation = info_schema.downcast_object::<RelationObject>().unwrap();
-        let rendered = info_relation.inner().render_self().unwrap();
-        assert_eq!(
-            rendered.as_str().unwrap(),
-            "test_db.test_schema.INFORMATION_SCHEMA.TABLES"
-        );
+        let rendered = info_schema.render_self_as_str();
+        assert_eq!(rendered, "test_db.test_schema.INFORMATION_SCHEMA.TABLES");
 
         // Test COLUMNS view
         let info_schema = relation
             .information_schema_inner(Some("other_db".to_string()), Some("COLUMNS"))
             .unwrap();
 
-        let info_relation = info_schema.downcast_object::<RelationObject>().unwrap();
-        let rendered = info_relation.inner().render_self().unwrap();
-        assert_eq!(
-            rendered.as_str().unwrap(),
-            "test_db.test_schema.INFORMATION_SCHEMA.COLUMNS"
-        );
+        let rendered = info_schema.render_self_as_str();
+        assert_eq!(rendered, "test_db.test_schema.INFORMATION_SCHEMA.COLUMNS");
 
         // Test SCHEMATA view - still uses dataset-level with project.dataset format
         let info_schema = relation
             .information_schema_inner(None, Some("SCHEMATA"))
             .unwrap();
 
-        let info_relation = info_schema.downcast_object::<RelationObject>().unwrap();
-        let rendered = info_relation.inner().render_self().unwrap();
-        assert_eq!(
-            rendered.as_str().unwrap(),
-            "test_db.test_schema.INFORMATION_SCHEMA.SCHEMATA"
-        );
+        let rendered = info_schema.render_self_as_str();
+        assert_eq!(rendered, "test_db.test_schema.INFORMATION_SCHEMA.SCHEMATA");
     }
 
     #[test]
@@ -503,10 +465,9 @@ mod tests {
             .information_schema_inner(None, Some("TABLES"))
             .unwrap();
 
-        let info_relation = info_schema.downcast_object::<RelationObject>().unwrap();
-        let rendered = info_relation.inner().render_self().unwrap();
+        let rendered = info_schema.render_self_as_str();
         assert_eq!(
-            rendered.as_str().unwrap(),
+            rendered,
             "`my-project-1a`.test_schema.INFORMATION_SCHEMA.TABLES"
         );
     }
@@ -539,10 +500,9 @@ mod tests {
             .information_schema_inner(Some("test_db".to_string()), Some("OBJECT_PRIVILEGES"))
             .unwrap();
 
-        let info_relation = info_schema.downcast_object::<RelationObject>().unwrap();
-        let rendered = info_relation.inner().render_self().unwrap();
+        let rendered = info_schema.render_self_as_str();
         assert_eq!(
-            rendered.as_str().unwrap(),
+            rendered,
             "test_db.`region-US`.INFORMATION_SCHEMA.OBJECT_PRIVILEGES"
         );
     }
@@ -563,10 +523,9 @@ mod tests {
             .information_schema_inner(Some("my-project-1a".to_string()), Some("OBJECT_PRIVILEGES"))
             .unwrap();
 
-        let info_relation = info_schema.downcast_object::<RelationObject>().unwrap();
-        let rendered = info_relation.inner().render_self().unwrap();
+        let rendered = info_schema.render_self_as_str();
         assert_eq!(
-            rendered.as_str().unwrap(),
+            rendered,
             "`my-project-1a`.`region-US`.INFORMATION_SCHEMA.OBJECT_PRIVILEGES"
         );
     }
@@ -587,12 +546,8 @@ mod tests {
             .information_schema_inner(None, Some("TABLES"))
             .unwrap();
 
-        let info_relation = info_schema.downcast_object::<RelationObject>().unwrap();
-        let rendered = info_relation.inner().render_self().unwrap();
-        assert_eq!(
-            rendered.as_str().unwrap(),
-            "test_schema.INFORMATION_SCHEMA.TABLES"
-        );
+        let rendered = info_schema.render_self_as_str();
+        assert_eq!(rendered, "test_schema.INFORMATION_SCHEMA.TABLES");
     }
 
     #[test]
@@ -609,8 +564,7 @@ mod tests {
         // Test TABLES view without database - uses dataset-level INFORMATION_SCHEMA
         let info_schema = relation.information_schema_inner(None, None).unwrap();
 
-        let info_relation = info_schema.downcast_object::<RelationObject>().unwrap();
-        let rendered = info_relation.inner().render_self().unwrap();
-        assert_eq!(rendered.as_str().unwrap(), "test_schema.INFORMATION_SCHEMA");
+        let rendered = info_schema.render_self_as_str();
+        assert_eq!(rendered, "test_schema.INFORMATION_SCHEMA");
     }
 }

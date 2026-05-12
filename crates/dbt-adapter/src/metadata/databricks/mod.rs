@@ -4,11 +4,13 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
+use crate::connection::AdapterConnectionFactory;
+
 use arrow_array::*;
 use arrow_schema::{Field, Schema};
+use dbt_adapter_core::AdapterType;
+use dbt_adapter_core::ExecutionPhase;
 use dbt_agate::AgateTable;
-use dbt_common::adapter::AdapterType;
-use dbt_common::adapter::ExecutionPhase;
 use dbt_common::cancellation::Cancellable;
 use dbt_common::cancellation::CancellationToken;
 use dbt_schemas::dbt_types::RelationType;
@@ -22,20 +24,20 @@ use minijinja::State;
 use once_cell::sync::Lazy;
 use regex::Regex;
 
+use crate::adapter::adapter_impl::AdapterImpl;
 use crate::errors::{AdapterError, AdapterResult, AsyncAdapterResult};
 use crate::metadata::CatalogAndSchema;
 use crate::metadata::databricks::describe_table::DatabricksTableMetadata;
 use crate::metadata::databricks::version::EngineVersion;
+use crate::metadata::*;
 use crate::query_ctx::query_ctx_from_state;
 use crate::record_batch_utils::get_column_values;
-use crate::relation::databricks::DatabricksRelation;
+use crate::relation::Relation;
 use crate::relation::databricks::config::{
     DatabricksRelationMetadata, DatabricksRelationMetadataKey,
 };
 use crate::sql_types::{TypeOps, make_arrow_field_v2};
-use crate::typed_adapter::ConcreteAdapter;
 use crate::{AdapterEngine, AdapterResponse};
-use crate::{AdapterTyping, metadata::*};
 
 pub mod dbr_capabilities;
 pub mod describe_table;
@@ -71,8 +73,15 @@ SELECT
 FROM `system`.`information_schema`.`tables`
 WHERE table_catalog = '{}'
     AND table_schema = '{}'",
-                            &db_schema.resolved_catalog,
-                            &db_schema.resolved_schema);
+                            // Databricks Unity Catalog stores all identifier names
+                            // (catalog, schema, table) in lowercase in information_schema,
+                            // regardless of how they were created. A case-sensitive WHERE
+                            // clause with an uppercase name returns no rows, causing the cache
+                            // to treat the schema as empty and re-create existing tables.
+                            // Lowercasing here is safe because Databricks identifiers are
+                            // case-insensitive by definition.
+                            &db_schema.resolved_catalog.to_lowercase(),
+                            &db_schema.resolved_schema.to_lowercase());
 
     let batch = engine.execute(None, conn, ctx, &sql, token)?;
 
@@ -95,7 +104,7 @@ WHERE table_catalog = '{}'
         let table_type = table_types.value(i).to_uppercase();
         let is_delta = file_formats.value(i) == "delta";
 
-        let relation = Arc::new(DatabricksRelation::new(
+        let relation = Arc::new(Relation::new(
             engine.adapter_type(),
             Some(catalog.to_string()),
             Some(schema.to_string()),
@@ -147,16 +156,16 @@ fn get_relation_with_quote_policy(
 }
 
 pub struct DatabricksMetadataAdapter {
-    adapter: ConcreteAdapter,
+    adapter: AdapterImpl,
 }
 
 impl DatabricksMetadataAdapter {
     pub fn new(engine: Arc<dyn AdapterEngine>) -> Self {
-        let adapter = ConcreteAdapter::new(engine);
+        let adapter = AdapterImpl::new(engine, None);
         Self { adapter }
     }
 
-    pub fn new_from_adapter(adapter: ConcreteAdapter) -> Self {
+    pub fn new_from_adapter(adapter: AdapterImpl) -> Self {
         Self { adapter }
     }
 
@@ -191,7 +200,7 @@ impl DatabricksMetadataAdapter {
     /// Spark:
     /// This runs a `SELECT version()`
     pub fn get_engine_version(
-        adapter: &ConcreteAdapter,
+        adapter: &AdapterImpl,
         ctx: &QueryCtx,
         conn: &mut dyn Connection,
         token: CancellationToken,
@@ -208,7 +217,7 @@ impl DatabricksMetadataAdapter {
                 // Returns a row like: (key, value) = ("spark.databricks.clusterUsageTags.sparkVersion", "15.4.x-scala2.12")
                 let sql = "SET spark.databricks.clusterUsageTags.sparkVersion";
                 let (_response, table) =
-                    adapter.execute(None, conn, ctx, sql, false, true, None, None, token)?;
+                    adapter.execute(None, conn, Some(ctx), sql, false, true, None, None, token)?;
                 let batch = table.original_record_batch();
 
                 // The result has two columns: "key" and "value"
@@ -221,7 +230,7 @@ impl DatabricksMetadataAdapter {
             AdapterType::Spark => {
                 let sql = "SELECT version() AS version";
                 let (_response, table) =
-                    adapter.execute(None, conn, ctx, sql, false, true, None, None, token)?;
+                    adapter.execute(None, conn, Some(ctx), sql, false, true, None, None, token)?;
                 let batch = table.original_record_batch();
                 let values = get_column_values::<StringArray>(&batch, "version")?;
                 debug_assert_eq!(values.len(), 1);
@@ -334,16 +343,7 @@ impl DatabricksMetadataAdapter {
             }
             RelationType::StreamingTable => {}
             RelationType::Table => {
-                let is_hive_metastore =
-                    base_relation.is_hive_metastore().try_into().map_err(|_| {
-                        AdapterError::new(
-                            AdapterErrorKind::Configuration,
-                            format!(
-                                "Unable to decode is_hive_metastore config for {}",
-                                base_relation.render_self_as_str()
-                            ),
-                        )
-                    })?;
+                let is_hive_metastore = base_relation.is_hive_metastore();
                 if is_hive_metastore {
                     return Err(AdapterError::new(
                         AdapterErrorKind::NotSupported,
@@ -474,7 +474,7 @@ impl DatabricksMetadataAdapter {
         self.adapter.execute(
             Some(state),
             conn,
-            &ctx,
+            Some(&ctx),
             sql,
             false, // auto_begin
             true,  // fetch
@@ -865,17 +865,14 @@ impl MetadataAdapter for DatabricksMetadataAdapter {
             }
         };
 
-        let connection_unique_id = unique_id.clone();
-        let adapter = self.adapter.clone(); // clone needed to move it into lambda
-        let new_connection_f = Box::new(move || {
-            adapter
-                .engine()
-                .new_connection(None, connection_unique_id.clone())
-                .map_err(Cancellable::Error)
-        });
+        let factory = Box::new(AdapterConnectionFactory::new(
+            self.adapter.engine().clone(),
+            self.adapter.engine().threads(),
+        ));
 
         let adapter = self.adapter.clone();
         let token_clone = token.clone();
+        let node_id = unique_id.clone();
         let map_f = move |conn: &'_ mut dyn Connection,
                           relation: &Arc<dyn BaseRelation>|
               -> AdapterResult<Arc<Schema>> {
@@ -937,8 +934,8 @@ impl MetadataAdapter for DatabricksMetadataAdapter {
             };
 
             let mut ctx = QueryCtx::new_metadata().with_desc("Get table schema");
-            if let Some(node_id) = unique_id.clone() {
-                ctx = ctx.with_node_id(&node_id);
+            if let Some(ref node_id) = node_id {
+                ctx = ctx.with_node_id(node_id);
             }
             if let Some(phase) = phase {
                 ctx = ctx.with_phase(phase.as_str());
@@ -962,12 +959,7 @@ impl MetadataAdapter for DatabricksMetadataAdapter {
             acc.insert(relation.semantic_fqn(), schema);
             Ok(())
         };
-        let map_reduce = MapReduce::new(
-            Box::new(new_connection_f),
-            Box::new(map_f),
-            Box::new(reduce_f),
-            MAX_CONNECTIONS,
-        );
+        let map_reduce = MapReduce::new(factory, Box::new(map_f), Box::new(reduce_f), unique_id);
         map_reduce.run(Arc::new(relations.to_vec()), token)
     }
 
@@ -996,13 +988,10 @@ impl MetadataAdapter for DatabricksMetadataAdapter {
 
         type Acc = BTreeMap<String, MetadataFreshness>;
 
-        let adapter = self.adapter.clone();
-        let new_connection_f = move || {
-            adapter
-                .engine()
-                .new_connection(None, None)
-                .map_err(Cancellable::Error)
-        };
+        let factory = Box::new(AdapterConnectionFactory::new(
+            self.adapter.engine().clone(),
+            self.adapter.engine().threads(),
+        ));
 
         let adapter = self.adapter.clone();
         let token_clone = token.clone();
@@ -1058,12 +1047,7 @@ impl MetadataAdapter for DatabricksMetadataAdapter {
             Ok(())
         };
 
-        let map_reduce = MapReduce::new(
-            Box::new(new_connection_f),
-            Box::new(map_f),
-            Box::new(reduce_f),
-            MAX_CONNECTIONS,
-        );
+        let map_reduce = MapReduce::new(factory, Box::new(map_f), Box::new(reduce_f), None);
         let keys = where_clauses_by_database.into_iter().collect::<Vec<_>>();
         map_reduce.run(Arc::new(keys), token)
     }
@@ -1082,13 +1066,10 @@ impl MetadataAdapter for DatabricksMetadataAdapter {
         token: CancellationToken,
     ) -> AsyncAdapterResult<'_, BTreeMap<CatalogAndSchema, AdapterResult<RelationVec>>> {
         type Acc = BTreeMap<CatalogAndSchema, AdapterResult<RelationVec>>;
-        let adapter = self.adapter.clone();
-        let new_connection_f = move || {
-            adapter
-                .engine()
-                .new_connection(None, None)
-                .map_err(Cancellable::Error)
-        };
+        let factory = Box::new(AdapterConnectionFactory::new(
+            self.adapter.engine().clone(),
+            self.adapter.engine().threads(),
+        ));
 
         let adapter = self.adapter.clone();
         let token_clone = token.clone();
@@ -1107,12 +1088,7 @@ impl MetadataAdapter for DatabricksMetadataAdapter {
             Ok(())
         };
 
-        let map_reduce = MapReduce::new(
-            Box::new(new_connection_f),
-            Box::new(map_f),
-            Box::new(reduce_f),
-            MAX_CONNECTIONS,
-        );
+        let map_reduce = MapReduce::new(factory, Box::new(map_f), Box::new(reduce_f), None);
         map_reduce.run(Arc::new(db_schemas.to_vec()), token)
     }
 
@@ -1180,7 +1156,7 @@ fn extract_dbr_version(version_str: &str) -> AdapterResult<EngineVersion> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::relation::databricks::DatabricksRelation;
+    use crate::relation::Relation;
     use dbt_schemas::dbt_types::RelationType;
     use dbt_schemas::schemas::common::ResolvedQuoting;
     use dbt_schemas::schemas::relations::base::BaseRelation;
@@ -1201,7 +1177,7 @@ mod tests {
             identifier: quote_identifier,
         };
 
-        Arc::new(DatabricksRelation::new(
+        Arc::new(Relation::new(
             AdapterType::Databricks,
             Some(database.to_string()),
             Some(schema.to_string()),

@@ -5,8 +5,10 @@ use std::str::FromStr;
 use std::{any::Any, collections::BTreeMap, fmt::Display, path::PathBuf, sync::Arc};
 
 use chrono::Utc;
-use dbt_common::adapter::AdapterType;
-use dbt_common::io_args::{StaticAnalysisKind, StaticAnalysisOffReason};
+use dbt_adapter_core::{AdapterType, adapter_type_supports_microbatch_concurrency};
+use dbt_common::constants::{DBT_COMPILED_DIR_NAME, DBT_RUN_DIR_NAME};
+use dbt_common::io_args::{ComputeArg, StaticAnalysisKind, StaticAnalysisOffReason};
+use dbt_common::path::get_target_write_path;
 use dbt_common::tracing::emit::{emit_error_log_message, emit_warn_log_message};
 use dbt_common::{ErrorCode, FsResult, err};
 use dbt_telemetry::{ExecutionPhase, NodeEvaluated, NodeProcessed, NodeType};
@@ -17,8 +19,9 @@ use crate::schemas::common::{PersistDocsConfig, hooks_equal, normalize_sql};
 use crate::schemas::dbt_column::{DbtColumnRef, deserialize_dbt_columns, serialize_dbt_columns};
 use crate::schemas::manifest::GrantAccessToTarget;
 use crate::schemas::project::configs::common::log_state_mod_diff;
-use crate::schemas::project::configs::common::{array_of_strings_eq, grants_eq, meta_eq};
+use crate::schemas::project::configs::common::{grants_eq, meta_eq, tags_eq, tags_eq_vec};
 use crate::schemas::project::{WarehouseSpecificNodeConfig, same_warehouse_config};
+use crate::schemas::relations::default_dbt_quoting_for;
 use crate::schemas::serde::{QueryTag, StringOrArrayOfStrings};
 use crate::schemas::{
     common::{
@@ -38,7 +41,9 @@ use crate::schemas::{
     properties::{
         FunctionArgument, FunctionReturnType, ModelConstraint, ModelFreshness, UnitTestOverrides,
     },
-    ref_and_source::{DbtRef, DbtSourceWrapper},
+    ref_and_source::{
+        DbtRef, DbtSourceWrapper, deserialize_dbt_function_refs, serialize_dbt_function_refs,
+    },
     serde::StringOrInteger,
 };
 use dbt_yaml::{DbtSchema, Spanned, UntaggedEnumDeserialize};
@@ -68,6 +73,17 @@ impl IntrospectionKind {
                 | IntrospectionKind::This
                 | IntrospectionKind::Unknown
         )
+    }
+
+    pub fn is_safe(&self) -> bool {
+        matches!(
+            self,
+            IntrospectionKind::None | IntrospectionKind::UpstreamSchema
+        )
+    }
+
+    pub fn is_none(&self) -> bool {
+        matches!(self, IntrospectionKind::None)
     }
 }
 
@@ -162,6 +178,36 @@ impl InternalDbtNodeWrapper {
     }
 }
 
+/// The kind of path to resolve for a node.
+///
+/// Each variant corresponds to a well-known location a node can have on disk:
+///
+/// - [`Definition`](Self::Definition) — the original source file.
+/// - [`Compiled`](Self::Compiled) — the compiled SQL under `target/compiled/`.
+/// - [`Executable`](Self::Executable) — the run-ready SQL under `target/run/`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodePathKind {
+    /// The original source file (sql for most nodes, yml for tests & yml-defined snapshots).
+    Definition,
+    /// The compiled SQL path (`target/compiled/…`).
+    Compiled,
+    /// The executable / run SQL path (`target/run/…`).
+    Executable,
+}
+
+/// Most call-sites that surface a node path already know their [`ExecutionPhase`].
+/// This conversion lets them pass the phase directly and get the right path kind
+/// without hard-coding the mapping at every call-site.
+impl From<ExecutionPhase> for NodePathKind {
+    fn from(phase: ExecutionPhase) -> Self {
+        match phase {
+            ExecutionPhase::Analyze => Self::Compiled,
+            ExecutionPhase::Run => Self::Executable,
+            _ => Self::Definition,
+        }
+    }
+}
+
 pub trait InternalDbtNode: Any + Send + Sync + fmt::Debug {
     fn common(&self) -> &CommonAttributes;
     fn base(&self) -> &NodeBaseAttributes;
@@ -174,6 +220,9 @@ pub trait InternalDbtNode: Any + Send + Sync + fmt::Debug {
         None
     }
     fn event_time(&self) -> Option<String> {
+        None
+    }
+    fn get_group(&self) -> Option<String> {
         None
     }
     fn is_extended_model(&self) -> bool {
@@ -212,8 +261,12 @@ pub trait InternalDbtNode: Any + Send + Sync + fmt::Debug {
     ) -> YmlValue;
 
     // Selector functions
-    fn has_same_config(&self, other: &dyn InternalDbtNode) -> bool;
-    fn has_same_content(&self, other: &dyn InternalDbtNode) -> bool;
+    fn has_same_config(&self, other: &dyn InternalDbtNode, adapter_type: AdapterType) -> bool;
+    fn has_same_content(&self, other: &dyn InternalDbtNode, adapter_type: AdapterType) -> bool;
+    fn has_same_body(&self, other: &dyn InternalDbtNode) -> bool {
+        self.common().checksum == other.common().checksum
+    }
+
     fn set_detected_introspection(&mut self, introspection: IntrospectionKind);
     fn introspection(&self) -> IntrospectionKind {
         IntrospectionKind::None
@@ -240,28 +293,111 @@ pub trait InternalDbtNode: Any + Send + Sync + fmt::Debug {
     }
 
     // Incremental strategy validation
-    fn warn_on_microbatch(&self) -> FsResult<()> {
-        Ok(())
+    fn warn_on_microbatch(&self, _adapter_type: AdapterType) -> usize {
+        0
     }
 
-    /// Returns the relative path from in_dir of the unrendered sql file for the current node.
+    /// Returns the path for the current node corresponding to `path_kind`, relative to `in_dir`.
     ///
-    /// - For most node types this is the path where the node is defined in the project.
-    /// - For snapshots this is the relative path to the generated snapshot file in the target directory
-    /// - For generic tests this is also the path to generated sql file
-    fn get_node_relative_path(&self, in_dir: &Path, out_dir: &Path) -> std::borrow::Cow<'_, Path> {
-        // For snapshots, use path (generated file) for display since it's unique per snapshot
-        // For other types, use original_file_path - as of today this field already incorporates
-        // the correct path for generic tests.
-        // TODO: the original_file_path should be fixed and the logic moved here
+    /// Callers that have an [`ExecutionPhase`] can convert it via `.into()`.
+    ///
+    /// For models, generic tests, and unit tests the path varies by kind:
+    ///
+    ///   - `Compiled`   - `target/compiled/{package}/{path_segment}` (via `get_target_write_path`)
+    ///   - `Executable` - `target/run/{package}/{path_segment}/{alias}.sql`
+    ///     (mirrors `write_file()` in `run_node_context.rs`; uses `alias` to
+    ///     avoid ENAMETOOLONG on Linux for long generic test names)
+    ///   - `Definition` - see `get_node_definition_path`
+    ///
+    /// For all other node types the definition path is always returned.
+    fn get_node_path(
+        &self,
+        path_kind: NodePathKind,
+        in_dir: &Path,
+        out_dir: &Path,
+    ) -> std::borrow::Cow<'_, Path> {
+        match (path_kind, self.resource_type()) {
+            (NodePathKind::Compiled, NodeType::Model | NodeType::Test | NodeType::UnitTest)
+            | (NodePathKind::Executable, NodeType::Model | NodeType::Test | NodeType::UnitTest) => {
+                let abs = self.get_node_path_abs(path_kind, in_dir, out_dir);
+                pathdiff::diff_paths(&abs, in_dir).unwrap_or(abs).into()
+            }
+            _ => self.get_node_definition_path(in_dir, out_dir),
+        }
+    }
+
+    /// Absolute counterpart to `get_node_path` for the `Compiled` and `Executable` kinds.
+    /// Useful when the caller needs to pass the path to filesystem APIs directly.
+    fn get_node_path_abs(&self, path_kind: NodePathKind, in_dir: &Path, out_dir: &Path) -> PathBuf {
+        let common = self.common();
+        let executable_filename = || {
+            // Mirror write_file's filename rule: alias if non-empty, else name. This avoids
+            // ENAMETOOLONG on Linux for generic tests with names exceeding 255 bytes.
+            let alias = &self.base().alias;
+            if alias.is_empty() {
+                common.name.clone()
+            } else {
+                alias.clone()
+            }
+        };
+        match path_kind {
+            NodePathKind::Compiled => {
+                let mut abs = get_target_write_path(
+                    in_dir,
+                    &out_dir.join(DBT_COMPILED_DIR_NAME),
+                    &common.package_name,
+                    &common.path,
+                    &common.original_file_path,
+                );
+                if self.resource_type() == NodeType::UnitTest {
+                    // Unit test SQL is synthesized at <alias>.sql, not at original_file_path (the YAML).
+                    abs = abs.with_file_name(format!("{}.sql", executable_filename()));
+                }
+                abs
+            }
+            NodePathKind::Executable => get_target_write_path(
+                in_dir,
+                &out_dir.join(DBT_RUN_DIR_NAME),
+                &common.package_name,
+                &common.path,
+                &common.original_file_path,
+            )
+            .with_file_name(format!("{}.sql", executable_filename())),
+            NodePathKind::Definition => self.get_node_definition_path(in_dir, out_dir).into_owned(),
+        }
+    }
+
+    /// Returns the definition path for the current node, relative to `in_dir`.
+    ///
+    /// This is where the node is defined in the project — independent of execution phase.
+    ///
+    /// - Snapshots: relative path to the generated snapshot file in the target directory.
+    /// - Generic tests: the YAML file where the test is declared (via `defined_at.file`).
+    ///   `original_file_path` is a misnomer for tests — it points at the generated SQL —
+    ///   so we prefer `defined_at` when available and fall back to it only if missing.
+    /// - Models / unit tests / others: `original_file_path` (already correct).
+    fn get_node_definition_path(
+        &self,
+        in_dir: &Path,
+        out_dir: &Path,
+    ) -> std::borrow::Cow<'_, Path> {
         if self.resource_type() == NodeType::Snapshot {
             let out_dir_relative =
                 pathdiff::diff_paths(out_dir, in_dir).unwrap_or_else(|| out_dir.to_owned());
-
-            out_dir_relative.join(&self.common().path).into()
-        } else {
-            self.common().original_file_path.as_path().into()
+            return out_dir_relative.join(&self.common().path).into();
         }
+        if self.resource_type() == NodeType::Test
+            && let Some(defined_at) = self.defined_at()
+        {
+            // defined_at.file is the YAML file where the test is declared. It's stored
+            // relative to project root in the YAML span; if it ever comes through absolute
+            // (e.g. a different parser path), strip in_dir so callers get a consistent
+            // relative form.
+            let file = defined_at.file.as_path();
+            let relative = pathdiff::diff_paths(file, in_dir).unwrap_or_else(|| file.to_owned());
+            return relative.into();
+        }
+        self.common().original_file_path.as_path().into()
     }
 
     fn get_node_evaluated_event(
@@ -288,12 +424,12 @@ pub trait InternalDbtNode: Any + Send + Sync + fmt::Debug {
         };
 
         // This is a quirk of historical reporting. For generic tests we report the yml source with line:col location,
-        // but for all other node types we follow the logic described in `get_node_relative_path`.
+        // but for all other node types we follow the logic described in `get_node_definition_path`.
         // TODO: streamline and ensure the path's reported via events align with what LSP is being sent
         let (relative_path, defined_at_line, defined_at_column) = self.defined_at().map_or_else(
             || {
                 (
-                    self.get_node_relative_path(in_dir, out_dir)
+                    self.get_node_path(NodePathKind::Definition, in_dir, out_dir)
                         .display()
                         .to_string(),
                     None,
@@ -370,12 +506,12 @@ pub trait InternalDbtNode: Any + Send + Sync + fmt::Debug {
         };
 
         // This is a quirk of historical reporting. For generic tests we report the yml source with line:col location,
-        // but for all other node types we follow the logic described in `get_node_relative_path`.
+        // but for all other node types we follow the logic described in `get_node_definition_path`.
         // TODO: streamline and ensure the path's reported via events align with what LSP is being sent
         let (relative_path, defined_at_line, defined_at_column) = self.defined_at().map_or_else(
             || {
                 (
-                    self.get_node_relative_path(in_dir, out_dir)
+                    self.get_node_path(NodePathKind::Definition, in_dir, out_dir)
                         .display()
                         .to_string(),
                     None,
@@ -414,6 +550,7 @@ pub trait InternalDbtNode: Any + Send + Sync + fmt::Debug {
             defined_at_column,
             node_checksum,
             in_selection,
+            self.get_group(),
         )
     }
 }
@@ -442,6 +579,14 @@ pub trait InternalDbtNodeAttributes: InternalDbtNode {
 
     fn name(&self) -> String {
         self.common().name.clone()
+    }
+
+    fn description(&self) -> Option<String> {
+        self.common().description.clone()
+    }
+
+    fn columns(&self) -> Vec<DbtColumnRef> {
+        self.base().columns.clone()
     }
 
     fn alias(&self) -> String {
@@ -476,8 +621,18 @@ pub trait InternalDbtNodeAttributes: InternalDbtNode {
         self.common().meta.clone()
     }
 
+    fn compute(&self) -> Option<ComputeArg> {
+        self.base().compute
+    }
+
     fn static_analysis(&self) -> Spanned<StaticAnalysisKind> {
         self.base().static_analysis.clone()
+    }
+
+    fn static_analysis_baseline(&self) -> Spanned<bool> {
+        self.static_analysis().map(|static_analysis| {
+            dbt_common::static_analysis::is_baseline_static_analysis(static_analysis)
+        })
     }
 
     fn static_analysis_enabled(&self) -> Spanned<bool> {
@@ -529,9 +684,6 @@ pub trait InternalDbtNodeAttributes: InternalDbtNode {
     fn get_access(&self) -> Option<Access> {
         None
     }
-    fn get_group(&self) -> Option<String> {
-        None
-    }
 
     /// Returns the search name for this node, following Python dbt patterns:
     /// - Models: name (or name.v{version} if versioned)
@@ -566,10 +718,23 @@ fn same_body(self_common: &CommonAttributes, other_common: &CommonAttributes) ->
 
 // Helper function to normalize descriptions: treat None and Some("") as equal
 // and strip all whitespace for non-empty descriptions
+fn canonicalize_typographic_quotes(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\u{201C}' | '\u{201D}' => '"',
+            '\u{2018}' | '\u{2019}' => '\'',
+            other => other,
+        })
+        .collect()
+}
+
 pub(crate) fn normalize_description(desc: &Option<String>) -> Option<String> {
-    desc.as_deref()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.chars().filter(|c| !c.is_whitespace()).collect())
+    desc.as_deref().filter(|s| !s.is_empty()).map(|s| {
+        canonicalize_typographic_quotes(s)
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    })
 }
 
 pub(crate) fn same_persisted_description(
@@ -619,13 +784,23 @@ pub(crate) fn same_persisted_description(
         let self_column_descriptions: Vec<_> = self_base
             .columns
             .iter()
-            .map(|column| column.description.clone())
+            .map(|column| {
+                column
+                    .description
+                    .as_deref()
+                    .map(canonicalize_typographic_quotes)
+            })
             .collect();
 
         let other_column_descriptions: Vec<_> = other_base
             .columns
             .iter()
-            .map(|column| column.description.clone())
+            .map(|column| {
+                column
+                    .description
+                    .as_deref()
+                    .map(canonicalize_typographic_quotes)
+            })
             .collect();
 
         if !optional_string_vecs_equal(&self_column_descriptions, &other_column_descriptions) {
@@ -949,7 +1124,7 @@ impl InternalDbtNode for DbtModel {
         crate::schemas::serialization_utils::serialize_with_mode(self, mode)
     }
 
-    fn has_same_config(&self, other: &dyn InternalDbtNode) -> bool {
+    fn has_same_config(&self, other: &dyn InternalDbtNode, _adapter_type: AdapterType) -> bool {
         if let Some(other_model) = other.as_any().downcast_ref::<DbtModel>() {
             let deprecated_config_eq = self
                 .deprecated_config
@@ -969,7 +1144,7 @@ impl InternalDbtNode for DbtModel {
         }
     }
 
-    fn has_same_content(&self, other: &dyn InternalDbtNode) -> bool {
+    fn has_same_content(&self, other: &dyn InternalDbtNode, adapter_type: AdapterType) -> bool {
         // TODO: the checksum for extended model is always different in mantle and fusion, dig more into this
         if self.is_extended_model() {
             return true;
@@ -978,7 +1153,7 @@ impl InternalDbtNode for DbtModel {
         if let Some(other_model) = other.as_any().downcast_ref::<DbtModel>() {
             // Equivalent to dbt-core's same_contents method for ParsedNode
             let same_body_result = same_body(&self.__common_attr__, &other_model.__common_attr__);
-            let same_config_result = self.has_same_config(other);
+            let same_config_result = self.has_same_config(other, adapter_type);
             let same_persisted_desc_result = same_persisted_description(
                 &self.__common_attr__,
                 &self.__base_attr__,
@@ -1039,19 +1214,26 @@ impl InternalDbtNode for DbtModel {
         self.__model_attr__.introspection
     }
 
-    fn warn_on_microbatch(&self) -> FsResult<()> {
-        // Microbatch incremental strategy is now supported
-        Ok(())
+    fn warn_on_microbatch(&self, adapter_type: AdapterType) -> usize {
+        let uses_microbatch =
+            self.__model_attr__.incremental_strategy == Some(DbtIncrementalStrategy::Microbatch);
+        let forces_concurrent_batches = self.deprecated_config.concurrent_batches == Some(true);
+
+        usize::from(
+            uses_microbatch
+                && forces_concurrent_batches
+                && !adapter_type_supports_microbatch_concurrency(adapter_type),
+        )
+    }
+
+    fn get_group(&self) -> Option<String> {
+        self.__model_attr__.group.clone()
     }
 }
 
 impl InternalDbtNodeAttributes for DbtModel {
     fn get_access(&self) -> Option<Access> {
         Some(self.__model_attr__.access.clone())
-    }
-
-    fn get_group(&self) -> Option<String> {
-        self.__model_attr__.group.clone()
     }
 
     fn search_name(&self) -> String {
@@ -1077,6 +1259,7 @@ impl InternalDbtNodeAttributes for DbtModel {
             .and_then(|sync| sync.schema_refresh_interval.clone())
     }
 }
+
 /// Helper function to compare materialized fields for seeds, treating None and default Seed materialization as equivalent
 fn seed_materialized_eq(a: &Option<DbtMaterialization>, b: &Option<DbtMaterialization>) -> bool {
     use crate::schemas::common::DbtMaterialization;
@@ -1296,27 +1479,37 @@ fn docs_config_equal(
 fn quoting_equal(
     left: &Option<crate::schemas::common::DbtQuoting>,
     right: &Option<crate::schemas::common::DbtQuoting>,
+    adapter_type: AdapterType,
 ) -> bool {
     use crate::schemas::common::DbtQuoting;
 
-    let database = |q: &DbtQuoting| -> bool { q.database.unwrap_or(false) };
-    let identifier = |q: &DbtQuoting| -> bool { q.identifier.unwrap_or(false) };
-    let schema = |q: &DbtQuoting| -> bool { q.schema.unwrap_or(false) };
-    let snowflake_ignore_case =
-        |q: &DbtQuoting| -> bool { q.snowflake_ignore_case.unwrap_or(false) };
+    let default = default_dbt_quoting_for(adapter_type);
+    let resolve = |q: Option<&DbtQuoting>| -> DbtQuoting {
+        let q = q.cloned().unwrap_or_default();
+        DbtQuoting {
+            database: Some(q.database.unwrap_or_else(|| {
+                default
+                    .database
+                    .expect("default quoting must have database")
+            })),
+            schema: Some(
+                q.schema
+                    .unwrap_or_else(|| default.schema.expect("default quoting must have schema")),
+            ),
+            identifier: Some(q.identifier.unwrap_or_else(|| {
+                default
+                    .identifier
+                    .expect("default quoting must have identifier")
+            })),
+            snowflake_ignore_case: Some(q.snowflake_ignore_case.unwrap_or_else(|| {
+                default
+                    .snowflake_ignore_case
+                    .expect("default quoting must have snowflake_ignore_case")
+            })),
+        }
+    };
 
-    match (left, right) {
-        (None, None) => true,
-        (Some(l), Some(r)) => {
-            database(l) == database(r)
-                && identifier(l) == identifier(r)
-                && schema(l) == schema(r)
-                && snowflake_ignore_case(l) == snowflake_ignore_case(r)
-        }
-        (None, Some(q)) | (Some(q), None) => {
-            !database(q) && !identifier(q) && !schema(q) && !snowflake_ignore_case(q)
-        }
-    }
+    resolve(left.as_ref()) == resolve(right.as_ref())
 }
 
 impl InternalDbtNode for DbtSeed {
@@ -1350,7 +1543,7 @@ impl InternalDbtNode for DbtSeed {
         crate::schemas::serialization_utils::serialize_with_mode(self, mode)
     }
 
-    fn has_same_config(&self, other: &dyn InternalDbtNode) -> bool {
+    fn has_same_config(&self, other: &dyn InternalDbtNode, _adapter_type: AdapterType) -> bool {
         if let Some(other_model) = other.as_any().downcast_ref::<DbtSeed>() {
             let deprecated_config_eq =
                 seed_configs_equal(&self.deprecated_config, &other_model.deprecated_config);
@@ -1369,7 +1562,7 @@ impl InternalDbtNode for DbtSeed {
         }
     }
 
-    fn has_same_content(&self, other: &dyn InternalDbtNode) -> bool {
+    fn has_same_content(&self, other: &dyn InternalDbtNode, adapter_type: AdapterType) -> bool {
         if let Some(other_seed) = other.as_any().downcast_ref::<DbtSeed>() {
             // Equivalent to dbt-core's same_contents method for ParsedNode
             // TODO: Seeds might have path based checksum. When they do,
@@ -1377,7 +1570,7 @@ impl InternalDbtNode for DbtSeed {
             // after confirming they make sense. See:
             //https://github.com/dbt-labs/dbt-core/blob/b75d5e701ef4dc2d7a98c5301ef63ecfc02eae15/core/dbt/contracts/graph/nodes.py#L900-L933
             let same_body_result = same_body(&self.__common_attr__, &other_seed.__common_attr__);
-            let same_config_result = self.has_same_config(other);
+            let same_config_result = self.has_same_config(other, adapter_type);
             let same_persisted_desc_result = same_persisted_description(
                 &self.__common_attr__,
                 &self.__base_attr__,
@@ -1489,7 +1682,7 @@ impl InternalDbtNode for DbtTest {
         crate::schemas::serialization_utils::serialize_with_mode(self, mode)
     }
 
-    fn has_same_config(&self, other: &dyn InternalDbtNode) -> bool {
+    fn has_same_config(&self, other: &dyn InternalDbtNode, adapter_type: AdapterType) -> bool {
         if let Some(other) = other.as_any().downcast_ref::<DbtTest>() {
             // these fields are what dbt compares for test nodes
             // Some other configs were skipped
@@ -1498,13 +1691,13 @@ impl InternalDbtNode for DbtTest {
             // so we do not do that comparison
             let enabled_eq = self.deprecated_config.enabled == other.deprecated_config.enabled;
             let alias_eq = self.deprecated_config.alias == other.deprecated_config.alias;
-            let tags_eq =
-                array_of_strings_eq(&self.deprecated_config.tags, &other.deprecated_config.tags);
+            let tags_eq = tags_eq(&self.deprecated_config.tags, &other.deprecated_config.tags);
             let meta_eq = meta_eq(&self.deprecated_config.meta, &other.deprecated_config.meta);
             let group_eq = self.deprecated_config.group == other.deprecated_config.group;
             let quoting_eq = quoting_equal(
                 &self.deprecated_config.quoting,
                 &other.deprecated_config.quoting,
+                adapter_type,
             );
 
             let result = enabled_eq && alias_eq && tags_eq && meta_eq && group_eq && quoting_eq;
@@ -1572,9 +1765,9 @@ impl InternalDbtNode for DbtTest {
         }
     }
 
-    fn has_same_content(&self, other: &dyn InternalDbtNode) -> bool {
+    fn has_same_content(&self, other: &dyn InternalDbtNode, adapter_type: AdapterType) -> bool {
         if let Some(other_test) = other.as_any().downcast_ref::<DbtTest>() {
-            let same_config_result = self.has_same_config(other);
+            let same_config_result = self.has_same_config(other, adapter_type);
             let same_fqn_result = self.common().fqn == other_test.common().fqn;
 
             let result = same_config_result && same_fqn_result;
@@ -1607,6 +1800,10 @@ impl InternalDbtNode for DbtTest {
     }
     fn introspection(&self) -> IntrospectionKind {
         self.__test_attr__.introspection
+    }
+
+    fn get_group(&self) -> Option<String> {
+        self.__test_attr__.group.clone()
     }
 }
 
@@ -1649,6 +1846,10 @@ impl InternalDbtNode for DbtUnitTest {
         self
     }
 
+    fn defined_at(&self) -> Option<&dbt_common::CodeLocationWithFile> {
+        self.defined_at.as_ref()
+    }
+
     fn serialize_inner(
         &self,
         mode: crate::schemas::serialization_utils::SerializationMode,
@@ -1656,13 +1857,22 @@ impl InternalDbtNode for DbtUnitTest {
         crate::schemas::serialization_utils::serialize_with_mode(self, mode)
     }
 
-    fn has_same_config(&self, other: &dyn InternalDbtNode) -> bool {
+    fn has_same_config(&self, other: &dyn InternalDbtNode, _adapter_type: AdapterType) -> bool {
         if let Some(other) = other.as_any().downcast_ref::<DbtUnitTest>() {
             let self_config = &self.deprecated_config;
             let other_config = &other.deprecated_config;
 
             let enabled_eq = self_config.enabled == other_config.enabled;
-            let static_analysis_eq = self_config.static_analysis == other_config.static_analysis;
+            // Treat None as equivalent to Some(default) so that old manifests
+            // that serialized null (before apply_resolve_defaults ran for unit tests)
+            // do not produce false-positive state:modified detections.
+            let default_sa = StaticAnalysisKind::default();
+            let static_analysis_eq =
+                match (&self_config.static_analysis, &other_config.static_analysis) {
+                    (None, None) => true,
+                    (None, Some(v)) | (Some(v), None) => **v == default_sa,
+                    (Some(a), Some(b)) => a == b,
+                };
             let warehouse_config_eq = same_warehouse_config(
                 &self_config.__warehouse_specific_config__,
                 &other_config.__warehouse_specific_config__,
@@ -1702,7 +1912,7 @@ impl InternalDbtNode for DbtUnitTest {
         }
     }
 
-    fn has_same_content(&self, other: &dyn InternalDbtNode) -> bool {
+    fn has_same_content(&self, other: &dyn InternalDbtNode, _adapter_type: AdapterType) -> bool {
         if let Some(other_unit_test) = other.as_any().downcast_ref::<DbtUnitTest>() {
             let same_fqn_result = self.common().fqn == other_unit_test.common().fqn;
 
@@ -1805,7 +2015,7 @@ impl InternalDbtNode for DbtSource {
         crate::schemas::serialization_utils::serialize_with_mode(self, mode)
     }
 
-    fn has_same_config(&self, other: &dyn InternalDbtNode) -> bool {
+    fn has_same_config(&self, other: &dyn InternalDbtNode, adapter_type: AdapterType) -> bool {
         if let Some(other_source) = other.as_any().downcast_ref::<DbtSource>() {
             // Merged fields are scattered across the DbtSource struct, while unmerged
             // fields are in deprecated_config.
@@ -1818,23 +2028,6 @@ impl InternalDbtNode for DbtSource {
                     (None, None) => true,
                     (None, Some(b_val)) => b_val.is_empty(),
                     (Some(a_val), None) => a_val.is_empty(),
-                    (Some(a_val), Some(b_val)) => a_val == b_val,
-                }
-            };
-            // Helper function to compare quoting where None equals default DbtQuoting
-            let quoting_eq = |a: &Option<crate::schemas::common::DbtQuoting>,
-                              b: &Option<crate::schemas::common::DbtQuoting>|
-             -> bool {
-                let default_quoting = crate::schemas::common::DbtQuoting {
-                    database: Some(false),
-                    identifier: Some(false),
-                    schema: Some(false),
-                    snowflake_ignore_case: Some(false),
-                };
-                match (a, b) {
-                    (None, None) => true,
-                    (None, Some(b_val)) => b_val == &default_quoting,
-                    (Some(a_val), None) => a_val == &default_quoting,
                     (Some(a_val), Some(b_val)) => a_val == b_val,
                 }
             };
@@ -1893,7 +2086,8 @@ impl InternalDbtNode for DbtSource {
                 }
             };
 
-            let quoting_eq = quoting_eq(&self_config.quoting, &other_config.quoting);
+            let quoting_eq =
+                quoting_equal(&self_config.quoting, &other_config.quoting, adapter_type);
 
             let loaded_at_field_eq = loaded_at_eq(
                 &self.__source_attr__.loaded_at_field,
@@ -1905,7 +2099,16 @@ impl InternalDbtNode for DbtSource {
                 &other_source.__source_attr__.loaded_at_query,
             );
 
-            let static_analysis_eq = self_config.static_analysis == other_config.static_analysis;
+            // Treat None as equivalent to Some(default) so that old manifests
+            // that serialized null (before apply_resolve_defaults ran for sources)
+            // do not produce false-positive state:modified detections.
+            let default_sa = StaticAnalysisKind::default();
+            let static_analysis_eq =
+                match (&self_config.static_analysis, &other_config.static_analysis) {
+                    (None, None) => true,
+                    (None, Some(v)) | (Some(v), None) => **v == default_sa,
+                    (Some(a), Some(b)) => a == b,
+                };
 
             let warehouse_config_eq = same_warehouse_config(
                 &self_config.__warehouse_specific_config__,
@@ -1993,14 +2196,14 @@ impl InternalDbtNode for DbtSource {
         }
     }
 
-    fn has_same_content(&self, other: &dyn InternalDbtNode) -> bool {
+    fn has_same_content(&self, other: &dyn InternalDbtNode, adapter_type: AdapterType) -> bool {
         if let Some(other_source) = other.as_any().downcast_ref::<DbtSource>() {
             let same_relation_name_result = same_relation_name(
                 &self.__base_attr__.relation_name,
                 &other_source.__base_attr__.relation_name,
             );
             let same_fqn_result = self.__common_attr__.fqn == other_source.__common_attr__.fqn;
-            let same_config_result = self.has_same_config(other);
+            let same_config_result = self.has_same_config(other, adapter_type);
             let same_loader_result =
                 self.__source_attr__.loader == other_source.__source_attr__.loader;
 
@@ -2111,7 +2314,7 @@ impl InternalDbtNode for DbtSnapshot {
         crate::schemas::serialization_utils::serialize_with_mode(self, mode)
     }
 
-    fn has_same_config(&self, other: &dyn InternalDbtNode) -> bool {
+    fn has_same_config(&self, other: &dyn InternalDbtNode, adapter_type: AdapterType) -> bool {
         if let Some(other_snapshot) = other.as_any().downcast_ref::<DbtSnapshot>() {
             let self_config = &self.deprecated_config;
             let other_config = &other_snapshot.deprecated_config;
@@ -2161,8 +2364,18 @@ impl InternalDbtNode for DbtSnapshot {
                 persist_docs_configs_equal(&self_config.persist_docs, &other_config.persist_docs);
             let grants_eq = grants_eq(&self_config.grants, &other_config.grants);
             let event_time_eq = self_config.event_time == other_config.event_time;
-            let quoting_eq = quoting_equal(&self_config.quoting, &other_config.quoting);
-            let static_analysis_eq = self_config.static_analysis == other_config.static_analysis;
+            let quoting_eq =
+                quoting_equal(&self_config.quoting, &other_config.quoting, adapter_type);
+            // Treat None as equivalent to Some(default) so that old manifests
+            // that serialized null (before apply_resolve_defaults ran for snapshots)
+            // do not produce false-positive state:modified detections.
+            let default_sa = StaticAnalysisKind::default();
+            let static_analysis_eq =
+                match (&self_config.static_analysis, &other_config.static_analysis) {
+                    (None, None) => true,
+                    (None, Some(v)) | (Some(v), None) => **v == default_sa,
+                    (Some(a), Some(b)) => a == b,
+                };
             let group_eq = self_config.group == other_config.group;
             let quote_columns_eq = self_config.quote_columns == other_config.quote_columns;
             let invalidate_hard_deletes_eq =
@@ -2385,12 +2598,12 @@ impl InternalDbtNode for DbtSnapshot {
         }
     }
 
-    fn has_same_content(&self, other: &dyn InternalDbtNode) -> bool {
+    fn has_same_content(&self, other: &dyn InternalDbtNode, adapter_type: AdapterType) -> bool {
         if let Some(other_snapshot) = other.as_any().downcast_ref::<DbtSnapshot>() {
             // Equivalent to dbt-core's same_contents method for ParsedNode
             let same_body_result =
                 same_body(&self.__common_attr__, &other_snapshot.__common_attr__);
-            let same_config_result = self.has_same_config(other);
+            let same_config_result = self.has_same_config(other, adapter_type);
             let same_persisted_desc_result = same_persisted_description(
                 &self.__common_attr__,
                 &self.__base_attr__,
@@ -2495,7 +2708,21 @@ impl InternalDbtNodeAttributes for DbtSnapshot {
     }
 
     fn serialized_config(&self) -> YmlValue {
-        dbt_yaml::to_value(&self.deprecated_config).expect("Failed to serialize to YAML")
+        let mut value =
+            dbt_yaml::to_value(&self.deprecated_config).expect("Failed to serialize to YAML");
+
+        // Snapshot macros read `snapshot_table_column_names` (legacy key), but users write
+        // `snapshot_meta_column_names`. Normalize here so both compile and run see the legacy key.
+        if let YmlValue::Mapping(ref mut map, _) = value {
+            if !map.contains_key("snapshot_table_column_names") {
+                if let Some(v) = map.get("snapshot_meta_column_names").cloned() {
+                    if !v.is_null() {
+                        map.insert("snapshot_table_column_names".into(), v);
+                    }
+                }
+            }
+        }
+        value
     }
 
     fn schema_refresh_interval(&self) -> Option<SchemaRefreshInterval> {
@@ -2531,7 +2758,7 @@ impl InternalDbtNode for DbtExposure {
     ) -> YmlValue {
         crate::schemas::serialization_utils::serialize_with_mode(self, mode)
     }
-    fn has_same_config(&self, other: &dyn InternalDbtNode) -> bool {
+    fn has_same_config(&self, other: &dyn InternalDbtNode, _adapter_type: AdapterType) -> bool {
         if let Some(other_exposure) = other.as_any().downcast_ref::<DbtExposure>() {
             let enabled_eq =
                 self.deprecated_config.enabled == other_exposure.deprecated_config.enabled;
@@ -2556,7 +2783,7 @@ impl InternalDbtNode for DbtExposure {
             false
         }
     }
-    fn has_same_content(&self, other: &dyn InternalDbtNode) -> bool {
+    fn has_same_content(&self, other: &dyn InternalDbtNode, _adapter_type: AdapterType) -> bool {
         if let Some(other_exposure) = other.as_any().downcast_ref::<DbtExposure>() {
             let same_name_result = self.__common_attr__.name == other_exposure.__common_attr__.name;
             let same_fqn_result = self.__common_attr__.fqn == other_exposure.__common_attr__.fqn;
@@ -2692,7 +2919,7 @@ impl InternalDbtNode for DbtSemanticModel {
     ) -> YmlValue {
         crate::schemas::serialization_utils::serialize_with_mode(self, mode)
     }
-    fn has_same_config(&self, other: &dyn InternalDbtNode) -> bool {
+    fn has_same_config(&self, other: &dyn InternalDbtNode, _adapter_type: AdapterType) -> bool {
         if let Some(_other_semantic_model) = other.as_any().downcast_ref::<DbtSemanticModel>() {
             // TODO: implement proper config comparison when needed
             true
@@ -2704,9 +2931,9 @@ impl InternalDbtNode for DbtSemanticModel {
     // dbt-core does in SemanticModel.same_contents(). See:
     // https://github.com/dbt-labs/dbt-core/blob/906e07c1f2161aaf8873f17ba323221a3cf48c9f/core/dbt/contracts/graph/nodes.py#L1585-L1602
     // TODO: group is not compared while it is in dbt-core. SemanticModel group is not implemented in dbt-fusion.
-    fn has_same_content(&self, other: &dyn InternalDbtNode) -> bool {
+    fn has_same_content(&self, other: &dyn InternalDbtNode, adapter_type: AdapterType) -> bool {
         if let Some(other_semantic_model) = other.as_any().downcast_ref::<DbtSemanticModel>() {
-            let same_config_result = self.has_same_config(other);
+            let same_config_result = self.has_same_config(other, adapter_type);
             let same_model_result = self.__semantic_model_attr__.model
                 == other_semantic_model.__semantic_model_attr__.model;
             let same_description_result = self.__common_attr__.description
@@ -2867,7 +3094,7 @@ impl InternalDbtNode for DbtMetric {
     ) -> YmlValue {
         crate::schemas::serialization_utils::serialize_with_mode(self, mode)
     }
-    fn has_same_config(&self, other: &dyn InternalDbtNode) -> bool {
+    fn has_same_config(&self, other: &dyn InternalDbtNode, _adapter_type: AdapterType) -> bool {
         if let Some(other_metric) = other.as_any().downcast_ref::<DbtMetric>() {
             let self_config = &self.deprecated_config;
             let other_config = &other_metric.deprecated_config;
@@ -2910,9 +3137,9 @@ impl InternalDbtNode for DbtMetric {
     // This function only compares a subset of the DbMetric node, similar to what
     // dbt-core does in Metric.same_contents(). See:
     // https://github.com/dbt-labs/dbt-core/blob/906e07c1f2161aaf8873f17ba323221a3cf48c9f/core/dbt/contracts/graph/nodes.py#L1496-L1511
-    fn has_same_content(&self, other: &dyn InternalDbtNode) -> bool {
+    fn has_same_content(&self, other: &dyn InternalDbtNode, adapter_type: AdapterType) -> bool {
         if let Some(other_metric) = other.as_any().downcast_ref::<DbtMetric>() {
-            let same_config_result = self.has_same_config(other);
+            let same_config_result = self.has_same_config(other, adapter_type);
             let same_filter_result =
                 self.__metric_attr__.filter == other_metric.__metric_attr__.filter;
             let same_metadata_result =
@@ -3042,7 +3269,7 @@ impl InternalDbtNode for DbtSavedQuery {
     ) -> YmlValue {
         crate::schemas::serialization_utils::serialize_with_mode(self, mode)
     }
-    fn has_same_config(&self, other: &dyn InternalDbtNode) -> bool {
+    fn has_same_config(&self, other: &dyn InternalDbtNode, _adapter_type: AdapterType) -> bool {
         if let Some(other_saved_query) = other.as_any().downcast_ref::<DbtSavedQuery>() {
             let self_config = &self.deprecated_config;
             let other_config = &other_saved_query.deprecated_config;
@@ -3109,16 +3336,18 @@ impl InternalDbtNode for DbtSavedQuery {
             false
         }
     }
-    fn has_same_content(&self, other: &dyn InternalDbtNode) -> bool {
+    fn has_same_content(&self, other: &dyn InternalDbtNode, adapter_type: AdapterType) -> bool {
         if let Some(other_saved_query) = other.as_any().downcast_ref::<DbtSavedQuery>() {
-            let same_config_result = self.has_same_config(other);
+            let same_config_result = self.has_same_config(other, adapter_type);
             let same_description_result =
                 self.__common_attr__.description == other_saved_query.__common_attr__.description;
             let same_fqn_result = self.__common_attr__.fqn == other_saved_query.__common_attr__.fqn;
             let same_label_result =
                 self.__saved_query_attr__.label == other_saved_query.__saved_query_attr__.label;
-            let same_tags_result =
-                self.__common_attr__.tags == other_saved_query.__common_attr__.tags;
+            let same_tags_result = tags_eq_vec(
+                &self.__common_attr__.tags,
+                &other_saved_query.__common_attr__.tags,
+            );
             let same_exports_result =
                 self.__saved_query_attr__.exports == other_saved_query.__saved_query_attr__.exports;
             let same_group_by_result = self.__saved_query_attr__.query_params.group_by
@@ -3265,7 +3494,7 @@ impl InternalDbtNode for DbtFunction {
         crate::schemas::serialization_utils::serialize_with_mode(self, mode)
     }
 
-    fn has_same_config(&self, other: &dyn InternalDbtNode) -> bool {
+    fn has_same_config(&self, other: &dyn InternalDbtNode, _adapter_type: AdapterType) -> bool {
         if let Some(other_function) = other.as_any().downcast_ref::<DbtFunction>() {
             let deprecated_config_eq = self
                 .deprecated_config
@@ -3285,7 +3514,7 @@ impl InternalDbtNode for DbtFunction {
         }
     }
 
-    fn has_same_content(&self, other: &dyn InternalDbtNode) -> bool {
+    fn has_same_content(&self, other: &dyn InternalDbtNode, _adapter_type: AdapterType) -> bool {
         if let Some(other_function) = other.as_any().downcast_ref::<DbtFunction>() {
             let same_checksum_result =
                 self.__common_attr__.checksum == other_function.__common_attr__.checksum;
@@ -3317,6 +3546,10 @@ impl InternalDbtNode for DbtFunction {
         // Functions don't support introspection in the same way as models
         // This could be a no-op or we could add introspection support later
     }
+
+    fn get_group(&self) -> Option<String> {
+        self.__function_attr__.group.clone()
+    }
 }
 
 impl InternalDbtNodeAttributes for DbtFunction {
@@ -3334,10 +3567,6 @@ impl InternalDbtNodeAttributes for DbtFunction {
 
     fn get_access(&self) -> Option<Access> {
         Some(self.__function_attr__.access.clone())
-    }
-
-    fn get_group(&self) -> Option<String> {
-        self.__function_attr__.group.clone()
     }
 
     fn search_name(&self) -> String {
@@ -3378,10 +3607,10 @@ impl InternalDbtNode for DbtMacro {
     ) -> YmlValue {
         crate::schemas::serialization_utils::serialize_with_mode(self, mode)
     }
-    fn has_same_config(&self, _other: &dyn InternalDbtNode) -> bool {
+    fn has_same_config(&self, _other: &dyn InternalDbtNode, _adapter_type: AdapterType) -> bool {
         unimplemented!("macro config comparison")
     }
-    fn has_same_content(&self, other: &dyn InternalDbtNode) -> bool {
+    fn has_same_content(&self, other: &dyn InternalDbtNode, _adapter_type: AdapterType) -> bool {
         if let Some(other_macro) = other.as_any().downcast_ref::<DbtMacro>() {
             let same_macro_sql_result = self.macro_sql == other_macro.macro_sql;
 
@@ -4067,10 +4296,26 @@ impl Nodes {
         Ok(())
     }
 
-    pub fn warn_on_microbatch(&self) -> FsResult<()> {
-        for (_, node) in self.iter() {
-            node.warn_on_microbatch()?;
+    pub fn warn_on_microbatch(&self, adapter_type: AdapterType) -> FsResult<()> {
+        let models_forcing_concurrent_batches: usize = self
+            .iter()
+            .map(|(_, node)| node.warn_on_microbatch(adapter_type))
+            .sum();
+
+        if models_forcing_concurrent_batches > 0 {
+            let maybe_plural_count_of_models = if models_forcing_concurrent_batches == 1 {
+                "1 microbatch model".to_string()
+            } else {
+                format!("{models_forcing_concurrent_batches} microbatch models")
+            };
+
+            return err!(
+                ErrorCode::InvalidConcurrentBatchesConfig,
+                "Found {maybe_plural_count_of_models} with the `concurrent_batches` config set to true, but the {} adapter does not support running batches concurrently. Batches will be run sequentially.",
+                adapter_type
+            );
         }
+
         Ok(())
     }
 }
@@ -4215,6 +4460,8 @@ pub struct NodeBaseAttributes {
     pub static_analysis: Spanned<StaticAnalysisKind>,
     #[serde(skip_deserializing, default)]
     pub static_analysis_off_reason: Option<StaticAnalysisOffReason>,
+    #[serde(default)]
+    pub compute: Option<ComputeArg>,
     pub enabled: bool,
     #[serde(skip_serializing, default = "default_false")]
     pub extended_model: bool,
@@ -4235,7 +4482,11 @@ pub struct NodeBaseAttributes {
     pub refs: Vec<DbtRef>,
     #[serde(default)]
     pub sources: Vec<DbtSourceWrapper>,
-    #[serde(default)]
+    #[serde(
+        default,
+        serialize_with = "serialize_dbt_function_refs",
+        deserialize_with = "deserialize_dbt_function_refs"
+    )]
     pub functions: Vec<DbtRef>,
     #[serde(default)]
     pub metrics: Vec<Vec<String>>,
@@ -4358,6 +4609,11 @@ pub struct DbtUnitTest {
     pub tested_node_unique_id: Option<String>,
     pub this_input_node_unique_id: Option<String>,
 
+    /// YAML span of the unit test's `name:` declaration. Used by the analyzer
+    /// to anchor error locations at the unit-test entry in the source YAML.
+    /// `None` on warm-start parquet reload (not yet persisted across sessions).
+    pub defined_at: Option<dbt_common::CodeLocationWithFile>,
+
     // To be deprecated
     #[serde(rename = "config")]
     pub deprecated_config: UnitTestConfig,
@@ -4429,6 +4685,8 @@ pub struct DbtTestAttr {
     /// This field stores the original name for selector matching purposes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub original_name: Option<String>,
+    #[serde(skip)]
+    pub group: Option<String>,
 }
 
 #[skip_serializing_none]
@@ -4924,7 +5182,7 @@ impl DbtModel {
             \n  - {breaking_change}\n"
         );
 
-        emit_warn_log_message(ErrorCode::DependencyWarning, warning_message, None);
+        emit_warn_log_message(ErrorCode::UnversionedBreakingChange, warning_message, None);
     }
 }
 
@@ -4983,10 +5241,21 @@ impl AdapterAttr {
                     external_volume: config.external_volume.clone(),
                     base_location_root: config.base_location_root.clone(),
                     base_location_subpath: config.base_location_subpath.clone(),
+                    change_tracking: config.change_tracking,
+                    data_retention_time_in_days: config.data_retention_time_in_days,
+                    max_data_extension_time_in_days: config.max_data_extension_time_in_days,
+                    storage_serialization_policy: config.storage_serialization_policy.clone(),
+                    iceberg_version: config.iceberg_version,
+                    target_file_size: config.target_file_size.clone(),
                     target_lag: config.target_lag.clone(),
+                    snowflake_initialization_warehouse: config
+                        .snowflake_initialization_warehouse
+                        .clone(),
                     snowflake_warehouse: config.snowflake_warehouse.clone(),
+                    immutable_where: config.immutable_where.clone(),
                     refresh_mode: config.refresh_mode.clone(),
                     initialize: config.initialize.clone(),
+                    scheduler: config.scheduler.clone(),
                     tmp_relation_type: config.tmp_relation_type.clone(),
                     query_tag: config.query_tag.clone(),
                     automatic_clustering: config.automatic_clustering,
@@ -5003,6 +5272,7 @@ impl AdapterAttr {
                     external_volume: config.external_volume.clone(),
                     base_location_root: config.base_location_root.clone(),
                     base_location_subpath: config.base_location_subpath.clone(),
+                    storage_uri: config.storage_uri.clone(),
                     file_format: config.file_format.clone(),
                     partition_by: config.partition_by.clone(),
                     cluster_by: config.cluster_by.clone(),
@@ -5039,6 +5309,7 @@ impl AdapterAttr {
                     partition_by: config.partition_by.clone(),
                     file_format: config.file_format.clone(),
                     location_root: config.location_root.clone(),
+                    use_uniform: config.use_uniform,
                     tblproperties: config.tblproperties.clone(),
                     include_full_name_in_path: config.include_full_name_in_path,
                     liquid_clustered_by: config.liquid_clustered_by.clone(),
@@ -5073,10 +5344,21 @@ impl AdapterAttr {
                         external_volume: config.external_volume.clone(),
                         base_location_root: config.base_location_root.clone(),
                         base_location_subpath: config.base_location_subpath.clone(),
+                        change_tracking: config.change_tracking,
+                        data_retention_time_in_days: config.data_retention_time_in_days,
+                        max_data_extension_time_in_days: config.max_data_extension_time_in_days,
+                        storage_serialization_policy: config.storage_serialization_policy.clone(),
+                        iceberg_version: config.iceberg_version,
+                        target_file_size: config.target_file_size.clone(),
                         target_lag: config.target_lag.clone(),
+                        snowflake_initialization_warehouse: config
+                            .snowflake_initialization_warehouse
+                            .clone(),
                         snowflake_warehouse: config.snowflake_warehouse.clone(),
+                        immutable_where: config.immutable_where.clone(),
                         refresh_mode: config.refresh_mode.clone(),
                         initialize: config.initialize.clone(),
+                        scheduler: config.scheduler.clone(),
                         tmp_relation_type: config.tmp_relation_type.clone(),
                         query_tag: config.query_tag.clone(),
                         automatic_clustering: config.automatic_clustering,
@@ -5090,6 +5372,7 @@ impl AdapterAttr {
                         external_volume: config.external_volume.clone(),
                         base_location_root: config.base_location_root.clone(),
                         base_location_subpath: config.base_location_subpath.clone(),
+                        storage_uri: config.storage_uri.clone(),
                         file_format: config.file_format.clone(),
                         partition_by: config.partition_by.clone(),
                         cluster_by: config.cluster_by.clone(),
@@ -5122,6 +5405,7 @@ impl AdapterAttr {
                         partition_by: config.partition_by.clone(),
                         file_format: config.file_format.clone(),
                         location_root: config.location_root.clone(),
+                        use_uniform: config.use_uniform,
                         tblproperties: config.tblproperties.clone(),
                         include_full_name_in_path: config.include_full_name_in_path,
                         liquid_clustered_by: config.liquid_clustered_by.clone(),
@@ -5162,10 +5446,19 @@ pub struct SnowflakeAttr {
     pub external_volume: Option<String>,
     pub base_location_root: Option<String>,
     pub base_location_subpath: Option<String>,
+    pub change_tracking: Option<bool>,
+    pub data_retention_time_in_days: Option<u64>,
+    pub max_data_extension_time_in_days: Option<u64>,
+    pub storage_serialization_policy: Option<String>,
+    pub iceberg_version: Option<u64>,
+    pub target_file_size: Option<String>,
     pub target_lag: Option<String>,
+    pub snowflake_initialization_warehouse: Option<String>,
     pub snowflake_warehouse: Option<String>,
+    pub immutable_where: Option<String>,
     pub refresh_mode: Option<String>,
     pub initialize: Option<String>,
+    pub scheduler: Option<String>,
     pub tmp_relation_type: Option<String>,
     pub query_tag: Option<QueryTag>,
     pub automatic_clustering: Option<bool>,
@@ -5182,6 +5475,7 @@ pub struct DatabricksAttr {
     pub partition_by: Option<PartitionConfig>,
     pub file_format: Option<String>,
     pub location_root: Option<String>,
+    pub use_uniform: Option<bool>,
     pub tblproperties: Option<BTreeMap<String, YmlValue>>,
     pub include_full_name_in_path: Option<bool>,
     pub liquid_clustered_by: Option<StringOrArrayOfStrings>,
@@ -5214,6 +5508,7 @@ pub struct BigQueryAttr {
     pub file_format: Option<String>,
     pub base_location_root: Option<String>,
     pub base_location_subpath: Option<String>,
+    pub storage_uri: Option<String>,
     pub partition_by: Option<PartitionConfig>,
     pub cluster_by: Option<ClusterConfig>,
     pub hours_to_expiration: Option<u64>,
@@ -5327,6 +5622,7 @@ mod tests {
         ModelConfig, hooks_equal, normalize_description, persist_docs_configs_equal, quoting_equal,
     };
     use crate::schemas::common::{Hooks, PersistDocsConfig};
+    use dbt_adapter_core::AdapterType;
     use dbt_yaml::Verbatim;
 
     type YmlValue = dbt_yaml::Value;
@@ -5398,8 +5694,16 @@ mod tests {
             snowflake_ignore_case: None,
         });
 
-        assert!(quoting_equal(&none_quoting, &all_none_quoting));
-        assert!(quoting_equal(&all_none_quoting, &none_quoting));
+        assert!(quoting_equal(
+            &none_quoting,
+            &all_none_quoting,
+            AdapterType::Snowflake
+        ));
+        assert!(quoting_equal(
+            &all_none_quoting,
+            &none_quoting,
+            AdapterType::Snowflake
+        ));
 
         // Case 2: None vs Some with all fields Some(false)
         let all_false_quoting: Option<DbtQuoting> = Some(DbtQuoting {
@@ -5409,12 +5713,28 @@ mod tests {
             snowflake_ignore_case: Some(false),
         });
 
-        assert!(quoting_equal(&none_quoting, &all_false_quoting));
-        assert!(quoting_equal(&all_false_quoting, &none_quoting));
+        assert!(quoting_equal(
+            &none_quoting,
+            &all_false_quoting,
+            AdapterType::Snowflake
+        ));
+        assert!(quoting_equal(
+            &all_false_quoting,
+            &none_quoting,
+            AdapterType::Snowflake
+        ));
 
         // Case 3: Some with all None vs Some with all Some(false)
-        assert!(quoting_equal(&all_none_quoting, &all_false_quoting));
-        assert!(quoting_equal(&all_false_quoting, &all_none_quoting));
+        assert!(quoting_equal(
+            &all_none_quoting,
+            &all_false_quoting,
+            AdapterType::Snowflake
+        ));
+        assert!(quoting_equal(
+            &all_false_quoting,
+            &all_none_quoting,
+            AdapterType::Snowflake
+        ));
 
         // Case 4: Mixed None and Some(false) should be equal
         let mixed_quoting_1: Option<DbtQuoting> = Some(DbtQuoting {
@@ -5431,7 +5751,11 @@ mod tests {
             snowflake_ignore_case: Some(false),
         });
 
-        assert!(quoting_equal(&mixed_quoting_1, &mixed_quoting_2));
+        assert!(quoting_equal(
+            &mixed_quoting_1,
+            &mixed_quoting_2,
+            AdapterType::Snowflake
+        ));
 
         // Case 5: Some(true) should NOT be equal to None or Some(false)
         let some_true_quoting: Option<DbtQuoting> = Some(DbtQuoting {
@@ -5441,9 +5765,21 @@ mod tests {
             snowflake_ignore_case: Some(false),
         });
 
-        assert!(!quoting_equal(&some_true_quoting, &none_quoting));
-        assert!(!quoting_equal(&some_true_quoting, &all_none_quoting));
-        assert!(!quoting_equal(&some_true_quoting, &all_false_quoting));
+        assert!(!quoting_equal(
+            &some_true_quoting,
+            &none_quoting,
+            AdapterType::Snowflake
+        ));
+        assert!(!quoting_equal(
+            &some_true_quoting,
+            &all_none_quoting,
+            AdapterType::Snowflake
+        ));
+        assert!(!quoting_equal(
+            &some_true_quoting,
+            &all_false_quoting,
+            AdapterType::Snowflake
+        ));
 
         // Case 6: Two identical configs with Some(true) should be equal
         let another_true_quoting: Option<DbtQuoting> = Some(DbtQuoting {
@@ -5453,7 +5789,11 @@ mod tests {
             snowflake_ignore_case: Some(false),
         });
 
-        assert!(quoting_equal(&some_true_quoting, &another_true_quoting));
+        assert!(quoting_equal(
+            &some_true_quoting,
+            &another_true_quoting,
+            AdapterType::Snowflake
+        ));
     }
 
     #[test]
@@ -5868,7 +6208,7 @@ impl InternalDbtNode for DbtAnalysis {
         crate::schemas::serialization_utils::serialize_with_mode(self, mode)
     }
 
-    fn has_same_config(&self, other: &dyn InternalDbtNode) -> bool {
+    fn has_same_config(&self, other: &dyn InternalDbtNode, _adapter_type: AdapterType) -> bool {
         if let Some(other_analysis) = other.as_any().downcast_ref::<DbtAnalysis>() {
             let self_config = &self.deprecated_config;
             let other_config = &other_analysis.deprecated_config;
@@ -5909,7 +6249,7 @@ impl InternalDbtNode for DbtAnalysis {
         }
     }
 
-    fn has_same_content(&self, other: &dyn InternalDbtNode) -> bool {
+    fn has_same_content(&self, other: &dyn InternalDbtNode, _adapter_type: AdapterType) -> bool {
         if let Some(other_analysis) = other.as_any().downcast_ref::<DbtAnalysis>() {
             self.__common_attr__.checksum == other_analysis.__common_attr__.checksum
         } else {
@@ -5937,10 +6277,6 @@ impl InternalDbtNodeAttributes for DbtAnalysis {
 
     fn get_access(&self) -> Option<Access> {
         None // Analysis nodes don't have access controls
-    }
-
-    fn get_group(&self) -> Option<String> {
-        None // Analysis nodes don't have groups
     }
 
     fn search_name(&self) -> String {

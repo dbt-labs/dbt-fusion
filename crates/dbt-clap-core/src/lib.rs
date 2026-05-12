@@ -4,11 +4,10 @@ use dbt_common::collections::HashSet;
 use dbt_common::io_utils::determine_project_dir;
 use dbt_common::{ErrorCode, FsResult, fs_err, stdfs};
 use dbt_yaml::Value as YValue;
-use log::LevelFilter;
 use serde::{Deserialize, Serialize};
 
 use std::any::Any;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::sync::LazyLock;
 use std::{
@@ -20,22 +19,25 @@ use strum::IntoEnumIterator;
 use strum_macros::Display;
 use uuid::Uuid;
 
+use clap::{
+    ArgAction, Parser, ValueEnum,
+    builder::{BoolishValueParser, TypedValueParser},
+};
+use clap_complete::Shell;
 use dbt_common::constants::{
     DBT_DEFAULT_LOG_FILE_MAX_BYTES, DBT_PROJECT_YML, DBT_TARGET_DIR_NAME, NOOP,
 };
 use dbt_common::io_args::FsCommand;
 use dbt_common::io_args::{BuildCacheMode, DisplayFormat, ListOutputFormat, StaticAnalysisKind};
 use dbt_common::io_args::{
-    ClapResourceType, ClapSchemaTypes, EvalArgs, InternalPackageMode, IoArgs,
-    LocalExecutionBackendKind, OptimizeTestsOptions, Phases, RunCacheMode, ShowOptions, SystemArgs,
-    TimeMachineModeKind, TimeMachineReplayOrdering, check_selector, check_target, check_var,
-    validate_project_name,
+    ClapResourceType, ClapSchemaTypes, ComputeArg, EvalArgs, InternalPackageMode, IoArgs,
+    LocalExecutionBackendKind, LogFormat, LogLevel, OptimizeTestsOptions, Phases, RunCacheMode,
+    ShowOptions, SystemArgs, TimeMachineModeKind, TimeMachineReplayOrdering,
+    check_key_value_cli_arg, check_selector, check_target, validate_project_name,
 };
 use dbt_common::row_limit::RowLimit;
+use dbt_common::warn_error_options::{WarnErrorOptions, parse_warn_error_options};
 
-use clap::{ArgAction, Parser, ValueEnum, arg, builder::BoolishValueParser, command};
-
-use dbt_common::logging::LogFormat;
 use dbt_common::node_selector::{
     IndirectSelection, MethodName, SelectionCriteria, parse_model_specifiers,
 };
@@ -140,19 +142,24 @@ impl CliParser {
         let mut cmd = self.app();
         err.format(&mut cmd)
     }
+
+    /// Write shell completion scripts for the given shell to `writer`.
+    pub fn write_completions<W: std::io::Write>(&self, shell: Shell, writer: &mut W) {
+        clap_complete::generate(shell, &mut self.app(), "dbt", writer);
+    }
 }
 
 impl CliParserTrait for CliParser {
     type CliType = Cli;
 
     /// Parse from `std::env::args_os()`, [exit][Error::exit] on error.
-    fn parse(&self) -> Cli {
+    fn parse(&self) -> Box<Cli> {
         let mut matches = self.app().get_matches();
         let res = self
             .try_parse_from_arg_matches_mut(&mut matches)
             .map_err(|err| self.format_error(err));
         match res {
-            Ok(s) => s,
+            Ok(s) => Box::new(s),
             Err(e) => {
                 // Since this is more of a development-time error, we aren't doing as fancy of a quit
                 // as `get_matches`
@@ -162,14 +169,16 @@ impl CliParserTrait for CliParser {
     }
 
     /// Parse from `std::env::args_os()`, return Err on error.
-    fn try_parse(&self) -> Result<Cli, clap::Error> {
+    fn try_parse(&self) -> Result<Box<Cli>, clap::Error> {
         let mut matches = self.app().try_get_matches()?;
-        self.try_parse_from_arg_matches_mut(&mut matches)
-            .map_err(|err| self.format_error(err))
+        let cli = self
+            .try_parse_from_arg_matches_mut(&mut matches)
+            .map_err(|err| self.format_error(err))?;
+        Ok(Box::new(cli))
     }
 
     /// Parse from iterator, [exit][clap::Error::exit] on error.
-    fn parse_from<I, T>(&self, itr: I) -> Self::CliType
+    fn parse_from<I, T>(&self, itr: I) -> Box<Self::CliType>
     where
         I: IntoIterator<Item = T>,
         T: Into<OsString> + Clone,
@@ -179,7 +188,7 @@ impl CliParserTrait for CliParser {
             .try_parse_from_arg_matches_mut(&mut matches)
             .map_err(|err| self.format_error(err));
         match res {
-            Ok(s) => s,
+            Ok(s) => Box::new(s),
             Err(e) => {
                 // Since this is more of a development-time error, we aren't doing as fancy of a quit
                 // as `get_matches_from`
@@ -189,18 +198,28 @@ impl CliParserTrait for CliParser {
     }
 
     /// Parse from iterator, return Err on error.
-    fn try_parse_from<I, T>(&self, itr: I) -> Result<Cli, clap::Error>
+    fn try_parse_from<I, T>(&self, itr: I) -> Result<Box<Cli>, clap::Error>
     where
         I: IntoIterator<Item = T>,
         T: Into<OsString> + Clone,
     {
         let mut matches = self.app().try_get_matches_from(itr)?;
-        self.try_parse_from_arg_matches_mut(&mut matches)
-            .map_err(|err| self.format_error(err))
+        let cli = self
+            .try_parse_from_arg_matches_mut(&mut matches)
+            .map_err(|err| self.format_error(err))?;
+        Ok(Box::new(cli))
     }
 
     fn fail_fast_flag(&self, cli: &Self::CliType) -> bool {
         cli.common_args.fail_fast
+    }
+
+    fn warn_error_options(&self, cli: &Self::CliType) -> Option<WarnErrorOptions> {
+        Some(cli.common_args.get_cli_warn_error_options())
+    }
+
+    fn write_index(&self, cli: &Self::CliType) -> bool {
+        cli.common_args.write_index
     }
 }
 
@@ -267,7 +286,11 @@ got {:?}, expected an instance of {}",
         // Some commands operate without project context, while others must be run in a project directory.
         let (in_dir, out_dir) = {
             match &self.command {
-                Command::Core(System(_)) | Command::Core(Man(_)) | Command::Core(Init(_)) => {
+                Command::Core(System(_))
+                | Command::Core(Man(_))
+                | Command::Core(Init(_))
+                | Command::Core(Docs(_))
+                | Command::Core(Completions(_)) => {
                     // These commands do not require a project directory
                     (PathBuf::from("."), PathBuf::from("."))
                 }
@@ -305,6 +328,8 @@ got {:?}, expected an instance of {}",
                 Man(args) => args.to_eval_args(system_arg, &in_dir, &out_dir),
                 Debug(args) => args.to_eval_args(system_arg, &in_dir, &out_dir),
                 Retry(args) => args.to_eval_args(system_arg, &in_dir, &out_dir),
+                Docs(args) => args.to_eval_args(system_arg, &in_dir, &out_dir),
+                Completions(args) => args.to_eval_args(system_arg, &in_dir, &out_dir),
             },
             Command::Extension(ext_cmd) => ext_cmd.to_eval_args(&common_args, system_arg)?,
         };
@@ -334,6 +359,7 @@ got {:?}, expected an instance of {}",
         }
     }
 
+    // TODO: Box the CommonArgs because it's a 1Kb struct
     pub fn common_args(&self) -> CommonArgs {
         match &self.command {
             Command::Core(core_cmd) => core_cmd.common_args().clone(),
@@ -378,6 +404,8 @@ got {:?}, expected an instance of {}",
                 Man(_args) => unreachable!("Man command does not need a phase"),
                 Debug(args) => args.common_args.phase.clone().unwrap_or(Phases::Debug),
                 Retry(args) => args.common_args.phase.clone().unwrap_or(Phases::All),
+                Docs(_args) => unreachable!("Docs command does not need a phase"),
+                Completions(_args) => unreachable!("Completions command does not need a phase"),
             },
             Command::Extension(ext_cmd) => ext_cmd.stage(),
         }
@@ -778,6 +806,7 @@ impl ShowArgs {
                 ClapResourceType::Seed,
                 ClapResourceType::Source,
                 ClapResourceType::Analysis,
+                ClapResourceType::Test,
             ];
         }
         eval_args.limit = self.limit.into();
@@ -1200,7 +1229,7 @@ pub struct RunOperationArgs {
     pub macro_name: String,
 
     /// Supply arguments to the macro. This dictionary will be mapped to the keyword arguments defined in the selected macro. This argument should be a yml string.
-    #[arg(long,value_parser = check_var)]
+    #[arg(long,value_parser = check_key_value_cli_arg)]
     pub args: Option<BTreeMap<String, YValue>>,
 
     // Flattened IO args
@@ -1250,6 +1279,32 @@ impl ManArgs {
                 .collect(),
         )
     }
+}
+
+#[derive(Parser, Debug, Default, Clone, Serialize, Deserialize)]
+pub struct DocsArgs {
+    // Flattened Common args
+    #[clap(flatten)]
+    pub common_args: CommonArgs,
+
+    #[command(subcommand)]
+    pub subcommand: Option<DocsSubcommand>,
+}
+
+impl DocsArgs {
+    pub fn to_eval_args(&self, arg: SystemArgs, in_dir: &Path, out_dir: &Path) -> EvalArgs {
+        self.common_args.to_eval_args(arg, in_dir, out_dir)
+    }
+}
+
+#[derive(clap::Subcommand, Debug, Clone, Serialize, Deserialize)]
+pub enum DocsSubcommand {
+    /// Generate docs catalog (deprecated: use `dbt compile --write-catalog` instead)
+    Generate,
+    /// Serve docs (deprecated: no longer supported in Fusion)
+    Serve,
+    #[command(external_subcommand)]
+    Other(Vec<String>),
 }
 
 #[derive(Parser, Debug, Default, Clone, Serialize, Deserialize)]
@@ -1322,7 +1377,7 @@ pub struct CommonArgs {
 
     /// Supply var bindings in yml format e.g. '{key: value}' or as separate key: value pairs
     // has no ENV_VAR
-    #[arg(global = true, long,value_parser = check_var, )]
+    #[arg(global = true, long,value_parser = check_key_value_cli_arg, )]
     pub vars: Option<BTreeMap<String, YValue>>,
 
     /// Select nodes to run
@@ -1346,17 +1401,21 @@ pub struct CommonArgs {
     pub indirect_selection: Option<IndirectSelection>,
 
     /// Suppress all non-error logging to stdout. Does not affect {{ print() }} macro calls.
-    #[arg(global = true, long, env = "DBT_QUIET", short = 'q')]
+    #[arg(global = true, long, env = "DBT_QUIET", short = 'q', default_value = "false", action = ArgAction::SetTrue, value_parser = BoolishValueParser::new())]
     pub quiet: bool,
+    #[arg(global = true, long, default_value = "false", action = ArgAction::SetTrue, value_parser = BoolishValueParser::new(), hide = true)]
+    pub no_quiet: bool,
 
     /// The number of threads to use [Run with --threads 0 to use max_cpu [default: max_cpu]]
     // has no ENV_VAR
     #[arg(global = true, long)]
     pub threads: Option<usize>,
 
-    /// Overrides threads.
-    #[arg(global = true, long = "single-threaded", action = ArgAction::SetTrue, env = "DBT_SINGLE_THREADED", value_parser = BoolishValueParser::new())]
-    pub single_threaded: bool,
+    /// Force sequential task execution and sequential parser rendering. Does
+    /// not affect the adapter connection pool — use `--threads` for that.
+    /// Hidden because it is primarily a test/debug knob.
+    #[arg(global = true, long = "no-parallel", action = ArgAction::SetTrue, env = "DBT_NO_PARALLEL", value_parser = BoolishValueParser::new(), hide = true)]
+    pub no_parallel: bool,
 
     /// Execution backend to use
     #[arg(
@@ -1376,27 +1435,27 @@ pub struct CommonArgs {
     #[arg(long, default_value_t = 8000, value_name = "PORT")]
     pub port: u16,
 
-    /// Warn on error (TODO: need to wire this in)
+    /// Warn on error
     #[arg(global = true, long, default_value = "false", action = ArgAction::SetTrue, env = "DBT_WARN_ERROR",hide = true, value_parser = BoolishValueParser::new())]
     pub warn_error: bool,
-    #[arg(global = true, long, default_value = "false", action = ArgAction::SetTrue,  env = "DBT_WARN_ERROR",hide = true, value_parser = BoolishValueParser::new())]
+    #[arg(global = true, long, default_value = "false", action = ArgAction::SetTrue, hide = true, value_parser = BoolishValueParser::new())]
     pub no_warn_error: bool,
 
     /// Warning error options
-    #[arg(global = true, long,value_parser = check_var,
+    #[arg(global = true, long, value_parser = parse_warn_error_options,
         env = "DBT_WARN_ERROR_OPTIONS",
         hide = true )]
-    pub warn_error_options: Option<BTreeMap<String, YValue>>,
+    pub warn_error_options: Option<WarnErrorOptions>,
 
     // TODO: currently only used to avoid suppressing warnings/errors from dependencies
     /// Show all deprecations warnings/errors instead of one per package
     #[arg(global = true, long, default_value = "false", action = ArgAction::SetTrue, env = "DBT_SHOW_ALL_DEPRECATIONS",hide = true, value_parser = BoolishValueParser::new())]
     pub show_all_deprecations: bool,
 
-    /// Debug flag
-    #[arg(global = true, long, short = 'd', default_value = "false", action = ArgAction::SetTrue,  env = "DBT_DEBUG", value_parser = BoolishValueParser::new(),hide = true)]
+    /// Display debug logging during dbt execution. Useful for debugging and making bug reports.
+    #[arg(global = true, long, short = 'd', default_value = "false", action = ArgAction::SetTrue, env = "DBT_DEBUG", value_parser = BoolishValueParser::new())]
     pub debug: bool,
-    #[arg(global = true, long, default_value = "false", action = ArgAction::SetTrue,  env = "DBT_DEBUG", value_parser = BoolishValueParser::new(),hide = true)]
+    #[arg(global = true, long, default_value = "false", action = ArgAction::SetTrue, env = "DBT_DEBUG", value_parser = BoolishValueParser::new(), hide = true)]
     pub no_debug: bool,
 
     /// Introspect flag
@@ -1416,8 +1475,8 @@ pub struct CommonArgs {
     pub write_catalog: bool,
 
     /// Write a parquet index alongside JSON artifacts for fast querying
-    #[arg(global = true, long, default_value_t=false, action = ArgAction::SetTrue, env = "DBT_USE_INDEX", value_parser = BoolishValueParser::new())]
-    pub use_index: bool,
+    #[arg(global = true, long = "write-index", alias = "use-index", default_value_t=false, action = ArgAction::SetTrue, env = "DBT_USE_INDEX", value_parser = BoolishValueParser::new())]
+    pub write_index: bool,
 
     /// Directory for the index output (default: <target>/index/)
     #[arg(global = true, long, env = "DBT_INDEX_DIR")]
@@ -1522,11 +1581,11 @@ pub struct CommonArgs {
     pub log_format_file: Option<LogFormat>,
 
     /// Set minimum severity for console/log file; use --log-level-file to set log file severity separately.
-    #[arg(global = true, long, env = "DBT_LOG_LEVEL")]
-    pub log_level: Option<LevelFilter>,
+    #[arg(global = true, long, env = "DBT_LOG_LEVEL", ignore_case = true)]
+    pub log_level: Option<LogLevel>,
     /// Set minimum log file severity, overriding the default and --log-level setting.
-    #[arg(global = true, long, env = "DBT_LOG_LEVEL_FILE")]
-    pub log_level_file: Option<LevelFilter>,
+    #[arg(global = true, long, env = "DBT_LOG_LEVEL_FILE", ignore_case = true)]
+    pub log_level_file: Option<LogLevel>,
 
     #[arg(global = true, long, default_value_t = false, action = ArgAction::SetTrue, env = "DBT_MACRO_DEBUGGING", value_parser = BoolishValueParser::new(),hide = true)]
     pub macro_debugging: bool,
@@ -1724,10 +1783,6 @@ pub struct CommonArgs {
     #[arg(global = true, long, default_value = "false", action = ArgAction::SetTrue, hide = true)]
     pub legacy_compile: bool,
 
-    /// Flag for compile conformance
-    #[arg(global = true, long, default_value = "false", action = ArgAction::SetTrue, hide= true)]
-    pub check_conformance: bool,
-
     /// Flag for semantic manifest validation
     #[arg(global = true, env = "DBT_SKIP_SEMANTIC_MANIFEST_VALIDATION", long, default_value = "false", action = ArgAction::SetTrue, value_parser = BoolishValueParser::new(), hide= true)]
     pub skip_semantic_manifest_validation: bool,
@@ -1768,6 +1823,47 @@ pub struct CommonArgs {
         default_value_t
     )]
     pub internal_package_mode: InternalPackageMode,
+
+    /// When installing packages from Package Hub, use v2-compatible downloads if available
+    #[arg(global = true, long, default_value = "false", action = ArgAction::SetTrue, hide = false, env = "DBT_USE_V2_COMPATIBLE_PACKAGE_DOWNLOADS", value_parser = BoolishValueParser::new())]
+    pub use_v2_compatible_package_downloads: bool,
+
+    /// If set, the maximum number of bytes that the ANTLR parser is allowed to
+    /// allocate in its (per-dialect) global cache before it aborts with an
+    /// error. USE WITH CAUTION: as setting this too low may cause parsing to
+    /// fail on large SQL inputs. Default is 0 (unlimited). [env:
+    /// DBT_ANTLR_PARSER_CACHE_HARD_LIMIT_BYTES]
+    #[arg(
+        global = true,
+        long,
+        env = "DBT_ANTLR_PARSER_CACHE_HARD_LIMIT_BYTES",
+        hide = true
+    )]
+    pub antlr_parser_cache_hard_limit_bytes: Option<usize>,
+
+    /// If set, places a hard limit on the size of each Antlr AST -- if the
+    /// limit is exceeded, the parser will abort with an error. The purpose of
+    /// this limit is to prevent excessively large inputs (e.g.
+    /// machine-generated SQL) causing the whole process to be OOM-killed.
+    /// Default is 0 (unlimited). [env: DBT_ANTLR_ARENA_LIMIT_BYTES]
+    #[arg(global = true, long, env = "DBT_ANTLR_ARENA_LIMIT_BYTES", hide = true)]
+    pub antlr_arena_limit_bytes: Option<usize>,
+
+    /// If set, the number of bytes that the ANTLR parser is allowed to allocate
+    /// in its (per-dialect) global cache before it attempts to reset the whole
+    /// cache to free up memory. This setting is a "soft" limit that is checked
+    /// at the end of each parse (since cache resets can not be performed while
+    /// a parse is in progress), and if exceeded, triggers a cache reset. USE
+    /// WITH CAUTION: setting this too low may cause excessive cache resets and
+    /// degrade parsing performance on large SQL inputs. Default is 0
+    /// (unlimited). [env: DBT_ANTLR_CACHE_THRESHOLD_BYTES]
+    #[arg(
+        global = true,
+        long,
+        env = "DBT_ANTLR_CACHE_THRESHOLD_BYTES",
+        hide = true
+    )]
+    pub antlr_parser_cache_threshold_bytes: Option<usize>,
 }
 
 fn resolve_show_arg(show_arg: &[ShowOptions], quiet: bool) -> HashSet<ShowOptions> {
@@ -1810,6 +1906,28 @@ fn resolve_show_arg(show_arg: &[ShowOptions], quiet: bool) -> HashSet<ShowOption
 }
 
 impl CommonArgs {
+    pub fn get_warn_error(&self) -> Option<bool> {
+        if self.warn_error {
+            Some(true)
+        } else if self.no_warn_error {
+            Some(false)
+        } else {
+            std::env::var_os("DBT_WARN_ERROR").and_then(|value| {
+                BoolishValueParser::new()
+                    .parse_ref(&clap::Command::new("dbt-fusion"), None, OsStr::new(&value))
+                    .ok()
+            })
+        }
+    }
+
+    /// Resolve the effective value of `--quiet` / `--no-quiet`.
+    ///
+    /// `--no-quiet` always wins over `DBT_QUIET` or `--quiet`, allowing callers to
+    /// override an ambient `DBT_QUIET=true` from the command line.
+    pub fn get_quiet(&self) -> bool {
+        if self.no_quiet { false } else { self.quiet }
+    }
+
     pub fn to_eval_args(&self, arg: SystemArgs, in_dir: &Path, out_dir: &Path) -> EvalArgs {
         let select_option = self.select.clone().map(|selectors| {
             let mut expr = parse_model_specifiers(&selectors).unwrap();
@@ -1828,7 +1946,7 @@ impl CommonArgs {
             }
             expr
         });
-        let show = resolve_show_arg(self.show.as_slice(), self.quiet);
+        let show = resolve_show_arg(self.show.as_slice(), self.get_quiet());
         let replay = pick_replay_mode(self, arg.io.invocation_id, out_dir);
         let build_cache_mode = if self.use_build_cache {
             Some(BuildCacheMode::ReadWrite)
@@ -1864,6 +1982,7 @@ impl CommonArgs {
                 beta_use_query_cache: self.beta_use_query_cache,
                 host: self.host.clone(),
                 port: self.port,
+                use_v2_compatible_package_downloads: self.use_v2_compatible_package_downloads,
             },
             profiles_dir: self.profiles_dir.clone(),
             packages_install_path: self.packages_install_path.clone(),
@@ -1883,21 +2002,16 @@ impl CommonArgs {
                 Some(10)
             },
             from_main: false,
-            // note: we use
-            // - 0 for free threading,
-            // - 1 for single threading and
-            // - > 1 for fixed number of threads
-            num_threads: if self.single_threaded {
-                Some(1)
-            } else {
-                self.threads
-            },
+            // `threads` controls connection backpressure and rendering
+            // parallelism. Sequential task execution is requested via the
+            // separate `no_parallel` flag below.
+            num_threads: self.threads,
+            no_parallel: self.no_parallel,
             select: select_option,
             exclude: exclude_option,
             indirect_selection: self.indirect_selection,
             replay,
             interactive: false,
-            check_conformance: self.check_conformance,
             skip_semantic_manifest_validation: self.skip_semantic_manifest_validation,
             export_saved_queries: self.export_saved_queries,
             max_depth: 0,
@@ -1915,7 +2029,7 @@ impl CommonArgs {
             resource_types: vec![],
             exclude_resource_types: vec![],
             //flags
-            warn_error: self.warn_error,
+            warn_error: self.get_warn_error(),
             warn_error_options: self.warn_error_options.clone().unwrap_or_default(),
             version_check: if self.no_version_check {
                 false
@@ -1935,18 +2049,18 @@ impl CommonArgs {
             log_format_file: self.log_format_file,
             log_format: self.log_format,
             log_level_file: match (self.debug, self.log_level_file) {
-                (true, Some(LevelFilter::Trace)) => Some(LevelFilter::Trace),
-                (true, _) => Some(LevelFilter::Debug),
+                (true, Some(LogLevel::Trace)) => Some(LogLevel::Trace),
+                (true, _) => Some(LogLevel::Debug),
                 (false, _) => self.log_level_file,
             },
             log_level: match (self.debug, self.log_level) {
-                (true, Some(LevelFilter::Trace)) => Some(LevelFilter::Trace),
-                (true, _) => Some(LevelFilter::Debug),
+                (true, Some(LogLevel::Trace)) => Some(LogLevel::Trace),
+                (true, _) => Some(LogLevel::Debug),
                 (false, _) => self.log_level,
             },
             log_path: self.log_path.clone(),
             project_dir: self.project_dir.clone(),
-            quiet: self.quiet,
+            quiet: self.get_quiet(),
             send_anonymous_usage_stats: self.get_send_anonymous_usage_stats(),
             write_json: if self.no_write_json {
                 false
@@ -1954,13 +2068,17 @@ impl CommonArgs {
                 self.write_json
             },
             write_catalog: self.write_catalog,
-            use_index: self.use_index,
+            write_index: self.write_index,
             index_dir: self.index_dir.clone(),
             fail_fast: self.fail_fast,
             target_path: self.target_path.clone(),
             empty: self.empty,
             sample: None,
-            favor_state: self.favor_state,
+            favor_state: if self.no_favor_state {
+                false
+            } else {
+                self.favor_state
+            },
             refresh_sources: false,
             run_cache_mode: RunCacheMode::Noop,
             task_cache_url: self.task_cache_url.clone(),
@@ -1977,6 +2095,7 @@ impl CommonArgs {
             event_time_start: self.event_time_start.clone(),
             internal_package_mode: self.internal_package_mode.clone(),
             skip_post_hooks: false,
+            skip_creating_generic_tests: false,
         }
     }
 
@@ -1991,57 +2110,17 @@ impl CommonArgs {
     pub fn get_introspect(&self) -> bool {
         !self.no_introspect
     }
-}
 
-impl From<ComputeArg> for LocalExecutionBackendKind {
-    fn from(arg: ComputeArg) -> Self {
-        match arg {
-            ComputeArg::Remote => LocalExecutionBackendKind::Remote,
-            ComputeArg::Inline => LocalExecutionBackendKind::Inline,
-            ComputeArg::Sidecar => LocalExecutionBackendKind::Worker,
-            ComputeArg::Service => LocalExecutionBackendKind::Service,
+    /// Returns warn_error_options resolved purely from cli args (including `--warn-error`)
+    pub fn get_cli_warn_error_options(&self) -> WarnErrorOptions {
+        let mut options = self.warn_error_options.clone().unwrap_or_default();
+
+        if self.warn_error {
+            options.add_all_to_error();
         }
-    }
-}
 
-#[derive(
-    Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, ValueEnum, Display, Default,
-)]
-#[serde(rename_all = "kebab-case")]
-#[clap(rename_all = "kebab-case")]
-pub enum ComputeArg {
-    #[default]
-    /// Execute on the remote warehouse (Snowflake, BigQuery, etc.)
-    Remote,
-    /// Run computations in-process
-    Inline,
-    /// Run computations in a separate, ephemeral worker process
-    Sidecar,
-    /// Run via the remote compute service (persistent workers/cluster).
-    Service,
-}
-#[derive(
-    Debug,
-    Copy,
-    Clone,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Default,
-    ValueEnum,
-    Display,
-    Serialize,
-    Deserialize,
-)]
-#[serde(rename_all = "lowercase")]
-#[clap(rename_all = "lowercase")]
-pub enum WarnErrorOptions {
-    #[default]
-    All,
-    InvalidTests,
-    Deprecation,
-    VersionMismatch,
+        options
+    }
 }
 
 /// Maintain the system: update and uninstall
@@ -2087,6 +2166,25 @@ pub struct SystemUpdateArgs {
 
 #[derive(Parser, Debug, Clone, Serialize, Deserialize)]
 pub struct SystemUninstallArgs {}
+
+/// Generate shell completion scripts
+#[derive(Parser, Debug, Clone)]
+pub struct CompletionsArgs {
+    /// The shell to generate completions for
+    #[arg(value_enum)]
+    pub shell: Shell,
+    // Flattened Common args
+    #[clap(flatten)]
+    pub common_args: CommonArgs,
+}
+
+impl CompletionsArgs {
+    pub fn to_eval_args(&self, arg: SystemArgs, in_dir: &Path, out_dir: &Path) -> EvalArgs {
+        let mut eval_args = self.common_args.to_eval_args(arg, in_dir, out_dir);
+        eval_args.phase = Phases::Deps;
+        eval_args
+    }
+}
 
 #[derive(
     Debug, Copy, Clone, PartialEq, Eq, Default, Display, ValueEnum, Serialize, Deserialize,
@@ -2162,6 +2260,9 @@ impl InitArgs {
                 beta_use_query_cache: self.common_args.beta_use_query_cache,
                 host: self.common_args.host.clone(),
                 port: self.common_args.port,
+                use_v2_compatible_package_downloads: self
+                    .common_args
+                    .use_v2_compatible_package_downloads,
             },
             task_cache_url: "noop".to_string(),
             favor_state: self.common_args.favor_state,
@@ -2181,7 +2282,7 @@ pub fn from_main(cli: &Cli) -> SystemArgs {
         io: IoArgs {
             invocation_id: common_args.invocation_id.unwrap_or_else(Uuid::now_v7),
             otel_parent_span_id: common_args.parent_span_id,
-            show: resolve_show_arg(common_args.show.as_slice(), common_args.quiet),
+            show: resolve_show_arg(common_args.show.as_slice(), common_args.get_quiet()),
             is_compile: command == FsCommand::Compile,
             debug: common_args.debug,
             in_dir: PathBuf::new(),
@@ -2191,13 +2292,13 @@ pub fn from_main(cli: &Cli) -> SystemArgs {
             status_reporter: None,
             log_format: common_args.log_format,
             log_level: match (common_args.debug, common_args.log_level) {
-                (true, Some(LevelFilter::Trace)) => Some(LevelFilter::Trace),
-                (true, _) => Some(LevelFilter::Debug),
+                (true, Some(LogLevel::Trace)) => Some(LogLevel::Trace),
+                (true, _) => Some(LogLevel::Debug),
                 (false, _) => common_args.log_level,
             },
             log_level_file: match (common_args.debug, common_args.log_level_file) {
-                (true, Some(LevelFilter::Trace)) => Some(LevelFilter::Trace),
-                (true, _) => Some(LevelFilter::Debug),
+                (true, Some(LogLevel::Trace)) => Some(LogLevel::Trace),
+                (true, _) => Some(LogLevel::Debug),
                 (false, _) => common_args.log_level_file,
             },
             log_file_max_bytes: common_args.log_file_max_bytes,
@@ -2213,11 +2314,13 @@ pub fn from_main(cli: &Cli) -> SystemArgs {
             beta_use_query_cache: common_args.beta_use_query_cache,
             host: common_args.host,
             port: common_args.port,
+            use_v2_compatible_package_downloads: common_args.use_v2_compatible_package_downloads,
         },
         from_main: true,
 
         target: common_args.target,
         num_threads: common_args.threads,
+        no_parallel: common_args.no_parallel,
     }
 }
 
@@ -2230,7 +2333,7 @@ pub fn from_lib(cli: &Cli) -> SystemArgs {
         io: IoArgs {
             invocation_id: common_args.invocation_id.unwrap_or_else(Uuid::now_v7),
             otel_parent_span_id: common_args.parent_span_id,
-            show: resolve_show_arg(common_args.show.as_slice(), common_args.quiet),
+            show: resolve_show_arg(common_args.show.as_slice(), common_args.get_quiet()),
             is_compile: command == FsCommand::Compile,
             debug: common_args.debug,
             in_dir: PathBuf::new(),
@@ -2255,9 +2358,11 @@ pub fn from_lib(cli: &Cli) -> SystemArgs {
             beta_use_query_cache: common_args.beta_use_query_cache,
             host: common_args.host,
             port: common_args.port,
+            use_v2_compatible_package_downloads: common_args.use_v2_compatible_package_downloads,
         },
         from_main: false,
         target: common_args.target,
         num_threads: common_args.threads,
+        no_parallel: common_args.no_parallel,
     }
 }

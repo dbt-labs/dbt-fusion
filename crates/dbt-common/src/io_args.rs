@@ -1,6 +1,8 @@
+use crate::warn_error_options::WarnErrorOptions;
 use clap::ValueEnum;
+use dbt_adapter_core::AdapterType;
 use dbt_base::{HashMap, HashSet};
-use dbt_telemetry::{NodeType, ShowDataOutputFormat};
+use dbt_telemetry::NodeType;
 use dbt_yaml::{JsonSchema, Value};
 use pathdiff::diff_paths;
 use serde::{Deserialize, Serialize};
@@ -15,8 +17,6 @@ use std::{
 use strum::EnumIter;
 use strum_macros::Display;
 
-use log::LevelFilter;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum LocalExecutionBackendKind {
     #[default]
@@ -30,7 +30,45 @@ pub enum LocalExecutionBackendKind {
     Service,
 }
 
-use crate::adapter::AdapterType;
+#[derive(
+    Debug,
+    Copy,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    ValueEnum,
+    Display,
+    Default,
+    JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+#[clap(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
+pub enum ComputeArg {
+    #[default]
+    /// Execute on the remote warehouse (Snowflake, BigQuery, etc.)
+    Remote,
+    /// Run computations in-process
+    Inline,
+    /// Run computations in a separate, ephemeral worker process
+    Sidecar,
+    /// Run via the remote compute service (persistent workers/cluster).
+    Service,
+}
+
+impl From<ComputeArg> for LocalExecutionBackendKind {
+    fn from(arg: ComputeArg) -> Self {
+        match arg {
+            ComputeArg::Remote => LocalExecutionBackendKind::Remote,
+            ComputeArg::Inline => LocalExecutionBackendKind::Inline,
+            ComputeArg::Sidecar => LocalExecutionBackendKind::Worker,
+            ComputeArg::Service => LocalExecutionBackendKind::Service,
+        }
+    }
+}
+
 use crate::constants::DBT_TARGET_DIR_NAME;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
@@ -57,13 +95,57 @@ impl Display for InternalPackageMode {
 use crate::{
     constants::{DBT_GENERIC_TESTS_DIR_NAME, DBT_SNAPSHOTS_DIR_NAME},
     io_utils::StatusReporter,
-    logging::LogFormat,
     node_selector::{
         IndirectSelection, SelectExpression, SelectionCriteria, conjoin_expression,
         parse_model_specifiers,
     },
     tracing::invocation::with_invocation_mut,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, ValueEnum, Serialize, Copy, Default)]
+pub enum LogFormat {
+    Text,
+    Json,
+    #[default]
+    Default,
+    Otel,
+}
+
+impl Display for LogFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text => write!(f, "text"),
+            Self::Json => write!(f, "json"),
+            Self::Default => write!(f, "default"),
+            Self::Otel => write!(f, "otel"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, ValueEnum, Serialize, Copy, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Off,
+    Error,
+    Warn,
+    #[default]
+    Info,
+    Debug,
+    Trace,
+}
+
+impl Display for LogLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Off => write!(f, "OFF"),
+            Self::Error => write!(f, "ERROR"),
+            Self::Warn => write!(f, "WARN"),
+            Self::Info => write!(f, "INFO"),
+            Self::Debug => write!(f, "DEBUG"),
+            Self::Trace => write!(f, "TRACE"),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FsCommand {
@@ -91,6 +173,8 @@ pub enum FsCommand {
     Man,
     Debug,
     Retry,
+    Docs,
+    Completions,
     /// All other commands provided by private cli's
     Extension(&'static str),
 }
@@ -118,6 +202,8 @@ impl FsCommand {
             FsCommand::Man => "man",
             FsCommand::Debug => "debug",
             FsCommand::Retry => "retry",
+            FsCommand::Docs => "docs",
+            FsCommand::Completions => "completions",
             FsCommand::Extension(s) => s,
         }
     }
@@ -142,13 +228,16 @@ pub struct IoArgs {
     pub otel_parquet_file_name: Option<String>,
     pub export_to_otlp: bool,
     pub log_format: LogFormat,
-    pub log_level: Option<LevelFilter>,
-    pub log_level_file: Option<LevelFilter>,
+    pub log_level: Option<LogLevel>,
+    pub log_level_file: Option<LogLevel>,
     pub log_file_max_bytes: u64,
     pub debug: bool,
 
     // Flags influencing error/warning behavior
     pub show_all_deprecations: bool,
+
+    // Flag for deps to use Fusion-compatible downloads from Package Hub
+    pub use_v2_compatible_package_downloads: bool,
 
     /// Optional status reporter for reporting status messages during execution
     pub status_reporter: Option<Arc<dyn StatusReporter>>,
@@ -316,6 +405,10 @@ pub struct SystemArgs {
     pub io: IoArgs,
     pub from_main: bool,
     pub num_threads: Option<usize>,
+    /// Request sequential task execution, decoupled from `num_threads`.
+    /// Drives the binary entrypoint's single-worker tokio runtime and the
+    /// task-scheduler's sequential visitor.
+    pub no_parallel: bool,
     pub target: Option<String>,
 }
 
@@ -351,8 +444,13 @@ pub struct EvalArgs {
     pub limit: Option<usize>,
     /// called as bin or as library
     pub from_main: bool,
-    /// The number of threads to use
+    /// The number of threads to use. Drives the adapter connection backpressure
+    /// high-water-mark and parser rendering parallelism. Not used to force
+    /// sequential task execution — use `no_parallel` for that.
     pub num_threads: Option<usize>,
+    /// Force sequential task execution and sequential parser rendering without
+    /// constraining the connection pool. Set by `--no-parallel`.
+    pub no_parallel: bool,
     /// yaml selector
     pub selector: Option<String>,
     /// Select nodes to operate on
@@ -374,9 +472,9 @@ pub struct EvalArgs {
     /// Set logging format
     pub log_format: LogFormat,
     /// Set minimum log file severity, overriding the default and --log-level setting.
-    pub log_level_file: Option<LevelFilter>,
+    pub log_level_file: Option<LogLevel>,
     /// Set minimum severity for console/log file
-    pub log_level: Option<LevelFilter>,
+    pub log_level: Option<LogLevel>,
     /// Set 'log-path' for the current run, overriding 'DBT_LOG_PATH'.
     pub log_path: Option<PathBuf>,
     /// The output directory for all produced assets
@@ -398,7 +496,6 @@ pub struct EvalArgs {
     pub replay: Option<ReplayMode>,
     pub static_analysis: Option<StaticAnalysisKind>,
     pub interactive: bool,
-    pub check_conformance: bool,
     pub skip_semantic_manifest_validation: bool,
     pub export_saved_queries: bool,
     pub task_cache_url: String,
@@ -413,8 +510,8 @@ pub struct EvalArgs {
     pub connection: bool,
     pub macro_name: String,
     pub macro_args: BTreeMap<String, Value>,
-    pub warn_error: bool,
-    pub warn_error_options: BTreeMap<String, Value>,
+    pub warn_error: Option<bool>,
+    pub warn_error_options: WarnErrorOptions,
     pub version_check: bool,
     pub introspect: bool,
     pub defer: bool,
@@ -443,9 +540,11 @@ pub struct EvalArgs {
     /// Whether to skip running post hook operations.
     pub skip_post_hooks: bool,
     /// Write parquet index alongside JSON artifacts
-    pub use_index: bool,
+    pub write_index: bool,
     /// Directory for the parquet index output (default: <target>/index/)
     pub index_dir: Option<PathBuf>,
+    /// Whether to skip creating generic tests
+    pub skip_creating_generic_tests: bool,
 }
 impl fmt::Debug for EvalArgs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -490,7 +589,7 @@ impl EvalArgsBuilder {
         self,
         target: String,
         threads: Option<usize>,
-        adapter_type: Option<AdapterType>,
+        adapter_type: AdapterType,
     ) -> Self {
         self.with_target(target)
             .with_threads(threads)
@@ -523,13 +622,8 @@ impl EvalArgsBuilder {
 
     /// Disable the static analysis for a specific adapter if the relevant dialect is unsupported.
     /// Otherwise, it's a noop
-    pub fn disable_static_analysis_if_not_supported(
-        mut self,
-        adapter_type: Option<AdapterType>,
-    ) -> Self {
-        let supported = adapter_type
-            .map(crate::adapter::adapter_type_supports_static_analysis)
-            .unwrap_or(false);
+    pub fn disable_static_analysis_if_not_supported(mut self, adapter_type: AdapterType) -> Self {
+        let supported = dbt_adapter_core::adapter_type_supports_static_analysis(adapter_type);
 
         // FIXME(serramatutu): there is a bug in Postgres' frontend parser that makes
         // all our recordings invalid if enable it, but we can't disable it otherwise
@@ -537,7 +631,7 @@ impl EvalArgsBuilder {
         // following for Postgres:
         // dbt1058: Column 'id' in node 'model.test.a' has a type mismatch. Overriding
         // 'int' with 'integer'.
-        let skip = adapter_type == Some(AdapterType::Postgres);
+        let skip = adapter_type == AdapterType::Postgres;
 
         if !supported && !skip {
             #[cfg(debug_assertions)]
@@ -565,6 +659,16 @@ impl EvalArgsBuilder {
 
     pub fn with_use_fqtn(mut self, use_fqtn: bool) -> Self {
         self.args.use_fqtn = use_fqtn;
+        self
+    }
+
+    pub fn with_warn_error_options(
+        mut self,
+        warn_error: bool,
+        warn_error_options: WarnErrorOptions,
+    ) -> Self {
+        self.args.warn_error = Some(warn_error);
+        self.args.warn_error_options = warn_error_options;
         self
     }
 
@@ -709,6 +813,11 @@ pub enum JsonSchemaTypes {
     Schema(bool),
     Project(bool),
     Profile(bool),
+    #[serde(rename = "dbt_cloud")]
+    #[strum(serialize = "dbt_cloud")]
+    DbtCloud(bool),
+    Packages(bool),
+    Dependencies(bool),
     Telemetry(bool),
 }
 
@@ -719,6 +828,9 @@ impl JsonSchemaTypes {
             | JsonSchemaTypes::Schema(is_pre)
             | JsonSchemaTypes::Project(is_pre)
             | JsonSchemaTypes::Profile(is_pre)
+            | JsonSchemaTypes::DbtCloud(is_pre)
+            | JsonSchemaTypes::Packages(is_pre)
+            | JsonSchemaTypes::Dependencies(is_pre)
             | JsonSchemaTypes::Telemetry(is_pre) => *is_pre,
         }
     }
@@ -728,7 +840,10 @@ impl JsonSchemaTypes {
             JsonSchemaTypes::Selector(_)
             | JsonSchemaTypes::Schema(_)
             | JsonSchemaTypes::Project(_)
-            | JsonSchemaTypes::Profile(_) => schemars::r#gen::SchemaSettings::default(),
+            | JsonSchemaTypes::Profile(_)
+            | JsonSchemaTypes::DbtCloud(_)
+            | JsonSchemaTypes::Packages(_)
+            | JsonSchemaTypes::Dependencies(_) => schemars::r#gen::SchemaSettings::default(),
             JsonSchemaTypes::Telemetry(_) => schemars::r#gen::SchemaSettings::draft07(),
         }
     }
@@ -741,6 +856,10 @@ pub enum ClapSchemaTypes {
     Schema,
     Project,
     Profile,
+    #[value(name = "dbt_cloud")]
+    DbtCloud,
+    Packages,
+    Dependencies,
     Telemetry,
 }
 
@@ -751,6 +870,9 @@ impl ClapSchemaTypes {
             ClapSchemaTypes::Schema => JsonSchemaTypes::Schema(is_pre),
             ClapSchemaTypes::Project => JsonSchemaTypes::Project(is_pre),
             ClapSchemaTypes::Profile => JsonSchemaTypes::Profile(is_pre),
+            ClapSchemaTypes::DbtCloud => JsonSchemaTypes::DbtCloud(is_pre),
+            ClapSchemaTypes::Packages => JsonSchemaTypes::Packages(is_pre),
+            ClapSchemaTypes::Dependencies => JsonSchemaTypes::Dependencies(is_pre),
             ClapSchemaTypes::Telemetry => JsonSchemaTypes::Telemetry(is_pre),
         }
     }
@@ -786,22 +908,6 @@ pub enum DisplayFormat {
     Name,
     /// Output nodes as file paths (node.original_file_path)
     Path,
-}
-
-impl TryFrom<DisplayFormat> for ShowDataOutputFormat {
-    type Error = ();
-
-    fn try_from(format: DisplayFormat) -> Result<Self, Self::Error> {
-        match format {
-            DisplayFormat::Json => Ok(Self::Json),
-            DisplayFormat::Table => Ok(Self::Text),
-            DisplayFormat::Csv => Ok(Self::Csv),
-            DisplayFormat::Tsv => Ok(Self::Tsv),
-            DisplayFormat::NdJson => Ok(Self::Ndjson),
-            DisplayFormat::Yml => Ok(Self::Yml),
-            _ => Err(()),
-        }
-    }
 }
 
 /// Output format for the list command. This is a subset of DisplayFormat
@@ -1185,7 +1291,14 @@ impl Display for PersistTarget {
 }
 // ----------------------------------------------------------------------------------------------
 pub fn check_selector(selector: &str) -> Result<String, String> {
-    // Convert the single selector to a vector with one element
+    // Parity with dbt-core: a delimiter-only value (e.g. "," or ",,") must not
+    // hard-error at CLI-parse time. Accept it here; parse_model_specifiers
+    // handles the assembled list — either skipping the token when real selectors
+    // are present, or synthesizing a literal no-match criterion when every
+    // token is delimiter-only (runtime then emits dbt1092 + dbt1601).
+    if selector.chars().all(|c| c == ',' || c.is_whitespace()) {
+        return Ok(selector.to_string());
+    }
     let query = vec![selector.to_string()];
     match parse_model_specifiers(&query) {
         Ok(_) => Ok(selector.to_string()),
@@ -1212,29 +1325,21 @@ pub fn check_target(filename: &str) -> Result<String, String> {
     }
 }
 
-pub fn check_var(vars: &str) -> Result<BTreeMap<String, Value>, String> {
+pub fn check_key_value_cli_arg(value: &str) -> Result<BTreeMap<String, Value>, String> {
     // Handle empty input
-    if vars.trim().is_empty() {
-        return Err("Empty vars input is not valid".into());
+    if value.trim().is_empty() {
+        return Err("Empty input is not valid".into());
     }
 
     // Strip outer quotes if present
-    let vars = vars.trim().trim_matches('\'');
+    let vars = value.trim().trim_matches('\'');
 
-    // Check if the input is already wrapped in curly braces
-    let yaml_str = if vars.trim().starts_with('{') {
-        vars.to_string()
-    } else {
-        // Handle single key-value pair separated by a colon
-        if vars.trim().matches(':').count() != 1 {
-            return Err(format!(
-                "Invalid key-value pair: '{vars}'. Expected format: 'key: value'."
-            ));
-        }
-        vars.to_string()
-    };
+    // Try parsing as YAML first. Both brace-wrapped flow style ({ key: value, ... })
+    // and bare block style (key1: value1\nkey2: value2) are valid YAML mappings.
+    // We rely on the YAML parser itself to reject non-mapping inputs (bare strings,
+    // lists, malformed syntax).
+    let yaml_str = vars.to_string();
 
-    // Try parsing as YAML first
     match dbt_yaml::from_str::<BTreeMap<String, Value>>(&yaml_str) {
         Ok(btree) => {
             // Disallow the '{key:value}' format for flow-style YAML syntax
@@ -1313,7 +1418,7 @@ mod tests {
 
     #[test]
     fn test_check_single_var() {
-        let result = check_var("key: value").unwrap();
+        let result = check_key_value_cli_arg("key: value").unwrap();
         let expected_result =
             BTreeMap::from([("key".to_string(), dbt_yaml::from_str("value").unwrap())]);
 
@@ -1322,7 +1427,7 @@ mod tests {
 
     #[test]
     fn test_check_single_bracket_var() {
-        let result = check_var("{key: value}").unwrap();
+        let result = check_key_value_cli_arg("{key: value}").unwrap();
         let expected_result =
             BTreeMap::from([("key".to_string(), dbt_yaml::from_str("value").unwrap())]);
 
@@ -1331,7 +1436,7 @@ mod tests {
 
     #[test]
     fn test_check_multiple_bracket_var() {
-        let result = check_var("{key: value, key2: value2}").unwrap();
+        let result = check_key_value_cli_arg("{key: value, key2: value2}").unwrap();
         let expected_result = BTreeMap::from([
             ("key".to_string(), dbt_yaml::from_str("value").unwrap()),
             ("key2".to_string(), dbt_yaml::from_str("value2").unwrap()),
@@ -1343,15 +1448,50 @@ mod tests {
     #[test]
     fn test_check_var_invalid() {
         let invalid_vars = vec![
-            "key",                    // Missing colon
-            "key:value",              // Missing space after colon
-            "key: value:with:colons", // Value with colons
-            "{key:value}",            // Flow-style YAML syntax without space after colon
+            "key",         // Missing colon — YAML returns scalar string, not dict
+            "key:value",   // No space after colon — YAML returns scalar string, not dict
+            "{key:value}", // Flow-style without space — key-contains-colon guard catches it
         ];
 
         for var in invalid_vars {
-            assert!(check_var(var).is_err(), "Should have failed: {var}");
+            assert!(
+                check_key_value_cli_arg(var).is_err(),
+                "Should have failed: {var}"
+            );
         }
+    }
+
+    #[test]
+    fn test_check_var_block_yaml_multikey() {
+        // The primary bug fix for issue #402: multi-key block YAML without surrounding braces
+        let result = check_key_value_cli_arg("key1: value1\nkey2: value2").unwrap();
+        let expected = BTreeMap::from([
+            ("key1".to_string(), dbt_yaml::from_str("value1").unwrap()),
+            ("key2".to_string(), dbt_yaml::from_str("value2").unwrap()),
+        ]);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_check_var_block_yaml_three_keys() {
+        let result = check_key_value_cli_arg("a: 1\nb: 2\nc: 3").unwrap();
+        assert_eq!(result.len(), 3);
+        assert!(result.contains_key("a"));
+        assert!(result.contains_key("b"));
+        assert!(result.contains_key("c"));
+    }
+
+    #[test]
+    fn test_check_var_value_with_colons() {
+        // Values containing colons are valid YAML (and valid in dbt-core / PyYAML).
+        // The colon-count pre-check that was removed in the fix for issue #402
+        // incorrectly rejected these.
+        let result = check_key_value_cli_arg("key: value:with:colons").unwrap();
+        let expected = BTreeMap::from([(
+            "key".to_string(),
+            dbt_yaml::from_str("value:with:colons").unwrap(),
+        )]);
+        assert_eq!(result, expected);
     }
 
     #[test]
@@ -1391,5 +1531,27 @@ mod tests {
                 )
             );
         }
+    }
+
+    // Parity with dbt-core on delimiter-only --select values: the CLI validator
+    // must not hard-error on a per-value token like "," or ",,". Downstream
+    // selection resolves this to zero matches + dbt1601 "Nothing to do".
+    #[test]
+    fn test_check_selector_allows_comma_only() {
+        let result = check_selector(",,");
+        assert!(
+            result.is_ok(),
+            "check_selector(\",,\") must be Ok to match dbt-core behavior, got: {result:?}"
+        );
+    }
+
+    // Regression pin: normal selectors must keep passing the validator unchanged.
+    #[test]
+    fn test_check_selector_preserves_normal_selector() {
+        let result = check_selector("tag:foo");
+        assert!(
+            result.is_ok(),
+            "check_selector(\"tag:foo\") must remain Ok, got: {result:?}"
+        );
     }
 }

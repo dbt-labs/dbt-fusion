@@ -1,6 +1,7 @@
 use crate::schemas::common::ClusterConfig;
 use crate::schemas::serde::OmissibleGrantConfig;
 use crate::schemas::serde::QueryTag;
+use dbt_common::io_args::ComputeArg;
 use dbt_common::io_args::StaticAnalysisKind;
 use dbt_common::serde_utils::Omissible;
 use dbt_yaml::DbtSchema;
@@ -26,7 +27,7 @@ use crate::schemas::common::PartitionConfig;
 use crate::schemas::common::PersistDocsConfig;
 use crate::schemas::common::SyncConfig;
 use crate::schemas::common::{Access, DbtQuoting, Schedule};
-use crate::schemas::common::{DocsConfig, OnConfigurationChange};
+use crate::schemas::common::{DocsConfig, OnConfigurationChange, OnError};
 use crate::schemas::common::{Hooks, OnSchemaChange, hooks_equal};
 use crate::schemas::manifest::GrantAccessToTarget;
 use crate::schemas::project::configs::common::default_column_types;
@@ -40,7 +41,7 @@ use crate::schemas::project::configs::common::{
     WarehouseSpecificNodeConfig, access_eq, docs_eq, grants_eq, meta_eq, omissible_option_eq,
     same_warehouse_config,
 };
-use crate::schemas::project::dbt_project::DefaultTo;
+use crate::schemas::project::dbt_project::ResolvableConfig;
 use crate::schemas::project::dbt_project::TypedRecursiveConfig;
 use crate::schemas::properties::ModelFreshness;
 use crate::schemas::serde::StringOrArrayOfStrings;
@@ -48,6 +49,7 @@ use crate::schemas::serde::{
     IndexesConfig, PrimaryKeyConfig, bool_or_string_bool, default_type, f64_or_string_f64,
     u64_or_string_u64,
 };
+use dbt_proc_macros::Resolvable;
 use dbt_yaml::ShouldBe;
 
 // NOTE: No #[skip_serializing_none] - we handle None serialization in serialize_with_mode
@@ -83,6 +85,18 @@ pub struct ProjectModelConfig {
     pub base_location_root: Option<String>,
     #[serde(rename = "+base_location_subpath")]
     pub base_location_subpath: Option<String>,
+    #[serde(
+        default,
+        rename = "+iceberg_version",
+        deserialize_with = "u64_or_string_u64"
+    )]
+    pub iceberg_version: Option<u64>,
+    #[serde(
+        default,
+        rename = "+change_tracking",
+        deserialize_with = "bool_or_string_bool"
+    )]
+    pub change_tracking: Option<bool>,
     #[serde(rename = "+batch_size")]
     pub batch_size: Option<DbtBatchSize>,
     #[serde(rename = "+begin")]
@@ -101,6 +115,8 @@ pub struct ProjectModelConfig {
     pub clustered_by: Option<StringOrArrayOfStrings>,
     #[serde(rename = "+column_types")]
     pub column_types: Option<BTreeMap<Spanned<String>, String>>,
+    #[serde(rename = "+compute")]
+    pub compute: Option<ComputeArg>,
     #[serde(
         default,
         rename = "+concurrent_batches",
@@ -209,6 +225,14 @@ pub struct ProjectModelConfig {
     pub incremental_strategy: Option<DbtIncrementalStrategy>,
     #[serde(rename = "+initialize")]
     pub initialize: Option<String>,
+    #[serde(rename = "+scheduler")]
+    pub scheduler: Option<String>,
+    #[serde(
+        default,
+        rename = "+data_retention_time_in_days",
+        deserialize_with = "u64_or_string_u64"
+    )]
+    pub data_retention_time_in_days: Option<u64>,
     #[serde(rename = "+kms_key_name")]
     pub kms_key_name: Option<String>,
     #[serde(rename = "+labels")]
@@ -225,6 +249,12 @@ pub struct ProjectModelConfig {
     pub location: Option<String>,
     #[serde(rename = "+location_root")]
     pub location_root: Option<String>,
+    #[serde(
+        default,
+        rename = "+use_uniform",
+        deserialize_with = "bool_or_string_bool"
+    )]
+    pub use_uniform: Option<bool>,
     #[serde(rename = "+lookback")]
     pub lookback: Option<i32>,
     #[serde(rename = "+matched_condition")]
@@ -233,6 +263,12 @@ pub struct ProjectModelConfig {
     pub materialized: Option<DbtMaterialization>,
     #[serde(rename = "+max_staleness")]
     pub max_staleness: Option<String>,
+    #[serde(
+        default,
+        rename = "+max_data_extension_time_in_days",
+        deserialize_with = "u64_or_string_u64"
+    )]
+    pub max_data_extension_time_in_days: Option<u64>,
     #[serde(rename = "+jar_file_uri")]
     pub jar_file_uri: Option<String>,
     #[serde(rename = "+timeout")]
@@ -255,6 +291,8 @@ pub struct ProjectModelConfig {
     pub enable_list_inference: Option<bool>,
     #[serde(rename = "+intermediate_format")]
     pub intermediate_format: Option<String>,
+    #[serde(rename = "+storage_uri")]
+    pub storage_uri: Option<String>,
     #[serde(rename = "+merge_exclude_columns")]
     pub merge_exclude_columns: Option<StringOrArrayOfStrings>,
     #[serde(rename = "+merge_update_columns")]
@@ -266,7 +304,7 @@ pub struct ProjectModelConfig {
     )]
     pub merge_with_schema_evolution: Option<bool>,
     #[serde(rename = "+meta")]
-    pub meta: Verbatim<Option<IndexMap<String, YmlValue>>>,
+    pub meta: Option<IndexMap<String, YmlValue>>,
     #[serde(rename = "+not_matched_by_source_action")]
     pub not_matched_by_source_action: Option<String>,
     #[serde(rename = "+not_matched_by_source_condition")]
@@ -279,6 +317,8 @@ pub struct ProjectModelConfig {
     pub target_alias: Option<String>,
     #[serde(rename = "+on_configuration_change")]
     pub on_configuration_change: Option<OnConfigurationChange>,
+    #[serde(rename = "+on_error")]
+    pub on_error: Option<OnError>,
     #[serde(rename = "+on_schema_change")]
     pub on_schema_change: Option<OnSchemaChange>,
     #[serde(rename = "+packages")]
@@ -324,6 +364,8 @@ pub struct ProjectModelConfig {
     pub table_tag: Option<String>,
     #[serde(rename = "+row_access_policy")]
     pub row_access_policy: Option<String>,
+    #[serde(rename = "+storage_serialization_policy")]
+    pub storage_serialization_policy: Option<String>,
     #[serde(rename = "+quoting")]
     pub quoting: Option<DbtQuoting>,
     #[serde(rename = "+refresh_mode")]
@@ -362,8 +404,12 @@ pub struct ProjectModelConfig {
     pub sort: Option<StringOrArrayOfStrings>,
     #[serde(rename = "+sort_type")]
     pub sort_type: Option<String>,
+    #[serde(rename = "+snowflake_initialization_warehouse")]
+    pub snowflake_initialization_warehouse: Option<String>,
     #[serde(rename = "+snowflake_warehouse")]
     pub snowflake_warehouse: Option<String>,
+    #[serde(rename = "+immutable_where")]
+    pub immutable_where: Option<String>,
     #[serde(rename = "+sql_header")]
     pub sql_header: Option<String>,
     #[serde(rename = "+static_analysis")]
@@ -374,6 +420,8 @@ pub struct ProjectModelConfig {
     pub tags: Omissible<StringOrArrayOfStrings>,
     #[serde(rename = "+target_lag")]
     pub target_lag: Option<String>,
+    #[serde(rename = "+target_file_size")]
+    pub target_file_size: Option<String>,
     #[serde(rename = "+tblproperties")]
     pub tblproperties: Option<BTreeMap<String, YmlValue>>,
     #[serde(rename = "+tmp_relation_type")]
@@ -439,8 +487,9 @@ impl TypedRecursiveConfig for ProjectModelConfig {
     }
 }
 
-#[derive(Deserialize, Serialize, Debug, Default, Clone, PartialEq, DbtSchema)]
+#[derive(Resolvable, Deserialize, Serialize, Debug, Default, Clone, PartialEq, DbtSchema)]
 pub struct ModelConfig {
+    #[resolved(promote, method = get_enabled_with_default)]
     #[serde(default, deserialize_with = "bool_or_string_bool")]
     pub enabled: Option<bool>,
     pub alias: Option<String>,
@@ -467,6 +516,7 @@ pub struct ModelConfig {
     )]
     pub meta: Option<IndexMap<String, YmlValue>>,
     pub group: Option<String>,
+    #[resolved(promote, default = DbtMaterialization::View)]
     pub materialized: Option<DbtMaterialization>,
     pub incremental_strategy: Option<DbtIncrementalStrategy>,
     pub incremental_predicates: Option<Vec<String>>,
@@ -476,13 +526,16 @@ pub struct ModelConfig {
     pub persist_docs: Option<PersistDocsConfig>,
     pub post_hook: Verbatim<Option<Hooks>>,
     pub pre_hook: Verbatim<Option<Hooks>>,
+    #[resolved(promote, expect = "apply_package_defaults guarantees quoting is set")]
     pub quoting: Option<DbtQuoting>,
     pub column_types: Option<BTreeMap<Spanned<String>, String>>,
+    pub compute: Option<ComputeArg>,
     #[serde(default, deserialize_with = "bool_or_string_bool")]
     pub full_refresh: Option<bool>,
     pub unique_key: Option<DbtUniqueKey>,
     pub on_schema_change: Option<OnSchemaChange>,
     pub on_configuration_change: Option<OnConfigurationChange>,
+    pub on_error: Option<OnError>,
     pub grants: OmissibleGrantConfig,
     pub packages: Option<StringOrArrayOfStrings>,
     pub python_version: Option<String>,
@@ -500,6 +553,7 @@ pub struct ModelConfig {
     pub merge_exclude_columns: Option<StringOrArrayOfStrings>,
     pub access: Option<Access>,
     pub table_format: Option<String>,
+    #[resolved(promote, expect = "static_analysis set by apply_resolve_defaults")]
     pub static_analysis: Option<Spanned<StaticAnalysisKind>>,
     pub freshness: Option<ModelFreshness>,
     pub sql_header: Option<String>,
@@ -558,6 +612,7 @@ impl From<ProjectModelConfig> for ModelConfig {
             user_folder_for_python: config.user_folder_for_python,
             catalog_name: config.catalog_name.clone(),
             column_types: config.column_types,
+            compute: config.compute,
             concurrent_batches: config.concurrent_batches,
             contract: config.contract,
             database: config.database,
@@ -575,8 +630,9 @@ impl From<ProjectModelConfig> for ModelConfig {
             materialized: config.materialized,
             merge_exclude_columns: config.merge_exclude_columns,
             merge_update_columns: config.merge_update_columns,
-            meta: (*config.meta).clone(),
+            meta: config.meta,
             on_configuration_change: config.on_configuration_change,
+            on_error: config.on_error,
             on_schema_change: config.on_schema_change,
             packages: config.packages,
             python_version: config.python_version,
@@ -602,10 +658,18 @@ impl From<ProjectModelConfig> for ModelConfig {
                 external_volume: config.external_volume,
                 base_location_root: config.base_location_root,
                 base_location_subpath: config.base_location_subpath,
+                change_tracking: config.change_tracking,
+                data_retention_time_in_days: config.data_retention_time_in_days,
+                max_data_extension_time_in_days: config.max_data_extension_time_in_days,
+                storage_serialization_policy: config.storage_serialization_policy,
+                target_file_size: config.target_file_size,
                 target_lag: config.target_lag,
+                snowflake_initialization_warehouse: config.snowflake_initialization_warehouse,
                 snowflake_warehouse: config.snowflake_warehouse,
+                immutable_where: config.immutable_where,
                 refresh_mode: config.refresh_mode,
                 initialize: config.initialize,
+                scheduler: config.scheduler,
                 tmp_relation_type: config.tmp_relation_type,
                 query_tag: config.query_tag,
                 table_tag: config.table_tag,
@@ -614,6 +678,7 @@ impl From<ProjectModelConfig> for ModelConfig {
                 copy_grants: config.copy_grants,
                 secure: config.secure,
                 transient: config.transient,
+                iceberg_version: config.iceberg_version,
 
                 partition_by: config.partition_by,
                 cluster_by: config.cluster_by,
@@ -637,10 +702,12 @@ impl From<ProjectModelConfig> for ModelConfig {
                 notebook_template_id: config.notebook_template_id,
                 enable_list_inference: config.enable_list_inference,
                 intermediate_format: config.intermediate_format,
+                storage_uri: config.storage_uri,
 
                 file_format: config.file_format,
                 catalog_name: config.catalog_name,
                 location_root: config.location_root,
+                use_uniform: config.use_uniform,
                 tblproperties: config.tblproperties,
                 include_full_name_in_path: config.include_full_name_in_path,
                 liquid_clustered_by: config.liquid_clustered_by,
@@ -698,6 +765,7 @@ impl From<ModelConfig> for ProjectModelConfig {
             bind: config.__warehouse_specific_config__.bind,
             catalog_name: config.catalog_name,
             column_types: config.column_types,
+            compute: config.compute,
             concurrent_batches: config.concurrent_batches,
             contract: config.contract,
             database: config.database,
@@ -716,7 +784,7 @@ impl From<ModelConfig> for ProjectModelConfig {
             materialized: config.materialized,
             merge_exclude_columns: config.merge_exclude_columns,
             merge_update_columns: config.merge_update_columns,
-            meta: Verbatim::from(config.meta),
+            meta: config.meta,
             submission_method: config.submission_method.clone(),
             job_cluster_config: config.job_cluster_config.clone(),
             python_job_config: config.python_job_config.clone(),
@@ -727,6 +795,7 @@ impl From<ModelConfig> for ProjectModelConfig {
             additional_libs: config.additional_libs.clone(),
             user_folder_for_python: config.user_folder_for_python,
             on_configuration_change: config.on_configuration_change,
+            on_error: config.on_error,
             on_schema_change: config.on_schema_change,
             packages: config.packages,
             python_version: config.python_version,
@@ -750,10 +819,20 @@ impl From<ModelConfig> for ProjectModelConfig {
             external_volume: config.__warehouse_specific_config__.external_volume,
             base_location_root: config.__warehouse_specific_config__.base_location_root,
             base_location_subpath: config.__warehouse_specific_config__.base_location_subpath,
+            iceberg_version: config.__warehouse_specific_config__.iceberg_version,
+            change_tracking: config.__warehouse_specific_config__.change_tracking,
+            data_retention_time_in_days: config
+                .__warehouse_specific_config__
+                .data_retention_time_in_days,
             target_lag: config.__warehouse_specific_config__.target_lag,
+            snowflake_initialization_warehouse: config
+                .__warehouse_specific_config__
+                .snowflake_initialization_warehouse,
             snowflake_warehouse: config.__warehouse_specific_config__.snowflake_warehouse,
+            immutable_where: config.__warehouse_specific_config__.immutable_where,
             refresh_mode: config.__warehouse_specific_config__.refresh_mode,
             initialize: config.__warehouse_specific_config__.initialize,
+            scheduler: config.__warehouse_specific_config__.scheduler,
             tmp_relation_type: config.__warehouse_specific_config__.tmp_relation_type,
             query_tag: config.__warehouse_specific_config__.query_tag,
             table_tag: config.__warehouse_specific_config__.table_tag,
@@ -766,6 +845,7 @@ impl From<ModelConfig> for ProjectModelConfig {
             notebook_template_id: config.__warehouse_specific_config__.notebook_template_id,
             enable_list_inference: config.__warehouse_specific_config__.enable_list_inference,
             intermediate_format: config.__warehouse_specific_config__.intermediate_format,
+            storage_uri: config.__warehouse_specific_config__.storage_uri,
             copy_grants: config.__warehouse_specific_config__.copy_grants,
             secure: config.__warehouse_specific_config__.secure,
             partition_by: config.__warehouse_specific_config__.partition_by,
@@ -791,8 +871,12 @@ impl From<ModelConfig> for ProjectModelConfig {
                 .__warehouse_specific_config__
                 .refresh_interval_minutes,
             max_staleness: config.__warehouse_specific_config__.max_staleness,
+            max_data_extension_time_in_days: config
+                .__warehouse_specific_config__
+                .max_data_extension_time_in_days,
             file_format: config.__warehouse_specific_config__.file_format,
             location_root: config.__warehouse_specific_config__.location_root,
+            use_uniform: config.__warehouse_specific_config__.use_uniform,
             tblproperties: config.__warehouse_specific_config__.tblproperties,
             include_full_name_in_path: config
                 .__warehouse_specific_config__
@@ -823,6 +907,10 @@ impl From<ModelConfig> for ProjectModelConfig {
             target_alias: config.__warehouse_specific_config__.target_alias,
             skip_matched_step: config.__warehouse_specific_config__.skip_matched_step,
             skip_not_matched_step: config.__warehouse_specific_config__.skip_not_matched_step,
+            storage_serialization_policy: config
+                .__warehouse_specific_config__
+                .storage_serialization_policy,
+            target_file_size: config.__warehouse_specific_config__.target_file_size,
             as_columnstore: config.__warehouse_specific_config__.as_columnstore,
             table_type: config.__warehouse_specific_config__.table_type,
             indexes: config.__warehouse_specific_config__.indexes,
@@ -835,7 +923,7 @@ impl From<ModelConfig> for ProjectModelConfig {
     }
 }
 
-impl DefaultTo<ModelConfig> for ModelConfig {
+impl ResolvableConfig<ModelConfig> for ModelConfig {
     /// Default this config to the parent config
     ///
     /// This method ensures that:
@@ -862,6 +950,7 @@ impl DefaultTo<ModelConfig> for ModelConfig {
             schema,
             database,
             catalog_name,
+            compute,
             group,
             materialized,
             incremental_strategy,
@@ -875,6 +964,7 @@ impl DefaultTo<ModelConfig> for ModelConfig {
             unique_key,
             on_schema_change,
             on_configuration_change,
+            on_error,
             grants,
             packages,
             python_version,
@@ -944,6 +1034,7 @@ impl DefaultTo<ModelConfig> for ModelConfig {
                 enabled,
                 alias,
                 catalog_name,
+                compute,
                 group,
                 materialized,
                 incremental_strategy,
@@ -956,6 +1047,7 @@ impl DefaultTo<ModelConfig> for ModelConfig {
                 unique_key,
                 on_schema_change,
                 on_configuration_change,
+                on_error,
                 python_version,
                 use_anonymous_sproc,
                 secrets,
@@ -992,38 +1084,38 @@ impl DefaultTo<ModelConfig> for ModelConfig {
         );
     }
 
-    fn get_enabled(&self) -> Option<bool> {
-        self.enabled
+    type Resolved = ResolvedModelConfig;
+    type PackageDefaults = DbtQuoting;
+    type ResolveDefaults = (StaticAnalysisKind, Option<SyncConfig>);
+
+    fn get_enabled_with_default(&self) -> bool {
+        self.enabled.unwrap_or(true)
     }
 
-    fn is_incremental(&self) -> bool {
-        self.incremental_strategy.is_some()
+    fn disable(&mut self) {
+        self.enabled = Some(false);
     }
 
-    fn database(&self) -> Option<String> {
-        self.database.clone().into_inner().unwrap_or(None)
+    fn apply_package_defaults(&mut self, quoting: DbtQuoting) {
+        if self.quoting.is_none() {
+            self.quoting = Some(quoting);
+        }
     }
 
-    fn schema(&self) -> Option<String> {
-        self.schema.clone().into_inner().unwrap_or(None)
+    fn apply_resolve_defaults(
+        &mut self,
+        (static_analysis, sync): (StaticAnalysisKind, Option<SyncConfig>),
+    ) {
+        if self.static_analysis.is_none() {
+            self.static_analysis = Some(Spanned::new(static_analysis));
+        }
+        if self.sync.is_none() {
+            self.sync = sync;
+        }
     }
 
-    fn alias(&self) -> Option<String> {
-        self.alias.clone()
-    }
-
-    fn get_pre_hook(&self) -> Option<&Hooks> {
-        (*self.pre_hook).as_ref()
-    }
-
-    fn get_post_hook(&self) -> Option<&Hooks> {
-        (*self.post_hook).as_ref()
-    }
-
-    fn get_static_analysis(&self) -> Option<StaticAnalysisKind> {
-        self.static_analysis
-            .as_ref()
-            .map(|s| s.clone().into_inner())
+    fn finalize(self) -> ResolvedModelConfig {
+        self.finalize_resolved()
     }
 }
 
@@ -1087,6 +1179,7 @@ impl ModelConfig {
             &self.on_configuration_change,
             &other.on_configuration_change,
         ); // Custom comparison for on_configuration_change
+        let on_error_eq = self.on_error == other.on_error;
         let grants_eq_result = grants_eq(&self.grants, &other.grants); // Custom comparison for grants
         let packages_eq = packages_and_imports_eq(&self.packages, &other.packages); // Custom comparison for packages
         let imports_eq = packages_and_imports_eq(&self.imports, &other.imports); // Custom comparison for imports (same function as packages)
@@ -1126,6 +1219,7 @@ impl ModelConfig {
             && unique_key_eq
             && on_schema_change_eq_result
             && on_configuration_change_eq_result
+            && on_error_eq
             && grants_eq_result
             && packages_eq
             && imports_eq
@@ -1261,6 +1355,14 @@ impl ModelConfig {
                         Some((
                             format!("{:?}", &self.on_configuration_change),
                             format!("{:?}", &other.on_configuration_change),
+                        )),
+                    ),
+                    (
+                        "on_error",
+                        on_error_eq,
+                        Some((
+                            format!("{:?}", &self.on_error),
+                            format!("{:?}", &other.on_error),
                         )),
                     ),
                     (
@@ -1537,7 +1639,7 @@ fn on_configuration_change_eq(
 
 // Helper function to compare materialized fields, treating None as View (the default)
 fn materialized_eq(a: &Option<DbtMaterialization>, b: &Option<DbtMaterialization>) -> bool {
-    let default_materialized = DbtMaterialization::View;
+    let default_materialized = ModelConfig::default_materialized();
 
     match (a, b) {
         (None, None) => true,
@@ -1553,7 +1655,7 @@ mod tests {
 
     #[test]
     fn test_packages_append() {
-        use crate::schemas::project::dbt_project::DefaultTo;
+        use crate::schemas::project::dbt_project::ResolvableConfig;
         use crate::schemas::serde::StringOrArrayOfStrings;
 
         let parent = ModelConfig {
@@ -1586,7 +1688,7 @@ mod tests {
 
     #[test]
     fn test_packages_append_with_string_variant() {
-        use crate::schemas::project::dbt_project::DefaultTo;
+        use crate::schemas::project::dbt_project::ResolvableConfig;
         use crate::schemas::serde::StringOrArrayOfStrings;
 
         let parent = ModelConfig {
@@ -1615,7 +1717,7 @@ mod tests {
 
     #[test]
     fn test_packages_none_child_inherits_parent() {
-        use crate::schemas::project::dbt_project::DefaultTo;
+        use crate::schemas::project::dbt_project::ResolvableConfig;
         use crate::schemas::serde::StringOrArrayOfStrings;
 
         let parent = ModelConfig {
@@ -1643,7 +1745,7 @@ mod tests {
 
     #[test]
     fn test_packages_no_deduplication() {
-        use crate::schemas::project::dbt_project::DefaultTo;
+        use crate::schemas::project::dbt_project::ResolvableConfig;
         use crate::schemas::serde::StringOrArrayOfStrings;
 
         let parent = ModelConfig {

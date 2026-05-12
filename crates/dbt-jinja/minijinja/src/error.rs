@@ -153,6 +153,8 @@ pub enum ErrorKind {
     TypeError,
     /// Execution error
     Execution,
+    /// Exit with status without producing an extra dbt error log.
+    ExitWithStatus,
 }
 
 impl ErrorKind {
@@ -203,6 +205,7 @@ impl ErrorKind {
             ErrorKind::DisabledModel => "model is disabled",
             ErrorKind::TypeError => "type error",
             ErrorKind::Execution => "execution error",
+            ErrorKind::ExitWithStatus => "exit with status",
         }
     }
 }
@@ -329,6 +332,11 @@ impl Error {
     /// Returns if the stack is empty.
     pub fn is_stack_empty(&self) -> bool {
         self.repr.stack.is_empty()
+    }
+
+    /// Returns all stack frames, innermost first.
+    pub fn stack(&self) -> &[ErrorStackItem] {
+        self.repr.stack.as_slice()
     }
 
     /// Returns the line number where the error occurred.

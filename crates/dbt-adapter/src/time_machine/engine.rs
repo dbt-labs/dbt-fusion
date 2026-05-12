@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use minijinja::Value;
 
-use dbt_common::adapter::AdapterType;
+use dbt_adapter_core::AdapterType;
 use dbt_schemas::schemas::common::ResolvedQuoting;
 
 use crate::time_machine::AdapterCallEvent;
@@ -170,7 +170,7 @@ impl EventReplayer {
 
     /// Get the result for an adapter call.
     ///
-    /// Pure/Cache calls are filtered at the bridge_adapter level and should never reach here.
+    /// Pure/Cache calls are filtered at the adapter level and should never reach here.
     pub fn get_result(
         &self,
         node_id: &str,
@@ -186,7 +186,27 @@ impl EventReplayer {
                 self.get_result_strict(node_id, method, &serialized_args, call_category)?
             }
             ReplayMode::Semantic => {
-                self.get_result_semantic(node_id, method, &serialized_args, call_category)?
+                match self.get_result_semantic(node_id, method, &serialized_args, call_category) {
+                    Ok(event) => event,
+                    Err(_)
+                        if !call_category.is_mutating()
+                            && self
+                                .validation_engine
+                                .is_known_nondeterministic_node(node_id) =>
+                    {
+                        // For read calls on nodes whose name marks them as known
+                        // non-deterministic (e.g. elementary via `.elementary.` in `node_id`),
+                        // return null when no matching event exists. This is about node
+                        // identity, not about non-deterministic ordering of replay events.
+                        tracing::warn!(
+                            node_id,
+                            method,
+                            "Replay: returning null for unmatched read on non-deterministic node"
+                        );
+                        return Ok(Value::from(()));
+                    }
+                    Err(err) => return Err(err),
+                }
             }
         };
 

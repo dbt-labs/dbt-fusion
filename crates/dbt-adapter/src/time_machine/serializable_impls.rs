@@ -133,9 +133,9 @@ impl TimeMachineSerializable for RelationObject {
         let quote_policy = self.quote_policy();
         serde_json::json!({
             "adapter_type": self.adapter_type(),
-            "database": self.database().as_str().unwrap_or_default(),
-            "schema": self.schema().as_str().unwrap_or_default(),
-            "identifier": self.identifier().as_str(),
+            "database": self.database().unwrap_or_default(),
+            "schema": self.schema().unwrap_or_default(),
+            "identifier": self.identifier(),
             "is_table": self.is_table(),
             "is_view": self.is_view(),
             "is_materialized_view": self.is_materialized_view(),
@@ -155,7 +155,7 @@ impl TimeMachineSerializable for RelationObject {
         json: &serde_json::Value,
         ctx: &ReplayContext,
     ) -> Option<minijinja::Value> {
-        use dbt_common::adapter::AdapterType;
+        use dbt_adapter_core::AdapterType;
         use dbt_schemas::schemas::common::ResolvedQuoting;
         use dbt_schemas::schemas::relations::{
             DEFAULT_RESOLVED_QUOTING, SNOWFLAKE_RESOLVED_QUOTING,
@@ -305,7 +305,7 @@ mod tests {
     use crate::relation::RelationObject;
 
     use super::*;
-    use dbt_common::adapter::AdapterType;
+    use dbt_adapter_core::AdapterType;
     use dbt_schemas::schemas::common::ResolvedQuoting;
 
     fn ctx() -> ReplayContext {

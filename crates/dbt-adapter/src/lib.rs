@@ -2,11 +2,10 @@
 
 #![allow(clippy::let_and_return)]
 
-#[macro_use]
-mod macros;
+mod macro_exec;
+mod value;
 
-pub mod base_adapter;
-pub mod bridge_adapter;
+pub mod adapter;
 pub mod cache;
 pub mod catalog_relation;
 pub mod column;
@@ -14,22 +13,19 @@ pub mod column;
 pub mod connection;
 pub mod engine;
 pub mod errors;
-pub mod factory;
 pub mod format_ident;
 pub mod formatter;
-pub mod funcs;
 pub mod information_schema;
 pub mod load_catalogs;
 pub mod metadata;
 pub mod need_quotes;
 pub(crate) mod python;
 pub mod query_cache;
-pub mod query_comment;
 pub mod query_ctx;
-pub mod record_and_replay;
 pub mod relation;
 pub mod render_constraint;
 pub mod response;
+pub(crate) mod seed;
 pub mod snapshots;
 /// Tokenizing and fuzzy diffing of SQL strings
 pub mod sql;
@@ -39,9 +35,6 @@ pub mod stmt_splitter;
 
 /// Cross-Version Record/Replay System
 pub mod time_machine;
-pub mod typed_adapter;
-#[allow(dead_code)]
-mod use_warehouse;
 
 // Re-export types and modules that were moved to dbt_auth
 pub mod auth {
@@ -67,10 +60,13 @@ pub use engine::AdapterEngine;
 /// Functions exposed to jinja
 pub mod load_store;
 
-pub use base_adapter::{AdapterType, AdapterTyping, BaseAdapter};
-pub use bridge_adapter::BridgeAdapter;
+pub use adapter::Adapter;
+pub use adapter::AdapterImpl;
 pub use column::{Column, ColumnBuilder};
+pub use dbt_adapter_core::AdapterType;
 pub use errors::AdapterResult;
-pub use funcs::{execute_macro_with_package, execute_macro_wrapper_with_package};
+pub use macro_exec::{
+    convert_macro_result_to_record_batch, execute_macro_with_package,
+    execute_macro_wrapper_with_package,
+};
 pub use response::AdapterResponse;
-pub use typed_adapter::ConcreteAdapter;

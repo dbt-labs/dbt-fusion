@@ -40,6 +40,7 @@ pub const DBT_MANIFEST_JSON: &str = "manifest.json";
 pub const DBT_MANIFEST_INFO: &str = "manifest.info";
 pub const DBT_SEMANTIC_MANIFEST_JSON: &str = "semantic_manifest.json";
 pub const DBT_CATALOG_JSON: &str = "catalog.json";
+pub const DBT_SOURCES_JSON: &str = "sources.json";
 pub const DBT_COMPILED_DIR_NAME: &str = "compiled";
 pub const DBT_METADATA_DIR_NAME: &str = "metadata";
 pub const DBT_EPHEMERAL_DIR_NAME: &str = "ephemeral";
@@ -51,6 +52,7 @@ pub const DBT_LOG_DIR_NAME: &str = "logs";
 pub const DBT_STATE_DIR_NAME: &str = "state";
 pub const DBT_DEFAULT_LOG_FILE_NAME: &str = "dbt.log";
 pub const DBT_DEFAULT_QUERY_LOG_FILE_NAME: &str = "query_log.sql";
+pub const DBT_DEFAULT_OTEL_PARQUET_FILE_NAME: &str = "otel.parquet";
 pub const DBT_DEFAULT_LOG_FILE_MAX_BYTES: u64 = 10 * 1024 * 1024;
 pub const DBT_DEFAULT_LOG_FILE_BACKUP_COUNT: usize = 5;
 pub const DBT_ROOT_PACKAGE_VAR_PREFIX: &str = "__root__";
@@ -79,7 +81,6 @@ pub const PANIC: &str = "panic:";
 // ----------------------------------------------------------------------------------------------
 // actions in order of appearance
 
-pub const ANALYZING: &str = " Analyzing";
 pub const LOADING: &str = "   Loading";
 pub const FETCHING: &str = "  Fetching";
 pub const INSTALLING: &str = "Installing";
@@ -89,7 +90,6 @@ pub const PARSING: &str = "   Parsing";
 pub const SCHEDULING: &str = "Scheduling";
 //
 pub const RENDERING: &str = " Rendering";
-pub const HYDRATING: &str = "  Hydrating";
 pub const RUNNING: &str = "   Running";
 pub const COMPARING: &str = "   Comparing";
 pub const CLONING: &str = "   Cloning";
@@ -103,7 +103,6 @@ pub const RENDERED: &str = "  Rendered";
 
 // debug command
 pub const VALIDATING: &str = "Validating";
-pub const DEBUGGED: &str = "  Debugged";
 
 // other
 pub const NOOP: &str = "noop";
@@ -119,3 +118,62 @@ pub const COLUMNS_WR: &str = "   Writing";
 pub const COLUMN_LINEAGE_WR: &str = "   Writing";
 
 pub const DBT_CDN_URL: &str = "https://public.cdn.getdbt.com/fs";
+
+// ----------------------------------------------------------------------------------------------
+// dbt custom environment variables
+
+/// Prefix for dbt custom environment variables that appear in metadata and structured logs.
+pub const DBT_ENV_CUSTOM_ENV_PREFIX: &str = "DBT_ENV_CUSTOM_ENV_";
+
+/// Collects all `DBT_ENV_CUSTOM_ENV_*` environment variables into a map,
+/// stripping the prefix from keys. Matches dbt-core behavior where
+/// e.g. `DBT_ENV_CUSTOM_ENV_FOO=bar` becomes `{"FOO": "bar"}`.
+pub fn collect_dbt_custom_envs() -> std::collections::BTreeMap<String, String> {
+    std::env::vars()
+        .filter_map(|(k, v)| {
+            k.strip_prefix(DBT_ENV_CUSTOM_ENV_PREFIX)
+                .map(|s| (s.to_string(), v))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_collect_dbt_custom_envs() {
+        const VAR_NAME: &str = "DBT_ENV_CUSTOM_ENV_TEST_KEY";
+        const VAR_VALUE: &str = "test_value";
+
+        // Save any pre-existing value, then set our test var
+        let prev = std::env::var(VAR_NAME).ok();
+        unsafe {
+            #[allow(clippy::disallowed_methods)]
+            std::env::set_var(VAR_NAME, VAR_VALUE);
+        }
+
+        let envs = collect_dbt_custom_envs();
+
+        // Cleanup before assertions so we don't leak on failure
+        unsafe {
+            #[allow(clippy::disallowed_methods)]
+            if let Some(v) = &prev {
+                std::env::set_var(VAR_NAME, v);
+            } else {
+                std::env::remove_var(VAR_NAME);
+            }
+        }
+
+        // The prefix should be stripped: key is "TEST_KEY", not the full var name
+        assert_eq!(
+            envs.get("TEST_KEY").map(String::as_str),
+            Some(VAR_VALUE),
+            "Expected collect_dbt_custom_envs to contain TEST_KEY={VAR_VALUE}"
+        );
+        assert!(
+            !envs.contains_key(VAR_NAME),
+            "Full prefixed key should not appear. The prefix should be stripped"
+        );
+    }
+}

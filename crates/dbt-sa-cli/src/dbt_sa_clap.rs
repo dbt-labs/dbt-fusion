@@ -3,11 +3,10 @@ use console::Style;
 use dbt_common::cli_parser_trait::CliParserTrait;
 use dbt_common::collections::HashSet;
 use dbt_common::constants::{DBT_DEFAULT_LOG_FILE_MAX_BYTES, DBT_PROJECT_YML, DBT_TARGET_DIR_NAME};
+use dbt_common::io_args::LogFormat;
 use dbt_common::io_utils::determine_project_dir;
-use dbt_common::logging::LogFormat;
 use dbt_common::{ErrorCode, FsResult, fs_err, stdfs};
 use dbt_yaml::Value;
-use log::LevelFilter;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::sync::LazyLock;
@@ -17,14 +16,15 @@ use std::{
 };
 use strum::{Display, IntoEnumIterator};
 
+use dbt_common::io_args::LogLevel;
 use dbt_common::io_args::{
     ClapResourceType, ClapSchemaTypes, DisplayFormat, EvalArgs, FsCommand, IoArgs, Phases,
-    ShowOptions, SystemArgs, check_selector, check_var,
+    ShowOptions, SystemArgs, check_key_value_cli_arg, check_selector,
 };
 use dbt_common::row_limit::RowLimit;
 
+use clap::ValueEnum;
 use clap::{Parser, Subcommand};
-use clap::{ValueEnum, arg};
 
 use dbt_common::node_selector::{IndirectSelection, parse_model_specifiers};
 
@@ -59,31 +59,35 @@ impl CliParserTrait for CliParser {
     type CliType = Cli;
 
     /// Parse from `std::env::args_os()`, [exit][Error::exit] on error.
-    fn parse(&self) -> Cli {
-        Cli::parse()
+    fn parse(&self) -> Box<Cli> {
+        let cli = Cli::parse();
+        Box::new(cli)
     }
 
     /// Parse from `std::env::args_os()`, return Err on error.
-    fn try_parse(&self) -> Result<Cli, clap::Error> {
-        Cli::try_parse()
+    fn try_parse(&self) -> Result<Box<Cli>, clap::Error> {
+        let cli = Cli::try_parse()?;
+        Ok(Box::new(cli))
     }
 
     /// Parse from iterator, return Err on error.
-    fn try_parse_from<I, T>(&self, itr: I) -> Result<Cli, clap::Error>
+    fn try_parse_from<I, T>(&self, itr: I) -> Result<Box<Cli>, clap::Error>
     where
         I: IntoIterator<Item = T>,
         T: Into<OsString> + Clone,
     {
-        Cli::try_parse_from(itr)
+        let cli = Cli::try_parse_from(itr)?;
+        Ok(Box::new(cli))
     }
 
     /// Parse from iterator, return Err on error.
-    fn parse_from<I, T>(&self, itr: I) -> Self::CliType
+    fn parse_from<I, T>(&self, itr: I) -> Box<Self::CliType>
     where
         I: IntoIterator<Item = T>,
         T: Into<OsString> + Clone,
     {
-        Cli::parse_from(itr)
+        let cli = Cli::parse_from(itr);
+        Box::new(cli)
     }
 
     fn fail_fast_flag(&self, _cli: &Self::CliType) -> bool {
@@ -270,7 +274,7 @@ pub struct CommonArgs {
 
     /// Supply var bindings in yml format e.g. '{key: value}' or as separate key: value pairs
     // has no ENV_VAR
-    #[arg(global = true, long,value_parser = check_var, )]
+    #[arg(global = true, long,value_parser = check_key_value_cli_arg, )]
     pub vars: Option<BTreeMap<String, Value>>,
 
     /// Select nodes to run
@@ -292,17 +296,21 @@ pub struct CommonArgs {
     pub indirect_selection: Option<IndirectSelection>,
 
     /// Suppress all non-error logging to stdout. Does not affect {{ print() }} macro calls.
-    #[arg(global = true, long, env = "DBT_QUIET", short = 'q')]
+    #[arg(global = true, long, env = "DBT_QUIET", short = 'q', default_value = "false", action = ArgAction::SetTrue, value_parser = BoolishValueParser::new())]
     pub quiet: bool,
+    #[arg(global = true, long, default_value = "false", action = ArgAction::SetTrue, value_parser = BoolishValueParser::new(), hide = true)]
+    pub no_quiet: bool,
 
     /// The number of threads to use [Run with --threads 0 to use max_cpu [default: max_cpu]]
     // has no ENV_VAR, but can be set in profiles.yml
     #[arg(global = true, long)]
     pub threads: Option<usize>,
 
-    /// Overrides threads.
-    #[arg(global = true, long = "single-threaded", action = ArgAction::SetTrue, env = "DBT_SINGLE_THREADED", value_parser = BoolishValueParser::new())]
-    pub single_threaded: bool,
+    /// Force sequential task execution and sequential parser rendering. Does
+    /// not affect the adapter connection pool — use `--threads` for that.
+    /// Hidden because it is primarily a test/debug knob.
+    #[arg(global = true, long = "no-parallel", action = ArgAction::SetTrue, env = "DBT_NO_PARALLEL", value_parser = BoolishValueParser::new(), hide = true)]
+    pub no_parallel: bool,
 
     /// Write JSON artifacts to disk [env: DBT_WRITE_JSON=]. Use --no-write-json to suppress writing JSON artifacts.
     #[arg(global = true, long,  default_value_t=true,  action = ArgAction::SetTrue, env = "DBT_WRITE_JSON", value_parser = BoolishValueParser::new())]
@@ -336,11 +344,11 @@ pub struct CommonArgs {
     pub log_format_file: Option<LogFormat>,
 
     /// Set minimum severity for console/log file; use --log-level-file to set log file severity separately.
-    #[arg(global = true, long, env = "DBT_LOG_LEVEL")]
-    pub log_level: Option<LevelFilter>,
+    #[arg(global = true, long, env = "DBT_LOG_LEVEL", ignore_case = true)]
+    pub log_level: Option<LogLevel>,
     /// Set minimum log file severity, overriding the default and --log-level setting.
-    #[arg(global = true, long, env = "DBT_LOG_LEVEL_FILE")]
-    pub log_level_file: Option<LevelFilter>,
+    #[arg(global = true, long, env = "DBT_LOG_LEVEL_FILE", ignore_case = true)]
+    pub log_level_file: Option<LogLevel>,
     /// Configure the max file size in bytes for a single dbt.log file, before rolling over. 0 means no limit.
     #[arg(global = true, long, default_value_t = DBT_DEFAULT_LOG_FILE_MAX_BYTES, env = "DBT_LOG_FILE_MAX_BYTES", hide = true)]
     pub log_file_max_bytes: u64,
@@ -367,6 +375,10 @@ pub struct CommonArgs {
     /// Show produced artifacts [default: 'progress']
     #[clap(long, num_args(0..), help = "Show produced artifacts [default: 'progress']")]
     pub show: Vec<ShowOptions>,
+
+    /// When installing packages from Package Hub, use v2-compatible downloads if available
+    #[arg(global = true, long, default_value = "false", action = ArgAction::SetTrue, env = "DBT_USE_V2_COMPATIBLE_PACKAGE_DOWNLOADS", hide = false, value_parser = BoolishValueParser::new())]
+    pub use_v2_compatible_package_downloads: bool,
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -556,6 +568,9 @@ impl InitArgs {
                 host: arg.io.host,
                 port: arg.io.port,
                 db_root: arg.io.db_root.clone(),
+                use_v2_compatible_package_downloads: self
+                    .common_args
+                    .use_v2_compatible_package_downloads,
             },
             send_anonymous_usage_stats: self.common_args.get_send_anonymous_usage_stats(),
             ..Default::default()
@@ -586,6 +601,13 @@ pub fn check_target(filename: &str) -> Result<String, String> {
 }
 
 impl CommonArgs {
+    /// Resolve the effective value of `--quiet` / `--no-quiet`.
+    ///
+    /// `--no-quiet` always wins, allowing callers to override an ambient `DBT_QUIET=true`.
+    pub fn get_quiet(&self) -> bool {
+        if self.no_quiet { false } else { self.quiet }
+    }
+
     pub fn to_eval_args(&self, arg: SystemArgs, in_dir: &Path, out_dir: &Path) -> EvalArgs {
         let mut show = if self.show.contains(&ShowOptions::All) {
             ShowOptions::iter().collect()
@@ -617,7 +639,7 @@ impl CommonArgs {
                 .collect()
         };
         // quiet overrules all show options..
-        if self.quiet {
+        if self.get_quiet() {
             show = HashSet::default();
         }
 
@@ -650,6 +672,7 @@ impl CommonArgs {
                 host: arg.io.host,
                 port: arg.io.port,
                 db_root: arg.io.db_root.clone(),
+                use_v2_compatible_package_downloads: arg.io.use_v2_compatible_package_downloads,
             },
             profiles_dir: self.profiles_dir.clone(),
             packages_install_path: self.packages_install_path.clone(),
@@ -660,11 +683,8 @@ impl CommonArgs {
             format: DEFAULT_FORMAT,
             limit: Some(10),
             debug: self.debug,
-            num_threads: if self.single_threaded {
-                Some(1)
-            } else {
-                self.threads
-            },
+            num_threads: self.threads,
+            no_parallel: self.no_parallel,
             select: self
                 .select
                 .clone()
@@ -678,18 +698,18 @@ impl CommonArgs {
             log_format_file: self.log_format_file,
             log_format: self.log_format,
             log_level_file: match (self.debug, self.log_level_file) {
-                (true, Some(LevelFilter::Trace)) => Some(LevelFilter::Trace),
-                (true, _) => Some(LevelFilter::Debug),
+                (true, Some(LogLevel::Trace)) => Some(LogLevel::Trace),
+                (true, _) => Some(LogLevel::Debug),
                 (false, _) => self.log_level_file,
             },
             log_level: match (self.debug, self.log_level) {
-                (true, Some(LevelFilter::Trace)) => Some(LevelFilter::Trace),
-                (true, _) => Some(LevelFilter::Debug),
+                (true, Some(LogLevel::Trace)) => Some(LogLevel::Trace),
+                (true, _) => Some(LogLevel::Debug),
                 (false, _) => self.log_level,
             },
             log_path: self.log_path.clone(),
             project_dir: self.project_dir.clone(),
-            quiet: self.quiet,
+            quiet: self.get_quiet(),
             write_json: if self.no_write_json {
                 false
             } else {
@@ -727,13 +747,13 @@ pub fn from_main(cli: &Cli) -> SystemArgs {
             status_reporter: None,
             log_format: cli.common_args().log_format,
             log_level: match (cli.common_args().debug, cli.common_args().log_level) {
-                (true, Some(LevelFilter::Trace)) => Some(LevelFilter::Trace),
-                (true, _) => Some(LevelFilter::Debug),
+                (true, Some(LogLevel::Trace)) => Some(LogLevel::Trace),
+                (true, _) => Some(LogLevel::Debug),
                 (false, _) => cli.common_args().log_level,
             },
             log_level_file: match (cli.common_args().debug, cli.common_args().log_level_file) {
-                (true, Some(LevelFilter::Trace)) => Some(LevelFilter::Trace),
-                (true, _) => Some(LevelFilter::Debug),
+                (true, Some(LogLevel::Trace)) => Some(LogLevel::Trace),
+                (true, _) => Some(LogLevel::Debug),
                 (false, _) => cli.common_args().log_level_file,
             },
             log_file_max_bytes: cli.common_args().log_file_max_bytes,
@@ -750,11 +770,15 @@ pub fn from_main(cli: &Cli) -> SystemArgs {
             host: "localhost".to_string(),
             port: 8000,
             db_root: cli.common_args().db_root,
+            use_v2_compatible_package_downloads: cli
+                .common_args()
+                .use_v2_compatible_package_downloads,
         },
         from_main: true,
 
         target: cli.common_args().target,
         num_threads: cli.common_args().threads,
+        no_parallel: cli.common_args().no_parallel,
     }
 }
 
@@ -790,9 +814,13 @@ pub fn from_lib(cli: &Cli) -> SystemArgs {
             host: "localhost".to_string(),
             port: 8000,
             db_root: cli.common_args().db_root,
+            use_v2_compatible_package_downloads: cli
+                .common_args()
+                .use_v2_compatible_package_downloads,
         },
         from_main: false,
         target: cli.common_args().target,
         num_threads: cli.common_args().threads,
+        no_parallel: cli.common_args().no_parallel,
     }
 }

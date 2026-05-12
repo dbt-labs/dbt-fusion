@@ -15,6 +15,13 @@
         {{ dynamic_table_execute_build_sql(build_sql, existing_relation, target_relation) }}
     {% endif %}
 
+    {%- set dynamic_table = target_relation.from_config(config.model) -%}
+    {%- if dynamic_table.scheduler | string | upper == 'DISABLE' -%}
+        {% call statement(name="refresh") %}
+            {{ snowflake__refresh_dynamic_table(target_relation) }}
+        {% endcall %}
+    {%- endif -%}
+
     {{ run_hooks(post_hooks) }}
 
     {% do unset_query_tag(query_tag) %}
@@ -91,7 +98,8 @@
 
 
 {% macro snowflake__get_dynamic_table_configuration_changes(existing_relation, new_config) -%}
-    {% set _existing_dynamic_table = snowflake__describe_dynamic_table(existing_relation) %}
+    {%- set _include_transient = new_config.get("transient") is not none -%}
+    {% set _existing_dynamic_table = adapter.describe_dynamic_table(existing_relation, _include_transient) %}
     {% set _configuration_changes = existing_relation.dynamic_table_config_changeset(_existing_dynamic_table, new_config.model) %}
     {% do return(_configuration_changes) %}
 {%- endmacro %}

@@ -7,10 +7,9 @@ use std::{
 
 use chrono::{NaiveDate, Utc};
 use dbt_adapter::relation::{RelationObject, create_relation, create_relation_from_node};
+use dbt_adapter_core::AdapterType;
 use dbt_common::{
-    CodeLocationWithFile, ErrorCode, FsResult,
-    adapter::AdapterType,
-    err, fs_err,
+    CodeLocationWithFile, ErrorCode, FsError, FsResult, err, fs_err,
     io_args::IoArgs,
     tracing::emit::{
         emit_error_log_from_fs_error, emit_warn_log_from_fs_error, emit_warn_log_message,
@@ -32,6 +31,22 @@ use minijinja::{Value as MinijinjaValue, value::function_object::FunctionObject}
 
 type RefRecord = (String, MinijinjaValue, ModelStatus, Option<MinijinjaValue>);
 
+fn downgraded_node_dependency_warning(
+    error: &FsError,
+    location: CodeLocationWithFile,
+) -> Option<(FsError, bool)> {
+    let has_disabled_dependency = match error.code {
+        ErrorCode::DisabledDependency => true,
+        ErrorCode::DependencyNotFound => false,
+        _ => return None,
+    };
+
+    Some((
+        FsError::new(ErrorCode::NodeNotFoundOrDisabled, error.to_string()).with_location(location),
+        has_disabled_dependency,
+    ))
+}
+
 /// A wrapper around refs and sources with methods to get and insert refs and sources.
 ///
 /// Carries optional `sample_plan` which, when present, remaps source relations to the
@@ -43,7 +58,9 @@ pub struct NodeResolver {
     pub refs: BTreeMap<String, Vec<RefRecord>>,
     /// Map of (package_name.source_name.name ) to (unique_id, relation, status)
     pub sources: BTreeMap<String, Vec<(String, MinijinjaValue, ModelStatus)>>,
-    /// Map of function_name (either {project}.{function_name}, {function_name}) to (unique_id, function_object, status)
+    /// Map of function_name (either {project}.{function_name}, {function_name}) to
+    /// (unique_id, function_object, status). The function object may be replaced
+    /// with its deferred version during defer hydration.
     pub functions: BTreeMap<String, Vec<(String, MinijinjaValue, ModelStatus)>>,
     /// Root project name (needed for resolving refs)
     pub root_package_name: String,
@@ -212,6 +229,17 @@ impl NodeResolver {
                     *relation = deferred_relation.clone();
                 }
             });
+    }
+
+    fn set_deferred_function(
+        entries: &mut [(String, MinijinjaValue, ModelStatus)],
+        unique_id: &str,
+        deferred_function: &MinijinjaValue,
+    ) {
+        entries
+            .iter_mut()
+            .filter(|(id, _, _)| id == unique_id)
+            .for_each(|(_, function, _)| *function = deferred_function.clone());
     }
 }
 
@@ -501,7 +529,7 @@ impl NodeResolverTracker for NodeResolver {
                     )
                 } else {
                     err!(
-                        ErrorCode::InvalidConfig,
+                        ErrorCode::DependencyNotFound,
                         "Ref '{}' not found in project. Searched for '{}'",
                         ref_name,
                         search_ref_names.join(", ")
@@ -561,7 +589,7 @@ impl NodeResolverTracker for NodeResolver {
             }
         } else {
             err!(
-                ErrorCode::InvalidConfig,
+                ErrorCode::DependencyNotFound,
                 "Source '{}' not found in project. Searched for '{}'",
                 source_table_name,
                 table_name
@@ -671,6 +699,25 @@ impl NodeResolverTracker for NodeResolver {
         adapter_type: AdapterType,
         is_frontier: bool,
     ) -> FsResult<()> {
+        if node.resource_type() == NodeType::Function {
+            let package_name = node.package_name();
+            let function_name = node.name();
+            let unique_id = node.unique_id();
+            let deferred_function =
+                create_function_object_from_node(adapter_type, node)?.into_value();
+
+            let function_entry = self.functions.entry(function_name.clone()).or_default();
+            Self::set_deferred_function(function_entry, &unique_id, &deferred_function);
+
+            let package_function_entry = self
+                .functions
+                .entry(format!("{package_name}.{function_name}"))
+                .or_default();
+            Self::set_deferred_function(package_function_entry, &unique_id, &deferred_function);
+
+            return Ok(());
+        }
+
         let package_name = &node.package_name();
         let model_name = node.name();
         let unique_id = node.unique_id();
@@ -835,7 +882,9 @@ pub fn resolve_dependencies(
                         .with_location(location);
                         emit_error_log_from_fs_error(&err_with_loc, io.status_reporter.as_ref());
                     } else {
-                        node_base.depends_on.nodes.push(dependency_id.clone());
+                        if !node_base.depends_on.nodes.contains(&dependency_id) {
+                            node_base.depends_on.nodes.push(dependency_id.clone());
+                        }
                         node_base
                             .depends_on
                             .nodes_with_ref_location
@@ -845,15 +894,11 @@ pub fn resolve_dependencies(
                 Err(e) => {
                     // For tests and exposures, warn on missing or disabled dependencies instead of erroring
                     if (is_test || is_exposure)
-                        && (e.code == ErrorCode::DisabledDependency
-                            || e.code == ErrorCode::InvalidConfig)
+                        && let Some((warning, disabled_dependency)) =
+                            downgraded_node_dependency_warning(&e, location.clone())
                     {
-                        // Only set has_disabled_dependency for disabled deps (not missing deps)
-                        if e.code == ErrorCode::DisabledDependency {
-                            has_disabled_dependency = true;
-                        }
-                        let err_with_loc = e.with_location(location);
-                        emit_warn_log_from_fs_error(&err_with_loc, io.status_reporter.as_ref());
+                        has_disabled_dependency |= disabled_dependency;
+                        emit_warn_log_from_fs_error(&warning, io.status_reporter.as_ref());
                     } else {
                         // Track this node as having an error (unresolved ref/source)
                         nodes_with_errors.insert(node_unique_id.clone());
@@ -878,7 +923,9 @@ pub fn resolve_dependencies(
 
             match node_resolver.lookup_source(&node_package_name, &source_name, &table_name) {
                 Ok((dependency_id, _, _)) => {
-                    node_base.depends_on.nodes.push(dependency_id.clone());
+                    if !node_base.depends_on.nodes.contains(&dependency_id) {
+                        node_base.depends_on.nodes.push(dependency_id.clone());
+                    }
                     node_base
                         .depends_on
                         .nodes_with_ref_location
@@ -887,15 +934,11 @@ pub fn resolve_dependencies(
                 Err(e) => {
                     // For tests and exposures, warn on missing or disabled dependencies instead of erroring
                     if (is_test || is_exposure)
-                        && (e.code == ErrorCode::DisabledDependency
-                            || e.code == ErrorCode::InvalidConfig)
+                        && let Some((warning, disabled_dependency)) =
+                            downgraded_node_dependency_warning(&e, location.clone())
                     {
-                        // Only set has_disabled_dependency for disabled deps (not missing deps)
-                        if e.code == ErrorCode::DisabledDependency {
-                            has_disabled_dependency = true;
-                        }
-                        let err_with_loc = e.with_location(location);
-                        emit_warn_log_from_fs_error(&err_with_loc, io.status_reporter.as_ref());
+                        has_disabled_dependency |= disabled_dependency;
+                        emit_warn_log_from_fs_error(&warning, io.status_reporter.as_ref());
                     } else {
                         // Track this node as having an error (unresolved ref/source)
                         nodes_with_errors.insert(node_unique_id.clone());
@@ -922,7 +965,9 @@ pub fn resolve_dependencies(
 
             match node_resolver.lookup_function(node_package_name_value, name, package) {
                 Ok((dependency_id, _, _)) => {
-                    node_base.depends_on.nodes.push(dependency_id.clone());
+                    if !node_base.depends_on.nodes.contains(&dependency_id) {
+                        node_base.depends_on.nodes.push(dependency_id.clone());
+                    }
                     node_base
                         .depends_on
                         .nodes_with_ref_location
@@ -992,11 +1037,18 @@ pub fn resolve_dependencies(
                         &Some(operation_package.clone()),
                     ) {
                         Ok((dependency_id, _, _, _)) => {
-                            operation
+                            if !operation
                                 .__base_attr__
                                 .depends_on
                                 .nodes
-                                .push(dependency_id.clone());
+                                .contains(&dependency_id)
+                            {
+                                operation
+                                    .__base_attr__
+                                    .depends_on
+                                    .nodes
+                                    .push(dependency_id.clone());
+                            }
                             operation
                                 .__base_attr__
                                 .depends_on
@@ -1037,7 +1089,14 @@ pub fn resolve_dependencies(
                             table_name,
                         ) {
                             Ok((dependency_id, _, _)) => {
-                                operation.__base_attr__.depends_on.nodes.push(dependency_id);
+                                if !operation
+                                    .__base_attr__
+                                    .depends_on
+                                    .nodes
+                                    .contains(&dependency_id)
+                                {
+                                    operation.__base_attr__.depends_on.nodes.push(dependency_id);
+                                }
                             }
                             Err(e) => {
                                 nodes_with_errors.insert(operation_unique_id.clone());
@@ -1116,11 +1175,7 @@ pub fn check_for_model_deprecations(io: &IoArgs, nodes: &Nodes) {
                  This model should be disabled or removed.",
                 info.name, version_str, info.deprecation_date
             );
-            emit_warn_log_message(
-                ErrorCode::DependencyWarning,
-                msg,
-                io.status_reporter.as_ref(),
-            );
+            emit_warn_log_message(ErrorCode::DeprecatedModel, msg, io.status_reporter.as_ref());
         }
     }
 
@@ -1159,7 +1214,7 @@ pub fn check_for_model_deprecations(io: &IoArgs, nodes: &Nodes) {
                         }
                     }
                     emit_warn_log_message(
-                        ErrorCode::DependencyWarning,
+                        ErrorCode::DeprecatedReference,
                         msg,
                         io.status_reporter.as_ref(),
                     );
@@ -1187,7 +1242,7 @@ pub fn check_for_model_deprecations(io: &IoArgs, nodes: &Nodes) {
                         }
                     }
                     emit_warn_log_message(
-                        ErrorCode::DependencyWarning,
+                        ErrorCode::UpcomingReferenceDeprecation,
                         msg,
                         io.status_reporter.as_ref(),
                     );
@@ -1258,6 +1313,49 @@ mod tests {
 
     fn make_io() -> IoArgs {
         IoArgs::default()
+    }
+
+    #[test]
+    fn downgraded_warning_maps_disabled_dependency() {
+        let warning = downgraded_node_dependency_warning(
+            &FsError::new(
+                ErrorCode::DisabledDependency,
+                "Attempted to use disabled ref 'x'",
+            ),
+            CodeLocationWithFile::default(),
+        )
+        .expect("disabled dependency should be downgraded");
+
+        assert_eq!(warning.0.code, ErrorCode::NodeNotFoundOrDisabled);
+        assert!(warning.1);
+    }
+
+    #[test]
+    fn downgraded_warning_maps_missing_ref_dependency() {
+        let warning = downgraded_node_dependency_warning(
+            &FsError::new(
+                ErrorCode::DependencyNotFound,
+                "Ref 'missing_model' not found in project. Searched for 'missing_model'",
+            ),
+            CodeLocationWithFile::default(),
+        )
+        .expect("missing ref should be downgraded");
+
+        assert_eq!(warning.0.code, ErrorCode::NodeNotFoundOrDisabled);
+        assert!(!warning.1);
+    }
+
+    #[test]
+    fn downgraded_warning_does_not_map_ambiguous_ref_errors() {
+        let warning = downgraded_node_dependency_warning(
+            &FsError::new(
+                ErrorCode::InvalidConfig,
+                "Found ambiguous ref('x') pointing to multiple nodes: ['a', 'b']",
+            ),
+            CodeLocationWithFile::default(),
+        );
+
+        assert!(warning.is_none());
     }
 
     #[test]

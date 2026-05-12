@@ -1,3 +1,4 @@
+use dbt_adapter_core::AdapterType;
 use dbt_cloud_api::{
     apis::{configuration::Configuration, connections_api, users_api, whoami_api},
     models,
@@ -5,7 +6,7 @@ use dbt_cloud_api::{
 use dbt_common::tracing::emit::{
     emit_debug_log_message, emit_info_log_message, emit_warn_log_message,
 };
-use dbt_common::{ErrorCode, FsResult, adapter::AdapterType, fs_err};
+use dbt_common::{ErrorCode, FsResult, fs_err};
 use dbt_schemas::schemas::profiles::{
     BigqueryDbConfig, DatabricksDbConfig, DbConfig, PostgresDbConfig, RedshiftDbConfig,
     SnowflakeDbConfig,
@@ -13,41 +14,12 @@ use dbt_schemas::schemas::profiles::{
 use dbt_schemas::schemas::serde::StringOrInteger;
 
 use serde::{Deserialize, Serialize};
-use std::fs;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CloudProject {
-    #[serde(rename = "project-name")]
-    pub project_name: String,
-    #[serde(rename = "project-id")]
-    pub project_id: String,
-    #[serde(rename = "account-name")]
-    pub account_name: String,
-    #[serde(rename = "account-id")]
-    pub account_id: String,
-    #[serde(rename = "account-host")]
-    pub account_host: String,
-    #[serde(rename = "token-name")]
-    pub token_name: String,
-    #[serde(rename = "token-value")]
-    pub token_value: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DbtCloudYml {
-    pub version: String,
-    pub context: DbtCloudContext,
-    pub projects: Vec<CloudProject>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DbtCloudContext {
-    #[serde(rename = "active-host")]
-    pub active_host: String,
-    #[serde(rename = "active-project")]
-    pub active_project: String,
-}
+/// Type aliases for backwards compatibility with downstream crates.
+pub type CloudProject = dbt_cloud_config::DbtCloudProject;
+pub type DbtCloudYml = dbt_cloud_config::DbtCloudConfig;
+pub type DbtCloudContext = dbt_cloud_config::DbtCloudContext;
 
 // Helper struct to provide information about the credential without the full ConfigMap
 #[derive(Debug, Clone)]
@@ -191,6 +163,7 @@ fn create_merged_db_config(
                 scopes: None,
                 keyfile_json: None,
                 execution_project: None,
+                api_endpoint: None,
                 compute_region: None,
                 dataproc_batch: None,
                 dataproc_cluster_name: None,
@@ -294,6 +267,7 @@ fn create_merged_db_config(
                     impersonate_service_account: bigquery.impersonate_service_account.clone(),
                     retries: bigquery.retries.map(|r| r as i64),
                     scopes: bigquery.scopes.clone(),
+                    api_endpoint: None,
                     // Authentication details - these could be used to construct keyfile_json
                     client_id: Some(bigquery.client_id.clone()),
                     token_uri: Some(bigquery.token_uri.clone()),
@@ -344,6 +318,7 @@ fn create_merged_db_config(
                     impersonate_service_account: bigquery_v1.impersonate_service_account.clone(),
                     retries: bigquery_v1.retries.map(|r| r as i64),
                     scopes: bigquery_v1.scopes.clone(),
+                    api_endpoint: None,
                     gcs_bucket: bigquery_v1.gcs_bucket.clone(),
                     dataproc_region: bigquery_v1.dataproc_region.clone(),
                     dataproc_cluster_name: bigquery_v1.dataproc_cluster_name.clone(),
@@ -402,7 +377,7 @@ fn create_merged_db_config(
             }
             _ => {
                 emit_warn_log_message(
-                    ErrorCode::Generic,
+                    ErrorCode::InvalidConfig,
                     "Adapter type mismatch between credential and connection",
                     None,
                 );
@@ -475,53 +450,15 @@ pub struct ConnectionDetails {
 pub struct DbtCloudClient;
 
 impl DbtCloudClient {
-    /// Determine the path to the dbt_cloud.yml configuration file
     pub fn get_cloud_project_path() -> FsResult<PathBuf> {
-        // Get home directory
-        let home_dir = match dirs::home_dir() {
-            Some(dir) => dir,
-            None => {
-                return Err(fs_err!(
-                    ErrorCode::IoError,
-                    "Could not determine home directory"
-                ));
-            }
-        };
-
-        Ok(home_dir.join(".dbt").join("dbt_cloud.yml"))
+        dbt_cloud_config::get_cloud_project_path().map_err(|e| fs_err!(ErrorCode::IoError, "{}", e))
     }
 
-    /// Parse the active cloud project from dbt_cloud.yml based on active-project setting
     pub fn parse_active_cloud_project(
         dbt_cloud_config_path: PathBuf,
     ) -> FsResult<Option<CloudProject>> {
-        if !dbt_cloud_config_path.exists() {
-            return Ok(None);
-        }
-
-        // Read and parse the dbt_cloud.yml file
-        let content = fs::read_to_string(&dbt_cloud_config_path)?;
-        let config: DbtCloudYml = dbt_yaml::from_str(&content)
-            .map_err(|e| fs_err!(ErrorCode::IoError, "Failed to parse dbt_cloud.yml: {}", e))?;
-
-        // Get the active project ID from context
-        let active_project_id = &config.context.active_project;
-
-        // Find the project that matches the active project ID
-        let active_project = config
-            .projects
-            .into_iter()
-            .find(|project| project.project_id == *active_project_id);
-
-        if active_project.is_none() {
-            emit_warn_log_message(
-                ErrorCode::Generic,
-                format!("No project found with active project ID: {active_project_id}"),
-                None,
-            );
-        }
-
-        Ok(active_project)
+        dbt_cloud_config::parse_active_cloud_project(&dbt_cloud_config_path)
+            .map_err(|e| fs_err!(ErrorCode::IoError, "{}", e))
     }
 
     /// Get current user ID from dbt Cloud API
@@ -706,7 +643,7 @@ impl DbtCloudClient {
                 Some(merged_config) => Ok(Some(merged_config)),
                 None => {
                     emit_warn_log_message(
-                        ErrorCode::Generic,
+                        ErrorCode::UnsupportedFusionFeature,
                         "Unable to create DbConfig from user credential and connection data",
                         None,
                     );

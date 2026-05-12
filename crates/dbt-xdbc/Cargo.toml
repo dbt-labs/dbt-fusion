@@ -19,7 +19,7 @@ workspace = true
 default = []
 odbc = ["odbc-sys"]
 xdbc-fuzzying = []
-repl = ["dialoguer", "clap", "dbt-common"]
+repl = ["dialoguer", "clap", "dbt-pretty-table"]
 
 [dependencies]
 adbc-core = { workspace = true }
@@ -31,7 +31,6 @@ atomic-wait = { version = "1.1.0" }
 base64 = { workspace = true }
 chrono = { workspace = true }
 dbt-base = { workspace = true }
-dbt-env = { workspace = true }
 dbt-fusion-workspace-hack = { version = "0.1" }
 dirs = { workspace = true }
 futures = { workspace = true }
@@ -48,6 +47,7 @@ serde = { workspace = true }
 sha2 = { workspace = true }
 siphasher = { workspace = true }
 tokio = { workspace = true }
+toml = { workspace = true }
 tracing = { workspace = true }
 tracy-client = { workspace = true }
 ureq = { workspace = true }
@@ -58,13 +58,17 @@ zstd-safe = { workspace = true }
 test-with = { version = "0.14.7", default-features = false }
 
 [[bin]]
+name = "xdbc-sync"
+path = "src/bin/xdbc_sync.rs"
+
+[[bin]]
 name = "dbt-xdbc-repl"
 path = "src/bin/repl.rs"
 required-features = ["repl"]
 
-[dependencies.dbt-common]
+[dependencies.dbt-pretty-table]
 optional = true
-path = "../dbt-common"
+path = "../dbt-pretty-table"
 
 [dependencies.dialoguer]
 features = ["history"]

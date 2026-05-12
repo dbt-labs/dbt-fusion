@@ -472,6 +472,23 @@ pub fn emit_error_log_message(
     );
 }
 
+/// Emit a package-scoped (coming from a dependency) error log message.
+#[track_caller]
+pub fn emit_error_log_message_package_scoped(
+    code: ErrorCode,
+    message: impl AsRef<str>,
+    package_name: &str,
+    status_reporter: Option<&Arc<dyn StatusReporter + 'static>>,
+) {
+    if let Some(status_reporter) = status_reporter {
+        status_reporter.collect_error(&fs_err!(code, "{}", message.as_ref()));
+    };
+
+    let mut log_message = LogMessage::new_from_level_and_code(code as u32, tracing::Level::ERROR);
+    log_message.package_name = Some(package_name.to_string());
+    emit_error_event(log_message, Some(message.as_ref()));
+}
+
 /// Emit a log message event at ERROR level based on the given FsError.
 ///
 /// This will also report the error to the provided status reporter, if any.
@@ -561,8 +578,8 @@ pub fn emit_strict_parse_error(
         Some(error.message().as_str()),
     );
 
-    // Unfortunately, the logic for downgrading parsing errors to warnings, as well
-    // as filtering repeated deprecations from packages is fully replicated here.
+    // Unfortunately, the logic for downgrading parsing errors to warnings, as well as filtering
+    // repeated package compatibility diagnostics is fully replicated here.
     //
     // This is a consequence of LSP (status_reporter) not being a tracing layer and
     // thus not being able to leverage the existing `parse_error_filter` middleware.
@@ -611,13 +628,13 @@ pub fn emit_strict_parse_error(
     };
 
     let downgrade_to_warn = if let Some(package_name) = package_name.as_ref() {
-        // If we are filtering repeated deprecations from packages,
-        // check if this is a deprecation message and if we've seen it before.
+        // If we are filtering repeated compatibility diagnostics from packages, check if this
+        // package has already emitted one.
         if !io.show_all_deprecations {
             let invocation_id = io.invocation_id.to_string();
 
             if has_package_with_error_or_warning(invocation_id.as_str(), package_name.as_ref()) {
-                // We've seen this deprecation message before, return
+                // We've seen this package compatibility diagnostic before, return
                 return;
             }
 
@@ -626,7 +643,7 @@ pub fn emit_strict_parse_error(
 
             // Create a new FsError instead of the original one
             let err = fs_err!(
-                ErrorCode::DependencyWarning,
+                ErrorCode::PackageParsingCompatibility,
                 "Package `{}` issued one or more compatibility warnings. To display all warnings associated with this package, run with `--show-all-deprecations`.",
                 package_name.as_ref()
             );

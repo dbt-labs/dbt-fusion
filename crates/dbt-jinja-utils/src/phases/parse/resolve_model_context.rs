@@ -1,37 +1,35 @@
 //! This module contains the scope guard for resolving models.
 
+use dbt_adapter_core::AdapterType;
 use indexmap::IndexMap;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Debug,
     path::{Path, PathBuf},
     rc::Rc,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex, atomic::AtomicBool},
 };
 
 use chrono::TimeZone;
 use chrono_tz::{Europe::London, Tz};
 use dbt_adapter::{cast_util::THIS_RELATION_KEY, load_store::ResultStore};
 use dbt_common::{
-    adapter::AdapterType,
     io_args::{IoArgs, StaticAnalysisKind},
     serde_utils::convert_yml_to_value_map,
 };
 use dbt_frontend_common::error::CodeLocation;
 use dbt_schemas::schemas::{
     DbtModelAttr, InternalDbtNode, IntrospectionKind,
-    common::{Access, DbtMaterialization, ResolvedQuoting},
+    common::{Access, ResolvedQuoting},
     nodes::AdapterAttr,
-    project::{DefaultTo, ModelConfig},
+    project::{ModelConfig, ResolvableConfig},
 };
 use dbt_schemas::{
     dbt_types::RelationType,
     schemas::{
         CommonAttributes, DbtModel, NodeBaseAttributes,
         common::{DbtChecksum, DbtQuoting, NodeDependsOn},
+        serde::yml_value_to_minijinja,
     },
     state::DbtRuntimeConfig,
 };
@@ -47,26 +45,17 @@ use minijinja::{
     },
 };
 use minijinja_contrib::modules::{py_datetime::datetime::PyDateTime, pytz::PytzTimezone};
+use serde::Serialize;
+
+use dbt_jinja_ctx::{JinjaObject, ParseExecute, ResolveModelCtx, to_jinja_btreemap};
 
 use crate::{phases::MacroLookupContext, serde::into_typed_with_error};
 
 use super::sql_resource::SqlResource;
 
-/// To be used as the `execute` flag in resolve-model context
-/// This is to record if an `execute` is encountered during parse in a .sql file
-#[derive(Debug, Clone)]
-struct ParseExecute(Arc<AtomicBool>);
-
-impl Object for ParseExecute {
-    fn is_true(self: &Arc<Self>) -> bool {
-        self.0.store(true, Ordering::Relaxed);
-        false
-    }
-}
-
 /// Builds a context for resolving models
 #[allow(clippy::too_many_arguments)]
-pub fn build_resolve_model_context<T: DefaultTo<T> + 'static>(
+pub fn build_resolve_model_context<T: ResolvableConfig<T> + Serialize + 'static>(
     config: &T,
     adapter_type: AdapterType,
     database: &str,
@@ -84,26 +73,25 @@ pub fn build_resolve_model_context<T: DefaultTo<T> + 'static>(
     global_static_analysis: Option<StaticAnalysisKind>,
 ) -> BTreeMap<String, MinijinjaValue> {
     // Create a relation for 'this' using config values
-    let mut context = BTreeMap::new();
     let sql_resources_clone = sql_resources.clone();
     let this_relation = ResolveThisFunction {
-        relation: dbt_adapter::relation::do_create_relation(
-            adapter_type,
-            database.to_string(),
-            schema.to_string(),
-            Some(model_name.to_string()),
-            None,
-            package_quoting
-                .try_into()
-                .expect("Failed to convert quoting to resolved quoting"),
-        )
-        .unwrap()
-        .as_value(),
+        relation: dbt_adapter::relation::RelationObject::new(Arc::from(
+            dbt_adapter::relation::do_create_relation(
+                adapter_type,
+                database.to_string(),
+                schema.to_string(),
+                Some(model_name.to_string()),
+                None,
+                package_quoting
+                    .try_into()
+                    .expect("Failed to convert quoting to resolved quoting"),
+            )
+            .unwrap(),
+        ))
+        .into_value(),
         sql_resources: sql_resources_clone,
     };
-
     let this_value = MinijinjaValue::from_object(this_relation);
-    context.insert("this".to_owned(), this_value);
 
     // Create a BTreeMap for builtins
     let mut builtins = BTreeMap::new();
@@ -119,8 +107,7 @@ pub fn build_resolve_model_context<T: DefaultTo<T> + 'static>(
         package_quoting,
     };
     let ref_value = MinijinjaValue::from_object(ref_function);
-    context.insert("ref".to_owned(), ref_value.clone());
-    builtins.insert("ref".to_string(), ref_value);
+    builtins.insert("ref".to_string(), ref_value.clone());
 
     // Create source function
     let source_function = ResolveSourceFunction {
@@ -131,8 +118,7 @@ pub fn build_resolve_model_context<T: DefaultTo<T> + 'static>(
         package_quoting,
     };
     let source_value = MinijinjaValue::from_object(source_function);
-    context.insert("source".to_owned(), source_value.clone());
-    builtins.insert("source".to_string(), source_value);
+    builtins.insert("source".to_string(), source_value.clone());
 
     // Create function function
     let function_function = ResolveFunctionFunction {
@@ -143,66 +129,55 @@ pub fn build_resolve_model_context<T: DefaultTo<T> + 'static>(
         package_quoting,
     };
     let function_value = MinijinjaValue::from_object(function_function);
-    context.insert("function".to_owned(), function_value.clone());
-    builtins.insert("function".to_string(), function_value);
+    builtins.insert("function".to_string(), function_value.clone());
 
     let sql_resources_clone = sql_resources.clone();
-    context.insert(
-        "metric".to_owned(),
-        MinijinjaValue::from_function(move |args: &[MinijinjaValue]| {
-            if args.is_empty() || args.len() > 3 {
-                return Err(MinijinjaError::new(
-                    MinijinjaErrorKind::InvalidOperation,
-                    "invalid number of arguments for metric macro",
-                ));
-            }
-            let mut parser = ArgParser::new(args, None);
-            // If there are two positional args, the first is the package name and the second is the model name
-            let arg0 = parser.get::<String>("")?;
-            let arg1 = parser.get_optional::<String>("");
-            let (package_name, metric_name) = match (arg0, arg1) {
-                (package_name, Some(metric_name)) => (Some(package_name), metric_name),
-                (metric_name, None) => (None, metric_name),
-            };
+    let metric_value = MinijinjaValue::from_function(move |args: &[MinijinjaValue]| {
+        if args.is_empty() || args.len() > 3 {
+            return Err(MinijinjaError::new(
+                MinijinjaErrorKind::InvalidOperation,
+                "invalid number of arguments for metric macro",
+            ));
+        }
+        let mut parser = ArgParser::new(args, None);
+        // If there are two positional args, the first is the package name and the second is the model name
+        let arg0 = parser.get::<String>("")?;
+        let arg1 = parser.get_optional::<String>("");
+        let (package_name, metric_name) = match (arg0, arg1) {
+            (package_name, Some(metric_name)) => (Some(package_name), metric_name),
+            (metric_name, None) => (None, metric_name),
+        };
 
-            // Push the SqlResource with all available information
-            sql_resources_clone
-                .lock()
-                .unwrap()
-                .push(SqlResource::Metric((
-                    metric_name.clone(),
-                    package_name.clone(),
-                )));
+        // Push the SqlResource with all available information
+        sql_resources_clone
+            .lock()
+            .unwrap()
+            .push(SqlResource::Metric((
+                metric_name.clone(),
+                package_name.clone(),
+            )));
 
-            // Create and return the DbtMetricReference
-            Ok(MinijinjaValue::from_object(ParseMetricReference {
-                metric_name,
-                _package_name: package_name,
-            }))
-        }),
-    );
-    // Register the config function
-    sql_resources
-        .lock()
-        .unwrap()
-        .push(SqlResource::BaseConfig(Box::new(config.clone())));
-
+        // Create and return the DbtMetricReference
+        Ok(MinijinjaValue::from_object(ParseMetricReference {
+            metric_name,
+            _package_name: package_name,
+        }))
+    });
     let package_dependency = if package_name == root_project_name {
         None
     } else {
         Some(package_name.to_string())
     };
-    let is_enabled = config.get_enabled().unwrap_or(true);
-    context.insert(
-        "config".to_owned(),
-        MinijinjaValue::from_object(ParseConfig {
-            enabled: is_enabled,
-            sql_resources: sql_resources.clone(),
-            io_args: io_args.clone().into(),
-            package_dependency: package_dependency.clone(),
-            error_path: Some(display_path.to_path_buf()),
-        }),
-    );
+    // Pre-finalization read: used to initialize the Jinja context before rendering starts,
+    // before the root overlay has been applied. The optimistic `true` default is intentional.
+    let is_enabled = config.get_enabled_with_default();
+    let config_value = MinijinjaValue::from_object(ParseConfig {
+        enabled: is_enabled,
+        sql_resources: sql_resources.clone(),
+        io_args: io_args.clone().into(),
+        package_dependency: package_dependency.clone(),
+        error_path: Some(display_path.to_path_buf()),
+    });
     builtins.insert(
         "config".to_string(),
         MinijinjaValue::from_object(ParseConfig {
@@ -237,9 +212,10 @@ pub fn build_resolve_model_context<T: DefaultTo<T> + 'static>(
             schema: schema.to_string(),
             alias: model_name.to_string(),
             relation_name: None,
-            materialized: DbtMaterialization::View,
+            materialized: ModelConfig::default_materialized(),
             static_analysis: global_static_analysis.unwrap_or_default().into(),
             static_analysis_off_reason: None,
+            compute: None,
             enabled: true,
             extended_model: false,
             persist_docs: None,
@@ -280,66 +256,69 @@ pub fn build_resolve_model_context<T: DefaultTo<T> + 'static>(
         deprecated_config: ModelConfig::default(),
     };
 
-    let mut model_map = convert_yml_to_value_map(model.serialize());
+    let mut model_map = convert_yml_to_value_map(InternalDbtNode::serialize(&model));
+    // Stub `DbtModel` uses `ModelConfig::default()` for `config` in YAML serialization. At parse
+    // time, kwargs to `config(...)` (e.g. `post_hook=my_macro(model)`) are evaluated while
+    // rendering; macros must see the merged node config (`properties_config` / `BaseConfig`),
+    // matching dbt-core (dbt-fusion#1414).
+    //
+    // Use `dbt_yaml::to_value` + `yml_value_to_minijinja` — same pipeline as
+    // `DbtModel::serialized_config()` — not `MinijinjaValue::from_serialize`, so later
+    // `dbt_yaml::to_value(model)` → `InternalDbtNodeWrapper::deserialize` in adapter helpers
+    // (`get_view_options`, `get_config_from_model`, …) round-trips correctly.
+    let config_yml = dbt_yaml::to_value(config)
+        .expect("Failed to serialize merged node config to dbt_yaml::Value for parse model.config");
+    model_map.insert("config".to_owned(), yml_value_to_minijinja(config_yml));
     model_map.insert(
         "batch".to_owned(),
         MinijinjaValue::from_object(init_batch_context()),
     );
 
-    context.insert("model".to_owned(), MinijinjaValue::from_object(model_map));
-
-    // Register builtins as a global
-    context.insert("builtins".to_owned(), MinijinjaValue::from_object(builtins));
-
-    context.insert("graph".to_owned(), MinijinjaValue::UNDEFINED);
-
-    context.insert(
-        TARGET_UNIQUE_ID.to_string(),
-        MinijinjaValue::from(format!("{package_name}.{model_name}")),
-    );
-
-    // Result Store
     let result_store = ResultStore::default();
-    context.insert(
-        "store_result".to_owned(),
-        MinijinjaValue::from_function(result_store.store_result()),
-    );
-    context.insert(
-        "load_result".to_owned(),
-        MinijinjaValue::from_function(result_store.load_result()),
-    );
-    context.insert(
-        "store_raw_result".to_owned(),
-        MinijinjaValue::from_function(result_store.store_raw_result()),
-    );
-
-    context.insert(
-        "execute".to_owned(),
-        MinijinjaValue::from_object(ParseExecute(execute_exists)),
-    );
-
     let mut packages: BTreeSet<String> = runtime_config.dependencies.keys().cloned().collect();
     packages.insert(root_project_name.to_string());
 
-    context.insert(
-        "context".to_owned(),
-        MinijinjaValue::from_object(MacroLookupContext {
+    // Object-typed slots are wrapped via `MinijinjaValue::from_object(...)` /
+    // `MinijinjaValue::from_function(closure)` HERE rather than in the typed
+    // ctx struct, because going through serde's `serialize_map` /
+    // `serialize_seq` paths would change the underlying Object's concrete
+    // type. `model` and `builtins` in particular get downcast to
+    // `BTreeMap<String, MinijinjaValue>` by compile/run-node-context code;
+    // the original `Vec<String>` regression in `MACRO_DISPATCH_ORDER`
+    // (dbt-fusion#…) showed why this matters. See `ResolveModelCtx`'s
+    // doc comment.
+    let ctx = ResolveModelCtx {
+        this: this_value,
+        ref_fn: ref_value,
+        source: source_value,
+        function: function_value,
+        metric: metric_value,
+        config: config_value,
+        model: MinijinjaValue::from_object(model_map),
+        builtins: MinijinjaValue::from_object(builtins),
+        graph: MinijinjaValue::UNDEFINED,
+        store_result: MinijinjaValue::from_function(result_store.store_result()),
+        load_result: MinijinjaValue::from_function(result_store.load_result()),
+        store_raw_result: MinijinjaValue::from_function(result_store.store_raw_result()),
+        execute: JinjaObject::new(ParseExecute::new(execute_exists)),
+        context: JinjaObject::new(MacroLookupContext {
             root_project_name: root_project_name.to_string(),
             current_project_name: None,
             packages,
         }),
-    );
+        target_unique_id: format!("{package_name}.{model_name}"),
+        current_path: display_path.to_string_lossy().into_owned(),
+        current_span: MinijinjaValue::from_serialize(Span::default()),
+    };
 
-    context.insert(
-        CURRENT_PATH.to_string(),
-        MinijinjaValue::from(display_path.to_string_lossy()),
-    );
-    context.insert(
-        CURRENT_SPAN.to_string(),
-        MinijinjaValue::from_serialize(Span::default()),
-    );
+    // Sanity: the constants downstream code uses to look up these keys must
+    // match the field-rename strings on `ResolveModelCtx`. Compile-time
+    // assertions; no runtime cost.
+    debug_assert_eq!(TARGET_UNIQUE_ID, "TARGET_UNIQUE_ID");
+    debug_assert_eq!(CURRENT_PATH, "__minijinja_current_path");
+    debug_assert_eq!(CURRENT_SPAN, "__minijinja_current_span");
 
-    context
+    to_jinja_btreemap(&ctx)
 }
 
 /// Batch Context (stubbing this on the fly for now. We'll need to implement this in the future)
@@ -367,7 +346,7 @@ fn init_batch_context() -> BTreeMap<String, MinijinjaValue> {
 }
 
 #[derive(Debug)]
-struct ResolveRefFunction<T: DefaultTo<T> + 'static> {
+struct ResolveRefFunction<T: ResolvableConfig<T> + 'static> {
     database: String,
     schema: String,
     adapter_type: AdapterType,
@@ -376,7 +355,7 @@ struct ResolveRefFunction<T: DefaultTo<T> + 'static> {
     package_quoting: DbtQuoting,
 }
 
-impl<T: DefaultTo<T>> Object for ResolveRefFunction<T> {
+impl<T: ResolvableConfig<T>> Object for ResolveRefFunction<T> {
     fn get_value(self: &Arc<Self>, key: &MinijinjaValue) -> Option<MinijinjaValue> {
         match key.as_str()? {
             "config" => Some(MinijinjaValue::from_dyn_object(self.runtime_config.clone())),
@@ -430,25 +409,27 @@ impl<T: DefaultTo<T>> Object for ResolveRefFunction<T> {
             location,
         )));
 
-        let relation = dbt_adapter::relation::do_create_relation(
-            self.adapter_type,
-            self.database.clone(),
-            self.schema.clone(),
-            Some(model_name),
-            None,
-            self.package_quoting
-                .try_into()
-                .expect("Failed to convert quoting to resolved quoting"),
-        )
-        .unwrap()
-        .as_value();
+        let relation = dbt_adapter::relation::RelationObject::new(Arc::from(
+            dbt_adapter::relation::do_create_relation(
+                self.adapter_type,
+                self.database.clone(),
+                self.schema.clone(),
+                Some(model_name),
+                None,
+                self.package_quoting
+                    .try_into()
+                    .expect("Failed to convert quoting to resolved quoting"),
+            )
+            .unwrap(),
+        ))
+        .into_value();
         // At resolve time, fqn do not have to be accurate
         Ok(relation)
     }
 }
 
 #[derive(Debug)]
-struct ResolveSourceFunction<T: DefaultTo<T>> {
+struct ResolveSourceFunction<T: ResolvableConfig<T>> {
     database: String,
     schema: String,
     adapter_type: AdapterType,
@@ -456,7 +437,7 @@ struct ResolveSourceFunction<T: DefaultTo<T>> {
     package_quoting: DbtQuoting,
 }
 
-impl<T: DefaultTo<T>> Object for ResolveSourceFunction<T> {
+impl<T: ResolvableConfig<T>> Object for ResolveSourceFunction<T> {
     fn get_value(self: &Arc<Self>, key: &MinijinjaValue) -> Option<MinijinjaValue> {
         match key.as_str()? {
             "function_name" => Some(MinijinjaValue::from("source")),
@@ -489,18 +470,20 @@ impl<T: DefaultTo<T>> Object for ResolveSourceFunction<T> {
                 )));
 
             // At resolve time, fqn do not have to be accurate
-            Ok(dbt_adapter::relation::do_create_relation(
-                self.adapter_type,
-                self.database.clone(),
-                self.schema.clone(),
-                Some(table_name),
-                Some(RelationType::External),
-                self.package_quoting
-                    .try_into()
-                    .expect("Failed to convert quoting to resolved quoting"),
-            )
-            .unwrap()
-            .as_value())
+            Ok(dbt_adapter::relation::RelationObject::new(Arc::from(
+                dbt_adapter::relation::do_create_relation(
+                    self.adapter_type,
+                    self.database.clone(),
+                    self.schema.clone(),
+                    Some(table_name),
+                    Some(RelationType::External),
+                    self.package_quoting
+                        .try_into()
+                        .expect("Failed to convert quoting to resolved quoting"),
+                )
+                .unwrap(),
+            ))
+            .into_value())
         } else {
             Err(MinijinjaError::new(
                 MinijinjaErrorKind::InvalidOperation,
@@ -511,7 +494,7 @@ impl<T: DefaultTo<T>> Object for ResolveSourceFunction<T> {
 }
 
 #[derive(Debug)]
-struct ResolveFunctionFunction<T: DefaultTo<T>> {
+struct ResolveFunctionFunction<T: ResolvableConfig<T>> {
     database: String,
     schema: String,
     adapter_type: AdapterType,
@@ -519,7 +502,7 @@ struct ResolveFunctionFunction<T: DefaultTo<T>> {
     package_quoting: DbtQuoting,
 }
 
-impl<T: DefaultTo<T>> Object for ResolveFunctionFunction<T> {
+impl<T: ResolvableConfig<T>> Object for ResolveFunctionFunction<T> {
     fn get_value(self: &Arc<Self>, key: &MinijinjaValue) -> Option<MinijinjaValue> {
         match key.as_str()? {
             "function_name" => Some(MinijinjaValue::from("function")),
@@ -611,9 +594,39 @@ impl Debug for ParseMetricReference {
     }
 }
 
+/// A stub value returned by `config.get()` during parsing.
+///
+/// We haven't populated `config` yet, so this stub value could be any type;
+/// therefore any method could be called on it. This prevents a crash during parse.
+///
+/// TODO: This is not a complete fix. If someone is using the config value in a
+/// type-specific way, there could still be issues.
+#[derive(Debug)]
+struct ParseConfigValue;
+
+impl Object for ParseConfigValue {
+    fn get_value(self: &Arc<Self>, _key: &MinijinjaValue) -> Option<MinijinjaValue> {
+        Some(MinijinjaValue::from_object(ParseConfigValue))
+    }
+
+    fn call_method(
+        self: &Arc<Self>,
+        _state: &State<'_, '_>,
+        _name: &str,
+        _args: &[MinijinjaValue],
+        _listeners: &[Rc<dyn RenderingEventListener>],
+    ) -> Result<MinijinjaValue, MinijinjaError> {
+        Ok(MinijinjaValue::from_object(ParseConfigValue))
+    }
+
+    fn render(self: &Arc<Self>, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "")
+    }
+}
+
 /// A struct that represents a parse config object to be used during parsing
 #[derive(Debug)]
-pub struct ParseConfig<T: DefaultTo<T> + 'static> {
+pub struct ParseConfig<T: ResolvableConfig<T> + 'static> {
     /// A pointer to a vector of sql resources to be collected during parsing
     pub sql_resources: Arc<Mutex<Vec<SqlResource<T>>>>,
     /// Whether the model is enabled (based on upstream config)
@@ -626,7 +639,7 @@ pub struct ParseConfig<T: DefaultTo<T> + 'static> {
     pub error_path: Option<PathBuf>,
 }
 
-impl<T: DefaultTo<T>> Object for ParseConfig<T> {
+impl<T: ResolvableConfig<T>> Object for ParseConfig<T> {
     /// Implement the call method on the config object
     fn call(
         self: &Arc<Self>,
@@ -758,12 +771,19 @@ impl<T: DefaultTo<T>> Object for ParseConfig<T> {
         _listeners: &[Rc<dyn RenderingEventListener>],
     ) -> Result<MinijinjaValue, MinijinjaError> {
         match name {
-            // At compile time, this will return the value of the config variable if it exists
-            // Here, we just return an empty string
+            // At compile time, this will return the value of the config variable if it exists.
+            // During parse, config isn't populated yet.  If the caller supplied a default
+            // value we return it so that downstream code that requires a concrete type
+            // (e.g. adapter.get_relation(identifier=...)) receives a usable value.
+            // Without a default we fall back to the ParseConfigValue stub.
             "get" => {
                 let mut args = ArgParser::new(args, None);
                 let _: String = args.get("name")?;
-                Ok(MinijinjaValue::from(""))
+                if let Some(default) = args.get_optional::<MinijinjaValue>("default") {
+                    Ok(default)
+                } else {
+                    Ok(MinijinjaValue::from_object(ParseConfigValue))
+                }
             }
             // At compile time, this just returns an empty string
             "set" => {
@@ -802,12 +822,12 @@ impl<T: DefaultTo<T>> Object for ParseConfig<T> {
 }
 
 #[derive(Debug)]
-struct ResolveThisFunction<T: DefaultTo<T> + 'static> {
+struct ResolveThisFunction<T: ResolvableConfig<T> + 'static> {
     relation: MinijinjaValue,
     sql_resources: Arc<Mutex<Vec<SqlResource<T>>>>,
 }
 
-impl<T: DefaultTo<T>> Object for ResolveThisFunction<T> {
+impl<T: ResolvableConfig<T>> Object for ResolveThisFunction<T> {
     fn call_method(
         self: &Arc<Self>,
         state: &State<'_, '_>,
@@ -885,5 +905,76 @@ mod test {
         assert_contains!(result, "test_db");
         assert_contains!(result, "test_schema");
         assert_contains!(result, "my_table");
+    }
+
+    /// Creates a ParseConfig for use in unit tests.
+    fn make_test_parse_config() -> ParseConfig<ModelConfig> {
+        ParseConfig {
+            sql_resources: Arc::new(Mutex::new(Vec::new())),
+            enabled: true,
+            io_args: Arc::new(IoArgs::default()),
+            package_dependency: None,
+            error_path: None,
+        }
+    }
+
+    /// Regression test: config.get('key', 'default') should return the default
+    /// value during parse phase, not a ParseConfigValue stub.
+    /// Without this, passing the result to adapter.get_relation(identifier=...)
+    /// fails with "incompatible type ParseConfigValue; value is not a string".
+    #[test]
+    fn test_config_get_with_default_returns_default() {
+        let mut env = minijinja::Environment::new();
+
+        let config = make_test_parse_config();
+        env.add_global("config", MinijinjaValue::from_object(config));
+
+        // config.get('alias', 'my_fallback') should render as "my_fallback"
+        let template = env
+            .template_from_str("{{ config.get('alias', 'my_fallback') }}")
+            .unwrap();
+        let result = template.render(minijinja::context!(), &[]).unwrap();
+
+        assert_eq!(result, "my_fallback");
+    }
+
+    /// Regression test: the rendered default from config.get must be usable as
+    /// a string argument (i.e. pass Value::as_str()).  This simulates what
+    /// adapter.get_relation(identifier=config.get('alias', 'tbl')) does.
+    #[test]
+    fn test_config_get_default_is_string_typed() {
+        let mut env = minijinja::Environment::new();
+
+        let config = make_test_parse_config();
+        env.add_global("config", MinijinjaValue::from_object(config));
+
+        // Evaluate config.get with a default and inspect the Value directly
+        let expr = env
+            .compile_expression("config.get('alias', 'tbl')")
+            .unwrap();
+        let value = expr.eval(minijinja::context!(), &[]).unwrap();
+
+        assert!(
+            value.as_str().is_some(),
+            "config.get with a default must return a string-typed Value, got: {:?}",
+            value
+        );
+        assert_eq!(value.as_str().unwrap(), "tbl");
+    }
+
+    /// Verify that config.get('key') without a default still returns a
+    /// ParseConfigValue stub (preserving backward compatibility).
+    #[test]
+    fn test_config_get_without_default_returns_stub() {
+        let mut env = minijinja::Environment::new();
+
+        let config = make_test_parse_config();
+        env.add_global("config", MinijinjaValue::from_object(config));
+
+        // Without a default, should render as empty string (ParseConfigValue::render)
+        let template = env.template_from_str("{{ config.get('alias') }}").unwrap();
+        let result = template.render(minijinja::context!(), &[]).unwrap();
+
+        assert_eq!(result, "");
     }
 }

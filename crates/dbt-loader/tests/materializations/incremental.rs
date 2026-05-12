@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use dbt_adapter::funcs::none_value;
-use dbt_common::adapter::AdapterType;
+use dbt_adapter::relation::RelationObject;
+use dbt_adapter_core::AdapterType;
 use dbt_jinja_utils::mock_object::MockJinjaObject;
 use dbt_schemas::dbt_types::RelationType;
 use minijinja::Value;
@@ -80,6 +80,8 @@ mod databricks {
             .load_all_macros()
             .with_stub_functions()
             .with_behavior_flag("use_materialization_v2", false)
+            .with_behavior_flag("use_catalogs_v2", false)
+            .with_behavior_flag("use_managed_iceberg", false)
             .build()
             .expect("harness should build");
 
@@ -124,7 +126,7 @@ mod databricks {
     #[test]
     fn no_existing_relation_creates_table() {
         let harness = build_harness();
-        harness.mock().on("get_relation", |_| Ok(none_value()));
+        harness.mock().on("get_relation", |_| Ok(Value::from(())));
 
         let ctx = incremental_ctx(&harness);
         render_incremental(&harness, ADAPTER, ctx)
@@ -148,9 +150,9 @@ mod databricks {
             "my_incr",
             Some(RelationType::View),
         );
-        harness
-            .mock()
-            .on("get_relation", move |_| Ok(existing.as_value()));
+        harness.mock().on("get_relation", move |_| {
+            Ok(RelationObject::new(Arc::clone(&existing)).into_value())
+        });
 
         let ctx = incremental_ctx(&harness);
         render_incremental(&harness, ADAPTER, ctx)
@@ -173,15 +175,15 @@ mod databricks {
             "my_incr",
             Some(RelationType::Table),
         );
-        harness
-            .mock()
-            .on("get_relation", move |_| Ok(existing.as_value()));
+        harness.mock().on("get_relation", move |_| {
+            Ok(RelationObject::new(Arc::clone(&existing)).into_value())
+        });
         harness
             .mock()
             .on("get_relation_config", |_| Ok(Value::UNDEFINED));
 
         let model_config = Arc::new(MockJinjaObject::new());
-        model_config.on("get_changeset", |_| Ok(none_value()));
+        model_config.on("get_changeset", |_| Ok(Value::from(())));
         let model_config_val = Value::from_dyn_object(model_config);
         harness.mock().on("get_config_from_model", move |_| {
             Ok(model_config_val.clone())

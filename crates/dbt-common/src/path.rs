@@ -4,6 +4,46 @@ use std::{
     path::{Component, Display, Path, PathBuf},
 };
 
+/// Compute the absolute write path for a node inside `target/compiled` or `target/run`,
+/// matching dbt-core's `ParsedNode.get_target_write_path` behavior.
+///
+/// Returns `{out_dir}/{package_name}/{path_segment}` where `path_segment` is:
+/// - `original_file_path` when its filename matches `path`'s filename (one-to-one, e.g. models)
+/// - `original_file_path/{path}` otherwise (many-to-one, e.g. generic tests from schema YAML)
+///
+/// Exception: if `in_dir.join(original_file_path)` resolves outside `in_dir`, `path` is used
+/// directly instead.
+///
+/// The escape case arises when `--target-path` points outside the project root (which dbt-core
+/// permits). Fusion's generic test nodes store `original_file_path` as the path to the generated
+/// SQL file; when that file lives in an out-of-project target directory, the path computed
+/// relative to the project root contains `..` segments. Embedding those segments into the
+/// compiled/run path produces nonsense, so we fall back to `path` (e.g. `generic_tests/foo.sql`)
+/// which is always relative to the project root and gives a clean result.
+///
+/// `in_dir` must be an absolute path (the project root). `out_dir` is the specific output
+/// subdirectory — e.g. `io_args.out_dir.join("compiled")` or `io_args.out_dir.join("run")`.
+///
+/// dbt-core reference: `contracts/graph/nodes.py` `ParsedNode.get_target_write_path`
+pub fn get_target_write_path(
+    in_dir: &Path,
+    out_dir: &Path,
+    package_name: &str,
+    path: &Path,
+    original_file_path: &Path,
+) -> PathBuf {
+    let abs_ofp = in_dir.join(original_file_path).normalize();
+    let escapes_root = !abs_ofp.starts_with(in_dir);
+    let path_segment = if escapes_root {
+        path.to_path_buf()
+    } else if path.file_name() == original_file_path.file_name() {
+        original_file_path.to_path_buf()
+    } else {
+        original_file_path.join(path)
+    };
+    out_dir.join(package_name).join(path_segment)
+}
+
 use normalize_path::NormalizePath;
 
 /// Self-normalizing path. Wrapper around [PathBuf].
@@ -26,6 +66,11 @@ impl DbtPath {
 
     pub fn to_path_buf(&self) -> PathBuf {
         self.0.clone()
+    }
+
+    /// Resolves this (relative) path against `base`, returning an absolute [`PathBuf`].
+    pub fn to_absolute(&self, base: &Path) -> PathBuf {
+        base.join(self.0.as_path())
     }
 
     /// See [Path::file_name] for documentation.
@@ -56,6 +101,17 @@ impl DbtPath {
     /// See [Path::join] for documentation.
     pub fn join(&self, path: &DbtPath) -> Self {
         Self(self.0.join(path.as_path()).normalize())
+    }
+
+    /// Case-sensitivity based on the OS.
+    pub fn has_extension(&self, ext: &str) -> bool {
+        self.extension().is_some_and(|x| {
+            if cfg!(target_os = "linux") {
+                x.eq(ext)
+            } else {
+                x.eq_ignore_ascii_case(ext)
+            }
+        })
     }
 
     /// Case-sensitivity based on the OS.
@@ -352,5 +408,16 @@ mod tests {
         assert!(path_separator_eq("foo\\bar", "foo/bar"));
         assert!(!path_separator_eq("foo/bar", "foo/baz"));
         assert!(!path_separator_eq("foo/bar", "foo/bar/baz"));
+    }
+
+    #[test]
+    fn test_to_absolute() {
+        let relative = DbtPath::from("models/my_model.sql");
+        let base = Path::new("/projects/my_project");
+        let absolute = relative.to_absolute(base);
+        assert_eq!(
+            absolute,
+            PathBuf::from("/projects/my_project/models/my_model.sql")
+        );
     }
 }

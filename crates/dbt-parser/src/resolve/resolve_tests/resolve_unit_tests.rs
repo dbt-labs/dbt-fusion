@@ -1,21 +1,22 @@
+use crate::args::ResolveArgs;
+use crate::dbt_project_config::ProjectConfigResolver;
 use crate::dbt_project_config::RootProjectConfigs;
 use crate::dbt_project_config::init_project_config;
 use crate::resolve::resolve_properties::MinimalPropertiesEntry;
+use crate::resolve::resolve_utils::validate_compute;
 use crate::utils::get_node_fqn;
 use crate::utils::get_unique_id;
+use crate::validation::check_node_static_analysis;
+use dbt_adapter_core::AdapterType;
 use dbt_common::CodeLocationWithFile;
 use dbt_common::ErrorCode;
 use dbt_common::FsResult;
-use dbt_common::adapter::AdapterType;
 use dbt_common::err;
 use dbt_common::error::AbstractLocation;
 use dbt_common::fs_err;
-use dbt_common::io_args::IoArgs;
 use dbt_common::io_args::StaticAnalysisKind;
 use dbt_common::io_args::StaticAnalysisOffReason;
-use dbt_common::static_analysis::{
-    StaticAnalysisDeprecationOrigin, check_deprecated_static_analysis_kind,
-};
+
 use dbt_jinja_utils::jinja_environment::JinjaEnv;
 use dbt_jinja_utils::phases::parse::build_resolve_model_context;
 use dbt_jinja_utils::phases::parse::sql_resource::SqlResource;
@@ -33,7 +34,8 @@ use dbt_schemas::schemas::common::Given;
 use dbt_schemas::schemas::common::NodeDependsOn;
 use dbt_schemas::schemas::packages::DeprecatedDbtPackageLock;
 use dbt_schemas::schemas::project::DbtProject;
-use dbt_schemas::schemas::project::DefaultTo;
+use dbt_schemas::schemas::project::ResolvableConfig;
+use dbt_schemas::schemas::project::ResolvedConfig;
 use dbt_schemas::schemas::project::UnitTestConfig;
 use dbt_schemas::schemas::properties::UnitTestProperties;
 use dbt_schemas::schemas::ref_and_source::DbtRef;
@@ -53,8 +55,7 @@ use std::sync::atomic::AtomicBool;
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn resolve_unit_tests(
-    io_args: &IoArgs,
-    global_static_analysis: Option<StaticAnalysisKind>,
+    arg: &ResolveArgs,
     unit_test_properties: BTreeMap<String, MinimalPropertiesEntry>,
     package: &DbtPackage,
     package_quoting: DbtQuoting,
@@ -71,19 +72,35 @@ pub fn resolve_unit_tests(
     let mut unit_tests: BTreeMap<String, Arc<DbtUnitTest>> = BTreeMap::new();
     let mut disabled_unit_tests: BTreeMap<String, Arc<DbtUnitTest>> = BTreeMap::new();
     let dependency_package_name = dependency_package_name_from_ctx(jinja_env, base_ctx);
-    let local_project_config = init_project_config(
-        io_args,
-        &package.dbt_project.unit_tests,
-        UnitTestConfig {
-            enabled: Some(true),
-            ..Default::default()
+    let config_resolver = ProjectConfigResolver::build(
+        root_project_configs.unit_tests.clone(),
+        dependency_package_name.is_some(),
+        || {
+            init_project_config(
+                &arg.io,
+                &package.dbt_project.unit_tests,
+                (),
+                dependency_package_name,
+            )
         },
-        dependency_package_name,
-    )?;
+    )?
+    .with_resolve_defaults(arg.static_analysis.unwrap_or_default());
 
     for (unit_test_name, mpe) in unit_test_properties.into_iter() {
+        // Capture YAML span of the unit-test `name:` declaration for error reporting.
+        // The analyzer uses this as `start_location` so messages anchor at the unit
+        // test's entry in the source YAML rather than at line 1 col 1.
+        let defined_at = mpe.name_span.is_valid().then(|| {
+            CodeLocationWithFile::new(
+                mpe.name_span.start.line as u32,
+                mpe.name_span.start.column as u32,
+                mpe.name_span.start.index as u32,
+                mpe.relative_path.clone(),
+            )
+        });
+
         let unit_test = into_typed_with_jinja::<UnitTestProperties, _>(
-            io_args,
+            &arg.io,
             mpe.schema_value,
             false,
             jinja_env,
@@ -100,14 +117,16 @@ pub fn resolve_unit_tests(
 
         let location = CodeLocationWithFile::default(); // TODO
         let model_name = format!("model.{}.{}", package_name, unit_test.model);
-        let (database, schema, _, model_found) = match models.get(&model_name) {
+        // `tested_node_unique_id` is the unversioned model's unique id when resolvable.
+        // Versioned cases below override it with the version-specific id.
+        let (database, schema, _, tested_node_unique_id) = match models.get(&model_name) {
             Some(model) => (
                 model.__base_attr__.database.clone(),
                 model.__base_attr__.schema.clone(),
                 model.__base_attr__.alias.clone(),
-                true,
+                Some(model_name.clone()),
             ),
-            None => (String::new(), String::new(), unit_test.model.clone(), false),
+            None => (String::new(), String::new(), unit_test.model.clone(), None),
         };
 
         // Create base unit test node
@@ -123,21 +142,18 @@ pub fn resolve_unit_tests(
             &package.dbt_project.all_source_paths(),
         );
 
-        let global_config = local_project_config.get_config_for_fqn(&fqn);
-        let mut project_config = root_project_configs
-            .unit_tests
-            .get_config_for_fqn(&fqn)
-            .clone();
-        project_config.default_to(global_config);
-        let properties_config = if let Some(properties) = &unit_test.config {
-            let mut properties_config: UnitTestConfig = properties.clone();
-            properties_config.default_to(&project_config);
-            properties_config
-        } else {
-            project_config
-        };
+        let properties_config =
+            config_resolver.resolve_with_properties(&fqn, unit_test.config.as_ref());
+        check_node_static_analysis(
+            &properties_config,
+            arg.static_analysis,
+            &base_unique_id,
+            dependency_package_name,
+            arg.io.status_reporter.as_ref(),
+        );
+        validate_compute(properties_config.compute, &mpe.relative_path)?;
 
-        let enabled = properties_config.get_enabled().unwrap_or(true);
+        let enabled = properties_config.enabled;
 
         // todo: generalize given input format, according to https://docs.getdbt.com/docs/build/unit-tests
 
@@ -216,21 +232,7 @@ pub fn resolve_unit_tests(
             }
         };
 
-        let static_analysis =
-            if let Some(static_analysis) = properties_config.static_analysis.clone() {
-                check_deprecated_static_analysis_kind(
-                    static_analysis.clone().into_inner(),
-                    StaticAnalysisDeprecationOrigin::NodeConfig {
-                        unique_id: base_unique_id.as_str(),
-                    },
-                    dependency_package_name,
-                    io_args.status_reporter.as_ref(),
-                );
-                static_analysis
-            } else {
-                // If global override is set, use it. Otherwise default
-                global_static_analysis.unwrap_or_default().into()
-            };
+        let static_analysis = properties_config.static_analysis.clone();
 
         let base_unit_test = DbtUnitTest {
             __common_attr__: CommonAttributes {
@@ -270,10 +272,10 @@ pub fn resolve_unit_tests(
                 quoting: package_quoting.try_into()?,
                 quoting_ignore_case: package_quoting.snowflake_ignore_case.unwrap_or(false),
                 materialized: DbtMaterialization::Unit,
-                static_analysis_off_reason: (static_analysis.clone().into_inner()
-                    == StaticAnalysisKind::Off)
+                static_analysis_off_reason: (*static_analysis == StaticAnalysisKind::Off)
                     .then_some(StaticAnalysisOffReason::ConfiguredOff),
                 static_analysis,
+                compute: properties_config.compute,
                 columns: vec![],
                 metrics: vec![],
                 unrendered_config: Default::default(),
@@ -286,7 +288,9 @@ pub fn resolve_unit_tests(
                 version: None,
                 overrides: unit_test.overrides.clone(),
             },
-            deprecated_config: properties_config,
+            tested_node_unique_id: tested_node_unique_id.clone(),
+            defined_at,
+            deprecated_config: properties_config.into(),
             ..Default::default()
         };
         // Check if this model has versions
@@ -360,6 +364,7 @@ pub fn resolve_unit_tests(
                     .depends_on
                     .nodes_with_ref_location =
                     vec![(versioned_model_unique_id.clone(), location.clone())];
+                versioned_test.tested_node_unique_id = Some(versioned_model_unique_id.clone());
 
                 unit_tests.insert(
                     versioned_test.__common_attr__.unique_id.clone(),
@@ -368,7 +373,7 @@ pub fn resolve_unit_tests(
             }
         } else {
             // Non-versioned case
-            if !model_found || !enabled {
+            if tested_node_unique_id.is_none() || !enabled {
                 disabled_unit_tests.insert(base_unique_id, Arc::new(base_unit_test));
             } else {
                 unit_tests.insert(base_unique_id, Arc::new(base_unit_test));

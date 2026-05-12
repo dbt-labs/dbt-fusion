@@ -1,7 +1,6 @@
-use dbt_common::io_args::IoArgs;
 use dbt_common::io_utils::StatusReporter;
 use dbt_common::pretty_string::{GREEN, RED};
-use dbt_common::tracing::emit::{emit_info_log_message, emit_warn_log_message};
+use dbt_common::tracing::emit::emit_info_log_message;
 use dbt_common::tracing::formatters::deps::get_package_display_name;
 use dbt_common::tracing::span_info::{
     SpanStatusRecorder as _, find_and_update_span_attrs, update_span_attrs,
@@ -11,12 +10,11 @@ use dbt_common::{
     constants::{DBT_PACKAGES_LOCK_FILE, INSTALLING},
     create_info_span, fs_err,
     pretty_string::BLUE,
-    stdfs,
+    stdfs, tokiofs,
 };
-use dbt_jinja_utils::jinja_environment::JinjaEnv;
-use dbt_schemas::schemas::packages::DbtPackagesLock;
+use dbt_schemas::schemas::packages::{DbtPackageLock, DbtPackagesLock};
 use dbt_telemetry::{DepsAllPackagesInstalled, DepsPackageInstalled, PackageType};
-use std::collections::BTreeMap;
+use dbt_yaml::Verbatim;
 use std::path::Path;
 use std::sync::Arc;
 use tracing::{Instrument as _, Span};
@@ -24,12 +22,14 @@ use vortex_events::package_install_event;
 
 use crate::package_listing::UnpinnedPackage;
 
+use crate::context::DepsOperationContext;
 use crate::{
-    github_client::download_git_like_package,
-    hub_client::HubClient,
+    git_client::install_git_like_package,
     package_listing::PackageListing,
-    tarball_client::TarballClient,
-    utils::{move_dir, read_and_validate_dbt_project, sanitize_git_url},
+    utils::{
+        ensure_dir, make_tempdir, move_dir, read_and_validate_dbt_project, sanitize_git_url,
+        scrub_package_name_secret_env_vars,
+    },
 };
 
 /// Create a package installation span and report to status reporter
@@ -87,20 +87,62 @@ fn create_package_installed_span(
     create_info_span(attrs)
 }
 
-#[allow(clippy::cognitive_complexity)]
+fn package_lock_needs_scrub(package: &DbtPackageLock) -> bool {
+    match package {
+        DbtPackageLock::Git(git_package_lock) => {
+            scrub_package_name_secret_env_vars(git_package_lock.git.as_str()).is_some()
+        }
+        DbtPackageLock::Tarball(tarball_package_lock) => {
+            scrub_package_name_secret_env_vars(tarball_package_lock.tarball.as_str()).is_some()
+        }
+        _ => false,
+    }
+}
+
+fn scrub_package_lock_for_file(dbt_packages_lock: &mut DbtPackagesLock) {
+    for package in dbt_packages_lock.packages.iter_mut() {
+        match package {
+            DbtPackageLock::Git(git_package_lock) => {
+                if let Some(scrubbed) =
+                    scrub_package_name_secret_env_vars(git_package_lock.git.as_str())
+                {
+                    git_package_lock.git = Verbatim::from(scrubbed.into_owned());
+                }
+            }
+            DbtPackageLock::Tarball(tarball_package_lock) => {
+                if let Some(scrubbed) =
+                    scrub_package_name_secret_env_vars(tarball_package_lock.tarball.as_str())
+                {
+                    tarball_package_lock.tarball = Verbatim::from(scrubbed.into_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 pub async fn install_packages(
-    io_args: &IoArgs,
-    vars: &BTreeMap<String, dbt_yaml::Value>,
-    hub_registry: &HubClient,
-    jinja_env: &JinjaEnv,
+    ctx: &DepsOperationContext<'_>,
     dbt_packages_lock: &DbtPackagesLock,
     packages_install_path: &Path,
-    skip_private_deps: bool,
 ) -> FsResult<()> {
     // Cleanup package-lock.yml
-    let package_lock_str = dbt_yaml::to_string(&dbt_packages_lock).unwrap();
+    let package_lock_str = if dbt_packages_lock
+        .packages
+        .iter()
+        .any(package_lock_needs_scrub)
+    {
+        let mut scrubbed_dbt_packages_lock = DbtPackagesLock {
+            packages: dbt_packages_lock.packages.clone(),
+            sha1_hash: dbt_packages_lock.sha1_hash.clone(),
+        };
+        scrub_package_lock_for_file(&mut scrubbed_dbt_packages_lock);
+        dbt_yaml::to_string(&scrubbed_dbt_packages_lock).unwrap()
+    } else {
+        dbt_yaml::to_string(dbt_packages_lock).unwrap()
+    };
     // Create tmp dir for tarball
-    let packages_lock_path = &io_args.in_dir.join(DBT_PACKAGES_LOCK_FILE);
+    let packages_lock_path = &ctx.io.in_dir.join(DBT_PACKAGES_LOCK_FILE);
     std::fs::write(packages_lock_path, &package_lock_str).map_err(|e| {
         fs_err!(
             ErrorCode::IoError,
@@ -127,12 +169,12 @@ pub async fn install_packages(
     if dbt_packages_lock.packages.is_empty() {
         return Ok(());
     }
-    let mut package_listing = PackageListing::new(io_args.clone(), vars.clone())
-        .with_skip_private_deps(skip_private_deps);
+    let mut package_listing = PackageListing::new(ctx.io.clone(), ctx.vars.clone())
+        .with_skip_private_deps(ctx.skip_private_deps);
 
     // Collect fusion-schema-compat upgrade suggestions
     let mut fusion_compat_suggestions: Vec<(String, String, String)> = Vec::new();
-    package_listing.hydrate_dbt_packages_lock(dbt_packages_lock, jinja_env)?;
+    package_listing.hydrate_dbt_packages_lock(dbt_packages_lock, ctx.jinja_env)?;
 
     // Update telemetry with resolved package count
     find_and_update_span_attrs(|ev: &mut DepsAllPackagesInstalled| {
@@ -141,9 +183,11 @@ pub async fn install_packages(
 
     for package in package_listing.packages.values() {
         // Create span for overall package installation
-        let pspan = create_package_installed_span(package, io_args.status_reporter.as_ref());
+        let pspan = create_package_installed_span(package, ctx.io.status_reporter.as_ref());
 
-        if skip_private_deps && let UnpinnedPackage::Private(private_unpinned_package) = package {
+        if ctx.skip_private_deps
+            && let UnpinnedPackage::Private(private_unpinned_package) = package
+        {
             emit_info_log_message(format!(
                 "Skipping private package {} due to --skip-private-deps flag",
                 private_unpinned_package
@@ -156,10 +200,7 @@ pub async fn install_packages(
 
         // Install package within that span and capture result
         install_package(
-            io_args,
-            vars,
-            hub_registry,
-            jinja_env,
+            ctx,
             packages_install_path,
             package,
             &mut fusion_compat_suggestions,
@@ -203,12 +244,8 @@ pub async fn install_packages(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn install_package(
-    io_args: &IoArgs,
-    vars: &BTreeMap<String, dbt_yaml::Value>,
-    hub_registry: &HubClient,
-    jinja_env: &JinjaEnv,
+    ctx: &DepsOperationContext<'_>,
     packages_install_path: &Path,
     package: &UnpinnedPackage,
     fusion_compat_suggestions: &mut Vec<(String, String, String)>,
@@ -216,21 +253,17 @@ async fn install_package(
 ) -> FsResult<()> {
     match package {
         UnpinnedPackage::Hub(hub_unpinned_package) => {
-            let pinned_package = hub_unpinned_package.resolved(hub_registry).await?;
+            let pinned_package = hub_unpinned_package.resolved(&ctx.hub_registry).await?;
 
             if pinned_package.version != pinned_package.version_latest
                 && (std::env::var("NEXTEST").is_err()
                     || (std::env::var("NEXTEST").is_ok()
                         && std::env::var("TEST_DEPS_LATEST_VERSION").is_ok()))
             {
-                emit_warn_log_message(
-                    ErrorCode::DependencyWarning,
-                    format!(
-                        "Updated version available for {}@{}: {}",
-                        pinned_package.name, pinned_package.version, pinned_package.version_latest,
-                    ),
-                    io_args.status_reporter.as_ref(),
-                );
+                emit_info_log_message(format!(
+                    "Updated version available for {}@{}: {}",
+                    pinned_package.name, pinned_package.version, pinned_package.version_latest,
+                ));
             }
 
             // Store resolved package version
@@ -239,7 +272,8 @@ async fn install_package(
             });
 
             // Check fusion-schema-compat and suggest upgrade if needed
-            let hub_package = hub_registry
+            let hub_package = ctx
+                .hub_registry
                 .get_hub_package(&pinned_package.package)
                 .await?;
 
@@ -262,18 +296,39 @@ async fn install_package(
                 ));
             }
 
-            let tarball_url = metadata.downloads.tarball.clone();
+            // try to substitute fusion compatible version if requested
+            let tarball_url = if ctx.use_v2_compatible_package_downloads
+                && let Some(fusion_compatibility) = &metadata.fusion_compatibility
+                && let Some(hub_fusion_compatible_download) =
+                    &fusion_compatibility.fusion_compatible_download
+                && let Some(fusion_compatible_download_url) =
+                    &hub_fusion_compatible_download.tarball
+            {
+                emit_info_log_message(format!(
+                    "Installing the v2-compatible download from Package Hub for {}@{}",
+                    pinned_package.name, pinned_package.version,
+                ));
+                fusion_compatible_download_url.clone()
+            } else {
+                metadata.downloads.tarball.clone()
+            };
+
             let project_name = metadata.name.clone();
             let final_path = packages_install_path.join(&project_name);
+            ensure_dir(&final_path).await?;
 
-            let tarball_client = TarballClient::new();
-            tarball_client
-                .download_and_extract_tarball(&tarball_url, &final_path, true, None)
-                .await?;
+            if let Err(e) = ctx
+                .tarball_client
+                .download_and_extract_tarball(&tarball_url, &final_path, true, None, &[])
+                .await
+            {
+                let _ = tokiofs::remove_dir_all(&final_path).await;
+                return Err(e);
+            }
 
-            if io_args.send_anonymous_usage_stats {
+            if ctx.io.send_anonymous_usage_stats {
                 package_install_event(
-                    io_args.invocation_id.to_string(),
+                    ctx.io.invocation_id.to_string(),
                     pinned_package.name.clone(),
                     pinned_package.version.clone(),
                     "hub".to_string(),
@@ -281,26 +336,31 @@ async fn install_package(
             }
         }
         UnpinnedPackage::Git(git_unpinned_package) => {
-            let tmp_dir = tempfile::tempdir_in(packages_install_path)
-                .map_err(|e| fs_err!(ErrorCode::IoError, "Failed to create temp dir: {}", e))?;
+            let tmp_dir = make_tempdir(Some(packages_install_path))?;
             let download_dir = tmp_dir.path().join("git_pkg");
-            let (checkout_path, commit_sha) = download_git_like_package(
+            ensure_dir(&download_dir).await?;
+            let sha = git_unpinned_package
+                .revisions
+                .last()
+                .cloned()
+                .unwrap_or_default();
+            let (checkout_path, commit_sha) = install_git_like_package(
+                ctx,
                 &git_unpinned_package.git,
-                &git_unpinned_package.revisions,
+                &sha,
                 &git_unpinned_package.subdirectory,
-                git_unpinned_package.warn_unpinned.unwrap_or_default(),
                 &download_dir,
             )
             .await?;
 
             let dbt_project = read_and_validate_dbt_project(
-                io_args,
+                ctx.io,
                 &checkout_path,
                 // do not report warnings here, since it would have alerady been reported
                 // during package resolution phase
                 false,
-                jinja_env,
-                vars,
+                ctx.jinja_env,
+                ctx.vars,
             )?;
             let project_name = dbt_project.name;
 
@@ -314,9 +374,9 @@ async fn install_package(
             // Keep tmp_dir alive until we're done with checkout_path
             drop(tmp_dir);
 
-            if io_args.send_anonymous_usage_stats {
+            if ctx.io.send_anonymous_usage_stats {
                 package_install_event(
-                    io_args.invocation_id.to_string(),
+                    ctx.io.invocation_id.to_string(),
                     project_name,
                     commit_sha,
                     "git".to_string(),
@@ -324,7 +384,7 @@ async fn install_package(
             }
         }
         UnpinnedPackage::Local(local_unpinned_package) => {
-            let package_path = &io_args.in_dir.join(&local_unpinned_package.local);
+            let package_path = &ctx.io.in_dir.join(&local_unpinned_package.local);
             let install_path =
                 packages_install_path.join(local_unpinned_package.name.as_ref().unwrap());
             let relative_package_path = stdfs::diff_paths(package_path, packages_install_path)?;
@@ -334,9 +394,9 @@ async fn install_package(
                 .clone()
                 .unwrap_or_else(|| package_path.display().to_string());
 
-            if io_args.send_anonymous_usage_stats {
+            if ctx.io.send_anonymous_usage_stats {
                 package_install_event(
-                    io_args.invocation_id.to_string(),
+                    ctx.io.invocation_id.to_string(),
                     package_name,
                     "".to_string(),
                     "local".to_string(),
@@ -344,25 +404,30 @@ async fn install_package(
             }
         }
         UnpinnedPackage::Private(private_unpinned_package) => {
-            let tmp_dir = tempfile::tempdir_in(packages_install_path)
-                .map_err(|e| fs_err!(ErrorCode::IoError, "Failed to create temp dir: {}", e))?;
+            let tmp_dir = make_tempdir(Some(packages_install_path))?;
             let download_dir = tmp_dir.path().join("private_pkg");
-            let (checkout_path, commit_sha) = download_git_like_package(
+            ensure_dir(&download_dir).await?;
+            let sha = private_unpinned_package
+                .revisions
+                .last()
+                .cloned()
+                .unwrap_or_default();
+            let (checkout_path, commit_sha) = install_git_like_package(
+                ctx,
                 &private_unpinned_package.private,
-                &private_unpinned_package.revisions,
+                &sha,
                 &private_unpinned_package.subdirectory,
-                private_unpinned_package.warn_unpinned.unwrap_or_default(),
                 &download_dir,
             )
             .await?;
             let dbt_project = read_and_validate_dbt_project(
-                io_args,
+                ctx.io,
                 &checkout_path,
                 // do not report warnings here, since it would have alerady been reported
                 // during package resolution phase
                 false,
-                jinja_env,
-                vars,
+                ctx.jinja_env,
+                ctx.vars,
             )?;
             let project_name = dbt_project.name;
 
@@ -380,9 +445,9 @@ async fn install_package(
                 .clone()
                 .unwrap_or_else(|| private_unpinned_package.private.clone());
 
-            if io_args.send_anonymous_usage_stats {
+            if ctx.io.send_anonymous_usage_stats {
                 package_install_event(
-                    io_args.invocation_id.to_string(),
+                    ctx.io.invocation_id.to_string(),
                     package_name,
                     commit_sha,
                     "private".to_string(),
@@ -392,28 +457,28 @@ async fn install_package(
         UnpinnedPackage::Tarball(tarball_unpinned_package) => {
             // Download and extract the tarball to a temp dir on the same filesystem as
             // packages_install_path so that the final rename is atomic (no cross-device move).
-            let tmp_extract = tempfile::tempdir_in(packages_install_path)
-                .map_err(|e| fs_err!(ErrorCode::IoError, "Failed to create temp dir: {}", e))?;
+            let tmp_extract = make_tempdir(Some(packages_install_path))?;
             let extract_path = tmp_extract.path().join("package");
+            ensure_dir(&extract_path).await?;
 
-            let tarball_client = TarballClient::new();
-            tarball_client
+            ctx.tarball_client
                 .download_and_extract_tarball(
                     &tarball_unpinned_package.tarball,
                     &extract_path,
                     true,
                     None,
+                    &[],
                 )
                 .await?;
 
             let dbt_project = read_and_validate_dbt_project(
-                io_args,
+                ctx.io,
                 &extract_path,
                 // do not report warnings here, since it would have alerady been reported
                 // during package resolution phase
                 false,
-                jinja_env,
-                vars,
+                ctx.jinja_env,
+                ctx.vars,
             )?;
             let project_name = dbt_project.name;
 
@@ -425,9 +490,9 @@ async fn install_package(
 
             move_dir(&extract_path, &packages_install_path.join(&project_name)).await?;
 
-            if io_args.send_anonymous_usage_stats {
+            if ctx.io.send_anonymous_usage_stats {
                 package_install_event(
-                    io_args.invocation_id.to_string(),
+                    ctx.io.invocation_id.to_string(),
                     project_name,
                     "tarball".to_string(),
                     "tarball".to_string(),

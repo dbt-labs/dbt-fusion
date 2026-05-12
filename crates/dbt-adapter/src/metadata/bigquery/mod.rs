@@ -1,15 +1,16 @@
+use crate::adapter::adapter_impl::AdapterImpl;
+use crate::connection::AdapterConnectionFactory;
 use crate::errors::*;
 use crate::metadata::CatalogAndSchema;
 use crate::metadata::*;
 use crate::record_batch_utils::get_column_values;
 use crate::relation::bigquery::BigqueryRelation;
-use crate::typed_adapter::ConcreteAdapter;
-use crate::{AdapterEngine, AdapterResult, AdapterTyping};
+use crate::{AdapterEngine, AdapterResult};
 
 use arrow_array::*;
 use arrow_schema::*;
-use dbt_common::adapter::AdapterType;
-use dbt_common::adapter::ExecutionPhase;
+use dbt_adapter_core::AdapterType;
+use dbt_adapter_core::ExecutionPhase;
 use dbt_common::cancellation::Cancellable;
 use dbt_common::cancellation::CancellationToken;
 use dbt_schemas::dbt_types::RelationType;
@@ -492,7 +493,7 @@ pub fn build_relation_clauses_bigquery(
 
 fn make_map_f(
     relations: Vec<Arc<dyn BaseRelation>>,
-    adapter: ConcreteAdapter,
+    adapter: AdapterImpl,
     token: CancellationToken,
 ) -> impl Fn(&mut dyn Connection, &(String, Vec<String>)) -> AdapterResult<Arc<RecordBatch>>
 + Send
@@ -503,7 +504,7 @@ fn make_map_f(
         // Query to get last modified times from BigQuery's __TABLES__ metadata table
         let table_list = relations
             .iter()
-            .map(|relation| format!("'{}'", relation.identifier()))
+            .map(|relation| format!("'{}'", relation.identifier().unwrap_or_default()))
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -544,12 +545,12 @@ fn make_map_f(
 }
 
 pub struct BigqueryMetadataAdapter {
-    adapter: ConcreteAdapter,
+    adapter: AdapterImpl,
 }
 
 impl BigqueryMetadataAdapter {
     pub fn new(engine: Arc<dyn AdapterEngine>) -> Self {
-        let adapter = ConcreteAdapter::new(engine);
+        let adapter = AdapterImpl::new(engine, None);
         Self { adapter }
     }
 }
@@ -877,16 +878,11 @@ impl MetadataAdapter for BigqueryMetadataAdapter {
         // All results are accumulated in an unordered map
         type Acc = HashMap<String, AdapterResult<Arc<Schema>>>;
 
-        let adapter: ConcreteAdapter = self.adapter.clone(); // clone needed to move it into lambda
-        let new_connection_f = Box::new(move || {
-            // FIXME(harry): this is not taking into account that we will have multiple connections open
-            // when relations are more than one, do we want to enforce single connection in record and replay tests?
-            let node_id = unique_id.clone().unwrap_or_else(|| "sources".to_string());
-            adapter
-                .engine()
-                .new_connection(None, Some(node_id))
-                .map_err(Cancellable::Error)
-        });
+        let factory = Box::new(AdapterConnectionFactory::new(
+            self.adapter.engine().clone(),
+            self.adapter.engine().threads(),
+        ));
+        let node_id = unique_id.or_else(|| Some("sources".to_string()));
 
         let adapter = self.adapter.clone();
         let token_clone = token.clone();
@@ -963,12 +959,7 @@ impl MetadataAdapter for BigqueryMetadataAdapter {
             acc.insert(relation.semantic_fqn(), schema);
             Ok(())
         };
-        let map_reduce = MapReduce::new(
-            Box::new(new_connection_f),
-            Box::new(map_f),
-            Box::new(reduce_f),
-            MAX_CONNECTIONS,
-        );
+        let map_reduce = MapReduce::new(factory, Box::new(map_f), Box::new(reduce_f), node_id);
         map_reduce.run(Arc::new(relations.to_vec()), token)
     }
 
@@ -997,13 +988,10 @@ impl MetadataAdapter for BigqueryMetadataAdapter {
 
         type Acc = BTreeMap<String, MetadataFreshness>;
 
-        let adapter = self.adapter.clone();
-        let new_connection_f = move || {
-            adapter
-                .engine()
-                .new_connection(None, None)
-                .map_err(Cancellable::Error)
-        };
+        let factory = Box::new(AdapterConnectionFactory::new(
+            self.adapter.engine().clone(),
+            self.adapter.engine().threads(),
+        ));
 
         let adapter = self.adapter.clone();
         let map_f = make_map_f(relations.to_vec(), adapter, token.clone());
@@ -1036,12 +1024,7 @@ impl MetadataAdapter for BigqueryMetadataAdapter {
             Ok(())
         };
 
-        let map_reduce = MapReduce::new(
-            Box::new(new_connection_f),
-            Box::new(map_f),
-            Box::new(reduce_f),
-            MAX_CONNECTIONS,
-        );
+        let map_reduce = MapReduce::new(factory, Box::new(map_f), Box::new(reduce_f), None);
         let keys = where_clauses_by_database.into_iter().collect::<Vec<_>>();
         map_reduce.run(Arc::new(keys), token)
     }
@@ -1060,13 +1043,10 @@ impl MetadataAdapter for BigqueryMetadataAdapter {
         token: CancellationToken,
     ) -> AsyncAdapterResult<'_, BTreeMap<CatalogAndSchema, AdapterResult<RelationVec>>> {
         type Acc = BTreeMap<CatalogAndSchema, AdapterResult<RelationVec>>;
-        let adapter = self.adapter.clone();
-        let new_connection_f = move || {
-            adapter
-                .engine()
-                .new_connection(None, None)
-                .map_err(Cancellable::Error)
-        };
+        let factory = Box::new(AdapterConnectionFactory::new(
+            self.adapter.engine().clone(),
+            self.adapter.engine().threads(),
+        ));
 
         let adapter = self.adapter.clone();
         let token_clone = token.clone();
@@ -1103,12 +1083,7 @@ impl MetadataAdapter for BigqueryMetadataAdapter {
             }
         };
 
-        let map_reduce = MapReduce::new(
-            Box::new(new_connection_f),
-            Box::new(map_f),
-            Box::new(reduce_f),
-            MAX_CONNECTIONS,
-        );
+        let map_reduce = MapReduce::new(factory, Box::new(map_f), Box::new(reduce_f), None);
         map_reduce.run(Arc::new(db_schemas.to_vec()), token)
     }
 

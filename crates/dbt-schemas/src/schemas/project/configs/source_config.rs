@@ -1,4 +1,6 @@
 use dbt_common::io_args::StaticAnalysisKind;
+use dbt_common::serde_utils::Omissible;
+use dbt_proc_macros::Resolvable;
 use dbt_yaml::{DbtSchema, ShouldBe, Spanned, Verbatim};
 use serde::{Deserialize, Serialize};
 // Type aliases for clarity
@@ -8,6 +10,7 @@ use std::collections::BTreeMap;
 use std::collections::btree_map::Iter;
 
 use super::config_keys::ConfigKeys;
+use super::omissible_utils::handle_omissible_override;
 use crate::default_to;
 use crate::schemas::common::PartitionConfig;
 use crate::schemas::common::{
@@ -16,9 +19,9 @@ use crate::schemas::common::{
 use crate::schemas::manifest::GrantAccessToTarget;
 use crate::schemas::project::configs::common::WarehouseSpecificNodeConfig;
 use crate::schemas::project::configs::common::{default_meta_and_tags, default_quoting};
-use crate::schemas::project::{DefaultTo, TypedRecursiveConfig};
+use crate::schemas::project::{ResolvableConfig, TypedRecursiveConfig};
 use crate::schemas::serde::{
-    IndexesConfig, PrimaryKeyConfig, QueryTag, StringOrArrayOfStrings, bool_or_string_bool,
+    IndexesConfig, PrimaryKeyConfig, StringOrArrayOfStrings, bool_or_string_bool,
     f64_or_string_f64, u64_or_string_u64,
 };
 
@@ -31,8 +34,8 @@ pub struct ProjectSourceConfig {
     pub event_time: Option<String>,
     #[serde(rename = "+meta")]
     pub meta: Option<IndexMap<String, YmlValue>>,
-    #[serde(rename = "+freshness")]
-    pub freshness: Option<FreshnessDefinition>,
+    #[serde(default, rename = "+freshness")]
+    pub freshness: Omissible<Option<FreshnessDefinition>>,
     #[serde(rename = "+tags")]
     pub tags: Option<StringOrArrayOfStrings>,
     #[serde(rename = "+quoting")]
@@ -43,52 +46,6 @@ pub struct ProjectSourceConfig {
     pub loaded_at_field: Option<String>,
     #[serde(rename = "+static_analysis")]
     pub static_analysis: Option<Spanned<StaticAnalysisKind>>,
-
-    // Snowflake specific fields
-    #[serde(rename = "+adapter_properties")]
-    pub adapter_properties: Option<BTreeMap<String, YmlValue>>,
-    #[serde(rename = "+external_volume")]
-    pub external_volume: Option<String>,
-    #[serde(rename = "+base_location_root")]
-    pub base_location_root: Option<String>,
-    #[serde(rename = "+base_location_subpath")]
-    pub base_location_subpath: Option<String>,
-    #[serde(rename = "+target_lag")]
-    pub target_lag: Option<String>,
-    #[serde(rename = "+snowflake_warehouse")]
-    pub snowflake_warehouse: Option<String>,
-    #[serde(rename = "+refresh_mode")]
-    pub refresh_mode: Option<String>,
-    #[serde(rename = "+initialize")]
-    pub initialize: Option<String>,
-    #[serde(rename = "+tmp_relation_type")]
-    pub tmp_relation_type: Option<String>,
-    #[serde(rename = "+query_tag")]
-    pub query_tag: Option<QueryTag>,
-    #[serde(rename = "+table_tag")]
-    pub table_tag: Option<String>,
-    #[serde(rename = "+row_access_policy")]
-    pub row_access_policy: Option<String>,
-    #[serde(
-        default,
-        rename = "+automatic_clustering",
-        deserialize_with = "bool_or_string_bool"
-    )]
-    pub automatic_clustering: Option<bool>,
-    #[serde(
-        default,
-        rename = "+copy_grants",
-        deserialize_with = "bool_or_string_bool"
-    )]
-    pub copy_grants: Option<bool>,
-    #[serde(default, rename = "+secure", deserialize_with = "bool_or_string_bool")]
-    pub secure: Option<bool>,
-    #[serde(
-        default,
-        rename = "+transient",
-        deserialize_with = "bool_or_string_bool"
-    )]
-    pub transient: Option<bool>,
 
     // BigQuery specific fields
     #[serde(rename = "+partition_by")]
@@ -273,23 +230,28 @@ impl TypedRecursiveConfig for ProjectSourceConfig {
 }
 
 // NOTE: No #[skip_serializing_none] - we handle None serialization in serialize_with_mode
-#[derive(Deserialize, Serialize, Debug, Clone, Default, PartialEq, DbtSchema)]
+#[derive(Resolvable, Deserialize, Serialize, Debug, Clone, Default, PartialEq, DbtSchema)]
 pub struct SourceConfig {
+    #[resolved(promote, method = get_enabled_with_default)]
     #[serde(default, deserialize_with = "bool_or_string_bool")]
     pub enabled: Option<bool>,
     pub event_time: Option<String>,
     pub meta: Option<IndexMap<String, YmlValue>>,
-    pub freshness: Option<FreshnessDefinition>,
+    #[serde(default)]
+    pub freshness: Omissible<Option<FreshnessDefinition>>,
     #[serde(
         default,
         serialize_with = "crate::schemas::nodes::serialize_none_as_empty_list"
     )]
     pub tags: Option<StringOrArrayOfStrings>,
+    #[resolved(promote, expect = "quoting set by apply_package_defaults")]
     pub quoting: Option<DbtQuoting>,
     pub loaded_at_field: Option<String>,
     pub loaded_at_query: Verbatim<Option<String>>,
+    #[resolved(promote, expect = "static_analysis set by apply_resolve_defaults")]
     pub static_analysis: Option<Spanned<StaticAnalysisKind>>,
     /// Specifies where the schema metadata originates: 'remote' (default) or 'local'
+    #[resolved(promote)]
     pub schema_origin: Option<SchemaOrigin>,
     /// Schema synchronization configuration
     pub sync: Option<SyncConfig>,
@@ -313,22 +275,31 @@ impl From<ProjectSourceConfig> for SourceConfig {
             sync: config.sync,
             __warehouse_specific_config__: WarehouseSpecificNodeConfig {
                 description: None, // Only for Bigquery Models
-                adapter_properties: config.adapter_properties,
-                external_volume: config.external_volume,
-                base_location_root: config.base_location_root,
-                base_location_subpath: config.base_location_subpath,
-                target_lag: config.target_lag,
-                snowflake_warehouse: config.snowflake_warehouse,
-                refresh_mode: config.refresh_mode,
-                initialize: config.initialize,
-                tmp_relation_type: config.tmp_relation_type,
-                query_tag: config.query_tag,
-                table_tag: config.table_tag,
-                row_access_policy: config.row_access_policy,
-                automatic_clustering: config.automatic_clustering,
-                copy_grants: config.copy_grants,
-                secure: config.secure,
-                transient: config.transient,
+                adapter_properties: None,
+                external_volume: None,
+                base_location_root: None,
+                base_location_subpath: None,
+                change_tracking: None,
+                data_retention_time_in_days: None,
+                max_data_extension_time_in_days: None,
+                storage_serialization_policy: None,
+                target_file_size: None,
+                target_lag: None,
+                snowflake_initialization_warehouse: None,
+                immutable_where: None,
+                snowflake_warehouse: None,
+                refresh_mode: None,
+                initialize: None,
+                scheduler: None,
+                tmp_relation_type: None,
+                query_tag: None,
+                table_tag: None,
+                row_access_policy: None,
+                automatic_clustering: None,
+                copy_grants: None,
+                secure: None,
+                transient: None,
+                iceberg_version: None,
 
                 partition_by: config.partition_by,
                 cluster_by: config.cluster_by,
@@ -352,10 +323,12 @@ impl From<ProjectSourceConfig> for SourceConfig {
                 notebook_template_id: None,
                 enable_list_inference: None,
                 intermediate_format: None,
+                storage_uri: None,
 
                 file_format: config.file_format,
                 catalog_name: config.catalog_name,
                 location_root: config.location_root,
+                use_uniform: None,
                 tblproperties: config.tblproperties,
                 include_full_name_in_path: config.include_full_name_in_path,
                 liquid_clustered_by: config.liquid_clustered_by,
@@ -412,23 +385,6 @@ impl From<SourceConfig> for ProjectSourceConfig {
             static_analysis: config.static_analysis,
             schema_origin: config.schema_origin,
             sync: config.sync,
-            // Snowflake fields
-            adapter_properties: config.__warehouse_specific_config__.adapter_properties,
-            external_volume: config.__warehouse_specific_config__.external_volume,
-            base_location_root: config.__warehouse_specific_config__.base_location_root,
-            base_location_subpath: config.__warehouse_specific_config__.base_location_subpath,
-            target_lag: config.__warehouse_specific_config__.target_lag,
-            snowflake_warehouse: config.__warehouse_specific_config__.snowflake_warehouse,
-            refresh_mode: config.__warehouse_specific_config__.refresh_mode,
-            initialize: config.__warehouse_specific_config__.initialize,
-            tmp_relation_type: config.__warehouse_specific_config__.tmp_relation_type,
-            query_tag: config.__warehouse_specific_config__.query_tag,
-            table_tag: config.__warehouse_specific_config__.table_tag,
-            row_access_policy: config.__warehouse_specific_config__.row_access_policy,
-            automatic_clustering: config.__warehouse_specific_config__.automatic_clustering,
-            copy_grants: config.__warehouse_specific_config__.copy_grants,
-            secure: config.__warehouse_specific_config__.secure,
-            transient: config.__warehouse_specific_config__.transient,
             // BigQuery fields
             partition_by: config.__warehouse_specific_config__.partition_by,
             cluster_by: config.__warehouse_specific_config__.cluster_by,
@@ -503,9 +459,39 @@ impl From<SourceConfig> for ProjectSourceConfig {
     }
 }
 
-impl DefaultTo<SourceConfig> for SourceConfig {
-    fn get_enabled(&self) -> Option<bool> {
-        self.enabled
+impl ResolvableConfig<SourceConfig> for SourceConfig {
+    type Resolved = ResolvedSourceConfig;
+    type PackageDefaults = DbtQuoting;
+    type ResolveDefaults = (StaticAnalysisKind, Option<SyncConfig>);
+
+    fn get_enabled_with_default(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+
+    fn disable(&mut self) {
+        self.enabled = Some(false);
+    }
+
+    fn apply_package_defaults(&mut self, quoting: DbtQuoting) {
+        if self.quoting.is_none() {
+            self.quoting = Some(quoting);
+        }
+    }
+
+    fn apply_resolve_defaults(
+        &mut self,
+        (static_analysis, sync): (StaticAnalysisKind, Option<SyncConfig>),
+    ) {
+        if self.static_analysis.is_none() {
+            self.static_analysis = Some(Spanned::new(static_analysis));
+        }
+        if self.sync.is_none() {
+            self.sync = sync;
+        }
+    }
+
+    fn finalize(self) -> ResolvedSourceConfig {
+        self.finalize_resolved()
     }
 
     fn default_to(&mut self, parent: &SourceConfig) {
@@ -536,12 +522,14 @@ impl DefaultTo<SourceConfig> for SourceConfig {
         #[allow(unused, clippy::let_unit_value)]
         let tags = ();
 
+        // Handle Omissible fields for hierarchical overrides
+        handle_omissible_override(freshness, &parent.freshness);
+
         default_to!(
             parent,
             [
                 enabled,
                 event_time,
-                freshness,
                 loaded_at_field,
                 loaded_at_query,
                 static_analysis,

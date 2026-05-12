@@ -10,6 +10,10 @@ cleanup() {
     if [ -n "${td:-}" ]; then
         rm -rf "$td"
     fi
+    # Remove any in-progress staging binary left behind by a failed install
+    if [ -n "${tmp_bin:-}" ]; then
+        rm -f "$tmp_bin"
+    fi
 }
 
 # Register the cleanup function to be called on EXIT.
@@ -57,7 +61,7 @@ need() {
 
 # Function to install jq automatically
 install_jq() {
-    jq_version="1.7.1"
+    jq_version="1.8.1"
     jq_url=""
     jq_binary_name="jq"
     temp_dir=""
@@ -155,6 +159,7 @@ help() {
     echo "  --target TARGET    Install for target platform TARGET"
     echo "  --to DEST          Install to DEST"
     echo "  --help, -h         Show this help text"
+    echo "  --package PACKAGE  Install package PACKAGE [dbt|all]"
 }
 
 update=false
@@ -537,9 +542,6 @@ install_package() {
         "dbt")
             url="https://public.cdn.getdbt.com/fs/cli/fs-v$version-$target.tar.gz"
             ;;
-        "dbt-lsp")
-            url="https://public.cdn.getdbt.com/fs/lsp/fs-lsp-v$version-$target.tar.gz"
-            ;;
         *)
             err_and_exit "Invalid package name: $package_name"
             ;;
@@ -562,24 +564,20 @@ install_package() {
             continue
         }
 
-        if [ -e "$dest/$package_name" ] && [ "$update" = true ]; then
-            # Remove file - no sudo needed for home directory
-            rm -f "$dest/$package_name" || {
-                err_and_exit "Error: Failed to remove existing $package_name binary."
-            }
-        fi
-
         log_debug "Moving $f to $dest/$package_name"
 
         # Ensure the destination directory exists
         mkdir -p "$dest" || err_and_exit "Error: Failed to create installation directory: $dest"
 
-        # Install the binary and pipe its verbose output to log_debug
-        install -v -m 755 "$td/$f" "$dest/$package_name" 2>&1 | while IFS= read -r line; do
+        # Stage into a temp file in the same directory (same filesystem = atomic mv).
+        # install sets permissions before the file goes live; mv -f atomically
+        # replaces any existing binary without a removal gap.
+        tmp_bin="$dest/.${package_name}.tmp.$$"
+        install -v -m 755 "$td/$f" "$tmp_bin" 2>&1 | while IFS= read -r line; do
             log_debug "$line"
-        done || {
-            err_and_exit "Error: Failed to install $package_name binary."
-        }
+        done || err_and_exit "Error: Failed to stage $package_name binary."
+        mv -f "$tmp_bin" "$dest/$package_name" || err_and_exit "Error: Failed to replace $package_name binary."
+        log_debug "Installed $package_name to $dest/$package_name"
     done
 
     display_ascii_art "$package_name" "$version"
@@ -601,9 +599,15 @@ install_packages() {
     dest="$4"
     update="$5"
     current_dbt_version=""
-    current_lsp_version=""
     dbt_needs_update=false
-    lsp_needs_update=false
+
+    if [ "$package" = "dbt-lsp" ]; then
+        err_and_exit "The standalone dbt-lsp package is no longer published. Install dbt and run 'dbt lsp' instead."
+    fi
+
+    if [ "$package" != "dbt" ] && [ "$package" != "all" ]; then
+        err_and_exit "Invalid package name: $package"
+    fi
 
     # Check if versions match
     if [ "$package" = "all" ] || [ "$package" = "dbt" ]; then
@@ -613,27 +617,14 @@ install_packages() {
         fi
     fi
 
-    if [ "$package" = "all" ] || [ "$package" = "dbt-lsp" ]; then
-        current_lsp_version=$(check_binary_version "$dest/dbt-lsp" "dbt-lsp")
-        if ! compare_versions "$current_lsp_version" "$target_version" "$version" "dbt-lsp"; then
-            lsp_needs_update=true
-        fi
-    fi
-
     # Exit if no updates needed
-    if [ "$dbt_needs_update" = false ] && [ "$lsp_needs_update" = false ]; then
+    if [ "$dbt_needs_update" = false ]; then
         return 0
     fi
 
     # Install packages
     if ([ "$package" = "all" ] || [ "$package" = "dbt" ]) && [ "$dbt_needs_update" = true ]; then
         if ! install_package "dbt" "$target_version" "$target" "$dest" "$update"; then
-            return 1
-        fi
-    fi
-
-    if ([ "$package" = "all" ] || [ "$package" = "dbt-lsp" ]) && [ "$lsp_needs_update" = true ]; then
-        if ! install_package "dbt-lsp" "$target_version" "$target" "$dest" "$update"; then
             return 1
         fi
     fi
@@ -646,33 +637,6 @@ install_packages() {
     return 0
 }
 
-validate_versions() {
-    dest="$1"
-
-    dbt_path="$dest/dbt"
-    lsp_path="$dest/dbt-lsp"
-
-    if [ -f "$dbt_path" ] && [ -x "$dbt_path" ]; then
-        dbt_version=$("$dbt_path" --version 2>/dev/null | cut -d ' ' -f 2 || echo "")
-    fi
-
-    if [ -f "$lsp_path" ] && [ -x "$lsp_path" ]; then
-        lsp_version=$("$lsp_path" --version 2>/dev/null | cut -d ' ' -f 2 || echo "")
-    fi
-
-    if [ -z "$dbt_version" ] || [ -z "$lsp_version" ]; then
-        # if both aren't installed, nothing to compare
-        return 0
-    fi
-
-    if [ "$dbt_version" != "$lsp_version" ]; then
-        log_grey "WARNING: dbt and dbt-lsp versions do not match"
-    fi
-
-    return 0
-}
-
-
 main() {
     # Initialize variables with defaults if not set by command-line parsing
     # These variables are parsed from command-line arguments (lines 155-189)
@@ -682,6 +646,14 @@ main() {
     target="${target:-}"
     dest="${dest:-$HOME/.local/bin}"
     update="${update:-false}"
+
+    if [ "$package" = "dbt-lsp" ]; then
+        err_and_exit "The standalone dbt-lsp package is no longer published. Install dbt and run 'dbt lsp' instead."
+    fi
+
+    if [ "$package" != "dbt" ] && [ "$package" != "all" ]; then
+        err_and_exit "Invalid package name: $package"
+    fi
 
     check_jq
 
@@ -698,10 +670,6 @@ main() {
 
     install_packages "$package" "$target_version" "$target_platform" "$dest" "$update"
 
-    # Only validate versions if not skipped and installing multiple packages
-    if [ -z "${_FS_SKIP_VERSION_CHECK:-}" ] && [ "$package" = "all" ]; then
-        validate_versions "$dest"
-    fi
 }
 
 

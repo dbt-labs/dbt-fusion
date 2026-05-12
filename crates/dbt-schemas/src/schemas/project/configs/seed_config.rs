@@ -2,6 +2,7 @@ use crate::schemas::common::ClusterConfig;
 use crate::schemas::serde::OmissibleGrantConfig;
 use crate::schemas::serde::QueryTag;
 use dbt_common::io_args::StaticAnalysisKind;
+use dbt_proc_macros::Resolvable;
 use dbt_yaml::DbtSchema;
 use dbt_yaml::ShouldBe;
 use dbt_yaml::Spanned;
@@ -24,7 +25,7 @@ use crate::schemas::common::PartitionConfig;
 use crate::schemas::common::PersistDocsConfig;
 use crate::schemas::common::Schedule;
 use crate::schemas::manifest::GrantAccessToTarget;
-use crate::schemas::project::DefaultTo;
+use crate::schemas::project::ResolvableConfig;
 use crate::schemas::project::TypedRecursiveConfig;
 use crate::schemas::project::configs::common::WarehouseSpecificNodeConfig;
 use crate::schemas::project::configs::common::default_column_types;
@@ -77,6 +78,10 @@ pub struct ProjectSeedConfig {
     pub quote_columns: Option<bool>,
     #[serde(rename = "+schema", alias = "+dataset")]
     pub schema: Option<String>,
+    #[serde(rename = "+snowflake_initialization_warehouse")]
+    pub snowflake_initialization_warehouse: Option<String>,
+    #[serde(rename = "+immutable_where")]
+    pub immutable_where: Option<String>,
     #[serde(rename = "+snowflake_warehouse")]
     pub snowflake_warehouse: Option<String>,
     #[serde(rename = "+static_analysis")]
@@ -103,6 +108,8 @@ pub struct ProjectSeedConfig {
     pub refresh_mode: Option<String>,
     #[serde(rename = "+initialize")]
     pub initialize: Option<String>,
+    #[serde(rename = "+scheduler")]
+    pub scheduler: Option<String>,
     #[serde(rename = "+tmp_relation_type")]
     pub tmp_relation_type: Option<String>,
     #[serde(rename = "+query_tag")]
@@ -288,7 +295,7 @@ impl TypedRecursiveConfig for ProjectSeedConfig {
 }
 
 // NOTE: No #[skip_serializing_none] - we handle None serialization in serialize_with_mode
-#[derive(Deserialize, Serialize, Debug, Default, PartialEq, Clone, DbtSchema)]
+#[derive(Resolvable, Deserialize, Serialize, Debug, Default, PartialEq, Clone, DbtSchema)]
 pub struct SeedConfig {
     pub column_types: Option<BTreeMap<Spanned<String>, String>>,
     #[serde(alias = "project", alias = "data_space")]
@@ -298,6 +305,7 @@ pub struct SeedConfig {
     pub alias: Option<String>,
     pub catalog_name: Option<String>,
     pub docs: Option<DocsConfig>,
+    #[resolved(promote, method = get_enabled_with_default)]
     #[serde(default, deserialize_with = "bool_or_string_bool")]
     pub enabled: Option<bool>,
     #[serde(default)]
@@ -309,6 +317,7 @@ pub struct SeedConfig {
     pub full_refresh: Option<bool>,
     pub group: Option<String>,
     pub meta: Option<IndexMap<String, YmlValue>>,
+    #[resolved(promote, expect = "static_analysis set by apply_resolve_defaults")]
     pub static_analysis: Option<Spanned<StaticAnalysisKind>>,
     pub persist_docs: Option<PersistDocsConfig>,
     #[serde(alias = "post-hook")]
@@ -320,6 +329,7 @@ pub struct SeedConfig {
         serialize_with = "crate::schemas::nodes::serialize_none_as_empty_list"
     )]
     pub tags: Option<StringOrArrayOfStrings>,
+    #[resolved(promote, expect = "quoting set by apply_package_defaults")]
     pub quoting: Option<DbtQuoting>,
     pub materialized: Option<DbtMaterialization>,
     // Adapter specific configs
@@ -356,10 +366,18 @@ impl From<ProjectSeedConfig> for SeedConfig {
                 external_volume: config.external_volume,
                 base_location_root: config.base_location_root,
                 base_location_subpath: config.base_location_subpath,
+                change_tracking: None,
+                data_retention_time_in_days: None,
+                max_data_extension_time_in_days: None,
+                storage_serialization_policy: None,
+                target_file_size: None,
                 target_lag: config.target_lag,
+                snowflake_initialization_warehouse: config.snowflake_initialization_warehouse,
+                immutable_where: config.immutable_where,
                 snowflake_warehouse: config.snowflake_warehouse,
                 refresh_mode: config.refresh_mode,
                 initialize: config.initialize,
+                scheduler: config.scheduler,
                 tmp_relation_type: config.tmp_relation_type,
                 query_tag: config.query_tag,
                 table_tag: config.table_tag,
@@ -368,6 +386,7 @@ impl From<ProjectSeedConfig> for SeedConfig {
                 copy_grants: config.copy_grants,
                 secure: config.secure,
                 transient: config.transient,
+                iceberg_version: None,
 
                 partition_by: config.partition_by,
                 cluster_by: config.cluster_by,
@@ -391,9 +410,11 @@ impl From<ProjectSeedConfig> for SeedConfig {
                 notebook_template_id: None,
                 enable_list_inference: None,
                 intermediate_format: None,
+                storage_uri: None,
                 file_format: config.file_format,
                 catalog_name: config.catalog_name,
                 location_root: config.location_root,
+                use_uniform: None,
                 tblproperties: config.tblproperties,
                 include_full_name_in_path: config.include_full_name_in_path,
                 liquid_clustered_by: config.liquid_clustered_by,
@@ -460,6 +481,10 @@ impl From<SeedConfig> for ProjectSeedConfig {
             quoting: config.quoting,
             // Snowflake fields
             adapter_properties: config.__warehouse_specific_config__.adapter_properties,
+            snowflake_initialization_warehouse: config
+                .__warehouse_specific_config__
+                .snowflake_initialization_warehouse,
+            immutable_where: config.__warehouse_specific_config__.immutable_where,
             snowflake_warehouse: config.__warehouse_specific_config__.snowflake_warehouse,
             transient: config.__warehouse_specific_config__.transient,
             copy_grants: config.__warehouse_specific_config__.copy_grants,
@@ -469,6 +494,7 @@ impl From<SeedConfig> for ProjectSeedConfig {
             target_lag: config.__warehouse_specific_config__.target_lag,
             refresh_mode: config.__warehouse_specific_config__.refresh_mode,
             initialize: config.__warehouse_specific_config__.initialize,
+            scheduler: config.__warehouse_specific_config__.scheduler,
             tmp_relation_type: config.__warehouse_specific_config__.tmp_relation_type,
             query_tag: config.__warehouse_specific_config__.query_tag,
             table_tag: config.__warehouse_specific_config__.table_tag,
@@ -546,17 +572,33 @@ impl From<SeedConfig> for ProjectSeedConfig {
     }
 }
 
-impl DefaultTo<SeedConfig> for SeedConfig {
-    fn get_enabled(&self) -> Option<bool> {
-        self.enabled
+impl ResolvableConfig<SeedConfig> for SeedConfig {
+    type Resolved = ResolvedSeedConfig;
+    type PackageDefaults = DbtQuoting;
+    type ResolveDefaults = StaticAnalysisKind;
+
+    fn get_enabled_with_default(&self) -> bool {
+        self.enabled.unwrap_or(true)
     }
 
-    fn get_pre_hook(&self) -> Option<&Hooks> {
-        (*self.pre_hook).as_ref()
+    fn disable(&mut self) {
+        self.enabled = Some(false);
     }
 
-    fn get_post_hook(&self) -> Option<&Hooks> {
-        (*self.post_hook).as_ref()
+    fn apply_package_defaults(&mut self, quoting: DbtQuoting) {
+        if self.quoting.is_none() {
+            self.quoting = Some(quoting);
+        }
+    }
+
+    fn apply_resolve_defaults(&mut self, static_analysis: StaticAnalysisKind) {
+        if self.static_analysis.is_none() {
+            self.static_analysis = Some(Spanned::new(static_analysis));
+        }
+    }
+
+    fn finalize(self) -> ResolvedSeedConfig {
+        self.finalize_resolved()
     }
 
     fn default_to(&mut self, parent: &SeedConfig) {
@@ -624,18 +666,6 @@ impl DefaultTo<SeedConfig> for SeedConfig {
                 materialized,
             ]
         );
-    }
-
-    fn database(&self) -> Option<String> {
-        self.database.clone()
-    }
-
-    fn schema(&self) -> Option<String> {
-        self.schema.clone()
-    }
-
-    fn alias(&self) -> Option<String> {
-        self.alias.clone()
     }
 }
 

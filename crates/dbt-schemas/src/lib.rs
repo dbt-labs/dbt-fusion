@@ -11,6 +11,7 @@ pub mod schemas {
     pub mod common;
     pub mod data_tests;
     pub mod dbt_catalogs;
+    pub mod dbt_catalogs_v2;
     pub mod dbt_column;
     pub mod serialization_utils;
 
@@ -29,7 +30,7 @@ pub mod schemas {
     pub mod selectors;
     pub mod serde;
     mod sources;
-    pub use prev_state::{ModificationType, PreviousState};
+    pub use prev_state::{ModificationType, OnManifestLoadFailure, PreviousState};
     pub use run_results::{
         ContextRunResult, RunResultOutput, RunResultsArgs, RunResultsArtifact, RunResultsMetadata,
         TimingInfo,
@@ -41,8 +42,8 @@ pub mod schemas {
         DbtFunction, DbtFunctionAttr, DbtModel, DbtModelAttr, DbtSeed, DbtSeedAttr, DbtSnapshot,
         DbtSnapshotAttr, DbtSource, DbtSourceAttr, DbtTest, DbtTestAttr, DbtUnitTest,
         DbtUnitTestAttr, ExposureType, InternalDbtNode, InternalDbtNodeAttributes,
-        InternalDbtNodeWrapper, IntrospectionKind, NodeBaseAttributes, Nodes, TestMetadata,
-        TimeSpine, TimeSpinePrimaryColumn, deserialize_empty_string_as_none,
+        InternalDbtNodeWrapper, IntrospectionKind, NodeBaseAttributes, NodePathKind, Nodes,
+        TestMetadata, TimeSpine, TimeSpinePrimaryColumn, deserialize_empty_string_as_none,
         serialize_none_as_empty_string,
     };
 
@@ -98,8 +99,11 @@ pub mod schemas {
         pub use v11::DbtManifestV11;
         pub use v12::DbtManifestV12;
     }
-    mod dbt_cloud;
-    pub use dbt_cloud::{DbtCloudConfig, DbtCloudContext, DbtCloudProject, DbtCloudProjectConfig};
+    pub mod dbt_cloud;
+    pub use dbt_cloud::{
+        CloudCredentials, DbtCloudConfig, DbtCloudContext, DbtCloudProject, DbtCloudProjectConfig,
+        ResolvedCloudConfig,
+    };
 
     pub mod semantic_layer {
         pub mod metric;
@@ -129,27 +133,41 @@ pub mod schemas {
             pub mod unit_test_config;
         }
 
-        pub use configs::analysis_config::{AnalysesConfig, ProjectAnalysisConfig};
+        pub use configs::analysis_config::{
+            AnalysesConfig, ProjectAnalysisConfig, ResolvedAnalysesConfig,
+        };
         pub use configs::common::{WarehouseSpecificNodeConfig, same_warehouse_config};
         pub use configs::config_keys::ConfigKeys;
-        pub use configs::data_test_config::{DataTestConfig, ProjectDataTestConfig};
-        pub use configs::exposure_config::{ExposureConfig, ProjectExposureConfig};
-        pub use configs::function_config::{FunctionConfig, ProjectFunctionConfig};
-        pub use configs::metric_config::{MetricConfig, ProjectMetricConfigs};
-        pub use configs::model_config::{ModelConfig, ProjectModelConfig};
+        pub use configs::data_test_config::{
+            DataTestConfig, ProjectDataTestConfig, ResolvedDataTestConfig,
+        };
+        pub use configs::exposure_config::{
+            ExposureConfig, ProjectExposureConfig, ResolvedExposureConfig,
+        };
+        pub use configs::function_config::{
+            FunctionConfig, ProjectFunctionConfig, ResolvedFunctionConfig,
+        };
+        pub use configs::metric_config::{
+            MetricConfig, ProjectMetricConfigs, ResolvedMetricConfig,
+        };
+        pub use configs::model_config::{ModelConfig, ProjectModelConfig, ResolvedModelConfig};
         pub use configs::saved_query_config::{
-            ExportConfigExportAs, SavedQueryCache, SavedQueryConfig,
+            ExportConfigExportAs, ResolvedSavedQueryConfig, SavedQueryCache, SavedQueryConfig,
         };
-        pub use configs::seed_config::{ProjectSeedConfig, SeedConfig};
-        pub use configs::semantic_model_config::{ProjectSemanticModelConfig, SemanticModelConfig};
+        pub use configs::seed_config::{ProjectSeedConfig, ResolvedSeedConfig, SeedConfig};
+        pub use configs::semantic_model_config::{
+            ProjectSemanticModelConfig, ResolvedSemanticModelConfig, SemanticModelConfig,
+        };
         pub use configs::snapshot_config::{
-            ProjectSnapshotConfig, SnapshotConfig, SnapshotMetaColumnNames,
+            ProjectSnapshotConfig, ResolvedSnapshotConfig, SnapshotConfig, SnapshotMetaColumnNames,
         };
-        pub use configs::source_config::{ProjectSourceConfig, SourceConfig};
-        pub use configs::unit_test_config::{ProjectUnitTestConfig, UnitTestConfig};
+        pub use configs::source_config::{ProjectSourceConfig, ResolvedSourceConfig, SourceConfig};
+        pub use configs::unit_test_config::{
+            ProjectUnitTestConfig, ResolvedUnitTestConfig, UnitTestConfig,
+        };
         pub use dbt_project::{
-            DbtProject, DbtProjectNameOnly, DbtProjectSimplified, DefaultTo, ProjectDbtCloudConfig,
-            QueryComment, TypedRecursiveConfig,
+            DbtProject, DbtProjectNameOnly, DbtProjectSimplified, ProjectDbtCloudConfig,
+            QueryComment, ResolvableConfig, ResolvedConfig, TypedRecursiveConfig,
         };
     }
 
@@ -172,7 +190,8 @@ pub mod schemas {
         pub use data_test_properties::DataTestProperties;
         pub use exposure_properties::ExposureProperties;
         pub use function_properties::{
-            FunctionArgument, FunctionKind, FunctionProperties, FunctionReturnType, Volatility,
+            FunctionArgument, FunctionKind, FunctionOverload, FunctionProperties,
+            FunctionReturnType, Volatility,
         };
         pub use metrics_properties::MetricsProperties;
         pub use model_properties::ModelConstraint;

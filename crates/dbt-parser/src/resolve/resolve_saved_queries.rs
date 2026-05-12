@@ -1,5 +1,5 @@
 use crate::args::ResolveArgs;
-use crate::dbt_project_config::{RootProjectConfigs, init_project_config};
+use crate::dbt_project_config::{ProjectConfigResolver, RootProjectConfigs, init_project_config};
 use crate::utils::{get_node_fqn, get_original_file_path, get_unique_id};
 
 use dbt_common::io_args::{StaticAnalysisKind, StaticAnalysisOffReason};
@@ -12,7 +12,6 @@ use dbt_schemas::schemas::common::{DbtChecksum, DbtMaterialization, NodeDependsO
 use dbt_schemas::schemas::manifest::saved_query::{
     self, DbtSavedQuery, DbtSavedQueryAttr, SavedQueryExportConfig, SavedQueryParams,
 };
-use dbt_schemas::schemas::project::{DefaultTo, SavedQueryConfig};
 use dbt_schemas::schemas::properties::SavedQueriesProperties;
 use dbt_schemas::schemas::{CommonAttributes, NodeBaseAttributes};
 use dbt_schemas::state::DbtPackage;
@@ -48,14 +47,17 @@ pub async fn resolve_saved_queries(
     }
 
     let dependency_package_name = dependency_package_name_from_ctx(&env, base_ctx);
-    let local_project_config = init_project_config(
-        &arg.io,
-        &package.dbt_project.saved_queries,
-        SavedQueryConfig {
-            enabled: Some(true),
-            ..Default::default()
+    let config_resolver = ProjectConfigResolver::build(
+        root_project_configs.saved_queries.clone(),
+        dependency_package_name.is_some(),
+        || {
+            init_project_config(
+                &arg.io,
+                &package.dbt_project.saved_queries,
+                (),
+                dependency_package_name,
+            )
         },
-        dependency_package_name,
     )?;
 
     // Validate saved query names with regex (similar to exposures)
@@ -99,20 +101,9 @@ pub async fn resolve_saved_queries(
             )?;
 
             // Get combined config from project config and saved query config
-            let global_config = local_project_config.get_config_for_fqn(&fqn);
-            let mut project_config = root_project_configs
-                .saved_queries
-                .get_config_for_fqn(&fqn)
-                .clone();
-            project_config.default_to(global_config);
-
-            let saved_query_config = if let Some(config) = &saved_query_props.config {
-                let mut final_config = config.clone();
-                final_config.default_to(&project_config);
-                final_config
-            } else {
-                project_config.clone()
-            };
+            let saved_query_config =
+                config_resolver.resolve_with_properties(&fqn, saved_query_props.config.as_ref());
+            let is_enabled = saved_query_config.enabled;
 
             let props_query_params = &saved_query_props.query_params;
 
@@ -225,6 +216,7 @@ pub async fn resolve_saved_queries(
                     materialized: DbtMaterialization::Unknown("export".to_string()),
                     static_analysis: StaticAnalysisKind::Off.into(),
                     static_analysis_off_reason: Some(StaticAnalysisOffReason::UnableToFetchSchema),
+                    compute: None,
                     enabled: true,
                     extended_model: false,
                     persist_docs: None,
@@ -247,12 +239,12 @@ pub async fn resolve_saved_queries(
                     created_at: chrono::Utc::now().timestamp() as f64,
                     cache: saved_query_config.cache.clone(),
                 },
-                deprecated_config: saved_query_config.clone(),
+                deprecated_config: saved_query_config.into(),
                 __other__: BTreeMap::new(),
             };
 
             // Check if saved query is enabled (following exposures pattern)
-            if saved_query_config.enabled.unwrap_or(true) {
+            if is_enabled {
                 saved_queries.insert(unique_id, Arc::new(dbt_saved_query));
             } else {
                 disabled_saved_queries.insert(unique_id, Arc::new(dbt_saved_query));

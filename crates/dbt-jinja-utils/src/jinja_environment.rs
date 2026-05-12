@@ -1,4 +1,4 @@
-use dbt_adapter::{BaseAdapter, BridgeAdapter, factory::create_static_relation};
+use dbt_adapter::{Adapter, column::ColumnStatic, relation::factory::create_static_relation};
 use dbt_common::{ErrorCode, FsError, FsResult, fs_err};
 use minijinja::{
     Environment, Error as MinijinjaError, State, Template, UndefinedBehavior, Value,
@@ -180,13 +180,17 @@ impl JinjaEnv {
     }
 
     /// Set the adapter
-    pub(crate) fn set_adapter(&mut self, adapter: Arc<dyn BaseAdapter>) {
+    pub(crate) fn set_adapter(&mut self, adapter: Arc<Adapter>) {
+        let adapter_type = adapter.adapter_type();
         let mut api_map = BTreeMap::new();
         api_map.insert(
             "Relation".to_string(),
-            create_static_relation(adapter.adapter_type(), adapter.quoting()),
+            create_static_relation(adapter_type, adapter.engine().quoting()),
         );
-        api_map.insert("Column".to_string(), adapter.column_type());
+        api_map.insert(
+            "Column".to_string(),
+            Some(Value::from_object(ColumnStatic::new(adapter_type))),
+        );
         self.env.add_global("api", Value::from_object(api_map));
 
         // Add the adapter type to the environment for easy access
@@ -196,21 +200,20 @@ impl JinjaEnv {
     }
 
     /// Get the adapter from the environment
-    pub fn get_adapter(&self) -> Option<Arc<BridgeAdapter>> {
+    pub fn get_adapter(&self) -> Option<Arc<Adapter>> {
         let adapter = self.env.get_global("adapter")?;
-        adapter.downcast_object::<BridgeAdapter>()
+        adapter.downcast_object::<Adapter>()
     }
 
     /// Get the adapter reference from the environment.
-    pub fn get_adapter_ref(&self) -> Option<&BridgeAdapter> {
+    pub fn get_adapter_ref(&self) -> Option<&Adapter> {
         let adapter = self.env.get_global_ref("adapter")?;
-        adapter.downcast_object_ref::<BridgeAdapter>()
+        adapter.downcast_object_ref::<Adapter>()
     }
 
     /// Get the adapter from the environment
-    pub fn get_base_adapter(&self) -> Option<Arc<dyn BaseAdapter>> {
-        self.get_adapter()
-            .map(|bridge| bridge as Arc<dyn BaseAdapter>)
+    pub fn get_base_adapter(&self) -> Option<Arc<Adapter>> {
+        self.get_adapter().map(|bridge| bridge as Arc<Adapter>)
     }
 
     /// Set the undefined behavior for the environment.

@@ -3,6 +3,7 @@ use dbt_common::io_args::StaticAnalysisKind;
 use dbt_common::serde_utils::Omissible;
 use dbt_yaml::DbtSchema;
 use dbt_yaml::ShouldBe;
+use dbt_yaml::Spanned;
 use serde::{Deserialize, Serialize};
 // Type aliases for clarity
 type YmlValue = dbt_yaml::Value;
@@ -14,20 +15,24 @@ use std::collections::btree_map::Iter;
 use super::config_keys::ConfigKeys;
 use super::omissible_utils::handle_omissible_override;
 
+use dbt_proc_macros::Resolvable;
+
 use crate::default_to;
 use crate::schemas::common::DocsConfig;
 use crate::schemas::common::{Access, DbtQuoting};
 use crate::schemas::project::configs::common::log_state_mod_diff;
 // Import comparison helpers from common
 use super::common::{
-    access_eq, docs_eq, grants_eq, meta_eq, omissible_option_eq, same_warehouse_config,
+    access_eq, array_of_strings_eq, docs_eq, grants_eq, meta_eq, omissible_option_eq,
+    same_warehouse_config,
 };
 use crate::schemas::project::configs::common::WarehouseSpecificNodeConfig;
 use crate::schemas::project::configs::common::{
-    default_meta_and_tags, default_quoting, default_to_grants,
+    default_meta_and_tags, default_packages, default_quoting, default_to_grants,
 };
-use crate::schemas::project::dbt_project::DefaultTo;
-use crate::schemas::project::dbt_project::TypedRecursiveConfig;
+use crate::schemas::project::dbt_project::{
+    ResolvableConfig, ResolvedConfig, TypedRecursiveConfig,
+};
 use crate::schemas::properties::{FunctionKind, Volatility};
 use crate::schemas::serde::StringOrArrayOfStrings;
 use crate::schemas::serde::{bool_or_string_bool, default_type};
@@ -64,7 +69,7 @@ pub struct ProjectFunctionConfig {
     #[serde(rename = "+schema")]
     pub schema: Omissible<Option<String>>,
     #[serde(rename = "+static_analysis")]
-    pub static_analysis: Option<StaticAnalysisKind>,
+    pub static_analysis: Option<Spanned<StaticAnalysisKind>>,
     #[serde(rename = "+tags")]
     pub tags: Option<StringOrArrayOfStrings>,
     #[serde(rename = "+type")]
@@ -75,6 +80,8 @@ pub struct ProjectFunctionConfig {
     pub runtime_version: Option<String>,
     #[serde(rename = "+entry_point")]
     pub entry_point: Option<String>,
+    #[serde(rename = "+packages")]
+    pub packages: Option<StringOrArrayOfStrings>,
 
     // Additional properties for directory structure
     pub __additional_properties__: BTreeMap<String, ShouldBe<ProjectFunctionConfig>>,
@@ -101,12 +108,35 @@ impl Default for ProjectFunctionConfig {
             volatility: None,
             runtime_version: None,
             entry_point: None,
+            packages: None,
             __additional_properties__: BTreeMap::new(),
         }
     }
 }
 
-impl DefaultTo<ProjectFunctionConfig> for ProjectFunctionConfig {
+impl ResolvedConfig for ProjectFunctionConfig {
+    fn enabled(&self) -> bool {
+        true
+    }
+}
+
+impl ResolvableConfig<ProjectFunctionConfig> for ProjectFunctionConfig {
+    type Resolved = Self;
+    type PackageDefaults = ();
+    type ResolveDefaults = ();
+
+    fn get_enabled_with_default(&self) -> bool {
+        true
+    }
+
+    fn disable(&mut self) {}
+
+    fn apply_package_defaults(&mut self, _: ()) {}
+
+    fn finalize(self) -> Self {
+        self
+    }
+
     fn default_to(&mut self, parent: &ProjectFunctionConfig) {
         let ProjectFunctionConfig {
             access,
@@ -127,6 +157,7 @@ impl DefaultTo<ProjectFunctionConfig> for ProjectFunctionConfig {
             volatility,
             runtime_version,
             entry_point,
+            packages,
             __additional_properties__: _,
         } = self;
 
@@ -136,6 +167,8 @@ impl DefaultTo<ProjectFunctionConfig> for ProjectFunctionConfig {
         default_to_grants(grants, &parent.grants);
         handle_omissible_override(database, &parent.database);
         handle_omissible_override(schema, &parent.schema);
+        #[allow(unused, clippy::let_unit_value)]
+        let packages = default_packages(packages, &parent.packages);
 
         default_to!(
             parent,
@@ -168,10 +201,11 @@ impl TypedRecursiveConfig for ProjectFunctionConfig {
 }
 
 #[skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, DbtSchema)]
+#[derive(Resolvable, Debug, Clone, Serialize, Deserialize, Default, PartialEq, DbtSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct FunctionConfig {
     pub access: Option<Access>,
+    #[resolved(promote, method = get_enabled_with_default)]
     #[serde(default, deserialize_with = "bool_or_string_bool")]
     pub enabled: Option<bool>,
     pub alias: Option<String>,
@@ -188,34 +222,49 @@ pub struct FunctionConfig {
     pub group: Option<String>,
     pub docs: Option<DocsConfig>,
     pub grants: OmissibleGrantConfig,
+    #[resolved(promote, expect = "quoting set by apply_package_defaults")]
     pub quoting: Option<DbtQuoting>,
     pub on_configuration_change: Option<String>,
-    pub static_analysis: Option<StaticAnalysisKind>,
+    #[resolved(promote, expect = "static_analysis set by apply_resolve_defaults")]
+    pub static_analysis: Option<Spanned<StaticAnalysisKind>>,
     #[serde(default = "default_function_kind", rename = "type")]
     pub function_kind: Option<FunctionKind>,
     pub volatility: Option<Volatility>,
     pub runtime_version: Option<String>,
     pub entry_point: Option<String>,
+    pub packages: Option<StringOrArrayOfStrings>,
 
     // Warehouse-specific configurations
     pub __warehouse_specific_config__: WarehouseSpecificNodeConfig,
 }
 
-impl DefaultTo<FunctionConfig> for FunctionConfig {
-    fn get_enabled(&self) -> Option<bool> {
-        self.enabled
+impl ResolvableConfig<FunctionConfig> for FunctionConfig {
+    type Resolved = ResolvedFunctionConfig;
+    type PackageDefaults = DbtQuoting;
+    type ResolveDefaults = StaticAnalysisKind;
+
+    fn get_enabled_with_default(&self) -> bool {
+        self.enabled.unwrap_or(true)
     }
 
-    fn database(&self) -> Option<String> {
-        self.database.clone().into_inner().unwrap_or(None)
+    fn disable(&mut self) {
+        self.enabled = Some(false);
     }
 
-    fn schema(&self) -> Option<String> {
-        self.schema.clone().into_inner().unwrap_or(None)
+    fn apply_package_defaults(&mut self, quoting: DbtQuoting) {
+        if self.quoting.is_none() {
+            self.quoting = Some(quoting);
+        }
     }
 
-    fn alias(&self) -> Option<String> {
-        self.alias.clone()
+    fn apply_resolve_defaults(&mut self, static_analysis: StaticAnalysisKind) {
+        if self.static_analysis.is_none() {
+            self.static_analysis = Some(Spanned::new(static_analysis));
+        }
+    }
+
+    fn finalize(self) -> ResolvedFunctionConfig {
+        self.finalize_resolved()
     }
 
     fn default_to(&mut self, parent: &FunctionConfig) {
@@ -237,6 +286,7 @@ impl DefaultTo<FunctionConfig> for FunctionConfig {
             volatility,
             runtime_version,
             entry_point,
+            packages,
             __warehouse_specific_config__: warehouse_config,
         } = self;
 
@@ -249,6 +299,8 @@ impl DefaultTo<FunctionConfig> for FunctionConfig {
 
         // Handle grants with custom merge logic
         default_to_grants(grants, &parent.grants);
+        #[allow(unused, clippy::let_unit_value)]
+        let packages = default_packages(packages, &parent.packages);
 
         default_to!(
             parent,
@@ -292,6 +344,7 @@ impl From<ProjectFunctionConfig> for FunctionConfig {
             volatility: config.volatility,
             runtime_version: config.runtime_version,
             entry_point: config.entry_point,
+            packages: config.packages,
             __warehouse_specific_config__: WarehouseSpecificNodeConfig::default(),
         }
     }
@@ -316,6 +369,7 @@ impl FunctionConfig {
         let function_kind_eq = self.function_kind == other.function_kind;
         let volatility_eq = self.volatility == other.volatility;
         let access_eq_result = access_eq(&self.access, &other.access); // Custom comparison for access
+        let packages_eq = array_of_strings_eq(&self.packages, &other.packages);
         let warehouse_config_eq = same_warehouse_config(
             &self.__warehouse_specific_config__,
             &other.__warehouse_specific_config__,
@@ -335,6 +389,7 @@ impl FunctionConfig {
             && function_kind_eq
             && volatility_eq
             && access_eq_result
+            && packages_eq
             && warehouse_config_eq;
 
         if !result {
@@ -435,6 +490,14 @@ impl FunctionConfig {
                             format!("{:?}", &other.access),
                         )),
                     ),
+                    (
+                        "packages",
+                        packages_eq,
+                        Some((
+                            format!("{:?}", &self.packages),
+                            format!("{:?}", &other.packages),
+                        )),
+                    ),
                     ("warehouse_config", warehouse_config_eq, None),
                 ],
             );
@@ -447,4 +510,92 @@ impl FunctionConfig {
 impl ConfigKeys for FunctionConfig {
     // The default implementation from the trait will handle
     // extracting field names via serialization automatically
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schemas::project::dbt_project::ResolvableConfig;
+    use crate::schemas::serde::StringOrArrayOfStrings;
+
+    #[test]
+    fn test_function_config_packages_append() {
+        let parent = FunctionConfig {
+            packages: Some(StringOrArrayOfStrings::ArrayOfStrings(vec![
+                "numpy".to_string(),
+                "pandas".to_string(),
+            ])),
+            ..Default::default()
+        };
+
+        let mut child = FunctionConfig {
+            packages: Some(StringOrArrayOfStrings::ArrayOfStrings(vec![
+                "matplotlib".to_string(),
+            ])),
+            ..Default::default()
+        };
+
+        child.default_to(&parent);
+
+        assert_eq!(
+            child.packages,
+            Some(StringOrArrayOfStrings::ArrayOfStrings(vec![
+                "numpy".to_string(),
+                "pandas".to_string(),
+                "matplotlib".to_string(),
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_function_config_packages_none_child_inherits_parent() {
+        let parent = FunctionConfig {
+            packages: Some(StringOrArrayOfStrings::ArrayOfStrings(vec![
+                "numpy".to_string(),
+            ])),
+            ..Default::default()
+        };
+
+        let mut child = FunctionConfig {
+            packages: None,
+            ..Default::default()
+        };
+
+        child.default_to(&parent);
+
+        assert_eq!(
+            child.packages,
+            Some(StringOrArrayOfStrings::ArrayOfStrings(vec![
+                "numpy".to_string(),
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_function_config_packages_same_config() {
+        let a = FunctionConfig {
+            packages: Some(StringOrArrayOfStrings::ArrayOfStrings(vec![
+                "numpy".to_string(),
+            ])),
+            ..Default::default()
+        };
+
+        let b = FunctionConfig {
+            packages: Some(StringOrArrayOfStrings::ArrayOfStrings(vec![
+                "numpy".to_string(),
+            ])),
+            ..Default::default()
+        };
+
+        assert!(a.same_config(&b));
+
+        let c = FunctionConfig {
+            packages: Some(StringOrArrayOfStrings::ArrayOfStrings(vec![
+                "pandas".to_string(),
+            ])),
+            ..Default::default()
+        };
+
+        assert!(!a.same_config(&c));
+    }
 }

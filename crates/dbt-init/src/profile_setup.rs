@@ -4,7 +4,7 @@ use crate::adapter_config::{
 };
 use crate::dbt_cloud_client::{CloudProject, DbtCloudClient, DbtCloudYml};
 use crate::yaml_utils::{has_top_level_key_parsed_file, remove_top_level_key_from_str};
-use dbt_common::adapter::AdapterType;
+use dbt_adapter_core::AdapterType;
 use dbt_common::constants::DBT_PACKAGES_DIR_NAME;
 use dbt_common::pretty_string::GREEN;
 use dbt_common::tracing::emit::{emit_info_log_message, emit_warn_log_message};
@@ -53,8 +53,9 @@ fn load_profile_with_loader(
 
     let dbt_project = DbtProjectSimplified {
         packages_install_path: Some(DBT_PACKAGES_DIR_NAME.to_string()),
-        profile: Some(profile_name.to_string()),
+        profile: Some(profile_name.to_string()).into(),
         dbt_cloud: None,
+        flags: None,
         data_paths: Default::default(),
         source_paths: Default::default(),
         log_path: Default::default(),
@@ -62,10 +63,7 @@ fn load_profile_with_loader(
         __ignored__: Default::default(),
     };
 
-    let jinja_env = initialize_load_profile_jinja_environment();
-    let empty_context = HashMap::<String, String>::new();
-
-    let dbt_profile = load_profiles(&load_args, &dbt_project, &jinja_env, &empty_context)?;
+    let dbt_profile = load_profiles(&load_args, &dbt_project)?;
     Ok(dbt_profile.db_config)
 }
 
@@ -189,13 +187,6 @@ impl ProfileSetup {
         existing_config: Option<&DbConfig>,
     ) -> FsResult<ProfileTarget> {
         let db_config = match adapter {
-            AdapterType::Sidecar => {
-                return Err(fs_err!(
-                    ErrorCode::InvalidConfig,
-                    "Sidecar is an internal adapter type and cannot be used directly in profiles.yml. \
-                     Use 'type: snowflake' (or another warehouse) with 'execute: sidecar' instead."
-                ));
-            }
             AdapterType::Snowflake => {
                 let snowflake_config = match existing_config {
                     Some(DbConfig::Snowflake(config)) => Some(config),
@@ -264,9 +255,11 @@ impl ProfileSetup {
                 ));
             }
             AdapterType::ClickHouse => todo!("ClickHouse"),
+            AdapterType::Exasol => todo!("Exasol"),
             AdapterType::Starburst => todo!("Starburst"),
             AdapterType::Athena => todo!("Athena"),
             AdapterType::Trino => todo!("Trino"),
+            AdapterType::Datafusion => todo!("Datafusion"),
             AdapterType::Dremio => todo!("Dremio"),
             AdapterType::Oracle => todo!("Oracle"),
         };
@@ -431,7 +424,7 @@ impl ProfileSetup {
             Ok(db_config) => Ok(db_config),
             Err(e) => {
                 emit_warn_log_message(
-                    ErrorCode::IoError,
+                    ErrorCode::DbtPlatformApiError,
                     format!("Failed to fetch cloud config: {e}"),
                     None,
                 );
@@ -500,9 +493,7 @@ impl ProfileSetup {
             _ => unreachable!(),
         }
 
-        let adapter_type = existing_config
-            .as_ref()
-            .and_then(|d| d.adapter_type_if_supported());
+        let adapter_type = existing_config.as_ref().map(|d| d.adapter_type());
         let adapter = Self::ask_for_adapter_choice(adapter_type)?;
 
         let cloud_config = if profile_action == 1 {
@@ -530,10 +521,7 @@ impl ProfileSetup {
 
         let should_use_existing_config = existing_config
             .as_ref()
-            .map(|d| {
-                d.adapter_type()
-                    .eq_ignore_ascii_case(adapter.to_string().as_str())
-            })
+            .map(|d| d.adapter_type() == adapter)
             .unwrap_or(false);
 
         let final_existing_config = if should_use_existing_config {

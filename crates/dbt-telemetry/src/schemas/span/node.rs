@@ -13,13 +13,16 @@ use std::borrow::Cow;
 
 pub use crate::impls::node::{
     AnyNodeOutcomeDetail, NodeEvent, get_cache_detail, get_freshness_detail,
-    get_node_outcome_detail, get_test_outcome, update_dbt_core_event_code_for_node_processed_end,
+    get_node_outcome_detail, get_test_outcome, has_node_warning,
+    set_node_warning_outcome_no_warnings, set_node_warning_outcome_warned,
+    update_dbt_core_event_code_for_node_processed_end,
 };
 pub use crate::proto::v1::public::events::fusion::node::{
     NodeCacheDetail, NodeCacheReason, NodeCancelReason, NodeErrorType, NodeEvaluated,
-    NodeMaterialization, NodeOutcome, NodeProcessed, NodeSkipReason, NodeSkipUpstreamDetail,
-    NodeType, SourceFreshnessDetail, SourceFreshnessOutcome, TestEvaluationDetail, TestOutcome,
-    node_evaluated::NodeOutcomeDetail, node_processed,
+    NodeEvaluationDetail, NodeMaterialization, NodeOutcome, NodeProcessed, NodeSkipReason,
+    NodeSkipUpstreamDetail, NodeType, NodeWarningOutcome, SourceFreshnessDetail,
+    SourceFreshnessOutcome, TestEvaluationDetail, TestOutcome, node_evaluated::NodeOutcomeDetail,
+    node_processed,
 };
 
 impl ProtoTelemetryEvent for NodeEvaluated {
@@ -269,6 +272,7 @@ impl ArrowSerializableTelemetryEvent for NodeProcessed {
             .into(),
             duration_ms: self.duration_ms,
             rows_affected: self.rows_affected,
+            group: self.group.as_deref().map(Cow::Borrowed),
             ..Default::default()
         }
     }
@@ -365,6 +369,7 @@ impl ArrowSerializableTelemetryEvent for NodeProcessed {
             duration_ms: record.duration_ms,
             in_selection: json_payload.in_selection,
             rows_affected: record.rows_affected,
+            group: record.group.as_deref().map(str::to_string),
         })
     }
 }

@@ -1,21 +1,27 @@
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use dbt_adapter::load_catalogs;
+use dbt_cloud_config::resolve_cloud_config;
 use dbt_common::cancellation::CancellationToken;
 use dbt_common::constants::{
     DBT_CATALOGS_YML, DBT_DEPENDENCIES_YML, DBT_PACKAGES_LOCK_FILE, DBT_PACKAGES_YML,
 };
 use dbt_common::io_args::{InternalPackageMode, ReplayMode, TimeMachineMode};
+use dbt_common::io_utils::StatusReporter;
 use dbt_common::once_cell_vars::DISPATCH_CONFIG;
 use dbt_common::path::DbtPath;
+use dbt_common::tracing::TracingConfigProvider;
+use dbt_common::tracing::emit::{emit_error_log_message, emit_warn_log_message};
 use dbt_common::tracing::span_info::SpanStatusRecorder;
+use dbt_common::warn_error_options::{
+    WarnErrorOptions, project_flags_get_value, resolve_warn_error_options,
+};
 use dbt_jinja_utils::invocation_args::InvocationArgs;
 use dbt_jinja_utils::jinja_environment::JinjaEnv;
 use dbt_jinja_utils::phases::load::init::initialize_load_jinja_environment;
 use dbt_jinja_utils::phases::load::init::initialize_load_profile_jinja_environment;
 use dbt_schemas::schemas::serde::{StringOrInteger, yaml_to_fs_error};
 use dbt_schemas::schemas::telemetry::{ExecutionPhase, PhaseExecuted};
-use dbt_schemas::schemas::{DbtCloudConfig, DbtCloudProjectConfig};
 use dbt_schemas::state::DbtProfile;
 use dbt_telemetry::GenericOpItemProcessed;
 use dbt_yaml;
@@ -23,11 +29,12 @@ use fs_deps::get_or_install_packages;
 use indexmap::IndexMap;
 use pathdiff::diff_paths;
 use serde::Deserialize;
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 use std::{fs, io};
 use tracing::Instrument;
@@ -35,8 +42,7 @@ use tracing::Instrument;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
 use dbt_common::constants::{
-    DBT_CLOUD_YML, DBT_CONFIG_DIR, DBT_INTERNAL_PACKAGES_DIR_NAME, DBT_PACKAGES_DIR_NAME,
-    DBT_PROJECT_YML,
+    DBT_INTERNAL_PACKAGES_DIR_NAME, DBT_PACKAGES_DIR_NAME, DBT_PROJECT_YML,
 };
 use dbt_common::error::LiftableResult;
 use project::DbtProject;
@@ -45,7 +51,7 @@ use dbt_common::stdfs::last_modified;
 use dbt_common::{ErrorCode, create_debug_span, ectx, err, tokiofs};
 use dbt_common::{FsResult, fs_err};
 use dbt_jinja_vars::DbtVars;
-use dbt_schemas::schemas::project::{self, DbtProjectSimplified, ProjectDbtCloudConfig};
+use dbt_schemas::schemas::project::{self, DbtProjectSimplified};
 use dbt_schemas::state::{DbtAsset, DbtPackage, DbtState, ResourcePathKind};
 
 use crate::args::LoadArgs;
@@ -74,7 +80,7 @@ fn resolve_and_set_threads(
                 StringOrInteger::Integer(n) => Some(*n as usize),
                 StringOrInteger::String(s) => Some(s.parse::<usize>().map_err(|_| {
                     fs_err!(
-                        ErrorCode::Generic,
+                        ErrorCode::ProfileInvalid,
                         "Invalid number of threads in profiles.yml: {s}",
                     )
                 })?),
@@ -95,6 +101,76 @@ fn resolve_and_set_threads(
     Ok(final_threads)
 }
 
+pub(crate) struct ResolvedWarnErrorOptions {
+    pub warn_error: bool,
+    pub warn_error_options: WarnErrorOptions,
+}
+
+/// Resolve warn-error options from CLI/env and project flags.
+///
+/// This has a side effect: when `tracing_features` is provided, it reloads the
+/// current tracing config with the resolved warn-error options.
+pub(crate) fn resolve_and_reload_weo_from_project(
+    simplified_dbt_project: &DbtProjectSimplified,
+    from_cli: Option<bool>,
+    from_cli_or_env: Option<&WarnErrorOptions>,
+    tracing_features: Option<&dyn TracingConfigProvider>,
+    status_reporter: Option<&Arc<dyn StatusReporter + 'static>>,
+) -> FsResult<ResolvedWarnErrorOptions> {
+    let (warn_error, warn_error_options) = resolve_warn_error_options(
+        from_cli,
+        from_cli_or_env,
+        simplified_dbt_project.flags.as_ref(),
+    );
+
+    let (warning_messages, error_message) = warn_error_options.validation_messages();
+
+    for message in warning_messages {
+        emit_warn_log_message(
+            ErrorCode::NotSupportedWarnErrorOption,
+            message,
+            status_reporter,
+        );
+    }
+
+    if let Some(message) = error_message {
+        emit_error_log_message(ErrorCode::InvalidOptions, &message, status_reporter);
+        return Err(dbt_common::FsError::exit_with_status(1));
+    }
+
+    if let Some(msg) = warn_error_options.deprecated_keys_message() {
+        emit_warn_log_message(
+            ErrorCode::WEOIncludeExcludeDeprecation,
+            msg,
+            status_reporter,
+        );
+    }
+    if let Some(tracing_handle) = tracing_features {
+        tracing_handle.set_warn_error_options(warn_error_options.clone());
+    }
+
+    Ok(ResolvedWarnErrorOptions {
+        warn_error,
+        warn_error_options,
+    })
+}
+
+fn project_flags_v2_compatible_download(flags: &dbt_yaml::Value) -> Option<bool> {
+    project_flags_get_value(flags, "use_v2_compatible_package_downloads")
+        .and_then(dbt_yaml::Value::as_bool)
+}
+
+pub fn resolve_use_v2_compatible_package_download_options(
+    from_cli: bool,
+    project_flags: Option<&dbt_yaml::Value>,
+) -> bool {
+    from_cli || {
+        project_flags
+            .and_then(project_flags_v2_compatible_download)
+            .unwrap_or_default()
+    }
+}
+
 #[tracing::instrument(
     skip_all,
     fields(
@@ -103,16 +179,23 @@ fn resolve_and_set_threads(
 )]
 pub async fn load(
     arg: &LoadArgs,
-    iarg: &InvocationArgs,
+    iarg: Cow<'_, InvocationArgs>,
+    tracing_features: Option<&dyn TracingConfigProvider>,
     token: &CancellationToken,
-) -> FsResult<(DbtState, Option<DbtCloudProjectConfig>)> {
+) -> FsResult<DbtState> {
     let (simplified_dbt_project, mut dbt_profile) =
         load_simplified_project_and_profiles(arg).await?;
 
-    let dbt_cloud_project = match &simplified_dbt_project.dbt_cloud {
-        Some(project_cloud) => load_cloud_project_config(project_cloud),
-        None => None,
-    };
+    // Parse dbt_cloud.yml (if it exists)
+    let dbt_cloud_yml = dbt_cloud_config::get_cloud_project_path()
+        .ok()
+        .and_then(|p| dbt_cloud_config::parse_cloud_config(&p).ok().flatten());
+
+    // Resolve cloud config with precedence: env > dbt_project.yml > dbt_cloud.yml
+    let cloud_config = resolve_cloud_config(
+        dbt_cloud_yml.as_ref(),
+        simplified_dbt_project.dbt_cloud.as_ref(),
+    );
 
     // Check if .gitignore exists and add dbt_internal_packages/ to it if not present
     let gitignore_path = arg.io.in_dir.join(".gitignore");
@@ -130,14 +213,34 @@ pub async fn load(
 
     // initialize loader into a crate accessible static location
     let env = initialize_load_profile_jinja_environment();
-    load_catalogs(arg, &env).await?;
+    load_catalogs(arg, &env, simplified_dbt_project.flags.as_ref()).await?;
 
-    let final_threads = resolve_and_set_threads(&mut dbt_profile, iarg)?;
+    let resolved_warn_error_options = resolve_and_reload_weo_from_project(
+        &simplified_dbt_project,
+        arg.cli_warn_error,
+        arg.cli_warn_error_options.as_ref(),
+        tracing_features,
+        arg.io.status_reporter.as_ref(),
+    )?;
+    let mut iarg = iarg;
+    if iarg.warn_error != resolved_warn_error_options.warn_error
+        || iarg.warn_error_options != resolved_warn_error_options.warn_error_options
+    {
+        let iarg_mut = iarg.to_mut();
+        iarg_mut.warn_error = resolved_warn_error_options.warn_error;
+        iarg_mut.warn_error_options = resolved_warn_error_options.warn_error_options.clone();
+    }
+    let final_threads = resolve_and_set_threads(&mut dbt_profile, iarg.as_ref())?;
 
-    let iarg = InvocationArgs {
-        num_threads: final_threads,
-        ..iarg.clone()
-    };
+    // Merge use_v2_compatible_package_downloads flags from project and CLI/env
+    let use_v2_compatible_package_downloads = resolve_use_v2_compatible_package_download_options(
+        arg.io.use_v2_compatible_package_downloads,
+        simplified_dbt_project.flags.as_ref(),
+    );
+
+    if iarg.num_threads != final_threads {
+        iarg.to_mut().num_threads = final_threads;
+    }
     let arg = LoadArgs {
         threads: final_threads,
         ..arg.clone()
@@ -150,11 +253,14 @@ pub async fn load(
         vars: BTreeMap::new(),
         cli_vars: arg.vars.clone(),
         catalogs: load_catalogs::fetch_catalogs(),
+        cloud_config,
+        warn_error: iarg.warn_error,
+        warn_error_options: iarg.warn_error_options.clone(),
     };
 
     // If we are running `dbt debug` we don't need to collect dbt_project.yml files
     if arg.debug_profile {
-        return Ok((dbt_state, dbt_cloud_project));
+        return Ok(dbt_state);
     }
 
     let flags: BTreeMap<String, minijinja::Value> = iarg.to_dict();
@@ -166,28 +272,12 @@ pub async fn load(
         dbt_state.dbt_profile.db_config.clone(),
         dbt_state.run_started_at,
         &flags,
+        iarg.warn_error_options.clone(),
         arg.io.clone(),
         dbt_state.catalogs.clone(),
     )?;
 
-    let adapter_type = dbt_state
-        .dbt_profile
-        .db_config
-        .adapter_type_if_supported()
-        .ok_or_else(|| {
-            let hint = dbt_state
-                .dbt_profile
-                .db_config
-                .unsupported_adapter_hint()
-                .map(|h| format!(" {h}"))
-                .unwrap_or_default();
-            fs_err!(
-                ErrorCode::InvalidConfig,
-                "Unknown or unsupported adapter type '{}'.{hint}",
-                dbt_state.dbt_profile.db_config.adapter_type()
-            )
-        })?;
-
+    let adapter_type = dbt_state.dbt_profile.db_config.adapter_type();
     let arg_ref = &arg;
     if let Some(prev_dbt_state) = arg.prev_dbt_state.clone() {
         let prev_root_package = prev_dbt_state.root_package();
@@ -216,7 +306,7 @@ pub async fn load(
         dbt_state.packages.extend(packages);
         dbt_state.packages[0] = new_root_package;
 
-        return Ok((dbt_state, dbt_cloud_project));
+        return Ok(dbt_state);
     }
 
     // Load the packages.yml file, if it exists and install the packages if arg.install_deps is true
@@ -248,6 +338,7 @@ pub async fn load(
         arg.skip_private_deps,
         iarg.replay.as_ref(),
         token,
+        use_v2_compatible_package_downloads,
     )
     .await?;
 
@@ -260,12 +351,13 @@ pub async fn load(
 
     if !is_time_machine_replay {
         // get publication artifact for each upstream project
-        download_publication_artifacts(&upstream_projects, &dbt_cloud_project, &arg.io).await?;
+        download_publication_artifacts(&upstream_projects, &dbt_state.cloud_config, &arg.io)
+            .await?;
     }
 
     // If we are running `dbt deps` we don't need to collect files
     if arg.install_deps {
-        return Ok((dbt_state, dbt_cloud_project));
+        return Ok(dbt_state);
     }
 
     let lookup_map = packages_lock.lookup_map();
@@ -336,7 +428,7 @@ pub async fn load(
         let _ = prepare_inline_sql(inline_sql, &arg.io.out_dir, &mut dbt_state).await?;
     }
 
-    Ok((dbt_state, dbt_cloud_project))
+    Ok(dbt_state)
 }
 
 /// Lightweight load function for the `clean` command.
@@ -349,10 +441,17 @@ pub async fn load(
     )
 )]
 pub async fn load_for_clean(arg: &LoadArgs) -> FsResult<DbtState> {
-    let (_simplified_dbt_project, dbt_profile) = load_simplified_project_and_profiles(arg).await?;
+    let (simplified_dbt_project, dbt_profile) = load_simplified_project_and_profiles(arg).await?;
+    let resolved_warn_error_options = resolve_and_reload_weo_from_project(
+        &simplified_dbt_project,
+        arg.cli_warn_error,
+        arg.cli_warn_error_options.as_ref(),
+        None,
+        arg.io.status_reporter.as_ref(),
+    )?;
 
     let env = initialize_load_profile_jinja_environment();
-    load_catalogs(arg, &env).await?;
+    load_catalogs(arg, &env, simplified_dbt_project.flags.as_ref()).await?;
 
     // Create minimal DbtState - no packages, no vars
     let dbt_state = DbtState {
@@ -362,12 +461,19 @@ pub async fn load_for_clean(arg: &LoadArgs) -> FsResult<DbtState> {
         vars: BTreeMap::new(),
         cli_vars: arg.vars.clone(),
         catalogs: load_catalogs::fetch_catalogs(),
+        cloud_config: None,
+        warn_error: resolved_warn_error_options.warn_error,
+        warn_error_options: resolved_warn_error_options.warn_error_options,
     };
 
     Ok(dbt_state)
 }
 
-pub async fn load_catalogs(arg: &LoadArgs, env: &JinjaEnv) -> FsResult<()> {
+pub async fn load_catalogs(
+    arg: &LoadArgs,
+    env: &JinjaEnv,
+    project_flags: Option<&dbt_yaml::Value>,
+) -> FsResult<()> {
     let ctx: BTreeMap<String, minijinja::Value> = BTreeMap::from([
         (
             "env_var".to_owned(),
@@ -385,7 +491,12 @@ pub async fn load_catalogs(arg: &LoadArgs, env: &JinjaEnv) -> FsResult<()> {
                 .map_err(|e| yaml_to_fs_error(e, Some(&catalogs_yml_path)))?;
             let text: dbt_yaml::Value =
                 into_typed_with_jinja(&arg.io, raw_text_yml, true, env, &ctx, &[], None, true)?;
-            load_catalogs::load_catalogs(text, &catalogs_yml_path)
+            load_catalogs::load_catalogs(
+                text,
+                &catalogs_yml_path,
+                project_flags,
+                arg.io.status_reporter.as_ref(),
+            )
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(fs_err!(
@@ -403,6 +514,7 @@ pub async fn load_simplified_project_and_profiles(
     let dbt_project_path = arg.io.in_dir.join(DBT_PROJECT_YML);
 
     let raw_dbt_project_in_val = value_from_file(&arg.io, &dbt_project_path, false, None)?;
+
     let env = initialize_load_profile_jinja_environment();
     let ctx: BTreeMap<String, minijinja::Value> = BTreeMap::from([
         (
@@ -463,44 +575,9 @@ pub async fn load_simplified_project_and_profiles(
         );
     }
 
-    let dbt_profile = load_profiles(arg, &simplified_dbt_project, &env, &ctx)?;
+    let dbt_profile = load_profiles(arg, &simplified_dbt_project)?;
 
     Ok((simplified_dbt_project, dbt_profile))
-}
-
-pub fn load_cloud_project_config(
-    project_dbt_cloud: &ProjectDbtCloudConfig,
-) -> Option<DbtCloudProjectConfig> {
-    // Get home directory
-    let home_dir = dirs::home_dir()?;
-
-    // Check if dbt_cloud.yml exists
-    let dbt_cloud_config_path = home_dir.join(DBT_CONFIG_DIR).join(DBT_CLOUD_YML);
-    if !dbt_cloud_config_path.exists() {
-        return None;
-    }
-
-    // Read and parse the dbt_cloud.yml file
-    let content = fs::read_to_string(&dbt_cloud_config_path).ok()?;
-    let cloud_config: DbtCloudConfig = dbt_yaml::from_str(&content).ok()?;
-
-    // TODO: unsure if we should exit early if the project_id is not set in dbt_project.yml
-    // or if we should fall back to the active_project in dbt_cloud.yml
-    let project = match &project_dbt_cloud.project_id {
-        Some(project_id) => cloud_config.get_project_by_id(project_id.to_string().as_str()),
-        None => cloud_config.get_project_by_id(&cloud_config.context.active_project),
-    };
-
-    let defer_env_id = project_dbt_cloud
-        .defer_env_id
-        .clone()
-        .map(|env_id| env_id.to_string())
-        .or_else(|| cloud_config.context.defer_env_id.clone());
-
-    Some(DbtCloudProjectConfig {
-        defer_env_id,
-        project: project.cloned(),
-    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -845,7 +922,7 @@ fn find_files_by_kind_and_extension(
 }
 
 /// Loads the .dbtignore file if it exists in the given path
-fn load_dbtignore(path: &Path) -> FsResult<Option<Gitignore>> {
+pub fn load_dbtignore(path: &Path) -> FsResult<Option<Gitignore>> {
     let dbtignore_path = path.join(".dbtignore");
     if dbtignore_path.exists() {
         let mut builder = GitignoreBuilder::new(path);
@@ -977,7 +1054,7 @@ fn collect_paths(dbt_project: &DbtProject) -> HashMap<ResourcePathKind, Vec<Stri
 }
 
 // returns (packages_install_path, internal_packages_install_path)
-fn get_packages_install_path(
+pub(crate) fn get_packages_install_path(
     in_dir: &Path,
     arg_packages_install_path: &Option<PathBuf>,
     arg_internal_packages_install_path: &Option<PathBuf>,

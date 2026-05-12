@@ -1,14 +1,15 @@
 #![allow(unused_qualifications)]
 
 use crate::schemas::relations::DEFAULT_DATABRICKS_DATABASE;
-use crate::schemas::serde::{QueryTag, StringOrInteger, StringOrMap};
+use crate::schemas::serde::{DuckDbExtension, QueryTag, StringOrInteger, StringOrMap};
 
-use dbt_common::adapter::AdapterType;
+use dbt_adapter_core::AdapterType;
 use dbt_yaml::DbtSchema;
 use dbt_yaml::UntaggedEnumDeserialize;
 use merge::Merge;
 use serde_derive::Deserialize;
 use serde_derive::Serialize;
+
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fmt::{self, Debug, Display};
@@ -49,12 +50,12 @@ pub enum DbConfig {
     Salesforce(Box<SalesforceDbConfig>),
     DuckDB(Box<DuckDbConfig>),
     // Hive,
-    // Exasol,
+    Exasol(Box<ExasolDbConfig>),
     // Oracle,
     // Synapse,
     Fabric(Box<FabricDbConfig>),
     // Dremio,
-    // ClickHouse,
+    ClickHouse(Box<ClickHouseDbConfig>),
     // Materialize,
     // Rockset,
     // Firebolt,
@@ -102,21 +103,26 @@ impl_from_db_config!(Datafusion, DatafusionDbConfig);
 impl_from_db_config!(Databricks, DatabricksDbConfig);
 impl_from_db_config!(DuckDB, DuckDbConfig);
 impl_from_db_config!(Fabric, FabricDbConfig);
+impl_from_db_config!(Exasol, ExasolDbConfig);
+impl_from_db_config!(ClickHouse, ClickHouseDbConfig);
 
 impl DbConfig {
-    pub fn get_unique_field(&self) -> Option<&String> {
+    pub fn get_unique_field(&self) -> Option<&str> {
         match self {
-            DbConfig::Snowflake(config) => config.account.as_ref(),
-            DbConfig::Postgres(config) => config.host.as_ref(),
-            DbConfig::Bigquery(config) => config.database.as_ref(),
-            DbConfig::Trino(config) => config.host.as_ref(),
-            DbConfig::Datafusion(config) => config.database.as_ref(),
-            DbConfig::Redshift(config) => config.host.as_ref(),
-            DbConfig::Databricks(config) => config.host.as_ref(),
-            DbConfig::Salesforce(config) => config.client_id.as_ref(),
-            DbConfig::DuckDB(config) => config.path.as_ref(),
-            DbConfig::Spark(config) => config.host.as_ref(),
-            DbConfig::Fabric(config) => config.host.as_ref(),
+            DbConfig::Snowflake(config) => config.account.as_deref(),
+            DbConfig::Postgres(config) => config.host.as_deref(),
+            DbConfig::Bigquery(config) => config.database.as_deref(),
+            DbConfig::Trino(config) => config.host.as_deref(),
+            DbConfig::Datafusion(config) => config.database.as_deref(),
+            DbConfig::Redshift(config) => config.host.as_deref(),
+            DbConfig::Databricks(config) => config.host.as_deref(),
+            DbConfig::Salesforce(config) => config.client_id.as_deref(),
+            // DuckDB `path` is optional — attach-only profiles default to `:memory:`.
+            DbConfig::DuckDB(config) => Some(config.path.as_deref().unwrap_or(":memory:")),
+            DbConfig::Spark(config) => config.host.as_deref(),
+            DbConfig::Fabric(config) => config.host.as_deref(),
+            DbConfig::Exasol(config) => config.host.as_deref(),
+            DbConfig::ClickHouse(config) => config.host.as_deref(),
         }
     }
 
@@ -175,6 +181,7 @@ impl DbConfig {
                 "database",
                 "execution_project",
                 "schema",
+                "api_endpoint",
                 "location",
                 "priority",
                 "maximum_bytes_billed",
@@ -207,6 +214,7 @@ impl DbConfig {
                 "autocreate",
                 "db_groups",
                 "ra3_node",
+                "datasharing",
                 "connect_timeout",
                 "role",
                 "retries",
@@ -252,6 +260,41 @@ impl DbConfig {
                 "trust_cert",
                 "api_url",
             ],
+            DbConfig::Exasol(_) => &[
+                "host",
+                "port",
+                "user",
+                "schema",
+                "encryption",
+                "certificate_validation",
+            ],
+            DbConfig::ClickHouse(_) => &[
+                "schema",
+                "driver",
+                "host",
+                "port",
+                "user",
+                "cluster",
+                "verify",
+                "secure",
+                "client_cert",
+                "client_cert_key",
+                "retries",
+                "compression",
+                "connect_timeout",
+                "send_receive_timeout",
+                "cluster_mode",
+                "use_lw_deletes",
+                "check_exchange",
+                "local_suffix",
+                "local_db_prefix",
+                "allow_automatic_deduplication",
+                "custom_settings",
+                "database_engine",
+                "threads",
+                "sync_request_timeout",
+                "compress_block_size",
+            ],
         }
     }
 
@@ -284,46 +327,27 @@ impl DbConfig {
             DbConfig::Spark(config) => dbt_yaml::to_value(config),
             DbConfig::Fabric(config) => dbt_yaml::to_value(config),
             DbConfig::DuckDB(config) => dbt_yaml::to_value(config),
+            DbConfig::Exasol(config) => dbt_yaml::to_value(config),
+            DbConfig::ClickHouse(config) => dbt_yaml::to_value(config),
         }
     }
 
-    // TODO: change to enum AdapterType
-    pub fn adapter_type(&self) -> &str {
+    pub fn adapter_type(&self) -> AdapterType {
         match self {
-            DbConfig::Redshift(..) => "redshift",
-            DbConfig::Snowflake(..) => "snowflake",
-            DbConfig::Postgres(..) => "postgres",
-            DbConfig::Bigquery(..) => "bigquery",
-            DbConfig::Trino(..) => "trino",
-            DbConfig::Datafusion(..) => "datafusion",
-            DbConfig::Databricks(..) => "databricks",
-            DbConfig::Salesforce(..) => "salesforce",
-            DbConfig::DuckDB(..) => "duckdb",
-            DbConfig::Spark(..) => "spark",
-            DbConfig::Fabric(..) => "fabric",
+            DbConfig::Redshift(..) => AdapterType::Redshift,
+            DbConfig::Snowflake(..) => AdapterType::Snowflake,
+            DbConfig::Postgres(..) => AdapterType::Postgres,
+            DbConfig::Bigquery(..) => AdapterType::Bigquery,
+            DbConfig::Trino(..) => AdapterType::Trino,
+            DbConfig::Datafusion(..) => AdapterType::Datafusion,
+            DbConfig::Databricks(..) => AdapterType::Databricks,
+            DbConfig::Salesforce(..) => AdapterType::Salesforce,
+            DbConfig::DuckDB(..) => AdapterType::DuckDB,
+            DbConfig::Spark(..) => AdapterType::Spark,
+            DbConfig::Fabric(..) => AdapterType::Fabric,
+            DbConfig::Exasol(..) => AdapterType::Exasol,
+            DbConfig::ClickHouse(..) => AdapterType::ClickHouse,
         }
-    }
-
-    pub fn adapter_type_if_supported(&self) -> Option<AdapterType> {
-        match self {
-            DbConfig::Redshift(..) => Some(AdapterType::Redshift),
-            DbConfig::Snowflake(..) => Some(AdapterType::Snowflake),
-            DbConfig::Postgres(..) => Some(AdapterType::Postgres),
-            DbConfig::Bigquery(..) => Some(AdapterType::Bigquery),
-            DbConfig::Trino(..) => None,
-            DbConfig::Datafusion(..) => None,
-            DbConfig::Databricks(..) => Some(AdapterType::Databricks),
-            DbConfig::Salesforce(..) => Some(AdapterType::Salesforce),
-            DbConfig::DuckDB(..) => Some(AdapterType::DuckDB),
-            DbConfig::Spark(..) => Some(AdapterType::Spark),
-            DbConfig::Fabric(..) => Some(AdapterType::Fabric),
-        }
-    }
-
-    /// Returns a hint string if the adapter is gated behind an environment variable.
-    /// Used by call sites to produce helpful error messages.
-    pub fn unsupported_adapter_hint(&self) -> Option<&'static str> {
-        None
     }
 
     pub fn get_database(&self) -> Option<&String> {
@@ -339,6 +363,8 @@ impl DbConfig {
             DbConfig::DuckDB(config) => config.database.as_ref(),
             DbConfig::Spark(_) => None,
             DbConfig::Fabric(config) => config.database.as_ref(),
+            DbConfig::Exasol(config) => config.database.as_ref(),
+            DbConfig::ClickHouse(_) => None,
         }
     }
 
@@ -355,25 +381,9 @@ impl DbConfig {
 
         // Otherwise, use adapter-specific defaults
         match self {
-            DbConfig::DuckDB(config) => {
-                // For DuckDB, derive database name from file path
-                if let Some(path) = &config.path {
-                    if path == ":memory:" {
-                        "main".to_string()
-                    } else if let Some(dbname) = duckdb_motherduck_database_name(path) {
-                        dbname
-                    } else {
-                        // Extract file stem (e.g., "jaffle_shop.duckdb" → "jaffle_shop")
-                        std::path::Path::new(path)
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| "main".to_string())
-                    }
-                } else {
-                    "main".to_string()
-                }
-            }
+            DbConfig::DuckDB(config) => DuckDBPathInfo::parse_path(config.path.as_deref())
+                .database
+                .to_owned(),
             DbConfig::Databricks(_) => DEFAULT_DATABRICKS_DATABASE.to_string(),
             _ => "".to_string(),
         }
@@ -392,6 +402,8 @@ impl DbConfig {
             DbConfig::DuckDB(config) => config.schema.as_ref(),
             DbConfig::Salesforce(_) => None,
             DbConfig::Fabric(config) => config.schema.as_ref(),
+            DbConfig::Exasol(config) => config.schema.as_ref(),
+            DbConfig::ClickHouse(config) => config.schema.as_ref(),
         }
     }
 
@@ -408,6 +420,8 @@ impl DbConfig {
             DbConfig::Salesforce(_) => None,
             DbConfig::Spark(_) => None,
             DbConfig::Fabric(_) => None,
+            DbConfig::Exasol(config) => config.threads.as_ref(),
+            DbConfig::ClickHouse(config) => config.threads.as_ref(),
         }
     }
 
@@ -424,6 +438,8 @@ impl DbConfig {
             DbConfig::Salesforce(_) => (),
             DbConfig::Spark(_) => (),
             DbConfig::Fabric(_) => (),
+            DbConfig::Exasol(config) => config.threads = threads,
+            DbConfig::ClickHouse(config) => config.threads = threads,
         }
     }
 
@@ -558,6 +574,8 @@ pub struct RedshiftDbConfig {
     pub db_groups: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ra3_node: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub datasharing: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub autocommit: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -753,6 +771,8 @@ pub struct BigqueryDbConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub execution_project: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub compute_region: Option<String>,
     // TODO: support this https://docs.getdbt.com/docs/core/connect-data-platform/bigquery-setup
     pub dataproc_batch: Option<YmlValue>,
@@ -934,6 +954,12 @@ pub struct DuckDbAttachment {
     /// Whether to attach read-only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_only: Option<bool>,
+    /// Whether this attachment is a DuckLake database.
+    /// Set to true to enable DuckLake-specific query generation (e.g., DROP without CASCADE).
+    /// Not needed when the path uses the `ducklake:` scheme, but required for MotherDuck
+    /// managed DuckLake where the path uses `md:` instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_ducklake: Option<bool>,
 }
 
 /// DuckDB adapter configuration
@@ -950,10 +976,10 @@ pub struct DuckDbConfig {
     /// Schema name (defaults to "main")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub schema: Option<String>,
-    /// Extensions to load (e.g., ["httpfs", "parquet"])
+    /// Extensions to load (e.g., ["httpfs", "parquet"] or [{name: "duckpgq", repo: "community"}])
     #[serde(skip_serializing_if = "Option::is_none")]
     #[merge(strategy = merge_strategies_extend::overwrite_always)]
-    pub extensions: Option<Vec<String>>,
+    pub extensions: Option<Vec<DuckDbExtension>>,
     /// DuckDB configuration settings (e.g., {"memory_limit": "4GB"})
     #[serde(skip_serializing_if = "Option::is_none")]
     #[merge(strategy = merge_strategies_extend::overwrite_always)]
@@ -969,18 +995,28 @@ pub struct DuckDbConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[merge(strategy = merge_strategies_extend::overwrite_always)]
     pub attach: Option<Vec<DuckDbAttachment>>,
+    /// Whether the primary database is a DuckLake database.
+    /// Set to true to enable DuckLake-specific query generation (e.g., DROP without CASCADE).
+    /// Not needed when the path uses the `ducklake:` scheme, but required for MotherDuck
+    /// managed DuckLake where the path uses `md:` instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_ducklake: Option<bool>,
     /// Root path for external materializations (defaults to ".")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub external_root: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, DbtSchema)]
-#[serde(rename_all = "snake_case")]
 pub enum SparkMethod {
-    Thrift,
-    Http,
+    #[serde(rename = "thrift")]
+    ThriftBinary,
+    #[serde(rename = "http")]
+    ThriftHttp,
+    #[serde(rename = "livy")]
     Livy,
-    // TODO: HTTP, Spark Connect, EMR StartJob, Session (?)
+    #[serde(rename = "spark-connect")]
+    SparkConnect,
+    // TODO: EMR StartJob (?)
 }
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Serialize, Deserialize, DbtSchema)]
@@ -1000,6 +1036,8 @@ pub enum SparkAuth {
     SaslPlain,
     #[serde(rename = "BASIC")]
     Basic,
+    #[serde(rename = "TOKEN")]
+    Token,
     #[serde(rename = "AWS_SIGV4")]
     AwsSigV4,
 }
@@ -1015,6 +1053,7 @@ impl Display for SparkAuth {
             Self::SaslPlain => write!(f, "PLAIN"),
             Self::Basic => write!(f, "BASIC"),
             Self::AwsSigV4 => write!(f, "AWS_SIGV4"),
+            Self::Token => write!(f, "TOKEN"),
         }
     }
 }
@@ -1031,6 +1070,7 @@ impl std::str::FromStr for SparkAuth {
             "NOSASL" => Ok(Self::NoSasl),
             "PLAIN" => Ok(Self::SaslPlain),
             "BASIC" => Ok(Self::Basic),
+            "TOKEN" => Ok(Self::Token),
             "AWS_SIGV4" => Ok(Self::AwsSigV4),
             _ => Err(format!("Invalid Spark auth mode: {s}")),
         }
@@ -1055,6 +1095,8 @@ pub struct SparkDbConfig {
     pub port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", alias = "token")]
+    pub password: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kerberos_service_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1076,34 +1118,6 @@ pub struct SparkDbConfig {
     // - query_timeout
     // - retry_all
     // - token
-}
-
-// https://docs.getdbt.com/docs/core/connect-data-platform/fabric-setup#microsoft-entra-id-authentication
-#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize, DbtSchema)]
-#[serde(rename_all = "PascalCase")]
-pub enum FabricAuth {
-    #[default]
-    #[serde(alias = "ServicePrincipal")]
-    ActiveDirectoryServicePrincipal,
-    // TODO: other auth methods
-
-    // ActiveDirectoryPassword,
-
-    // #[serde(rename = "environment")]
-    // Environment,
-
-    // #[serde(rename = "CLI")]
-    // AzureCLI,
-
-    // /// Tries the following in order:
-    // /// 1. Environment
-    // /// 2. Managed Identity (not supported)
-    // /// 3. Visual Studio (Windows only)
-    // /// 4. VSCode
-    // /// 5. Azure CLI
-    // /// 6. Azure PowerShell module
-    // #[serde(rename = "auto")]
-    // Auto,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, DbtSchema, Merge)]
@@ -1145,7 +1159,7 @@ pub struct FabricDbConfig {
     pub access_token_expires_on: Option<String>, // default = 0 | Added for access token expiration for oAuth and integration tests scenarios.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(alias = "auth")]
-    pub authentication: Option<FabricAuth>, // default = "ActiveDirectoryServicePrincipal"
+    pub authentication: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encrypt: Option<bool>, // default = True  | default value in MS ODBC Driver 18 as well
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1172,6 +1186,241 @@ pub struct FabricDbConfig {
     pub api_url: Option<String>, // default = "https://api.fabric.microsoft.com/v1"
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, DbtSchema, Merge)]
+#[merge(strategy = merge_strategies_extend::overwrite_option)]
+#[serde(rename_all = "snake_case")]
+pub struct ExasolDbConfig {
+    pub user: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", alias = "pass")]
+    pub password: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<StringOrInteger>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub database: Option<String>,
+    pub schema: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encryption: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub certificate_validation: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub certificate_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection_timeout: Option<StringOrInteger>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threads: Option<StringOrInteger>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, DbtSchema, Merge)]
+#[merge(strategy = merge_strategies_extend::overwrite_option)]
+#[serde(rename_all = "snake_case")]
+pub struct ClickHouseDbConfig {
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default = "default_clickhouse_schema"
+    )]
+    pub schema: Option<String>,
+
+    /// Auto-detected from `port` and `secure` when not set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
+
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default = "default_clickhouse_host"
+    )]
+    pub host: Option<String>,
+
+    /// Auto-detected from `driver` and `secure` when not set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<StringOrInteger>,
+
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default = "default_clickhouse_user"
+    )]
+    pub user: Option<String>,
+
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        alias = "pass",
+        default = "default_clickhouse_empty_string"
+    )]
+    pub password: Option<String>,
+
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default = "default_clickhouse_empty_string"
+    )]
+    pub cluster: Option<String>,
+
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default = "default_clickhouse_true"
+    )]
+    pub verify: Option<bool>,
+
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default = "default_clickhouse_false"
+    )]
+    pub secure: Option<bool>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_cert: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_cert_key: Option<String>,
+
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default = "default_clickhouse_retries"
+    )]
+    pub retries: Option<i64>,
+
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default = "default_clickhouse_empty_string"
+    )]
+    pub compression: Option<String>,
+
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default = "default_clickhouse_connect_timeout"
+    )]
+    pub connect_timeout: Option<i64>,
+
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default = "default_clickhouse_send_receive_timeout"
+    )]
+    pub send_receive_timeout: Option<i64>,
+
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default = "default_clickhouse_false"
+    )]
+    pub cluster_mode: Option<bool>,
+
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default = "default_clickhouse_false"
+    )]
+    pub use_lw_deletes: Option<bool>,
+
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default = "default_clickhouse_true"
+    )]
+    pub check_exchange: Option<bool>,
+
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default = "default_clickhouse_local_suffix"
+    )]
+    pub local_suffix: Option<String>,
+
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default = "default_clickhouse_empty_string"
+    )]
+    pub local_db_prefix: Option<String>,
+
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default = "default_clickhouse_false"
+    )]
+    pub allow_automatic_deduplication: Option<bool>,
+
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default = "default_clickhouse_custom_settings"
+    )]
+    #[merge(strategy = merge_strategies_extend::overwrite_always)]
+    pub custom_settings: Option<HashMap<String, YmlValue>>,
+
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default = "default_clickhouse_empty_string"
+    )]
+    pub database_engine: Option<String>,
+
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default = "default_clickhouse_threads"
+    )]
+    pub threads: Option<StringOrInteger>,
+
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default = "default_clickhouse_sync_request_timeout"
+    )]
+    pub sync_request_timeout: Option<i64>,
+
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default = "default_clickhouse_compress_block_size"
+    )]
+    pub compress_block_size: Option<i64>,
+}
+
+fn default_clickhouse_schema() -> Option<String> {
+    Some("default".to_string())
+}
+
+fn default_clickhouse_host() -> Option<String> {
+    Some("localhost".to_string())
+}
+
+fn default_clickhouse_user() -> Option<String> {
+    Some("default".to_string())
+}
+
+fn default_clickhouse_empty_string() -> Option<String> {
+    Some(String::new())
+}
+
+fn default_clickhouse_true() -> Option<bool> {
+    Some(true)
+}
+
+fn default_clickhouse_false() -> Option<bool> {
+    Some(false)
+}
+
+fn default_clickhouse_retries() -> Option<i64> {
+    Some(1)
+}
+
+fn default_clickhouse_connect_timeout() -> Option<i64> {
+    Some(10)
+}
+
+fn default_clickhouse_send_receive_timeout() -> Option<i64> {
+    Some(300)
+}
+
+fn default_clickhouse_local_suffix() -> Option<String> {
+    Some("_local".to_string())
+}
+
+fn default_clickhouse_custom_settings() -> Option<HashMap<String, YmlValue>> {
+    Some(HashMap::new())
+}
+
+fn default_clickhouse_threads() -> Option<StringOrInteger> {
+    Some(StringOrInteger::Integer(1))
+}
+
+fn default_clickhouse_sync_request_timeout() -> Option<i64> {
+    Some(5)
+}
+
+fn default_clickhouse_compress_block_size() -> Option<i64> {
+    Some(1_048_576)
+}
+
 #[derive(Serialize, DbtSchema)]
 #[serde(untagged)]
 #[serde(rename_all = "snake_case")]
@@ -1188,6 +1437,8 @@ pub enum TargetContext {
     DuckDB(DuckDbTargetEnv),
     Spark(SparkTargetEnv),
     Fabric(FabricTargetEnv),
+    Exasol(ExasolTargetEnv),
+    ClickHouse(ClickHouseTargetEnv),
     // Add other variants as needed
 }
 
@@ -1307,6 +1558,7 @@ pub struct RedshiftTargetEnv {
     pub autocreate: bool,
     pub db_groups: Option<Vec<String>>,
     pub ra3_node: Option<bool>,
+    pub datasharing: Option<bool>,
     pub connect_timeout: Option<i64>,
     pub role: Option<String>,
     pub retries: i64,
@@ -1344,6 +1596,7 @@ pub struct SparkTargetEnv {
     pub host: String,
     pub port: u16,
     pub user: String,
+    pub password: String,
     pub auth: SparkAuth,
     pub use_ssl: bool,
     pub kerberos_service_name: String,
@@ -1352,29 +1605,125 @@ pub struct SparkTargetEnv {
 #[derive(Serialize, DbtSchema)]
 pub struct FabricTargetEnv {
     pub __common__: CommonTargetContext,
-    pub authentication: FabricAuth,
+    pub authentication: String,
     // TODO: ...
 }
 
-/// Derive a database name from a MotherDuck path (`md:` or `motherduck:` prefix).
-///
-/// Returns `None` if the path is not a MotherDuck path.
-/// `md:my_db` → `Some("my_db")`, `md:` → `Some("my_db")` (default), strips query params.
-fn duckdb_motherduck_database_name(path: &str) -> Option<String> {
-    let lower = path.to_lowercase();
-    let prefix_len = if lower.starts_with("motherduck:") {
-        "motherduck:".len()
-    } else if lower.starts_with("md:") {
-        "md:".len()
-    } else {
-        return None;
-    };
-    let stripped = &path[prefix_len..];
-    let name = stripped.split('?').next().unwrap_or("");
-    if name.is_empty() {
-        Some("my_db".to_owned())
-    } else {
-        Some(name.to_owned())
+#[derive(Serialize, DbtSchema)]
+#[serde(rename_all = "snake_case")]
+pub struct ExasolTargetEnv {
+    pub host: Option<String>,
+    pub user: Option<String>,
+    pub __common__: CommonTargetContext,
+}
+
+#[derive(Serialize, DbtSchema)]
+#[serde(rename_all = "snake_case")]
+pub struct ClickHouseTargetEnv {
+    pub driver: Option<String>,
+    pub host: Option<String>,
+    pub port: Option<StringOrInteger>,
+    pub user: Option<String>,
+    pub retries: Option<i64>,
+    pub cluster: Option<String>,
+    pub database_engine: Option<String>,
+    pub cluster_mode: Option<bool>,
+    pub secure: Option<bool>,
+    pub verify: Option<bool>,
+    pub connect_timeout: Option<i64>,
+    pub send_receive_timeout: Option<i64>,
+    pub sync_request_timeout: Option<i64>,
+    pub compress_block_size: Option<i64>,
+    pub compression: Option<String>,
+    pub check_exchange: Option<bool>,
+    pub custom_settings: Option<HashMap<String, YmlValue>>,
+    pub use_lw_deletes: Option<bool>,
+    pub allow_automatic_deduplication: Option<bool>,
+    pub local_suffix: Option<String>,
+    pub local_db_prefix: Option<String>,
+    pub __common__: CommonTargetContext,
+}
+
+/// The location type of a DuckDB database path.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DuckDBLocation<'a> {
+    /// In-memory database (`:memory:` or no path).
+    Memory,
+    /// MotherDuck cloud database (`md:` or `motherduck:` prefix).
+    Motherduck { url: &'a str },
+    /// Local filesystem database file.
+    Filesystem { path: &'a str },
+}
+
+/// Parsed information about a DuckDB connection path.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DuckDBPathInfo<'a> {
+    pub location: DuckDBLocation<'a>,
+    /// The effective database name derived from the path.
+    pub database: &'a str,
+    /// Whether the path uses the `ducklake:` scheme.
+    pub is_ducklake: bool,
+}
+
+impl<'a> DuckDBPathInfo<'a> {
+    /// Parse a DuckDB connection path into its component parts.
+    ///
+    /// Handles a single `ducklake:` prefix, MotherDuck (`md:` / `motherduck:`)
+    /// URLs, `:memory:`, and filesystem paths.
+    pub fn parse_path(path: Option<&'a str>) -> Self {
+        let Some(effective) = path else {
+            return Self {
+                location: DuckDBLocation::Memory,
+                database: "main",
+                is_ducklake: false,
+            };
+        };
+
+        // Strip a single `ducklake:` prefix.
+        let (is_ducklake, effective) = match effective.strip_prefix("ducklake:") {
+            Some(inner) => (true, inner),
+            None => (false, effective),
+        };
+
+        if effective == ":memory:" || effective.is_empty() {
+            return Self {
+                location: DuckDBLocation::Memory,
+                database: "main",
+                is_ducklake,
+            };
+        }
+
+        // Check for MotherDuck prefix.
+        let lower = effective.to_lowercase();
+        let md_prefix_len = if lower.starts_with("motherduck:") {
+            Some("motherduck:".len())
+        } else if lower.starts_with("md:") {
+            Some("md:".len())
+        } else {
+            None
+        };
+
+        if let Some(prefix_len) = md_prefix_len {
+            let stripped = &effective[prefix_len..];
+            let name = stripped.split('?').next().unwrap_or("");
+            let database = if name.is_empty() { "my_db" } else { name };
+            return Self {
+                location: DuckDBLocation::Motherduck { url: effective },
+                database,
+                is_ducklake,
+            };
+        }
+
+        // Filesystem path — derive database name from file stem.
+        let database = std::path::Path::new(effective)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("main");
+        Self {
+            location: DuckDBLocation::Filesystem { path: effective },
+            database,
+            is_ducklake,
+        }
     }
 }
 
@@ -1557,6 +1906,7 @@ impl TryFrom<DbConfig> for TargetContext {
                     autocreate: config.autocreate.unwrap_or(false),
                     db_groups: config.db_groups,
                     ra3_node: config.ra3_node,
+                    datasharing: config.datasharing,
                     connect_timeout: config.connect_timeout,
                     role: config.role,
                     retries: config.retries.unwrap_or(1),
@@ -1597,21 +1947,9 @@ impl TryFrom<DbConfig> for TargetContext {
                 __common__: CommonTargetContext {
                     // Derive database name from path if not explicitly set (same logic as get_database())
                     database: config.database.clone().unwrap_or_else(|| {
-                        if let Some(path) = &config.path {
-                            if path == ":memory:" {
-                                "main".to_string()
-                            } else if let Some(dbname) = duckdb_motherduck_database_name(path) {
-                                dbname
-                            } else {
-                                std::path::Path::new(path)
-                                    .file_stem()
-                                    .and_then(|s| s.to_str())
-                                    .map(|s| s.to_string())
-                                    .unwrap_or_else(|| "main".to_string())
-                            }
-                        } else {
-                            "main".to_string()
-                        }
+                        DuckDBPathInfo::parse_path(config.path.as_deref())
+                            .database
+                            .to_owned()
                     }),
                     schema: config.schema.unwrap_or_else(|| "main".to_string()),
                     type_: adapter_type,
@@ -1632,6 +1970,7 @@ impl TryFrom<DbConfig> for TargetContext {
                 host: config.host.ok_or_else(|| missing("host"))?,
                 port: config.port.unwrap_or(10000),
                 user: config.user.unwrap_or_default(),
+                password: config.password.unwrap_or_default(),
 
                 kerberos_service_name: config.kerberos_service_name.unwrap_or_default(),
                 use_ssl: config.use_ssl.unwrap_or(false),
@@ -1659,6 +1998,57 @@ impl TryFrom<DbConfig> for TargetContext {
                     authentication,
                 }))
             }
+            DbConfig::Exasol(config) => Ok(TargetContext::Exasol(ExasolTargetEnv {
+                host: config.host.clone(),
+                user: config.user.clone(),
+                __common__: CommonTargetContext {
+                    database: config
+                        .database
+                        .clone()
+                        .unwrap_or_else(|| "exasol".to_string()),
+                    schema: config.schema.ok_or_else(|| missing("schema"))?,
+                    type_: adapter_type,
+                    threads: None,
+                },
+            })),
+
+            DbConfig::ClickHouse(config) => Ok(TargetContext::ClickHouse(ClickHouseTargetEnv {
+                driver: config.driver.clone(),
+                host: config.host.clone(),
+                port: config.port.clone(),
+                user: config.user.clone(),
+                retries: config.retries,
+                cluster: config.cluster.clone(),
+                database_engine: config.database_engine.clone(),
+                cluster_mode: config.cluster_mode,
+                secure: config.secure,
+                verify: config.verify,
+                connect_timeout: config.connect_timeout,
+                send_receive_timeout: config.send_receive_timeout,
+                sync_request_timeout: config.sync_request_timeout,
+                compress_block_size: config.compress_block_size,
+                compression: config.compression.clone(),
+                check_exchange: config.check_exchange,
+                custom_settings: config.custom_settings.clone(),
+                use_lw_deletes: config.use_lw_deletes,
+                allow_automatic_deduplication: config.allow_automatic_deduplication,
+                local_suffix: config.local_suffix.clone(),
+                local_db_prefix: config.local_db_prefix.clone(),
+                __common__: CommonTargetContext {
+                    database: String::new(),
+                    schema: config.schema.clone().ok_or_else(|| missing("schema"))?,
+                    type_: adapter_type,
+                    threads: match config.threads {
+                        Some(StringOrInteger::String(threads)) => Some(
+                            threads
+                                .parse::<u16>()
+                                .map_err(|_| "threads must be a positive integer".to_string())?,
+                        ),
+                        Some(StringOrInteger::Integer(threads)) => Some(threads as u16),
+                        None => None,
+                    },
+                },
+            })),
         }
     }
 }
@@ -1675,10 +2065,7 @@ mod tests {
         }
         .into();
 
-        assert_eq!(
-            config.get_unique_field().map(String::as_str),
-            Some("kw27752")
-        );
+        assert_eq!(config.get_unique_field(), Some("kw27752"));
         assert_eq!(
             config.get_adapter_unique_id(),
             Some("c27a9a57d35df4a8f81aec929cbdc7cd".to_string())
@@ -1695,6 +2082,26 @@ mod tests {
 
         assert_eq!(config.get_unique_field(), None);
         assert_eq!(config.get_adapter_unique_id(), None);
+    }
+
+    #[test]
+    fn test_duckdb_adapter_unique_id_defaults_to_memory_when_path_missing() {
+        let config: DbConfig = DuckDbConfig {
+            path: None,
+            attach: Some(vec![DuckDbAttachment {
+                path: "md:some_db".to_string(),
+                is_ducklake: Some(true),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }
+        .into();
+
+        assert_eq!(config.get_unique_field(), Some(":memory:"));
+        assert_eq!(
+            config.get_adapter_unique_id(),
+            Some("f7935d72c5941a25cc019e2fb05ae050".to_string())
+        );
     }
 
     #[test]
@@ -1748,5 +2155,351 @@ mod tests {
             panic!("expected snowflake target context");
         };
         assert_eq!(target.user.as_deref(), Some("user"));
+    }
+
+    #[test]
+    fn test_duckdb_parse_path_variants() {
+        // Memory
+        let info = DuckDBPathInfo::parse_path(None);
+        assert_eq!(info.location, DuckDBLocation::Memory);
+        assert_eq!(info.database, "main");
+        assert!(!info.is_ducklake);
+
+        let info = DuckDBPathInfo::parse_path(Some(":memory:"));
+        assert_eq!(info.location, DuckDBLocation::Memory);
+        assert_eq!(info.database, "main");
+
+        // MotherDuck
+        let info = DuckDBPathInfo::parse_path(Some("md:my_db"));
+        assert!(matches!(info.location, DuckDBLocation::Motherduck { .. }));
+        assert_eq!(info.database, "my_db");
+        assert!(!info.is_ducklake);
+
+        let info = DuckDBPathInfo::parse_path(Some("motherduck:my_db?token=secret"));
+        assert!(matches!(info.location, DuckDBLocation::Motherduck { .. }));
+        assert_eq!(info.database, "my_db");
+
+        // Filesystem
+        let info = DuckDBPathInfo::parse_path(Some("/tmp/jaffle_shop.duckdb"));
+        assert!(matches!(info.location, DuckDBLocation::Filesystem { .. }));
+        assert_eq!(info.database, "jaffle_shop");
+        assert!(!info.is_ducklake);
+
+        // DuckLake with MotherDuck
+        let info = DuckDBPathInfo::parse_path(Some("ducklake:md:my_db"));
+        assert!(matches!(info.location, DuckDBLocation::Motherduck { .. }));
+        assert_eq!(info.database, "my_db");
+        assert!(info.is_ducklake);
+    }
+
+    #[test]
+    fn test_duckdb_config_parses_top_level_is_ducklake() {
+        let config: DbConfig = dbt_yaml::from_str(
+            "type: duckdb\n\
+             path: md:my_db\n\
+             is_ducklake: true",
+        )
+        .unwrap();
+
+        assert_eq!(config.get_database_or_default(), "my_db");
+
+        let DbConfig::DuckDB(duckdb_config) = config else {
+            panic!("Expected DbConfig::DuckDB");
+        };
+        assert_eq!(duckdb_config.is_ducklake, Some(true));
+    }
+
+    #[test]
+    fn test_duckdb_extensions_as_strings() {
+        // Test that extensions can be simple strings (existing behavior)
+        let config: DbConfig = dbt_yaml::from_str(
+            "type: duckdb\n\
+             path: db.duckdb\n\
+             extensions:\n\
+               - httpfs\n\
+               - parquet",
+        )
+        .unwrap();
+
+        let DbConfig::DuckDB(duckdb_config) = config else {
+            panic!("Expected DbConfig::DuckDB");
+        };
+        assert!(duckdb_config.extensions.is_some());
+        let extensions = duckdb_config.extensions.unwrap();
+        assert_eq!(extensions.len(), 2);
+    }
+
+    #[test]
+    fn test_duckdb_extensions_as_objects() {
+        // Test that extensions can be objects with name and repo (issue #1530)
+        let config: DbConfig = dbt_yaml::from_str(
+            "type: duckdb\n\
+             path: db.duckdb\n\
+             extensions:\n\
+               - name: duckpgq\n\
+                 repo: community",
+        )
+        .unwrap();
+
+        let DbConfig::DuckDB(duckdb_config) = config else {
+            panic!("Expected DbConfig::DuckDB");
+        };
+        assert!(duckdb_config.extensions.is_some());
+        let extensions = duckdb_config.extensions.unwrap();
+        assert_eq!(extensions.len(), 1);
+    }
+
+    #[test]
+    fn test_duckdb_extensions_mixed() {
+        // Test that extensions can mix strings and objects
+        let yaml_str = r#"
+type: duckdb
+path: db.duckdb
+extensions:
+  - httpfs
+  - name: duckpgq
+    repo: community
+  - parquet
+"#;
+        let config: DbConfig = dbt_yaml::from_str(yaml_str).unwrap();
+
+        let DbConfig::DuckDB(duckdb_config) = config else {
+            panic!("Expected DbConfig::DuckDB");
+        };
+        assert!(duckdb_config.extensions.is_some());
+        let extensions = duckdb_config.extensions.unwrap();
+        assert_eq!(extensions.len(), 3);
+    }
+
+    #[test]
+    fn test_clickhouse_minimal_config_parses() {
+        let config: DbConfig = dbt_yaml::from_str(
+            "type: clickhouse\n\
+             schema: analytics\n",
+        )
+        .unwrap();
+
+        let DbConfig::ClickHouse(clickhouse_config) = config else {
+            panic!("Expected DbConfig::ClickHouse");
+        };
+        assert_eq!(clickhouse_config.host, Some("localhost".to_string()));
+        assert_eq!(clickhouse_config.port, None);
+        assert_eq!(clickhouse_config.user, Some("default".to_string()));
+        assert_eq!(clickhouse_config.password, Some(String::new()));
+        assert_eq!(clickhouse_config.schema, Some("analytics".to_string()));
+        assert_eq!(clickhouse_config.secure, Some(false));
+    }
+
+    #[test]
+    fn test_clickhouse_full_config_parses() {
+        let config: DbConfig = dbt_yaml::from_str(
+            "type: clickhouse\n\
+             host: ch.prod.internal\n\
+             port: 9000\n\
+             user: alice\n\
+             password: secret\n\
+             schema: analytics\n\
+             secure: true\n\
+             threads: 4\n",
+        )
+        .unwrap();
+
+        let DbConfig::ClickHouse(clickhouse_config) = config else {
+            panic!("Expected DbConfig::ClickHouse");
+        };
+        assert_eq!(clickhouse_config.host, Some("ch.prod.internal".to_string()));
+        assert_eq!(clickhouse_config.port, Some(StringOrInteger::Integer(9000)));
+        assert_eq!(clickhouse_config.user, Some("alice".to_string()));
+        assert_eq!(clickhouse_config.password, Some("secret".to_string()));
+        assert_eq!(clickhouse_config.schema, Some("analytics".to_string()));
+        assert_eq!(clickhouse_config.secure, Some(true));
+        assert_eq!(clickhouse_config.threads, Some(StringOrInteger::Integer(4)));
+    }
+
+    #[test]
+    fn test_clickhouse_schema_is_target_database() {
+        let config: DbConfig = dbt_yaml::from_str(
+            "type: clickhouse\n\
+             schema: analytics\n",
+        )
+        .unwrap();
+
+        assert_eq!(config.get_database(), None);
+        let target = TargetContext::try_from(config).expect("clickhouse target context");
+        let TargetContext::ClickHouse(target) = target else {
+            panic!("expected clickhouse target context");
+        };
+        assert_eq!(target.__common__.database, "");
+        assert_eq!(target.__common__.schema, "analytics");
+    }
+
+    #[test]
+    fn test_clickhouse_adapter_type_dispatch() {
+        let config: DbConfig = ClickHouseDbConfig {
+            host: Some("ch.example.com".to_string()),
+            schema: Some("analytics".to_string()),
+            ..Default::default()
+        }
+        .into();
+
+        assert_eq!(config.adapter_type(), AdapterType::ClickHouse);
+        assert_eq!(config.get_unique_field(), Some("ch.example.com"));
+    }
+
+    fn clickhouse_profile_parity_target_context() -> ClickHouseTargetEnv {
+        let yaml_str = r#"
+type: clickhouse
+driver: native
+host: ch.prod.internal
+port: 9000
+user: analytics
+password: secret
+schema: analytics
+cluster: my_cluster
+database_engine: Replicated
+cluster_mode: true
+secure: true
+verify: false
+client_cert: /path/to/cert.pem
+client_cert_key: /path/to/key.pem
+retries: 5
+compression: lz4
+connect_timeout: 30
+send_receive_timeout: 600
+sync_request_timeout: 10
+compress_block_size: 524288
+check_exchange: false
+use_lw_deletes: true
+allow_automatic_deduplication: true
+custom_settings:
+  async_insert: 1
+local_suffix: _shard
+local_db_prefix: shard_
+threads: 8
+"#;
+        let config: DbConfig = dbt_yaml::from_str(yaml_str).unwrap();
+        let target = TargetContext::try_from(config).expect("clickhouse target context");
+        let TargetContext::ClickHouse(target) = target else {
+            panic!("expected clickhouse target context");
+        };
+
+        target
+    }
+
+    #[test]
+    fn test_clickhouse_target_context_exposes_connection_fields() {
+        let t = clickhouse_profile_parity_target_context();
+
+        assert_eq!(t.driver.as_deref(), Some("native"));
+        assert_eq!(t.host.as_deref(), Some("ch.prod.internal"));
+        match t.port {
+            Some(StringOrInteger::Integer(p)) => assert_eq!(p, 9000),
+            other => panic!("expected Integer(9000), got {other:?}"),
+        }
+        assert_eq!(t.user.as_deref(), Some("analytics"));
+        assert_eq!(t.retries, Some(5));
+        assert_eq!(t.cluster.as_deref(), Some("my_cluster"));
+        assert_eq!(t.database_engine.as_deref(), Some("Replicated"));
+        assert_eq!(t.cluster_mode, Some(true));
+        assert_eq!(t.secure, Some(true));
+        assert_eq!(t.verify, Some(false));
+        assert_eq!(t.connect_timeout, Some(30));
+        assert_eq!(t.send_receive_timeout, Some(600));
+        assert_eq!(t.sync_request_timeout, Some(10));
+        assert_eq!(t.compress_block_size, Some(524_288));
+        assert_eq!(t.compression.as_deref(), Some("lz4"));
+        assert_eq!(t.check_exchange, Some(false));
+    }
+
+    #[test]
+    fn test_clickhouse_target_context_exposes_materialization_fields() {
+        let t = clickhouse_profile_parity_target_context();
+
+        assert_eq!(t.use_lw_deletes, Some(true));
+        assert_eq!(t.allow_automatic_deduplication, Some(true));
+        assert_eq!(t.local_suffix.as_deref(), Some("_shard"));
+        assert_eq!(t.local_db_prefix.as_deref(), Some("shard_"));
+        let custom_settings = t.custom_settings.as_ref().expect("custom_settings");
+        assert!(custom_settings.contains_key("async_insert"));
+        assert_eq!(t.__common__.database, "");
+        assert_eq!(t.__common__.schema, "analytics");
+        assert_eq!(t.__common__.threads, Some(8));
+
+        let serialized = dbt_yaml::to_value(&t).expect("serialize");
+        let mapping = serialized.as_mapping().expect("mapping");
+        assert!(!mapping.contains_key(YmlValue::string("client_cert".to_string())));
+        assert!(!mapping.contains_key(YmlValue::string("client_cert_key".to_string())));
+    }
+
+    #[test]
+    fn test_clickhouse_profile_parity_default_connection_fields() {
+        let config: DbConfig = dbt_yaml::from_str("type: clickhouse").unwrap();
+        let DbConfig::ClickHouse(ch) = &config else {
+            panic!("Expected DbConfig::ClickHouse");
+        };
+        assert!(ch.driver.is_none());
+        assert!(ch.port.is_none());
+        assert!(ch.client_cert.is_none());
+        assert!(ch.client_cert_key.is_none());
+        assert_eq!(ch.host.as_deref(), Some("localhost"));
+        assert_eq!(ch.user.as_deref(), Some("default"));
+        assert_eq!(ch.password.as_deref(), Some(""));
+        assert_eq!(ch.schema.as_deref(), Some("default"));
+        assert_eq!(ch.cluster.as_deref(), Some(""));
+        assert_eq!(ch.database_engine.as_deref(), Some(""));
+        assert_eq!(ch.compression.as_deref(), Some(""));
+        assert_eq!(ch.local_suffix.as_deref(), Some("_local"));
+        assert_eq!(ch.local_db_prefix.as_deref(), Some(""));
+        let custom_settings = ch.custom_settings.as_ref().expect("custom_settings");
+        assert!(custom_settings.is_empty());
+    }
+
+    #[test]
+    fn test_clickhouse_profile_parity_default_boolean_fields() {
+        let config: DbConfig = dbt_yaml::from_str("type: clickhouse").unwrap();
+        let DbConfig::ClickHouse(ch) = &config else {
+            panic!("Expected DbConfig::ClickHouse");
+        };
+
+        assert_eq!(ch.cluster_mode, Some(false));
+        assert_eq!(ch.secure, Some(false));
+        assert_eq!(ch.verify, Some(true));
+        assert_eq!(ch.check_exchange, Some(true));
+        assert_eq!(ch.use_lw_deletes, Some(false));
+        assert_eq!(ch.allow_automatic_deduplication, Some(false));
+    }
+
+    #[test]
+    fn test_clickhouse_profile_parity_default_numeric_and_target_fields() {
+        let config: DbConfig = dbt_yaml::from_str("type: clickhouse").unwrap();
+        let DbConfig::ClickHouse(ch) = &config else {
+            panic!("Expected DbConfig::ClickHouse");
+        };
+
+        assert_eq!(ch.retries, Some(1));
+        assert_eq!(ch.connect_timeout, Some(10));
+        assert_eq!(ch.send_receive_timeout, Some(300));
+        assert_eq!(ch.sync_request_timeout, Some(5));
+        assert_eq!(ch.compress_block_size, Some(1_048_576));
+
+        let target = TargetContext::try_from(config).expect("clickhouse target context");
+        let TargetContext::ClickHouse(t) = target else {
+            panic!("expected clickhouse target context");
+        };
+        assert_eq!(t.__common__.database, "");
+        assert_eq!(t.__common__.schema, "default");
+        assert_eq!(t.__common__.threads, Some(1));
+    }
+
+    #[test]
+    fn test_clickhouse_get_database_returns_none() {
+        let config: DbConfig = ClickHouseDbConfig {
+            schema: Some("analytics".to_string()),
+            ..Default::default()
+        }
+        .into();
+
+        assert_eq!(config.get_database(), None);
+        assert_eq!(config.get_database_or_default(), "");
     }
 }

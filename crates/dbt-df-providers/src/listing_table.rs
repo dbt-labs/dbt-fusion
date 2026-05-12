@@ -1,6 +1,6 @@
 //! Utilities for building DataFusion listing table providers with dbt semantics.
 
-use arrow_schema::Schema;
+use arrow_schema::{DataType, Field, Schema};
 use datafusion::{
     datasource::listing::{ListingTable, ListingTableConfig, ListingTableUrl},
     execution::options::ReadOptions,
@@ -8,7 +8,9 @@ use datafusion::{
 };
 use datafusion_catalog::Session;
 use datafusion_common::DataFusionError;
-use dbt_common::adapter::AdapterType;
+use dbt_adapter_core::AdapterType;
+use std::fs::File;
+use std::io::BufReader;
 use std::{path::Path, sync::Arc};
 /// Supported on-disk table formats.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +57,67 @@ pub async fn make_listing_table_provider(
         .with_schema(schema);
     let provider = Arc::new(ListingTable::try_new(config).unwrap());
     Ok(provider)
+}
+
+/// Read a seed file's Arrow schema **without** constructing a DataFusion
+/// `SessionContext` — parquet from the file footer, JSON via `arrow_json`'s
+/// schema inference. Useful for seed registration (LSP / static-analysis
+/// builds) where we need the schema for the binder but don't want to pull
+/// the `datafusion` umbrella into the caller's dep graph.
+///
+/// The returned schema matches what [`make_listing_table_provider`] would
+/// produce for the same file: for parquet we apply the same Utf8/Binary →
+/// view-type transform that DataFusion's default `ParquetFormat` applies
+/// (schema_force_view_types=true), so the schema we register upfront agrees
+/// with the batches that `scan_seed_file_arrow` later streams into the data
+/// store.
+pub fn read_listing_schema(
+    path: &Path,
+    table_format: TableFormat,
+) -> Result<Arc<Schema>, DataFusionError> {
+    match table_format {
+        TableFormat::Parquet => {
+            let file = File::open(path).map_err(|e| DataFusionError::External(Box::new(e)))?;
+            let builder =
+                parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            Ok(Arc::new(transform_schema_to_view(builder.schema())))
+        }
+        TableFormat::Json => {
+            let file = File::open(path).map_err(|e| DataFusionError::External(Box::new(e)))?;
+            let mut reader = BufReader::new(file);
+            let (schema, _) = arrow::json::reader::infer_json_schema(&mut reader, None)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            Ok(Arc::new(schema))
+        }
+        TableFormat::Csv => Err(DataFusionError::Internal(
+            "TableFormat::Csv is not supported in read_listing_schema".to_string(),
+        )),
+    }
+}
+
+/// Port of `datafusion::datasource::file_format::parquet::transform_schema_to_view`.
+/// Rewrites Utf8/LargeUtf8 as Utf8View and Binary/LargeBinary as BinaryView so
+/// our compute-free schema inference agrees with what DataFusion's
+/// `ParquetFormat::infer_schema` produces (given `schema_force_view_types=true`
+/// in the default session config).
+fn transform_schema_to_view(schema: &Schema) -> Schema {
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|field| match field.data_type() {
+            DataType::Utf8 | DataType::LargeUtf8 => field_with_new_type(field, DataType::Utf8View),
+            DataType::Binary | DataType::LargeBinary => {
+                field_with_new_type(field, DataType::BinaryView)
+            }
+            _ => Arc::clone(field),
+        })
+        .collect::<Vec<_>>();
+    Schema::new_with_metadata(fields, schema.metadata().clone())
+}
+
+fn field_with_new_type(field: &Arc<Field>, new_type: DataType) -> Arc<Field> {
+    Arc::new(field.as_ref().clone().with_data_type(new_type))
 }
 
 async fn infer_schema_for_listing_options(
@@ -111,14 +174,15 @@ pub fn infer_seed_column_name_strategy(
             AdapterType::Bigquery
             | AdapterType::Databricks
             | AdapterType::Spark
-            | AdapterType::Fabric
-            | AdapterType::Sidecar,
+            | AdapterType::Fabric,
         ) => InferColumnNameStrategy::Verbatim,
         (false, AdapterType::ClickHouse) => todo!("ClickHouse"),
+        (false, AdapterType::Exasol) => InferColumnNameStrategy::Uppercase,
         (false, AdapterType::Starburst) => todo!("Starburst"),
         (false, AdapterType::Athena) => todo!("Athena"),
         (false, AdapterType::Trino) => todo!("Trino"),
         (false, AdapterType::Dremio) => todo!("Dremio"),
         (false, AdapterType::Oracle) => todo!("Oracle"),
+        (false, AdapterType::Datafusion) => todo!("Datafusion"),
     }
 }

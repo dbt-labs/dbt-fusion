@@ -8,7 +8,7 @@ use dbt_telemetry::{
     LogMessage, LogRecordInfo, NodeEvaluated, NodeEvent, NodeOutcome, NodeProcessed,
     NodeSkipReason, NodeType, ProgressMessage, QueryExecuted, SeverityNumber, ShowDataOutput,
     ShowResult, SpanEndInfo, SpanStartInfo, StatusCode, TelemetryOutputFlags, TestOutcome,
-    UserLogMessage, get_freshness_detail, get_test_outcome,
+    UserLogMessage, get_freshness_detail, get_test_outcome, has_node_warning,
 };
 
 use serde_json::json;
@@ -17,6 +17,8 @@ use tracing::level_filters::LevelFilter;
 use super::super::{
     background_writer::BackgroundWriter,
     data_provider::DataProvider,
+    dbt_metrics::{FusionMetricKey, InvocationMetricKey},
+    event_classifiers::is_exit_with_status_log,
     formatters::{
         deps::{format_package_installed_end, format_package_installed_start, format_package_spec},
         duration::format_timestamp_utc_zulu,
@@ -32,7 +34,6 @@ use super::super::{
         query_log::format_query_log,
     },
     layer::{ConsumerLayer, TelemetryConsumer},
-    metrics::{InvocationMetricKey, MetricKey},
     shared_writer::SharedWriter,
     shutdown::TelemetryShutdownItem,
 };
@@ -167,6 +168,7 @@ struct JsonCompatLayer {
     invocation_id: uuid::Uuid,
     filter_flag: TelemetryOutputFlags,
     command: FsCommand,
+    custom_envs: std::collections::BTreeMap<String, String>,
 }
 
 impl JsonCompatLayer {
@@ -176,6 +178,7 @@ impl JsonCompatLayer {
         command: FsCommand,
     ) -> Self {
         let is_tty = writer.is_terminal();
+        let custom_envs = crate::constants::collect_dbt_custom_envs();
 
         Self {
             writer: Box::new(writer),
@@ -186,6 +189,7 @@ impl JsonCompatLayer {
                 TelemetryOutputFlags::OUTPUT_LOG_FILE
             },
             command,
+            custom_envs,
         }
     }
 
@@ -208,7 +212,11 @@ impl JsonCompatLayer {
             msg,
             level: level.to_lowercase(),
             #[allow(clippy::disallowed_types)]
-            extra: std::collections::HashMap::new(),
+            extra: self
+                .custom_envs
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
         }
     }
 
@@ -286,7 +294,7 @@ impl JsonCompatLayer {
             }
 
             format!(
-                "running dbt-fusion with argumets {}",
+                "running dbt-fusion with arguments {}",
                 serde_json::to_string(eval_args).unwrap_or_default()
             )
         } else {
@@ -388,7 +396,7 @@ impl JsonCompatLayer {
             .as_secs_f32();
 
         let completed_at_str = format_timestamp_utc_zulu(span.end_time_unix_nano);
-        let success = data_provider.get_metric(MetricKey::InvocationMetric(
+        let success = data_provider.get_metric(FusionMetricKey::InvocationMetric(
             InvocationMetricKey::TotalErrors,
         )) == 0;
 
@@ -887,6 +895,7 @@ impl JsonCompatLayer {
             node_skip_reason,
             test_outcome,
             freshness_outcome,
+            has_node_warning(node.into()),
             false,
         );
 
@@ -1238,6 +1247,9 @@ impl TelemetryConsumer for JsonCompatLayer {
             .attributes
             .output_flags()
             .contains(self.filter_flag)
+            // ExitWithStatus is a pseudo error used only to short-circuit execution, so we
+            // filter it from dbt-facing output
+            && !is_exit_with_status_log(log_record)
     }
 
     fn on_span_start(&self, span: &SpanStartInfo, _data_provider: &mut DataProvider<'_>) {

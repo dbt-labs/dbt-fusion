@@ -155,6 +155,10 @@ impl Object for TargetLagConfig {
     {
         write!(f, "{}", self.target_lag)
     }
+
+    fn is_true(self: &Arc<Self>) -> bool {
+        true
+    }
 }
 
 impl Display for TargetLagConfig {
@@ -221,6 +225,10 @@ impl Object for RefreshModeConfig {
             Some("refresh_mode") => Some(Value::from(self.refresh_mode.to_string())),
             _ => None,
         }
+    }
+
+    fn is_true(self: &Arc<Self>) -> bool {
+        true
     }
 
     fn render(self: &Arc<Self>, f: &mut Formatter<'_>) -> std::fmt::Result
@@ -293,6 +301,10 @@ impl Object for InitializeConfig {
         }
     }
 
+    fn is_true(self: &Arc<Self>) -> bool {
+        true
+    }
+
     fn render(self: &Arc<Self>, f: &mut Formatter<'_>) -> std::fmt::Result
     where
         Self: Sized + 'static,
@@ -314,6 +326,81 @@ impl TryFrom<&str> for InitializeConfig {
 /// This config follows the specs found here:
 /// https://docs.snowflake.com/en/sql-reference/sql/create-dynamic-table
 /// Reference:
+/// https://github.com/dbt-labs/dbt-adapters/blob/272e4bbbe4903b0d26a31f588c304475443f7793/dbt-snowflake/src/dbt/adapters/snowflake/relation_configs/dynamic_table.py#L37
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Scheduler {
+    #[default]
+    Enable,
+    Disable,
+}
+
+impl Display for Scheduler {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Enable => write!(f, "ENABLE"),
+            Self::Disable => write!(f, "DISABLE"),
+        }
+    }
+}
+
+impl TryFrom<&str> for Scheduler {
+    type Error = String;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        if value.eq_ignore_ascii_case("enable") {
+            Ok(Self::Enable)
+        } else if value.eq_ignore_ascii_case("disable") {
+            Ok(Self::Disable)
+        } else {
+            Err(format!("Unsupported scheduler value: {value}"))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SchedulerConfig {
+    pub scheduler: Scheduler,
+}
+
+impl Object for SchedulerConfig {
+    fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
+        match key.as_str() {
+            Some("scheduler") => Some(Value::from(self.scheduler.to_string())),
+            _ => None,
+        }
+    }
+
+    fn is_true(self: &Arc<Self>) -> bool {
+        true
+    }
+
+    fn render(self: &Arc<Self>, f: &mut Formatter<'_>) -> std::fmt::Result
+    where
+        Self: Sized + 'static,
+    {
+        write!(f, "{}", self.scheduler)
+    }
+}
+
+impl Display for SchedulerConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.scheduler.fmt(f)
+    }
+}
+
+impl TryFrom<&str> for SchedulerConfig {
+    type Error = String;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Ok(Self {
+            scheduler: Scheduler::try_from(value)?,
+        })
+    }
+}
+
+/// This config follows the specs found here:
+/// https://docs.snowflake.com/en/sql-reference/sql/create-dynamic-table
+/// Reference:
 /// https://github.com/dbt-labs/dbt-adapters/blob/816d190c9e31391a48cee979bd049aeb34c89ad3/dbt-snowflake/src/dbt/adapters/snowflake/relation_configs/dynamic_table.py#L36
 // XXX: Deviation from core: raw SQL is not used here - that is already available within the macro as {{ sql }}
 #[derive(Debug, Clone)]
@@ -326,9 +413,11 @@ pub struct SnowflakeDynamicTableConfig {
     pub database_name: String,
     /// The maximum amount of time that the dynamic table's content should lag behind updates to the source tables.
     /// This configuration option is required.
-    pub target_lag: TargetLagConfig,
+    pub target_lag: Option<TargetLagConfig>,
     /// The name of the warehouse that provides the compute resources for refreshing the dynamic table.
     pub snowflake_warehouse: String,
+    /// The name of the warehouse used for the initializations and reinitializations of the dynamic table.
+    pub snowflake_initialization_warehouse: Option<String>,
     /// Specifies the refresh mode for the dynamic table.
     pub refresh_mode: RefreshModeConfig,
     /// Specifies the behavior of the initial refresh of the dynamic table.
@@ -339,13 +428,19 @@ pub struct SnowflakeDynamicTableConfig {
     pub table_tag: Option<String>,
     /// Specifies the columns to cluster on
     pub cluster_by: Option<String>,
+    /// Specifies an immutability constraint expression
+    pub immutable_where: Option<String>,
+    /// Specifies whether the dynamic table is transient (no fail-safe period).
+    pub transient: Option<bool>,
+    /// Specifies whether to ENABLE or DISABLE the dynamic table's scheduler
+    pub scheduler: SchedulerConfig,
 }
 
 impl TryFrom<&DbtModel> for SnowflakeDynamicTableConfig {
     type Error = String;
 
     /// Default behavior follows the table here: https://docs.getdbt.com/reference/resource-configs/snowflake-configs.
-    /// Note that `target_lag` and `snowflake_warehouse` are required.
+    /// `target_lag` is required when `scheduler='ENABLE'` and must be omitted when `scheduler='DISABLE'`.
     ///
     /// Reference: https://github.com/dbt-labs/dbt-adapters/blob/816d190c9e31391a48cee979bd049aeb34c89ad3/dbt-snowflake/src/dbt/adapters/snowflake/relation_configs/dynamic_table.py#L87
     fn try_from(model: &DbtModel) -> Result<Self, Self::Error> {
@@ -359,20 +454,18 @@ impl TryFrom<&DbtModel> for SnowflakeDynamicTableConfig {
             .as_ref()
             .ok_or("Snowflake attributes not found.")?;
 
-        // The following two fields are required.
-        let target_lag = TargetLagConfig::try_from(
-            snowflake_config
-                .target_lag
-                .clone()
-                .ok_or("Failed to get required field target_lag from dynamic_table config.")?
-                .as_str(),
-        )?;
+        let target_lag = match snowflake_config.target_lag.as_deref() {
+            Some(s) => Some(TargetLagConfig::try_from(s)?),
+            None => None,
+        };
         let snowflake_warehouse = snowflake_config
             .snowflake_warehouse
             .clone()
             .ok_or("Failed to get required field snowflake_warehouse from dynamic_table config.")?;
 
         // The remaining fields are not required.
+        let snowflake_initialization_warehouse =
+            snowflake_config.snowflake_initialization_warehouse.clone();
         let refresh_mode = snowflake_config
             .refresh_mode
             .clone()
@@ -394,19 +487,66 @@ impl TryFrom<&DbtModel> for SnowflakeDynamicTableConfig {
             fields.join(", ")
         });
 
+        let immutable_where = snowflake_config.immutable_where.clone();
+        let transient = snowflake_config.transient;
+        let scheduler = match snowflake_config.scheduler.as_deref() {
+            Some(s) => SchedulerConfig::try_from(s)?,
+            None if target_lag.is_some() => SchedulerConfig {
+                scheduler: Scheduler::Enable,
+            },
+            None => SchedulerConfig {
+                scheduler: Scheduler::Disable,
+            },
+        };
+
+        // `target_lag` is not allowed if `scheduler=DISABLE`
+        match scheduler.scheduler {
+            Scheduler::Enable => {
+                if target_lag.is_none() {
+                    return Err(
+                        "Invalid dynamic table config: `scheduler='ENABLE'` requires `target_lag`."
+                            .into(),
+                    );
+                }
+            }
+            Scheduler::Disable => {
+                if target_lag.is_some() {
+                    return Err(
+                        "Invalid dynamic table config: `scheduler='DISABLE'` requires `target_lag` to be omitted."
+                            .into(),
+                    );
+                }
+            }
+        }
+
         Ok(Self {
             table_name,
             schema_name,
             database_name,
             target_lag,
             snowflake_warehouse,
+            snowflake_initialization_warehouse,
             refresh_mode,
             initialize,
             row_access_policy,
             table_tag,
             cluster_by,
+            immutable_where,
+            transient,
+            scheduler,
         })
     }
+}
+
+// Helper function to get a bool value from a RecordBatch by column name.
+// Returns None if the column is absent.
+fn get_bool_by_name_from_record_batch(batch: &Arc<RecordBatch>, col_name: &str) -> Option<bool> {
+    use arrow::array::BooleanArray;
+    let col = get_column_values::<BooleanArray>(batch, col_name).ok()?;
+    if col.len() != 1 {
+        return None;
+    }
+    col.is_valid(0).then(|| col.value(0))
 }
 
 // Helper function to get a string value from an Record Batch by column name
@@ -447,13 +587,62 @@ impl TryFrom<DescribeDynamicTableResults> for SnowflakeDynamicTableConfig {
 
         let snowflake_warehouse = get_string_by_name_from_record_batch(&batch, "warehouse")?;
 
-        let target_lag = TargetLagConfig::try_from(
-            get_string_by_name_from_record_batch(&batch, "target_lag")?.as_str(),
-        )?;
+        // Some Snowflake accounts don't support the initialization_warehouse field, so this column might not be present.
+        // Snowflake returns the string "NONE" for unset optional warehouse values; normalize to None.
+        let snowflake_initialization_warehouse =
+            get_string_by_name_from_record_batch(&batch, "initialization_warehouse")
+                .ok()
+                .and_then(|v| {
+                    if v.is_empty() || v.eq_ignore_ascii_case("NONE") {
+                        None
+                    } else {
+                        Some(v)
+                    }
+                });
 
         let refresh_mode = RefreshModeConfig::try_from(
             get_string_by_name_from_record_batch(&batch, "refresh_mode")?.as_str(),
         )?;
+
+        // Snowflake returns "IMMUTABLE WHERE (expr)" — strip prefix/suffix to get bare expression.
+        let immutable_where = get_string_by_name_from_record_batch(&batch, "immutable_where")
+            .ok()
+            .and_then(|v| {
+                let v = v.trim().to_string();
+                if v.is_empty() {
+                    None
+                } else {
+                    let stripped = v
+                        .strip_prefix("IMMUTABLE WHERE (")
+                        .and_then(|s| s.strip_suffix(')'))
+                        .map(|s| s.to_string())
+                        .unwrap_or(v);
+                    Some(stripped)
+                }
+            });
+
+        let transient = get_bool_by_name_from_record_batch(&batch, "transient");
+
+        let target_lag = match get_string_by_name_from_record_batch(&batch, "target_lag") {
+            Ok(s) if !s.is_empty() => Some(TargetLagConfig::try_from(s.as_str())?),
+            _ => None,
+        };
+        let scheduler = get_string_by_name_from_record_batch(&batch, "scheduler")
+            .ok()
+            .and_then(|s| {
+                if s.is_empty() {
+                    None
+                } else {
+                    Scheduler::try_from(s.as_str()).ok()
+                }
+            })
+            .unwrap_or_else(|| {
+                if target_lag.is_some() {
+                    Scheduler::Enable
+                } else {
+                    Scheduler::Disable
+                }
+            });
 
         Ok(Self {
             table_name,
@@ -461,14 +650,27 @@ impl TryFrom<DescribeDynamicTableResults> for SnowflakeDynamicTableConfig {
             database_name,
             target_lag,
             snowflake_warehouse,
+            snowflake_initialization_warehouse,
             refresh_mode,
             // We don't get initialize since that's a one-time scheduler attribute, not a DT attribute
             initialize: InitializeConfig::default(),
             // These can't be queried from Snowflake
             row_access_policy: None,
             table_tag: None,
-            // TODO: This _can_ be queried from Snowflake, but Core doesn't read it at all
-            cluster_by: None,
+            // Normalize: Snowflake returns "" or "NONE" for unset cluster_by.
+            cluster_by: get_string_by_name_from_record_batch(&batch, "cluster_by")
+                .ok()
+                .and_then(|s| {
+                    let s = s.trim().to_string();
+                    if s.is_empty() || s.eq_ignore_ascii_case("NONE") {
+                        None
+                    } else {
+                        Some(s)
+                    }
+                }),
+            immutable_where,
+            transient,
+            scheduler: SchedulerConfig { scheduler },
         })
     }
 }
@@ -479,13 +681,22 @@ impl Object for SnowflakeDynamicTableConfig {
             Some("table_name") => Some(Value::from(self.table_name.clone())),
             Some("schema_name") => Some(Value::from(self.schema_name.clone())),
             Some("database_name") => Some(Value::from(self.database_name.clone())),
-            Some("target_lag") => Some(Value::from_object(self.target_lag.clone())),
+            Some("target_lag") => Some(match &self.target_lag {
+                Some(tl) => Value::from_object(tl.clone()),
+                None => Value::from(()),
+            }),
             Some("snowflake_warehouse") => Some(Value::from(self.snowflake_warehouse.clone())),
+            Some("snowflake_initialization_warehouse") => {
+                Some(Value::from(self.snowflake_initialization_warehouse.clone()))
+            }
             Some("refresh_mode") => Some(Value::from_object(self.refresh_mode.clone())),
             Some("initialize") => Some(Value::from_object(self.initialize.clone())),
+            Some("scheduler") => Some(Value::from_object(self.scheduler.clone())),
             Some("row_access_policy") => Some(Value::from(self.row_access_policy.clone())),
             Some("table_tag") => Some(Value::from(self.table_tag.clone())),
             Some("cluster_by") => Some(Value::from(self.cluster_by.clone())),
+            Some("immutable_where") => Some(Value::from(self.immutable_where.clone())),
+            Some("transient") => Some(Value::from(self.transient)),
             _ => None,
         }
     }
@@ -494,7 +705,7 @@ impl Object for SnowflakeDynamicTableConfig {
 #[derive(Debug, Clone)]
 pub struct SnowflakeDynamicTableTargetLagConfigChange {
     // Deviation from core: we must include a context to change to, since the presence of this object enforces a config change for this field.
-    context: TargetLagConfig,
+    context: Option<TargetLagConfig>,
 }
 
 impl RelationChangeSet for SnowflakeDynamicTableTargetLagConfigChange {
@@ -519,7 +730,10 @@ impl Object for SnowflakeDynamicTableTargetLagConfigChange {
 
     fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
         match key.as_str() {
-            Some("context") => Some(Value::from_object(self.context.clone())),
+            Some("context") => match &self.context {
+                Some(context) => Some(Value::from_object(context.clone())),
+                None => Some(Value::NONE),
+            },
             _ => None,
         }
     }
@@ -528,13 +742,19 @@ impl Object for SnowflakeDynamicTableTargetLagConfigChange {
     where
         Self: Sized + 'static,
     {
-        write!(f, "{}", self.context)
+        match &self.context {
+            Some(s) => write!(f, "{s}"),
+            None => write!(f, ""),
+        }
     }
 }
 
 impl Display for SnowflakeDynamicTableTargetLagConfigChange {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        self.context.fmt(f)
+        match &self.context {
+            Some(s) => write!(f, "{s}"),
+            None => write!(f, ""),
+        }
     }
 }
 
@@ -581,6 +801,101 @@ impl Object for SnowflakeDynamicTableWarehouseConfigChange {
 }
 
 impl Display for SnowflakeDynamicTableWarehouseConfigChange {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.context.fmt(f)
+    }
+}
+
+// Reference: https://github.com/dbt-labs/dbt-adapters/blob/818a81ab04aef3768fe7bce4ddb50a033e110f18/dbt-snowflake/src/dbt/adapters/snowflake/relation_configs/dynamic_table.py#L207
+#[derive(Debug, Clone)]
+pub struct SnowflakeDynamicTableInitializationWarehouseConfigChange {
+    // Deviation from core: we must include a context to change to, since the presence of this object enforces a config change for this field.
+    context: String,
+}
+
+impl RelationChangeSet for SnowflakeDynamicTableInitializationWarehouseConfigChange {
+    fn requires_full_refresh(&self) -> bool {
+        false
+    }
+
+    // TODO(anna): come back to this!
+    fn changes(&self) -> &std::collections::BTreeMap<String, Arc<dyn ComponentConfig>> {
+        todo!()
+    }
+
+    fn get_change(&self, _component_name: &str) -> Option<&dyn ComponentConfig> {
+        todo!()
+    }
+}
+
+impl Object for SnowflakeDynamicTableInitializationWarehouseConfigChange {
+    fn enumerate(self: &Arc<Self>) -> minijinja::value::Enumerator {
+        minijinja::value::Enumerator::Str(&["context"])
+    }
+
+    fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
+        match key.as_str() {
+            Some("context") => Some(Value::from(self.context.clone())),
+            _ => None,
+        }
+    }
+
+    fn render(self: &Arc<Self>, f: &mut Formatter<'_>) -> std::fmt::Result
+    where
+        Self: Sized + 'static,
+    {
+        write!(f, "{}", self.context)
+    }
+}
+
+impl Display for SnowflakeDynamicTableInitializationWarehouseConfigChange {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.context.fmt(f)
+    }
+}
+
+// Reference: https://github.com/dbt-labs/dbt-adapters/blob/main/dbt-snowflake/src/dbt/adapters/snowflake/relation_configs/dynamic_table.py
+#[derive(Debug, Clone)]
+pub struct SnowflakeDynamicTableImmutableWhereConfigChange {
+    context: String,
+}
+
+impl RelationChangeSet for SnowflakeDynamicTableImmutableWhereConfigChange {
+    fn requires_full_refresh(&self) -> bool {
+        false
+    }
+
+    // TODO(anna): come back to this!
+    fn changes(&self) -> &std::collections::BTreeMap<String, Arc<dyn ComponentConfig>> {
+        todo!()
+    }
+
+    fn get_change(&self, _component_name: &str) -> Option<&dyn ComponentConfig> {
+        todo!()
+    }
+}
+
+impl Object for SnowflakeDynamicTableImmutableWhereConfigChange {
+    fn enumerate(self: &Arc<Self>) -> minijinja::value::Enumerator {
+        minijinja::value::Enumerator::Str(&["context"])
+    }
+
+    fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
+        match key.as_str() {
+            Some("context") => Some(Value::from(self.context.clone())),
+            _ => None,
+        }
+    }
+
+    fn render(self: &Arc<Self>, f: &mut Formatter<'_>) -> std::fmt::Result
+    where
+        Self: Sized + 'static,
+    {
+        write!(f, "{}", self.context)
+    }
+}
+
+impl Display for SnowflakeDynamicTableImmutableWhereConfigChange {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         self.context.fmt(f)
     }
@@ -634,22 +949,175 @@ impl Object for SnowflakeDynamicTableRefreshModeConfigChange {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct SnowflakeDynamicTableTransientConfigChange {
+    context: bool,
+}
+
+impl RelationChangeSet for SnowflakeDynamicTableTransientConfigChange {
+    fn requires_full_refresh(&self) -> bool {
+        true
+    }
+
+    fn changes(&self) -> &std::collections::BTreeMap<String, Arc<dyn ComponentConfig>> {
+        todo!()
+    }
+
+    fn get_change(&self, _component_name: &str) -> Option<&dyn ComponentConfig> {
+        todo!()
+    }
+}
+
+impl Object for SnowflakeDynamicTableTransientConfigChange {
+    fn enumerate(self: &Arc<Self>) -> minijinja::value::Enumerator {
+        minijinja::value::Enumerator::Str(&["context"])
+    }
+
+    fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
+        match key.as_str() {
+            Some("context") => Some(Value::from(self.context)),
+            _ => None,
+        }
+    }
+
+    fn render(self: &Arc<Self>, f: &mut Formatter<'_>) -> std::fmt::Result
+    where
+        Self: Sized + 'static,
+    {
+        write!(f, "{}", self.context)
+    }
+}
+
+impl Display for SnowflakeDynamicTableTransientConfigChange {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.context.fmt(f)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SnowflakeDynamicTableClusterByConfigChange {
+    /// The new clustering expression. None means drop the clustering key.
+    context: Option<String>,
+}
+
+impl RelationChangeSet for SnowflakeDynamicTableClusterByConfigChange {
+    fn requires_full_refresh(&self) -> bool {
+        false
+    }
+
+    fn changes(&self) -> &std::collections::BTreeMap<String, Arc<dyn ComponentConfig>> {
+        todo!()
+    }
+
+    fn get_change(&self, _component_name: &str) -> Option<&dyn ComponentConfig> {
+        todo!()
+    }
+}
+
+impl Object for SnowflakeDynamicTableClusterByConfigChange {
+    fn enumerate(self: &Arc<Self>) -> minijinja::value::Enumerator {
+        minijinja::value::Enumerator::Str(&["context"])
+    }
+
+    fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
+        match key.as_str() {
+            Some("context") => Some(Value::from(self.context.clone())),
+            _ => None,
+        }
+    }
+
+    fn render(self: &Arc<Self>, f: &mut Formatter<'_>) -> std::fmt::Result
+    where
+        Self: Sized + 'static,
+    {
+        match &self.context {
+            Some(s) => write!(f, "{s}"),
+            None => write!(f, ""),
+        }
+    }
+}
+
+impl Display for SnowflakeDynamicTableClusterByConfigChange {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match &self.context {
+            Some(s) => write!(f, "{s}"),
+            None => write!(f, ""),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SnowflakeDynamicTableSchedulerConfigChange {
+    context: SchedulerConfig,
+}
+
+impl RelationChangeSet for SnowflakeDynamicTableSchedulerConfigChange {
+    fn requires_full_refresh(&self) -> bool {
+        false
+    }
+
+    fn changes(&self) -> &std::collections::BTreeMap<String, Arc<dyn ComponentConfig>> {
+        todo!()
+    }
+
+    fn get_change(&self, _component_name: &str) -> Option<&dyn ComponentConfig> {
+        todo!()
+    }
+}
+
+impl Object for SnowflakeDynamicTableSchedulerConfigChange {
+    fn enumerate(self: &Arc<Self>) -> minijinja::value::Enumerator {
+        minijinja::value::Enumerator::Str(&["context"])
+    }
+
+    fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
+        match key.as_str() {
+            Some("context") => Some(Value::from_object(self.context.clone())),
+            _ => None,
+        }
+    }
+
+    fn render(self: &Arc<Self>, f: &mut Formatter<'_>) -> std::fmt::Result
+    where
+        Self: Sized + 'static,
+    {
+        write!(f, "{}", self.context)
+    }
+}
+
+impl Display for SnowflakeDynamicTableSchedulerConfigChange {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.context.fmt(f)
+    }
+}
+
 // Reference: https://github.com/dbt-labs/dbt-adapters/blob/acd3177d8a734e508c902a1e933e4dc52b272220/dbt-snowflake/src/dbt/adapters/snowflake/relation_configs/dynamic_table.py#L159
 #[derive(Debug)]
 pub struct SnowflakeDynamicTableConfigChangeset {
     target_lag: Option<SnowflakeDynamicTableTargetLagConfigChange>,
     snowflake_warehouse: Option<SnowflakeDynamicTableWarehouseConfigChange>,
+    snowflake_initialization_warehouse:
+        Option<SnowflakeDynamicTableInitializationWarehouseConfigChange>,
+    immutable_where: Option<SnowflakeDynamicTableImmutableWhereConfigChange>,
     refresh_mode: Option<SnowflakeDynamicTableRefreshModeConfigChange>,
+    transient: Option<SnowflakeDynamicTableTransientConfigChange>,
+    cluster_by: Option<SnowflakeDynamicTableClusterByConfigChange>,
+    scheduler: Option<SnowflakeDynamicTableSchedulerConfigChange>,
 }
 
 impl SnowflakeDynamicTableConfigChangeset {
     pub fn new(old: SnowflakeDynamicTableConfig, new: SnowflakeDynamicTableConfig) -> Self {
-        let target_lag = if old.target_lag != new.target_lag {
-            Some(SnowflakeDynamicTableTargetLagConfigChange {
-                context: new.target_lag,
-            })
-        } else {
-            None
+        let target_lag = match (old.target_lag, new.target_lag) {
+            (None, Some(new_target_lag)) => Some(SnowflakeDynamicTableTargetLagConfigChange {
+                context: Some(new_target_lag),
+            }),
+            (Some(old_target_lag), Some(new_target_lag)) if old_target_lag != new_target_lag => {
+                Some(SnowflakeDynamicTableTargetLagConfigChange {
+                    context: Some(new_target_lag),
+                })
+            }
+            (Some(_), None) => Some(SnowflakeDynamicTableTargetLagConfigChange { context: None }),
+            _ => None,
         };
 
         let snowflake_warehouse = if !old
@@ -663,6 +1131,38 @@ impl SnowflakeDynamicTableConfigChangeset {
             None
         };
 
+        let snowflake_initialization_warehouse = match (
+            old.snowflake_initialization_warehouse,
+            new.snowflake_initialization_warehouse,
+        ) {
+            (Some(old_warehouse), Some(new_warehouse))
+                if !old_warehouse.eq_ignore_ascii_case(&new_warehouse) =>
+            {
+                Some(SnowflakeDynamicTableInitializationWarehouseConfigChange {
+                    context: new_warehouse,
+                })
+            }
+            (Some(_), None) => Some(SnowflakeDynamicTableInitializationWarehouseConfigChange {
+                context: String::new(),
+            }),
+            (None, Some(new_warehouse)) => {
+                Some(SnowflakeDynamicTableInitializationWarehouseConfigChange {
+                    context: new_warehouse,
+                })
+            }
+            _ => None,
+        };
+
+        let immutable_where = match (old.immutable_where, new.immutable_where) {
+            (old_expr, Some(new_expr)) if old_expr.as_deref() != Some(new_expr.as_str()) => {
+                Some(SnowflakeDynamicTableImmutableWhereConfigChange { context: new_expr })
+            }
+            (Some(_), None) => Some(SnowflakeDynamicTableImmutableWhereConfigChange {
+                context: String::new(),
+            }),
+            _ => None,
+        };
+
         let refresh_mode = if new.refresh_mode.refresh_mode != RefreshMode::Auto
             && old.refresh_mode != new.refresh_mode
         {
@@ -673,10 +1173,41 @@ impl SnowflakeDynamicTableConfigChangeset {
             None
         };
 
+        // Transient is only compared when both sides are explicitly known:
+        // - new is None when the user omitted transient from their config ("don't care")
+        // - existing is None when describe_dynamic_table was called without include_transient
+        let transient = match (old.transient, new.transient) {
+            (Some(old_t), Some(new_t)) if old_t != new_t => {
+                Some(SnowflakeDynamicTableTransientConfigChange { context: new_t })
+            }
+            _ => None,
+        };
+
+        let cluster_by = if old.cluster_by != new.cluster_by {
+            Some(SnowflakeDynamicTableClusterByConfigChange {
+                context: new.cluster_by,
+            })
+        } else {
+            None
+        };
+
+        let scheduler = if old.scheduler != new.scheduler {
+            Some(SnowflakeDynamicTableSchedulerConfigChange {
+                context: new.scheduler,
+            })
+        } else {
+            None
+        };
+
         SnowflakeDynamicTableConfigChangeset {
             target_lag,
             snowflake_warehouse,
+            snowflake_initialization_warehouse,
+            immutable_where,
             refresh_mode,
+            transient,
+            cluster_by,
+            scheduler,
         }
     }
 }
@@ -698,12 +1229,44 @@ impl RelationChangeSet for SnowflakeDynamicTableConfigChangeset {
             .as_ref()
             .is_some_and(|warehouse| warehouse.requires_full_refresh());
 
+        let initialization_warehouse_requires_refresh = self
+            .snowflake_initialization_warehouse
+            .as_ref()
+            .is_some_and(|warehouse| warehouse.requires_full_refresh());
+
+        let immutable_where_requires_refresh = self
+            .immutable_where
+            .as_ref()
+            .is_some_and(|immutable_where| immutable_where.requires_full_refresh());
+
         let refresh_mode_requires_refresh = self
             .refresh_mode
             .as_ref()
             .is_some_and(|refresh_mode| refresh_mode.requires_full_refresh());
 
-        target_lag_requires_refresh || warehouse_requires_refresh || refresh_mode_requires_refresh
+        let transient_requires_refresh = self
+            .transient
+            .as_ref()
+            .is_some_and(|transient| transient.requires_full_refresh());
+
+        let cluster_by_requires_refresh = self
+            .cluster_by
+            .as_ref()
+            .is_some_and(|cluster_by| cluster_by.requires_full_refresh());
+
+        let scheduler_requires_refresh = self
+            .scheduler
+            .as_ref()
+            .is_some_and(|s| s.requires_full_refresh());
+
+        target_lag_requires_refresh
+            || warehouse_requires_refresh
+            || initialization_warehouse_requires_refresh
+            || immutable_where_requires_refresh
+            || refresh_mode_requires_refresh
+            || transient_requires_refresh
+            || cluster_by_requires_refresh
+            || scheduler_requires_refresh
     }
 
     // TODO(anna): These can't be implemented right now because we're not implementing BaseRelationConfig
@@ -714,7 +1277,12 @@ impl RelationChangeSet for SnowflakeDynamicTableConfigChangeset {
     fn has_changes(&self) -> bool {
         self.target_lag.is_some()
             || self.snowflake_warehouse.is_some()
+            || self.snowflake_initialization_warehouse.is_some()
+            || self.immutable_where.is_some()
             || self.refresh_mode.is_some()
+            || self.transient.is_some()
+            || self.cluster_by.is_some()
+            || self.scheduler.is_some()
     }
 }
 
@@ -733,12 +1301,36 @@ impl Object for SnowflakeDynamicTableConfigChangeset {
                     .as_ref()
                     .map(|warehouse_config| Value::from_object(warehouse_config.clone()))
             }
+            Some("snowflake_initialization_warehouse") => {
+                // Return None if no change, otherwise return the config as an object
+                self.snowflake_initialization_warehouse.as_ref().map(
+                    |initialization_warehouse_config| {
+                        Value::from_object(initialization_warehouse_config.clone())
+                    },
+                )
+            }
+            Some("immutable_where") => self
+                .immutable_where
+                .as_ref()
+                .map(|immutable_where_config| Value::from_object(immutable_where_config.clone())),
             Some("refresh_mode") => {
                 // Return None if no change, otherwise return the config as an object
                 self.refresh_mode
                     .as_ref()
                     .map(|refresh_mode_config| Value::from_object(refresh_mode_config.clone()))
             }
+            Some("transient") => self
+                .transient
+                .as_ref()
+                .map(|transient_config| Value::from_object(transient_config.clone())),
+            Some("cluster_by") => self
+                .cluster_by
+                .as_ref()
+                .map(|cluster_by_config| Value::from_object(cluster_by_config.clone())),
+            Some("scheduler") => self
+                .scheduler
+                .as_ref()
+                .map(|s| Value::from_object(s.clone())),
             Some("requires_full_refresh") => Some(Value::from(self.requires_full_refresh())),
             _ => None,
         }
@@ -756,10 +1348,11 @@ mod tests {
             table_name: "table".into(),
             schema_name: "schema".into(),
             database_name: "database".into(),
-            target_lag: TargetLagConfig {
+            target_lag: Some(TargetLagConfig {
                 target_lag: TargetLag::Downstream,
-            },
+            }),
             snowflake_warehouse: "warehouse".into(),
+            snowflake_initialization_warehouse: None,
             refresh_mode: RefreshModeConfig {
                 refresh_mode: RefreshMode::Auto,
             },
@@ -769,16 +1362,20 @@ mod tests {
             row_access_policy: None,
             table_tag: None,
             cluster_by: None,
+            immutable_where: None,
+            transient: None,
+            scheduler: SchedulerConfig::default(),
         };
 
         let config_2 = SnowflakeDynamicTableConfig {
             table_name: "table".into(),
             schema_name: "schema".into(),
             database_name: "database".into(),
-            target_lag: TargetLagConfig {
+            target_lag: Some(TargetLagConfig {
                 target_lag: TargetLag::Downstream,
-            },
+            }),
             snowflake_warehouse: "warehouse".into(),
+            snowflake_initialization_warehouse: None,
             refresh_mode: RefreshModeConfig {
                 refresh_mode: RefreshMode::Full,
             },
@@ -788,16 +1385,20 @@ mod tests {
             row_access_policy: None,
             table_tag: None,
             cluster_by: None,
+            immutable_where: None,
+            transient: None,
+            scheduler: SchedulerConfig::default(),
         };
 
         let config_3 = SnowflakeDynamicTableConfig {
             table_name: "table".into(),
             schema_name: "schema".into(),
             database_name: "database".into(),
-            target_lag: TargetLagConfig {
+            target_lag: Some(TargetLagConfig {
                 target_lag: TargetLag::Downstream,
-            },
+            }),
             snowflake_warehouse: "other_warehouse".into(),
+            snowflake_initialization_warehouse: None,
             refresh_mode: RefreshModeConfig {
                 refresh_mode: RefreshMode::Auto,
             },
@@ -807,16 +1408,20 @@ mod tests {
             row_access_policy: None,
             table_tag: None,
             cluster_by: None,
+            immutable_where: None,
+            transient: None,
+            scheduler: SchedulerConfig::default(),
         };
 
         let config_4 = SnowflakeDynamicTableConfig {
             table_name: "table".into(),
             schema_name: "schema".into(),
             database_name: "database".into(),
-            target_lag: TargetLagConfig {
+            target_lag: Some(TargetLagConfig {
                 target_lag: TargetLag::TimeBased(1, TargetLagInterval::Hours),
-            },
+            }),
             snowflake_warehouse: "other_warehouse".into(),
+            snowflake_initialization_warehouse: None,
             refresh_mode: RefreshModeConfig {
                 refresh_mode: RefreshMode::Incremental,
             },
@@ -826,6 +1431,9 @@ mod tests {
             row_access_policy: None,
             table_tag: None,
             cluster_by: None,
+            immutable_where: None,
+            transient: None,
+            scheduler: SchedulerConfig::default(),
         };
 
         /* Changeset:
@@ -886,9 +1494,9 @@ mod tests {
         assert!(changeset.refresh_mode.is_some());
         assert_eq!(
             changeset.target_lag.unwrap().context,
-            TargetLagConfig {
+            Some(TargetLagConfig {
                 target_lag: TargetLag::TimeBased(1, TargetLagInterval::Hours)
-            }
+            })
         );
         assert_eq!(
             changeset.snowflake_warehouse.unwrap().context,
@@ -900,6 +1508,143 @@ mod tests {
                 refresh_mode: RefreshMode::Incremental
             }
         );
+    }
+
+    #[test]
+    fn test_compute_initialization_warehouse_changeset() {
+        let base_config = SnowflakeDynamicTableConfig {
+            table_name: "table".into(),
+            schema_name: "schema".into(),
+            database_name: "database".into(),
+            target_lag: Some(TargetLagConfig {
+                target_lag: TargetLag::Downstream,
+            }),
+            snowflake_warehouse: "warehouse".into(),
+            snowflake_initialization_warehouse: None,
+            refresh_mode: RefreshModeConfig {
+                refresh_mode: RefreshMode::Auto,
+            },
+            initialize: InitializeConfig {
+                initialize: Initialize::OnCreate,
+            },
+            row_access_policy: None,
+            table_tag: None,
+            cluster_by: None,
+            immutable_where: None,
+            transient: None,
+            scheduler: SchedulerConfig::default(),
+        };
+
+        // (Some, None): warehouse removed → UNSET (empty context)
+        let old = SnowflakeDynamicTableConfig {
+            snowflake_initialization_warehouse: Some("DBT_TESTING".into()),
+            ..base_config.clone()
+        };
+        let new = base_config.clone();
+        let changeset = SnowflakeDynamicTableConfigChangeset::new(old, new);
+        assert!(changeset.has_changes());
+        assert!(!changeset.requires_full_refresh());
+        let change = changeset.snowflake_initialization_warehouse.unwrap();
+        assert!(change.context.is_empty());
+
+        // (None, Some): warehouse added → SET
+        let old = base_config.clone();
+        let new = SnowflakeDynamicTableConfig {
+            snowflake_initialization_warehouse: Some("DBT_TESTING".into()),
+            ..base_config.clone()
+        };
+        let changeset = SnowflakeDynamicTableConfigChangeset::new(old, new);
+        assert!(changeset.has_changes());
+        assert!(!changeset.requires_full_refresh());
+        let change = changeset.snowflake_initialization_warehouse.unwrap();
+        assert_eq!(change.context, "DBT_TESTING");
+
+        // (Some, Some) same value case-insensitive: no change
+        let old = SnowflakeDynamicTableConfig {
+            snowflake_initialization_warehouse: Some("DBT_TESTING".into()),
+            ..base_config.clone()
+        };
+        let new = SnowflakeDynamicTableConfig {
+            snowflake_initialization_warehouse: Some("dbt_testing".into()),
+            ..base_config
+        };
+        let changeset = SnowflakeDynamicTableConfigChangeset::new(old, new);
+        assert!(!changeset.has_changes());
+        assert!(changeset.snowflake_initialization_warehouse.is_none());
+    }
+
+    #[test]
+    fn test_compute_immutable_where_changeset() {
+        let base_config = SnowflakeDynamicTableConfig {
+            table_name: "table".into(),
+            schema_name: "schema".into(),
+            database_name: "database".into(),
+            target_lag: Some(TargetLagConfig {
+                target_lag: TargetLag::Downstream,
+            }),
+            snowflake_warehouse: "warehouse".into(),
+            snowflake_initialization_warehouse: None,
+            refresh_mode: RefreshModeConfig {
+                refresh_mode: RefreshMode::Auto,
+            },
+            initialize: InitializeConfig {
+                initialize: Initialize::OnCreate,
+            },
+            row_access_policy: None,
+            table_tag: None,
+            cluster_by: None,
+            immutable_where: None,
+            transient: None,
+            scheduler: SchedulerConfig::default(),
+        };
+
+        // (None, Some): expression added → SET
+        let old = base_config.clone();
+        let new = SnowflakeDynamicTableConfig {
+            immutable_where: Some("id < 100".into()),
+            ..base_config.clone()
+        };
+        let changeset = SnowflakeDynamicTableConfigChangeset::new(old, new);
+        assert!(changeset.has_changes());
+        assert!(!changeset.requires_full_refresh());
+        assert_eq!(changeset.immutable_where.unwrap().context, "id < 100");
+
+        // (Some, None): expression removed → UNSET (empty context)
+        let old = SnowflakeDynamicTableConfig {
+            immutable_where: Some("id < 100".into()),
+            ..base_config.clone()
+        };
+        let new = base_config.clone();
+        let changeset = SnowflakeDynamicTableConfigChangeset::new(old, new);
+        assert!(changeset.has_changes());
+        assert!(!changeset.requires_full_refresh());
+        assert!(changeset.immutable_where.unwrap().context.is_empty());
+
+        // (Some, Some) different value: SET with new expression
+        let old = SnowflakeDynamicTableConfig {
+            immutable_where: Some("id < 100".into()),
+            ..base_config.clone()
+        };
+        let new = SnowflakeDynamicTableConfig {
+            immutable_where: Some("id < 50".into()),
+            ..base_config.clone()
+        };
+        let changeset = SnowflakeDynamicTableConfigChangeset::new(old, new);
+        assert!(changeset.has_changes());
+        assert_eq!(changeset.immutable_where.unwrap().context, "id < 50");
+
+        // (Some, Some) same value: no change (case-sensitive)
+        let old = SnowflakeDynamicTableConfig {
+            immutable_where: Some("id < 100".into()),
+            ..base_config.clone()
+        };
+        let new = SnowflakeDynamicTableConfig {
+            immutable_where: Some("id < 100".into()),
+            ..base_config
+        };
+        let changeset = SnowflakeDynamicTableConfigChangeset::new(old, new);
+        assert!(!changeset.has_changes());
+        assert!(changeset.immutable_where.is_none());
     }
 
     // Minijinja Object trait tests
@@ -1034,13 +1779,17 @@ mod tests {
                 table_name: "table".to_string(),
                 schema_name: "schema".to_string(),
                 database_name: "database".to_string(),
-                target_lag: target_lag_config.clone(),
+                target_lag: Some(target_lag_config.clone()),
                 snowflake_warehouse: "warehouse".to_string(),
+                snowflake_initialization_warehouse: None,
+                immutable_where: None,
+                transient: None,
                 refresh_mode: refresh_mode_config.clone(),
                 initialize: initialize_config.clone(),
                 row_access_policy: None,
                 table_tag: None,
                 cluster_by: None,
+                scheduler: SchedulerConfig::default(),
             };
             let config_value = Value::from_object(config);
 
@@ -1124,7 +1873,9 @@ mod tests {
             };
             let config_value = Value::from_object(config.clone());
 
-            let config_change = SnowflakeDynamicTableTargetLagConfigChange { context: config };
+            let config_change = SnowflakeDynamicTableTargetLagConfigChange {
+                context: Some(config),
+            };
             let config_change_value = Value::from_object(config_change.clone());
 
             assert!(
@@ -1231,15 +1982,24 @@ mod tests {
     #[test]
     fn test_snowflake_dynamic_table_config_changeset_object() {
         let target_lag = TargetLag::TimeBased(15210, TargetLagInterval::Hours);
-        let target_lag_config = TargetLagConfig {
+        let target_lag_config = Some(TargetLagConfig {
             target_lag: target_lag.clone(),
-        };
+        });
         let target_lag_config_change = SnowflakeDynamicTableTargetLagConfigChange {
             context: target_lag_config,
         };
 
         let warehouse_config_change = SnowflakeDynamicTableWarehouseConfigChange {
             context: "new_warehouse".to_string(),
+        };
+
+        let initialization_warehouse_config_change =
+            SnowflakeDynamicTableInitializationWarehouseConfigChange {
+                context: "new_initialization_warehouse".to_string(),
+            };
+
+        let immutable_where_config_change = SnowflakeDynamicTableImmutableWhereConfigChange {
+            context: "id < 5".to_string(),
         };
 
         let refresh_mode = RefreshMode::Full;
@@ -1250,10 +2010,23 @@ mod tests {
             context: refresh_config,
         };
 
+        let transient_config_change = SnowflakeDynamicTableTransientConfigChange { context: true };
+
+        let cluster_by_config_change = SnowflakeDynamicTableClusterByConfigChange {
+            context: Some("id".to_string()),
+        };
+
         let config_changeset = SnowflakeDynamicTableConfigChangeset {
             target_lag: Some(target_lag_config_change.clone()),
             snowflake_warehouse: Some(warehouse_config_change.clone()),
+            snowflake_initialization_warehouse: Some(
+                initialization_warehouse_config_change.clone(),
+            ),
+            immutable_where: Some(immutable_where_config_change.clone()),
             refresh_mode: Some(refresh_config_change.clone()),
+            transient: Some(transient_config_change.clone()),
+            cluster_by: Some(cluster_by_config_change.clone()),
+            scheduler: None,
         };
         let config_changeset_value = Value::from_object(config_changeset);
 
@@ -1290,6 +2063,31 @@ mod tests {
         );
         assert_eq!(warehouse_value.to_string(), "new_warehouse");
 
+        let initialization_warehouse_value = config_changeset_value
+            .get_item(&Value::from("snowflake_initialization_warehouse"))
+            .unwrap();
+        assert!(!initialization_warehouse_value.is_none());
+        assert_eq!(
+            initialization_warehouse_value,
+            Value::from(Some(Value::from_object(
+                initialization_warehouse_config_change
+            )))
+        );
+        assert_eq!(
+            initialization_warehouse_value.to_string(),
+            "new_initialization_warehouse"
+        );
+
+        let immutable_where_value = config_changeset_value
+            .get_item(&Value::from("immutable_where"))
+            .unwrap();
+        assert!(!immutable_where_value.is_none());
+        assert_eq!(
+            immutable_where_value,
+            Value::from(Some(Value::from_object(immutable_where_config_change)))
+        );
+        assert_eq!(immutable_where_value.to_string(), "id < 5");
+
         assert!(
             config_changeset_value
                 .get_item(&Value::from("refresh_mode"))
@@ -1306,5 +2104,198 @@ mod tests {
             Value::from(Some(Value::from_object(refresh_config_change)))
         );
         assert_eq!(refresh_value.to_string(), refresh_mode.to_string());
+
+        let transient_value = config_changeset_value
+            .get_item(&Value::from("transient"))
+            .unwrap();
+        assert!(!transient_value.is_none());
+        assert_eq!(
+            transient_value,
+            Value::from(Some(Value::from_object(transient_config_change)))
+        );
+        assert_eq!(transient_value.to_string(), "true");
+
+        let cluster_by_value = config_changeset_value
+            .get_item(&Value::from("cluster_by"))
+            .unwrap();
+        assert!(!cluster_by_value.is_none());
+        assert_eq!(
+            cluster_by_value,
+            Value::from(Some(Value::from_object(cluster_by_config_change)))
+        );
+        assert_eq!(cluster_by_value.to_string(), "id");
+    }
+
+    #[test]
+    fn test_compute_transient_changeset() {
+        let base_config = SnowflakeDynamicTableConfig {
+            table_name: "table".into(),
+            schema_name: "schema".into(),
+            database_name: "database".into(),
+            target_lag: Some(TargetLagConfig {
+                target_lag: TargetLag::Downstream,
+            }),
+            snowflake_warehouse: "warehouse".into(),
+            snowflake_initialization_warehouse: None,
+            refresh_mode: RefreshModeConfig {
+                refresh_mode: RefreshMode::Auto,
+            },
+            initialize: InitializeConfig {
+                initialize: Initialize::OnCreate,
+            },
+            row_access_policy: None,
+            table_tag: None,
+            cluster_by: None,
+            immutable_where: None,
+            transient: None,
+            scheduler: SchedulerConfig::default(),
+        };
+
+        // false → true: change detected, requires full refresh
+        let old = SnowflakeDynamicTableConfig {
+            transient: Some(false),
+            ..base_config.clone()
+        };
+        let new = SnowflakeDynamicTableConfig {
+            transient: Some(true),
+            ..base_config.clone()
+        };
+        let changeset = SnowflakeDynamicTableConfigChangeset::new(old, new);
+        assert!(changeset.has_changes());
+        assert!(changeset.requires_full_refresh());
+        assert!(changeset.transient.unwrap().context);
+
+        // true → false: change detected, requires full refresh
+        let old = SnowflakeDynamicTableConfig {
+            transient: Some(true),
+            ..base_config.clone()
+        };
+        let new = SnowflakeDynamicTableConfig {
+            transient: Some(false),
+            ..base_config.clone()
+        };
+        let changeset = SnowflakeDynamicTableConfigChangeset::new(old, new);
+        assert!(changeset.has_changes());
+        assert!(changeset.requires_full_refresh());
+        assert!(!changeset.transient.unwrap().context);
+
+        // same value: no change
+        let old = SnowflakeDynamicTableConfig {
+            transient: Some(true),
+            ..base_config.clone()
+        };
+        let new = SnowflakeDynamicTableConfig {
+            transient: Some(true),
+            ..base_config.clone()
+        };
+        let changeset = SnowflakeDynamicTableConfigChangeset::new(old, new);
+        assert!(!changeset.has_changes());
+        assert!(changeset.transient.is_none());
+
+        // None on either side: no change (not queried / user omitted)
+        let old = SnowflakeDynamicTableConfig {
+            transient: None,
+            ..base_config.clone()
+        };
+        let new = SnowflakeDynamicTableConfig {
+            transient: Some(true),
+            ..base_config.clone()
+        };
+        let changeset = SnowflakeDynamicTableConfigChangeset::new(old, new);
+        assert!(!changeset.has_changes());
+        assert!(changeset.transient.is_none());
+
+        let old = SnowflakeDynamicTableConfig {
+            transient: Some(true),
+            ..base_config.clone()
+        };
+        let new = SnowflakeDynamicTableConfig {
+            transient: None,
+            ..base_config
+        };
+        let changeset = SnowflakeDynamicTableConfigChangeset::new(old, new);
+        assert!(!changeset.has_changes());
+        assert!(changeset.transient.is_none());
+    }
+
+    #[test]
+    fn test_compute_cluster_by_changeset() {
+        let base_config = SnowflakeDynamicTableConfig {
+            table_name: "table".into(),
+            schema_name: "schema".into(),
+            database_name: "database".into(),
+            target_lag: Some(TargetLagConfig {
+                target_lag: TargetLag::Downstream,
+            }),
+            snowflake_warehouse: "warehouse".into(),
+            snowflake_initialization_warehouse: None,
+            refresh_mode: RefreshModeConfig {
+                refresh_mode: RefreshMode::Auto,
+            },
+            initialize: InitializeConfig {
+                initialize: Initialize::OnCreate,
+            },
+            row_access_policy: None,
+            table_tag: None,
+            cluster_by: None,
+            immutable_where: None,
+            transient: None,
+            scheduler: SchedulerConfig::default(),
+        };
+
+        // None → Some: cluster by added, no full refresh required
+        let old = base_config.clone();
+        let new = SnowflakeDynamicTableConfig {
+            cluster_by: Some("id".into()),
+            ..base_config.clone()
+        };
+        let changeset = SnowflakeDynamicTableConfigChangeset::new(old, new);
+        assert!(changeset.has_changes());
+        assert!(!changeset.requires_full_refresh());
+        assert_eq!(
+            changeset.cluster_by.as_ref().unwrap().context,
+            Some("id".to_string())
+        );
+
+        // Some → Some (different): cluster by altered
+        let old = SnowflakeDynamicTableConfig {
+            cluster_by: Some("id".into()),
+            ..base_config.clone()
+        };
+        let new = SnowflakeDynamicTableConfig {
+            cluster_by: Some("id, val".into()),
+            ..base_config.clone()
+        };
+        let changeset = SnowflakeDynamicTableConfigChangeset::new(old, new);
+        assert!(changeset.has_changes());
+        assert!(!changeset.requires_full_refresh());
+        assert_eq!(
+            changeset.cluster_by.as_ref().unwrap().context,
+            Some("id, val".to_string())
+        );
+
+        // Some → None: cluster by dropped (context is None → drop clustering key)
+        let old = SnowflakeDynamicTableConfig {
+            cluster_by: Some("id".into()),
+            ..base_config.clone()
+        };
+        let new = base_config.clone();
+        let changeset = SnowflakeDynamicTableConfigChangeset::new(old, new);
+        assert!(changeset.has_changes());
+        assert!(!changeset.requires_full_refresh());
+        assert!(changeset.cluster_by.as_ref().unwrap().context.is_none());
+
+        // Same value: no change
+        let old = SnowflakeDynamicTableConfig {
+            cluster_by: Some("id".into()),
+            ..base_config.clone()
+        };
+        let new = SnowflakeDynamicTableConfig {
+            cluster_by: Some("id".into()),
+            ..base_config
+        };
+        let changeset = SnowflakeDynamicTableConfigChangeset::new(old, new);
+        assert!(!changeset.has_changes());
+        assert!(changeset.cluster_by.is_none());
     }
 }

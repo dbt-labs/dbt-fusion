@@ -9,29 +9,35 @@ use super::{
             build_json_compat_layer, build_json_compat_layer_with_background_writer,
         },
         jsonl_writer::{build_jsonl_layer, build_jsonl_layer_with_background_writer},
-        otlp::build_otlp_layer,
+        otlp::{OtlpResourceConfig, build_otlp_layer},
         parquet_writer::build_parquet_writer_layer,
         query_log::build_query_log_layer_with_background_writer,
         tui_layer::build_tui_layer,
     },
     middlewares::markdown_log_filter::TelemetryMarkdownLogFilter,
     middlewares::metric_aggregator::TelemetryMetricAggregator,
+    middlewares::node_warn_outcome::TelemetryNodeWarnOutcome,
+    middlewares::warn_error_options::TelemetryWarnErrorOptionsMiddleware,
     rotating_file_writer::RotatingFileWriter,
     shutdown::TelemetryShutdownItem,
+    tracing_feature_handles::TracingConfigProvider,
 };
-use crate::collections::HashSet;
+use crate::{
+    collections::HashSet, tracing::tracing_feature_handles::create_tracing_config_provider,
+};
 use crate::{
     constants::{
         DBT_DEFAULT_LOG_FILE_BACKUP_COUNT, DBT_DEFAULT_LOG_FILE_MAX_BYTES,
-        DBT_DEFAULT_LOG_FILE_NAME, DBT_DEFAULT_QUERY_LOG_FILE_NAME, DBT_LOG_DIR_NAME,
-        DBT_METADATA_DIR_NAME, DBT_PROJECT_YML, DBT_TARGET_DIR_NAME,
+        DBT_DEFAULT_LOG_FILE_NAME, DBT_DEFAULT_OTEL_PARQUET_FILE_NAME,
+        DBT_DEFAULT_QUERY_LOG_FILE_NAME, DBT_FUSION, DBT_LOG_DIR_NAME, DBT_METADATA_DIR_NAME,
+        DBT_PROJECT_YML, DBT_TARGET_DIR_NAME,
     },
-    io_args::{FsCommand, IoArgs, ShowOptions},
+    io_args::{FsCommand, IoArgs, LogFormat, ShowOptions},
     io_utils::determine_project_dir,
-    logging::LogFormat,
     tracing::middlewares::parse_error_filter::TelemetryParsingErrorFilter,
+    warn_error_options::WarnErrorOptions,
 };
-use dbt_error::{ErrorCode, FsResult};
+use dbt_error::{ErrorCode, FsError, FsResult};
 use tracing::level_filters::LevelFilter;
 
 /// Configuration for tracing.
@@ -81,6 +87,8 @@ pub struct FsTraceConfig {
     pub(super) show_options: HashSet<ShowOptions>,
     /// Show all deprecations warnings/errors instead of one per package
     pub(super) show_all_deprecations: bool,
+    /// The initial warn-error options loaded from CLI/env before project flags are resolved.
+    pub(super) warn_error_options: WarnErrorOptions,
     /// If True, disables stdout/console output even when using Text/Default format.
     /// Useful for long-running services like LSP that only want file logging.
     pub(super) disable_console_output: bool,
@@ -105,6 +113,7 @@ impl Default for FsTraceConfig {
             enable_query_log: false,
             show_options: HashSet::default(),
             show_all_deprecations: false,
+            warn_error_options: WarnErrorOptions::default(),
             disable_console_output: false,
         }
     }
@@ -130,6 +139,31 @@ fn calculate_trace_dirs(
         .unwrap_or_else(|| in_dir.join(DBT_TARGET_DIR_NAME));
 
     (in_dir, out_dir)
+}
+
+pub struct FsTraceLayers {
+    middleware_layers: Vec<MiddlewareLayer>,
+    consumer_layers: Vec<ConsumerLayer>,
+    shutdown_items: Vec<TelemetryShutdownItem>,
+    tracing_config_provider: Box<dyn TracingConfigProvider>,
+}
+
+impl FsTraceLayers {
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<MiddlewareLayer>,
+        Vec<ConsumerLayer>,
+        Vec<TelemetryShutdownItem>,
+        Box<dyn TracingConfigProvider>,
+    ) {
+        (
+            self.middleware_layers,
+            self.consumer_layers,
+            self.shutdown_items,
+            self.tracing_config_provider,
+        )
+    }
 }
 
 impl FsTraceConfig {
@@ -163,6 +197,7 @@ impl FsTraceConfig {
     /// * `enable_query_log` - If true, enables writing a separate query log file
     /// * `show_options` - Set of ShowOptions controlling terminal/file output visibility
     /// * `show_all_deprecations` - If true, show all deprecation warnings/errors instead of one per package
+    /// * `warn_error_options` - Initial warn-error options from CLI/env before project flags are resolved
     /// * `log_file_name` - Optional custom name for the log file. If None, defaults to `dbt.log`.
     ///   If Some, creates log file at `{log_path}/{log_file_name}`
     /// * `log_file_max_bytes` - Max size for rotating file logs in bytes.
@@ -218,6 +253,7 @@ impl FsTraceConfig {
         enable_query_log: bool,
         show_options: HashSet<ShowOptions>,
         show_all_deprecations: bool,
+        warn_error_options: WarnErrorOptions,
         log_file_name: Option<&str>,
         log_file_max_bytes: u64,
         disable_console_output: bool,
@@ -254,18 +290,25 @@ impl FsTraceConfig {
             enable_query_log,
             show_options,
             show_all_deprecations,
+            warn_error_options,
             disable_console_output,
         }
     }
 
     /// Creates a new FsTraceConfig with proper path resolution.
     /// This method never fails - it uses fallback logic for directory resolution.
+    ///
+    /// When `write_index` is true and `otel_parquet_file_name` is not explicitly set,
+    /// this method automatically defaults to [`DBT_DEFAULT_OTEL_PARQUET_FILE_NAME`] so the parquet tracing
+    /// layer is created for index consumption.
     pub fn new_from_io_args(
         command: FsCommand,
         project_dir: Option<&PathBuf>,
         target_path: Option<&PathBuf>,
         io_args: &IoArgs,
+        warn_error_options: Option<&WarnErrorOptions>,
         package: &'static str,
+        write_index: bool,
     ) -> Self {
         let max_log_verbosity = io_args
             .log_level
@@ -277,6 +320,17 @@ impl FsTraceConfig {
             .map(|lf| log_level_filter_to_tracing(&lf))
             .unwrap_or(LevelFilter::DEBUG);
 
+        // When --write-index is active, default to OTel parquet tracing for index consumption.
+        // This must happen here (at tracing config construction time) so that all code paths
+        // — including the test infrastructure — create the parquet tracing layer.
+        let otel_parquet_file_name = io_args.otel_parquet_file_name.as_deref().or_else(|| {
+            if write_index && command != FsCommand::Show {
+                Some(DBT_DEFAULT_OTEL_PARQUET_FILE_NAME)
+            } else {
+                None
+            }
+        });
+
         Self::new(
             package,
             command,
@@ -286,7 +340,7 @@ impl FsTraceConfig {
             max_log_verbosity,
             max_file_log_verbosity,
             io_args.otel_file_name.as_deref(),
-            io_args.otel_parquet_file_name.as_deref(),
+            otel_parquet_file_name,
             io_args.invocation_id,
             io_args.otel_parent_span_id,
             io_args.export_to_otlp,
@@ -294,6 +348,7 @@ impl FsTraceConfig {
             true, // Always enable query log for now
             io_args.show.clone(),
             io_args.show_all_deprecations,
+            warn_error_options.cloned().unwrap_or_default(),
             None, // log_file_name - use default dbt.log
             io_args.log_file_max_bytes,
             false, // disable_console_output defaults to false for CLI
@@ -303,15 +358,11 @@ impl FsTraceConfig {
     /// Builds the configured tracing layers and corresponding shutdown items.
     /// This method handles all path creation and file opening as needed.
     /// If no layers are configured, returns an empty layer and no shutdown items.
-    pub fn build_layers(
-        &self,
-    ) -> FsResult<(
-        Vec<MiddlewareLayer>,
-        Vec<ConsumerLayer>,
-        Vec<TelemetryShutdownItem>,
-    )> {
+    pub fn build_layers(&self) -> FsResult<FsTraceLayers> {
         let mut shutdown_items = Vec::new();
         let mut consumer_layers = Vec::new();
+        let (warn_error_options_middleware, warn_error_options) =
+            TelemetryWarnErrorOptionsMiddleware::new(self.warn_error_options.clone());
 
         // Create jsonl writer layer if file path provided
         if let Some(file_path) = &self.otel_file_path {
@@ -358,7 +409,8 @@ impl FsTraceConfig {
             let file = std::fs::File::create(file_path)
                 .map_err(|e| fs_err!(ErrorCode::IoError, "Failed to create parquet file: {}", e))?;
 
-            let (parquet_layer, writer_handle) = build_parquet_writer_layer(file)?;
+            let (parquet_layer, writer_handle) =
+                build_parquet_writer_layer(file).map_err(FsError::from)?;
 
             // Keep a handle for shutdown
             shutdown_items.push(writer_handle);
@@ -403,7 +455,7 @@ impl FsTraceConfig {
             crate::stdfs::create_dir_all(&self.log_path)?;
         }
 
-        if self.max_file_log_verbosity != LevelFilter::OFF {
+        let file_log_path = if self.max_file_log_verbosity != LevelFilter::OFF {
             let log_file_name = self
                 .log_file_name
                 .as_deref()
@@ -441,7 +493,14 @@ impl FsTraceConfig {
                 // Create layer. User specified filtering is not applied here
                 consumer_layers.push(file_log_layer)
             }
+
+            Some(file_log_path)
+        } else {
+            None
         };
+
+        let tracing_config_provider =
+            create_tracing_config_provider(warn_error_options, file_log_path);
 
         // Create query log writer layer (always enabled; internal-only event sink)
         if self.enable_query_log {
@@ -457,21 +516,32 @@ impl FsTraceConfig {
 
         // Create OTLP layer - if enabled and endpoint is set via env vars
         if self.export_to_otlp
-            && let Some((otlp_layer, mut handles)) = build_otlp_layer()
+            && let Some((otlp_layer, mut handles)) = build_otlp_layer(OtlpResourceConfig::new(
+                DBT_FUSION,
+                env!("CARGO_PKG_VERSION"),
+            ))
         {
             shutdown_items.append(&mut handles);
             consumer_layers.push(otlp_layer)
         };
 
-        Ok((
-            vec![
-                // Order important! First downgrade markdown errors, then handle parsing errors, then aggregate metrics
+        Ok(FsTraceLayers {
+            middleware_layers: vec![
+                // Order matters:
+                // 1. Downgrade markdown errors first
+                // 2. Filter parsing errors
+                // 3. Apply warn-error-options (may silence or upgrade warns to errors)
+                // 4. Mark node spans with WithWarnings for remaining Warn logs
+                // 5. Aggregate metrics last (sees final severity after all transforms)
                 Box::new(TelemetryMarkdownLogFilter),
                 Box::new(TelemetryParsingErrorFilter::new(self.show_all_deprecations)),
+                Box::new(warn_error_options_middleware),
+                Box::new(TelemetryNodeWarnOutcome),
                 Box::new(TelemetryMetricAggregator),
             ],
             consumer_layers,
             shutdown_items,
-        ))
+            tracing_config_provider,
+        })
     }
 }

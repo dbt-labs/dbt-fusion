@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 use std::{collections::BTreeMap, sync::Arc};
 
-use dbt_common::adapter::AdapterType;
+use crate::resolve::resolve_utils::err_resource_name_has_spaces;
+
+use dbt_adapter_core::AdapterType;
 use dbt_common::cancellation::CancellationToken;
-use dbt_common::io_args::StaticAnalysisKind;
 use dbt_common::tracing::emit::emit_warn_log_from_fs_error;
 use dbt_common::{ErrorCode, FsResult, error::AbstractLocation, fs_err};
 use dbt_jinja_utils::jinja_environment::JinjaEnv;
@@ -26,7 +27,7 @@ use dbt_schemas::{
 use minijinja::MacroSpans;
 
 use super::resolve_properties::MinimalPropertiesEntry;
-use crate::dbt_project_config::{RootProjectConfigs, init_project_config};
+use crate::dbt_project_config::{ProjectConfigResolver, RootProjectConfigs, init_project_config};
 use crate::renderer::{RenderCtx, RenderCtxInner};
 use crate::utils::{RelationComponents, update_node_relation_components};
 use crate::{
@@ -61,33 +62,32 @@ pub async fn resolve_analyses(
     let jinja_type_checking_event_listener_factory =
         Arc::new(DefaultJinjaTypeCheckEventListenerFactory::default());
 
-    let local_project_config = if package.dbt_project.name == root_project.name {
-        root_project_configs.analyses.clone()
-    } else {
-        init_project_config(
-            &arg.io,
-            &package.dbt_project.analyses,
-            AnalysesConfig {
-                enabled: Some(true),
-                static_analysis: Some(StaticAnalysisKind::Off.into()),
-                ..Default::default()
-            },
-            dependency_package_name_from_ctx(&env, base_ctx),
-        )?
-    };
+    let dependency_package_name = dependency_package_name_from_ctx(&env, base_ctx);
+
+    let config_resolver = ProjectConfigResolver::build(
+        root_project_configs.analyses.clone(),
+        dependency_package_name.is_some(),
+        || {
+            init_project_config(
+                &arg.io,
+                &package.dbt_project.analyses,
+                (),
+                dependency_package_name,
+            )
+        },
+    )?;
 
     let render_ctx = RenderCtx {
         inner: Arc::new(RenderCtxInner {
             args: arg.clone(),
             root_project_name: root_project.name.clone(),
-            root_project_config: root_project_configs.analyses.clone(),
+            config_resolver,
             package_quoting,
             base_ctx: base_ctx.clone(),
             package_name: package_name.to_string(),
             adapter_type,
             database: database.to_string(),
             schema: schema.to_string(),
-            local_project_config,
             resource_paths: package
                 .dbt_project
                 .analysis_paths
@@ -124,6 +124,7 @@ pub async fn resolve_analyses(
     for SqlFileRenderResult {
         asset: dbt_asset,
         sql_file_info,
+        config: analysis_config,
         rendered_sql,
         macro_spans,
         properties: maybe_properties,
@@ -133,7 +134,10 @@ pub async fn resolve_analyses(
     } in analysis_sql_resources_map.into_iter()
     {
         let analysis_name = dbt_asset.path.file_stem().unwrap().to_str().unwrap();
-        let analysis_config = *sql_file_info.config;
+
+        if analysis_name.contains(' ') {
+            return Err(err_resource_name_has_spaces(analysis_name, &dbt_asset.path));
+        }
 
         let original_file_path =
             get_original_file_path(&dbt_asset.base_path, &arg.io.in_dir, &dbt_asset.path);
@@ -217,11 +221,9 @@ pub async fn resolve_analyses(
                 materialized: DbtMaterialization::Analysis,
                 quoting: ResolvedQuoting::trues(),
                 quoting_ignore_case: false,
-                static_analysis: analysis_config
-                    .static_analysis
-                    .clone()
-                    .unwrap_or_else(|| StaticAnalysisKind::Unsafe.into()),
+                static_analysis: analysis_config.static_analysis.clone(),
                 static_analysis_off_reason: None,
+                compute: None,
                 columns,
                 depends_on: NodeDependsOn {
                     macros: macro_depends_on,
@@ -260,7 +262,7 @@ pub async fn resolve_analyses(
                 metrics,
             },
             __analysis_attr__: DbtAnalysisAttr::default(),
-            deprecated_config: analysis_config,
+            deprecated_config: analysis_config.into(),
             __other__: BTreeMap::new(),
         };
 
@@ -294,7 +296,7 @@ pub async fn resolve_analyses(
     for (analysis_name, mpe) in analysis_properties.iter() {
         if !mpe.schema_value.is_null() {
             let err = fs_err!(
-                code => ErrorCode::InvalidConfig,
+                code => ErrorCode::NoNodeForYamlKey,
                 loc => mpe.relative_path.clone(),
                 "Unused schema.yml entry for analysis '{}'",
                 analysis_name,

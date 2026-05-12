@@ -2,9 +2,9 @@
 #[cfg(test)]
 #[allow(clippy::module_inception)]
 mod tests {
+    use dbt_adapter::Adapter;
     use dbt_adapter::sql_types::SATypeOpsImpl;
-    use dbt_adapter::{BaseAdapter, BridgeAdapter};
-    use dbt_common::adapter::AdapterType;
+    use dbt_adapter_core::AdapterType;
     use dbt_common::io_args::StaticAnalysisKind;
     use dbt_common::{FsResult, io_args::IoArgs};
     use dbt_frontend_common::error::CodeLocation;
@@ -17,11 +17,12 @@ mod tests {
     use dbt_jinja_utils::utils::render_sql;
     use dbt_schemas::schemas::profiles::PostgresDbConfig;
     use dbt_schemas::schemas::project::ProjectModelConfig;
-    use dbt_schemas::schemas::project::{DefaultTo, ModelConfig};
+    use dbt_schemas::schemas::project::{ModelConfig, ResolvableConfig};
     use dbt_schemas::schemas::relations::DEFAULT_DBT_QUOTING;
     use dbt_schemas::schemas::serde::StringOrInteger;
     use dbt_schemas::state::DbtRuntimeConfig;
     use dbt_test_primitives::assert_contains;
+    use minijinja::ArgSpec;
     use minijinja::constants::TARGET_PACKAGE_NAME;
     use minijinja::machinery::Span;
     use minijinja::{AutoEscape, Error};
@@ -38,7 +39,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::{collections::BTreeMap, path::PathBuf};
 
-    fn create_resolve_model_context<T: DefaultTo<T> + 'static>(
+    fn create_resolve_model_context<T: ResolvableConfig<T> + serde::Serialize + 'static>(
         init_config: &T,
         sql_resources: &Arc<Mutex<Vec<SqlResource<T>>>>,
     ) -> BTreeMap<String, Value> {
@@ -86,7 +87,7 @@ mod tests {
             "common",
             "profile",
             "target",
-            "postgres",
+            AdapterType::Postgres,
             (PostgresDbConfig {
                 port: Some(StringOrInteger::Integer(5432)),
                 database: Some("postgres".to_string()),
@@ -116,26 +117,20 @@ mod tests {
     }
 
     #[test]
-    fn test_meta_field_defers_jinja_expansion() {
-        // Build a minimal ProjectModelConfig YAML with +meta containing a Jinja expression,
-        // and a regular field (+description) that should be eagerly rendered.
+    fn test_meta_field_renders_at_parse_time() {
+        // +meta Jinja is rendered eagerly at parse time (matching dbt-core behavior),
+        // just like other string config fields such as +description.
         let yaml = r#"
         +meta:
           demo: "{{ 1 + 2 }}"
         +description: "prefix {{ 1 + 2 }}"
         "#;
 
-        // Parse YAML to Value first, then render with into_typed_with_jinja
         let val: dbt_yaml::Value = dbt_yaml::from_str(yaml).unwrap();
-
-        // Reuse the existing test env setup for a valid Jinja environment
         let (env, _sql_resources, _init_cfg) = setup_test_env();
-
-        // Empty context and listeners for rendering
         let ctx: BTreeMap<String, Value> = BTreeMap::new();
         let listeners: Vec<Rc<dyn minijinja::listener::RenderingEventListener>> = Vec::new();
 
-        // Perform typed deserialization with Jinja rendering enabled
         let cfg: ProjectModelConfig = dbt_jinja_utils::serde::into_typed_with_jinja(
             &IoArgs::default(),
             val,
@@ -148,18 +143,95 @@ mod tests {
         )
         .unwrap();
 
-        // Assert: +meta is Verbatim -> inner string should NOT be rendered
-        let meta_opt = (*cfg.meta).as_ref();
-        assert!(meta_opt.is_some(), "+meta should be present");
-        let meta = meta_opt.unwrap();
+        let meta = cfg.meta.as_ref().expect("+meta should be present");
         let demo_val = meta.get("demo").expect("demo key in +meta");
+        // `{{ 1 + 2 }}` renders to the integer 3; the YAML value reflects the evaluated type.
         match demo_val {
-            dbt_yaml::Value::String(s, _) => assert_eq!(s, "{{ 1 + 2 }}"),
-            other => panic!("expected string in +meta.demo, got {other:?}"),
+            dbt_yaml::Value::Number(n, _) => assert_eq!(n.as_i64(), Some(3)),
+            other => panic!("expected number in +meta.demo, got {other:?}"),
         }
 
-        // Assert: +description is a normal string -> should be rendered to "3"
         assert_eq!(cfg.description.as_deref(), Some("prefix 3"));
+    }
+
+    #[test]
+    fn test_freshness_dict_literal_renders_as_typed() {
+        use dbt_schemas::schemas::common::{FreshnessDefinition, FreshnessPeriod};
+
+        // Body contains a dict literal, so inner `{`/`}` are present. The
+        // outer `{{ ... }}` is still a single expression and must deserialize
+        // into FreshnessRules rather than collapsing to the string
+        // "{'count': 38, 'period': 'day'}".
+        let yaml = r#"
+        error_after: "{{ {'count': 38, 'period': 'day'} }}"
+        warn_after:
+          count: 10
+          period: hour
+        "#;
+
+        let val: dbt_yaml::Value = dbt_yaml::from_str(yaml).unwrap();
+        let (env, _sql_resources, _init_cfg) = setup_test_env();
+        let ctx: BTreeMap<String, Value> = BTreeMap::new();
+        let listeners: Vec<Rc<dyn minijinja::listener::RenderingEventListener>> = Vec::new();
+
+        let freshness: FreshnessDefinition = dbt_jinja_utils::serde::into_typed_with_jinja(
+            &IoArgs::default(),
+            val,
+            false,
+            &env,
+            &ctx,
+            &listeners,
+            None,
+            true,
+        )
+        .unwrap();
+
+        let error = freshness
+            .error_after
+            .expect("error_after should deserialize as FreshnessRules");
+        assert_eq!(error.count, Some(38));
+        assert_eq!(error.period, Some(FreshnessPeriod::day));
+
+        let warn = freshness
+            .warn_after
+            .expect("warn_after should deserialize as FreshnessRules");
+        assert_eq!(warn.count, Some(10));
+        assert_eq!(warn.period, Some(FreshnessPeriod::hour));
+    }
+
+    #[test]
+    fn test_freshness_dict_literal_ternary_renders_as_null() {
+        use dbt_schemas::schemas::common::FreshnessDefinition;
+
+        // Ternary where the `none` branch is taken. The dict literal on the
+        // other branch injects inner `{`/`}` into the expression body, but
+        // the rendered result must still be YAML null — not the string "None".
+        let yaml = r#"
+        error_after: "{{ none if true else {'count': 1, 'period': 'day'} }}"
+        "#;
+
+        let val: dbt_yaml::Value = dbt_yaml::from_str(yaml).unwrap();
+        let (env, _sql_resources, _init_cfg) = setup_test_env();
+        let ctx: BTreeMap<String, Value> = BTreeMap::new();
+        let listeners: Vec<Rc<dyn minijinja::listener::RenderingEventListener>> = Vec::new();
+
+        let freshness: FreshnessDefinition = dbt_jinja_utils::serde::into_typed_with_jinja(
+            &IoArgs::default(),
+            val,
+            false,
+            &env,
+            &ctx,
+            &listeners,
+            None,
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            freshness.error_after.is_none(),
+            "expected error_after to deserialize as null, got {:?}",
+            freshness.error_after
+        );
     }
 
     #[tokio::test]
@@ -187,15 +259,12 @@ mod tests {
             );
             assert_eq!(
                 sql_resources_locked,
-                vec![
-                    SqlResource::BaseConfig(Box::new(init_config)),
-                    SqlResource::Ref((
-                        "my_table".to_string(),
-                        None,
-                        None,
-                        CodeLocation::new(1, 15, 14)
-                    ))
-                ]
+                vec![SqlResource::Ref((
+                    "my_table".to_string(),
+                    None,
+                    None,
+                    CodeLocation::new(1, 15, 14)
+                ))]
             );
         }
     }
@@ -225,14 +294,11 @@ mod tests {
             );
             assert_eq!(
                 sql_resources_locked,
-                vec![
-                    SqlResource::BaseConfig(Box::new(init_config)),
-                    SqlResource::Source((
-                        "my_schema".to_string(),
-                        "my_table".to_string(),
-                        CodeLocation::new(1, 15, 14)
-                    ))
-                ]
+                vec![SqlResource::Source((
+                    "my_schema".to_string(),
+                    "my_table".to_string(),
+                    CodeLocation::new(1, 15, 14)
+                ))]
             );
         }
     }
@@ -260,7 +326,6 @@ mod tests {
             assert_eq!(
                 sql_resources_locked,
                 vec![
-                    SqlResource::BaseConfig(Box::new(init_config)),
                     SqlResource::Metric(("metric".to_string(), None)),
                     SqlResource::Metric((
                         "metric_two".to_string(),
@@ -309,13 +374,7 @@ mod tests {
             };
 
             let sql_resources_locked = sql_resources.lock().unwrap().clone();
-            assert_eq!(
-                sql_resources_locked,
-                vec![
-                    SqlResource::BaseConfig(Box::new(init_config)),
-                    expected_config
-                ]
-            );
+            assert_eq!(sql_resources_locked, vec![expected_config]);
         }
     }
 
@@ -336,13 +395,13 @@ mod tests {
             ctx: S,
         ) -> Result<String, Error> {
             let mut env = Environment::new();
-            let adapter = Arc::new(BridgeAdapter::new_parse_phase_adapter(
+            let adapter = Arc::new(Adapter::new_parse_phase_adapter(
                 AdapterType::Postgres,
                 dbt_yaml::Mapping::default(),
                 DEFAULT_DBT_QUOTING,
                 Box::new(SATypeOpsImpl::new(AdapterType::Postgres)),
                 None,
-            )) as Arc<dyn BaseAdapter>;
+            ));
             env.add_global("adapter", adapter.as_value());
             let empty_blocks = BTreeMap::new();
             let vm = Vm::new(&env);
@@ -625,6 +684,16 @@ mod tests {
                     end_col: 26,
                     end_offset: 186
                 },
+                vec![
+                    ArgSpec {
+                        name: "model".to_string(),
+                        is_optional: false
+                    },
+                    ArgSpec {
+                        name: "column_name".to_string(),
+                        is_optional: false
+                    },
+                ],
                 Span {
                     start_line: 2,
                     start_col: 21,
@@ -690,6 +759,10 @@ mod tests {
                         end_col: 26,
                         end_offset: 190
                     },
+                    vec![ArgSpec {
+                        name: "model".to_string(),
+                        is_optional: false
+                    }],
                     Span {
                         start_line: 6,
                         start_col: 21,
@@ -797,6 +870,61 @@ mod tests {
         let result = parse_macro_statements(sql, &PathBuf::from("test.sql"), &["macro"]);
         println!("result: {result:?}");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_unclosed_if_inside_macro_gives_rich_error() {
+        // Reproducer from https://github.com/dbt-labs/dbt-fusion/issues/130
+        let sql = r#"
+            {% macro my_macro() %}
+              {% if true %}
+            {% endmacro %}
+        "#;
+
+        let err = parse_macro_statements(sql, &PathBuf::from("macros/my_macro.sql"), &["macro"])
+            .unwrap_err();
+        let msg = err.to_string();
+        println!("error: {msg}");
+        assert!(
+            msg.contains("Encountered unknown tag 'endmacro'"),
+            "expected 'Encountered unknown tag' in: {msg}"
+        );
+        assert!(
+            msg.contains("innermost block that needs to be closed is 'if'"),
+            "expected innermost block hint in: {msg}"
+        );
+        assert!(
+            msg.contains("looking for"),
+            "expected 'looking for' hint in: {msg}"
+        );
+        assert!(
+            msg.contains("'endif'") || msg.contains("endif"),
+            "expected 'endif' in expected tags hint: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_unclosed_for_inside_if_gives_rich_error() {
+        let sql = r#"
+            {% macro my_macro() %}
+              {% if true %}
+                {% for x in [] %}
+              {% endif %}
+            {% endmacro %}
+        "#;
+
+        let err = parse_macro_statements(sql, &PathBuf::from("macros/my_macro.sql"), &["macro"])
+            .unwrap_err();
+        let msg = err.to_string();
+        println!("error: {msg}");
+        assert!(
+            msg.contains("Encountered unknown tag 'endif'"),
+            "expected 'Encountered unknown tag' in: {msg}"
+        );
+        assert!(
+            msg.contains("innermost block that needs to be closed is 'for'"),
+            "expected innermost block hint in: {msg}"
+        );
     }
 
     #[test]

@@ -2,14 +2,15 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    str::FromStr as _,
     sync::{Arc, Mutex},
 };
 
 use chrono::DateTime;
 use chrono_tz::Tz;
-use dbt_adapter::{BaseAdapter, BridgeAdapter, sql_types::SATypeOpsImpl};
-use dbt_common::{ErrorCode, FsResult, adapter::AdapterType, fs_err, io_args::IoArgs};
+use dbt_adapter::{Adapter, sql_types::SATypeOpsImpl};
+use dbt_adapter_core::*;
+use dbt_common::{ErrorCode, FsResult, fs_err, io_args::IoArgs};
+use dbt_jinja_ctx::{GlobalCore, JinjaObject, ResolveCore, to_jinja_btreemap};
 use dbt_jinja_vars::DbtVars;
 use dbt_schemas::schemas::{
     common::DbtQuoting,
@@ -38,7 +39,7 @@ pub fn initialize_parse_jinja_environment(
     project_name: &str,
     profile: &str,
     target: &str,
-    adapter_type: &str,
+    adapter_type: AdapterType,
     db_config: DbConfig,
     package_quoting: DbtQuoting,
     macro_units: BTreeMap<String, Vec<MacroUnit>>,
@@ -64,67 +65,46 @@ pub fn initialize_parse_jinja_environment(
     let inv_flags = Flags::from_invocation_args(invocation_args.to_dict());
     let joined_flags = prj_flags.join(inv_flags);
 
-    let invocation_args_dict =
-        MinijinjaValue::from_serialize(invocation_args_to_dict(invocation_args, &prj_flags));
+    let invocation_args_dict = invocation_args_to_dict(invocation_args, &prj_flags);
 
-    let globals = BTreeMap::from([
-        (
-            "project_name".to_string(),
-            MinijinjaValue::from(project_name),
-        ),
-        (
-            "run_started_at".to_string(),
-            MinijinjaValue::from_object(PyDateTime::new_aware(
-                run_started_at,
-                Some(PytzTimezone::new(Tz::UTC)),
-            )),
-        ),
-        (
-            "target".to_string(),
-            MinijinjaValue::from_serialize(target_context.clone()),
-        ),
-        (
-            "env".to_string(),
-            MinijinjaValue::from_serialize(target_context),
-        ),
-        (
-            "flags".to_string(),
-            MinijinjaValue::from_object(joined_flags),
-        ),
-        ("invocation_args_dict".to_string(), invocation_args_dict),
-        (
-            "invocation_id".to_string(),
-            MinijinjaValue::from_serialize(invocation_args.invocation_id.to_string()),
-        ),
-        (
-            "var".to_string(),
-            MinijinjaValue::from_object(ConfiguredVar::new(vars, cli_vars)),
-        ),
-        ("database".to_string(), MinijinjaValue::from(database)),
-        ("schema".to_string(), MinijinjaValue::from(schema)),
-        ("write".to_string(), MinijinjaValue::NONE),
-    ]);
-
-    let adapter_type = AdapterType::from_str(adapter_type).map_err(|_| {
-        fs_err!(
-            ErrorCode::InvalidConfig,
-            "Unknown or unsupported adapter type '{adapter_type}'",
-        )
-    })?;
     let type_formatter = Box::new(SATypeOpsImpl::new(adapter_type));
-    let adapter = BridgeAdapter::new_parse_phase_adapter(
+    let adapter = Arc::new(Adapter::new_parse_phase_adapter(
         adapter_type,
         adapter_config_mapping,
         package_quoting,
         type_formatter,
         catalogs,
-    );
+    ));
 
+    let resolve_core = ResolveCore {
+        global_core: GlobalCore {
+            run_started_at: JinjaObject::new(PyDateTime::new_aware(
+                run_started_at,
+                Some(PytzTimezone::new(Tz::UTC)),
+            )),
+            target: target_context.clone(),
+            flags: MinijinjaValue::from_object(joined_flags),
+        },
+        project_name: project_name.to_string(),
+        env: target_context,
+        invocation_args_dict,
+        invocation_id: invocation_args.invocation_id.to_string(),
+        var: JinjaObject::new(ConfiguredVar::new(vars, cli_vars)),
+        database,
+        schema,
+        write: MinijinjaValue::NONE,
+    };
+
+    // Globals must be registered BEFORE `try_with_macros` so its replay-mode
+    // detection (`invocation_args_dict.replay`) sees them — otherwise the
+    // elementary upload-artifacts macros are not no-op'd in replay and the
+    // private-dependency replay goldie drifts on temp-table SQL.
     let mut env = JinjaEnvBuilder::new()
         .with_undefined_behavior(minijinja::UndefinedBehavior::AllowAll)
-        .with_adapter(Arc::new(adapter) as Arc<dyn BaseAdapter>)
+        .with_adapter(adapter)
         .with_root_package(project_name.to_string())
-        .with_globals(globals)
+        .with_globals(to_jinja_btreemap(&resolve_core))
+        .with_warn_error_options(invocation_args.warn_error_options.clone())
         .with_io_args(io_args)
         .try_with_macros(MacroUnitsWrapper::new(macro_units))?
         .build();

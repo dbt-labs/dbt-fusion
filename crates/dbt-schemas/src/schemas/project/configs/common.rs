@@ -19,7 +19,7 @@ use crate::schemas::common::merge_tags;
 use crate::schemas::common::{ClusterConfig, DbtQuoting, DocsConfig, Schedule};
 use crate::schemas::manifest::GrantAccessToTarget;
 use crate::schemas::project::configs::model_config::DataLakeObjectCategory;
-use crate::schemas::project::dbt_project::DefaultTo;
+use crate::schemas::project::dbt_project::{ResolvableConfig, ResolvedConfig};
 use crate::schemas::serde::QueryTag;
 use crate::schemas::serde::StringOrArrayOfStrings;
 use crate::schemas::serde::{
@@ -146,6 +146,38 @@ pub fn array_of_strings_eq(
         (Some(StringOrArrayOfStrings::ArrayOfStrings(values)), None) => values.is_empty(),
         _ => false,
     }
+}
+
+/// Compare optional tag fields with set semantics.
+///
+/// dbt-core builds tag lists by *concatenating* inherited tags (project + model +
+/// column + test level), which produces duplicates in the manifest — e.g. a column
+/// with `tags: [weekly]` under a model with `tags: [weekly]` ends up serialized as
+/// `tags: ['weekly', 'weekly']`. Fusion deduplicates. For `state:modified` parity
+/// against dbt-core-produced manifests, tag equality must ignore both ordering and
+/// multiplicity, since tags are conceptually a set (selection via `tag:foo` is set
+/// membership, not a count).
+///
+/// Use this only for tag-shaped fields. For ordered/multiset fields like Python
+/// `packages` (where order or duplicates can be meaningful), use
+/// `array_of_strings_eq` instead.
+pub fn tags_eq(a: &Option<StringOrArrayOfStrings>, b: &Option<StringOrArrayOfStrings>) -> bool {
+    use std::collections::BTreeSet;
+    let to_set = |v: &Option<StringOrArrayOfStrings>| -> BTreeSet<String> {
+        match v {
+            None => BTreeSet::new(),
+            Some(StringOrArrayOfStrings::String(s)) => BTreeSet::from([s.clone()]),
+            Some(StringOrArrayOfStrings::ArrayOfStrings(arr)) => arr.iter().cloned().collect(),
+        }
+    };
+    to_set(a) == to_set(b)
+}
+
+/// Same set semantics as [`tags_eq`], for plain `Vec<String>` tag fields
+/// (e.g. `CommonAttributes.tags`). Same caveat: only use for tag-shaped fields.
+pub fn tags_eq_vec(a: &[String], b: &[String]) -> bool {
+    use std::collections::BTreeSet;
+    a.iter().cloned().collect::<BTreeSet<_>>() == b.iter().cloned().collect::<BTreeSet<_>>()
 }
 
 /// Helper function to handle default_to logic for column_types
@@ -299,6 +331,7 @@ pub struct WarehouseSpecificNodeConfig {
     pub notebook_template_id: Option<u64>,
     pub intermediate_format: Option<String>,
     pub enable_list_inference: Option<bool>,
+    pub storage_uri: Option<String>,
 
     // Used by both Databricks and Bigquery
     pub file_format: Option<String>,
@@ -306,6 +339,8 @@ pub struct WarehouseSpecificNodeConfig {
     // Databricks
     pub catalog_name: Option<String>,
     pub location_root: Option<String>,
+    #[serde(default, deserialize_with = "bool_or_string_bool")]
+    pub use_uniform: Option<bool>,
     pub tblproperties: Option<BTreeMap<String, YmlValue>>,
     // this config is introduced here https://github.com/databricks/dbt-databricks/pull/823
     #[serde(default, deserialize_with = "bool_or_string_bool")]
@@ -339,10 +374,21 @@ pub struct WarehouseSpecificNodeConfig {
     pub external_volume: Option<String>,
     pub base_location_root: Option<String>,
     pub base_location_subpath: Option<String>,
+    #[serde(default, deserialize_with = "bool_or_string_bool")]
+    pub change_tracking: Option<bool>,
+    #[serde(default, deserialize_with = "u64_or_string_u64")]
+    pub data_retention_time_in_days: Option<u64>,
+    #[serde(default, deserialize_with = "u64_or_string_u64")]
+    pub max_data_extension_time_in_days: Option<u64>,
+    pub storage_serialization_policy: Option<String>,
+    pub target_file_size: Option<String>,
     pub target_lag: Option<String>,
+    pub snowflake_initialization_warehouse: Option<String>,
     pub snowflake_warehouse: Option<String>,
+    pub immutable_where: Option<String>,
     pub refresh_mode: Option<String>,
     pub initialize: Option<String>,
+    pub scheduler: Option<String>,
     pub tmp_relation_type: Option<String>,
     pub query_tag: Option<QueryTag>,
     #[serde(default, deserialize_with = "bool_or_string_bool")]
@@ -353,6 +399,8 @@ pub struct WarehouseSpecificNodeConfig {
     pub secure: Option<bool>,
     #[serde(default, deserialize_with = "bool_or_string_bool")]
     pub transient: Option<bool>,
+    #[serde(default, deserialize_with = "u64_or_string_u64")]
+    pub iceberg_version: Option<u64>,
 
     // Redshift
     #[serde(default, deserialize_with = "bool_or_string_bool")]
@@ -385,7 +433,29 @@ pub struct WarehouseSpecificNodeConfig {
     pub category: Option<DataLakeObjectCategory>,
 }
 
-impl DefaultTo<WarehouseSpecificNodeConfig> for WarehouseSpecificNodeConfig {
+impl ResolvedConfig for WarehouseSpecificNodeConfig {
+    fn enabled(&self) -> bool {
+        true
+    }
+}
+
+impl ResolvableConfig<WarehouseSpecificNodeConfig> for WarehouseSpecificNodeConfig {
+    type Resolved = Self;
+    type PackageDefaults = ();
+    type ResolveDefaults = ();
+
+    fn get_enabled_with_default(&self) -> bool {
+        true
+    }
+
+    fn disable(&mut self) {}
+
+    fn apply_package_defaults(&mut self, _: ()) {}
+
+    fn finalize(self) -> Self {
+        self
+    }
+
     #[allow(clippy::cognitive_complexity)]
     fn default_to(&mut self, parent: &WarehouseSpecificNodeConfig) {
         // Exhaustive destructuring ensures all fields are handled
@@ -416,11 +486,13 @@ impl DefaultTo<WarehouseSpecificNodeConfig> for WarehouseSpecificNodeConfig {
             notebook_template_id,
             enable_list_inference,
             intermediate_format,
+            storage_uri,
 
             // Databricks
             file_format,
             catalog_name,
             location_root,
+            use_uniform,
             tblproperties,
             include_full_name_in_path,
             liquid_clustered_by,
@@ -449,16 +521,25 @@ impl DefaultTo<WarehouseSpecificNodeConfig> for WarehouseSpecificNodeConfig {
             external_volume,
             base_location_root,
             base_location_subpath,
+            change_tracking,
+            data_retention_time_in_days,
+            max_data_extension_time_in_days,
+            storage_serialization_policy,
+            target_file_size,
             target_lag,
+            snowflake_initialization_warehouse,
             snowflake_warehouse,
+            immutable_where,
             refresh_mode,
             initialize,
+            scheduler,
             tmp_relation_type,
             query_tag,
             automatic_clustering,
             copy_grants,
             secure,
             transient,
+            iceberg_version,
 
             // Redshift
             auto_refresh,
@@ -507,6 +588,7 @@ impl DefaultTo<WarehouseSpecificNodeConfig> for WarehouseSpecificNodeConfig {
                 file_format,
                 catalog_name,
                 location_root,
+                use_uniform,
                 tblproperties,
                 include_full_name_in_path,
                 liquid_clustered_by,
@@ -534,6 +616,7 @@ impl DefaultTo<WarehouseSpecificNodeConfig> for WarehouseSpecificNodeConfig {
                 notebook_template_id,
                 enable_list_inference,
                 intermediate_format,
+                storage_uri,
                 // Snowflake
                 table_tag,
                 row_access_policy,
@@ -541,16 +624,25 @@ impl DefaultTo<WarehouseSpecificNodeConfig> for WarehouseSpecificNodeConfig {
                 external_volume,
                 base_location_root,
                 base_location_subpath,
+                change_tracking,
+                data_retention_time_in_days,
+                max_data_extension_time_in_days,
+                storage_serialization_policy,
+                target_file_size,
                 target_lag,
+                snowflake_initialization_warehouse,
                 snowflake_warehouse,
+                immutable_where,
                 refresh_mode,
                 initialize,
+                scheduler,
                 tmp_relation_type,
                 query_tag,
                 automatic_clustering,
                 copy_grants,
                 secure,
                 transient,
+                iceberg_version,
                 // Redshift
                 auto_refresh,
                 backup,
@@ -714,14 +806,19 @@ pub fn same_warehouse_config(
     let base_location_root_eq = self_wh.base_location_root == other_wh.base_location_root;
     let base_location_subpath_eq = self_wh.base_location_subpath == other_wh.base_location_subpath;
     let target_lag_eq = self_wh.target_lag == other_wh.target_lag;
+    let snowflake_initialization_warehouse_eq =
+        self_wh.snowflake_initialization_warehouse == other_wh.snowflake_initialization_warehouse;
+    let immutable_where_eq = self_wh.immutable_where == other_wh.immutable_where;
     let refresh_mode_eq = self_wh.refresh_mode == other_wh.refresh_mode;
     let initialize_eq = self_wh.initialize == other_wh.initialize;
+    let scheduler_eq = self_wh.scheduler == other_wh.scheduler;
     let tmp_relation_type_eq = self_wh.tmp_relation_type == other_wh.tmp_relation_type;
     let query_tag_eq = self_wh.query_tag == other_wh.query_tag;
     let automatic_clustering_eq = self_wh.automatic_clustering == other_wh.automatic_clustering;
     let copy_grants_eq = self_wh.copy_grants == other_wh.copy_grants;
     let secure_eq = self_wh.secure == other_wh.secure;
     let transient_eq = self_wh.transient == other_wh.transient;
+    let iceberg_version_eq = self_wh.iceberg_version == other_wh.iceberg_version;
     let auto_refresh_eq = self_wh.auto_refresh == other_wh.auto_refresh;
     let backup_eq = self_wh.backup == other_wh.backup;
     let bind_eq = self_wh.bind == other_wh.bind;
@@ -778,14 +875,18 @@ pub fn same_warehouse_config(
         && base_location_root_eq
         && base_location_subpath_eq
         && target_lag_eq
+        && snowflake_initialization_warehouse_eq
+        && immutable_where_eq
         && refresh_mode_eq
         && initialize_eq
+        && scheduler_eq
         && tmp_relation_type_eq
         && query_tag_eq
         && automatic_clustering_eq
         && copy_grants_eq
         && secure_eq
         && transient_eq
+        && iceberg_version_eq
         && auto_refresh_eq
         && backup_eq
         && bind_eq
@@ -1156,6 +1257,22 @@ pub fn same_warehouse_config(
                     )),
                 ),
                 (
+                    "snowflake_initialization_warehouse",
+                    snowflake_initialization_warehouse_eq,
+                    Some((
+                        format!("{:?}", &self_wh.snowflake_initialization_warehouse),
+                        format!("{:?}", &other_wh.snowflake_initialization_warehouse),
+                    )),
+                ),
+                (
+                    "immutable_where",
+                    immutable_where_eq,
+                    Some((
+                        format!("{:?}", &self_wh.immutable_where),
+                        format!("{:?}", &other_wh.immutable_where),
+                    )),
+                ),
+                (
                     "refresh_mode",
                     refresh_mode_eq,
                     Some((
@@ -1169,6 +1286,14 @@ pub fn same_warehouse_config(
                     Some((
                         format!("{:?}", &self_wh.initialize),
                         format!("{:?}", &other_wh.initialize),
+                    )),
+                ),
+                (
+                    "scheduler",
+                    scheduler_eq,
+                    Some((
+                        format!("{:?}", &self_wh.scheduler),
+                        format!("{:?}", &other_wh.scheduler),
                     )),
                 ),
                 (
@@ -1217,6 +1342,14 @@ pub fn same_warehouse_config(
                     Some((
                         format!("{:?}", &self_wh.transient),
                         format!("{:?}", &other_wh.transient),
+                    )),
+                ),
+                (
+                    "iceberg_version",
+                    iceberg_version_eq,
+                    Some((
+                        format!("{:?}", &self_wh.iceberg_version),
+                        format!("{:?}", &other_wh.iceberg_version),
                     )),
                 ),
                 (
@@ -1363,5 +1496,84 @@ mod tests {
         ]));
 
         assert!(array_of_strings_eq(&string_val, &array_val));
+    }
+
+    #[test]
+    fn test_tags_eq_ignores_duplicates_and_ordering() {
+        // Regression: dbt-core concatenates inherited tag lists (model + column +
+        // test level), producing duplicates in the manifest like ['weekly', 'weekly'].
+        // Fusion deduplicates. For state:modified parity, equality must be set-based.
+        let with_dupes = Some(StringOrArrayOfStrings::ArrayOfStrings(vec![
+            "weekly".to_string(),
+            "weekly".to_string(),
+        ]));
+        let dedup = Some(StringOrArrayOfStrings::ArrayOfStrings(vec![
+            "weekly".to_string(),
+        ]));
+        let single_string = Some(StringOrArrayOfStrings::String("weekly".to_string()));
+
+        assert!(tags_eq(&with_dupes, &dedup));
+        assert!(tags_eq(&dedup, &with_dupes));
+        assert!(tags_eq(&with_dupes, &single_string));
+        assert!(tags_eq(&single_string, &with_dupes));
+
+        // Order should also be ignored.
+        let abc = Some(StringOrArrayOfStrings::ArrayOfStrings(vec![
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+        ]));
+        let cab = Some(StringOrArrayOfStrings::ArrayOfStrings(vec![
+            "c".to_string(),
+            "a".to_string(),
+            "b".to_string(),
+        ]));
+        assert!(tags_eq(&abc, &cab));
+    }
+
+    #[test]
+    fn test_tags_eq_none_and_empty_array() {
+        // Same none/empty equivalence as array_of_strings_eq.
+        let none_val: Option<StringOrArrayOfStrings> = None;
+        let empty_array = Some(StringOrArrayOfStrings::ArrayOfStrings(vec![]));
+
+        assert!(tags_eq(&none_val, &empty_array));
+        assert!(tags_eq(&empty_array, &none_val));
+        assert!(tags_eq(&none_val, &none_val));
+    }
+
+    #[test]
+    fn test_tags_eq_vec_set_semantics() {
+        // Plain Vec<String> tag form (e.g. CommonAttributes.tags) — same set
+        // semantics as tags_eq. Saved queries store tags as Vec<String>.
+        let with_dupes = vec!["weekly".to_string(), "weekly".to_string()];
+        let dedup = vec!["weekly".to_string()];
+        assert!(tags_eq_vec(&with_dupes, &dedup));
+        assert!(tags_eq_vec(&dedup, &with_dupes));
+        assert!(tags_eq_vec(&[], &[]));
+
+        // Order-insensitive
+        let abc = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let cab = vec!["c".to_string(), "a".to_string(), "b".to_string()];
+        assert!(tags_eq_vec(&abc, &cab));
+
+        // Real differences still flagged
+        let with_extra = vec!["weekly".to_string(), "critical".to_string()];
+        assert!(!tags_eq_vec(&with_extra, &dedup));
+    }
+
+    #[test]
+    fn test_tags_eq_genuinely_different_tags() {
+        // Set semantics must still flag real differences as unequal.
+        let left = Some(StringOrArrayOfStrings::ArrayOfStrings(vec![
+            "weekly".to_string(),
+            "critical".to_string(),
+        ]));
+        let right = Some(StringOrArrayOfStrings::ArrayOfStrings(vec![
+            "weekly".to_string(),
+        ]));
+
+        assert!(!tags_eq(&left, &right));
+        assert!(!tags_eq(&right, &left));
     }
 }

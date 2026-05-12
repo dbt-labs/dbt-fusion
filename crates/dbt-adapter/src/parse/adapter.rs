@@ -1,11 +1,11 @@
 use crate::AdapterEngine;
 use crate::cast_util::downcast_value_to_dyn_base_relation;
-use crate::funcs::*;
 use crate::relation::{RelationObject, do_create_relation};
+use crate::value::empty_mutable_vec_value;
 
 use dashmap::{DashMap, DashSet};
+use dbt_adapter_core::AdapterType;
 use dbt_common::FsError;
-use dbt_common::adapter::AdapterType;
 use dbt_schemas::schemas::dbt_catalogs::DbtCatalogs;
 use dbt_schemas::schemas::relations::base::{BaseRelation, RelationPattern};
 use minijinja::constants::TARGET_UNIQUE_ID;
@@ -87,15 +87,15 @@ impl ParseAdapterState {
         schema: &str,
         identifier: &str,
     ) -> Result<(), minijinja::Error> {
-        let relation = do_create_relation(
+        let relation = RelationObject::new(Arc::from(do_create_relation(
             self.adapter_type,
             database.to_string(),
             schema.to_string(),
             Some(identifier.to_string()),
             None,
             self.engine.quoting(),
-        )?
-        .as_value();
+        )?))
+        .into_value();
 
         if state.is_execute() {
             if let Some(unique_id) = state.lookup(TARGET_UNIQUE_ID, &[]) {

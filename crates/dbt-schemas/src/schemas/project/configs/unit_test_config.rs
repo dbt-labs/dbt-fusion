@@ -1,4 +1,6 @@
+use dbt_common::io_args::ComputeArg;
 use dbt_common::io_args::StaticAnalysisKind;
+use dbt_proc_macros::Resolvable;
 use dbt_yaml::{DbtSchema, ShouldBe, Spanned};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -13,7 +15,7 @@ use crate::{
         common::{ClusterConfig, PartitionConfig, Schedule},
         manifest::GrantAccessToTarget,
         project::{
-            DefaultTo, TypedRecursiveConfig,
+            ResolvableConfig, TypedRecursiveConfig,
             configs::{
                 common::{WarehouseSpecificNodeConfig, default_meta_and_tags},
                 config_keys::ConfigKeys,
@@ -31,6 +33,8 @@ use crate::{
 pub struct ProjectUnitTestConfig {
     #[serde(default, rename = "+enabled", deserialize_with = "bool_or_string_bool")]
     pub enabled: Option<bool>,
+    #[serde(rename = "+compute")]
+    pub compute: Option<ComputeArg>,
     #[serde(rename = "+meta")]
     pub meta: Option<IndexMap<String, YmlValue>>,
     #[serde(rename = "+tags")]
@@ -49,12 +53,18 @@ pub struct ProjectUnitTestConfig {
     pub base_location_subpath: Option<String>,
     #[serde(rename = "+target_lag")]
     pub target_lag: Option<String>,
+    #[serde(rename = "+snowflake_initialization_warehouse")]
+    pub snowflake_initialization_warehouse: Option<String>,
+    #[serde(rename = "+immutable_where")]
+    pub immutable_where: Option<String>,
     #[serde(rename = "+snowflake_warehouse")]
     pub snowflake_warehouse: Option<String>,
     #[serde(rename = "+refresh_mode")]
     pub refresh_mode: Option<String>,
     #[serde(rename = "+initialize")]
     pub initialize: Option<String>,
+    #[serde(rename = "+scheduler")]
+    pub scheduler: Option<String>,
     #[serde(rename = "+tmp_relation_type")]
     pub tmp_relation_type: Option<String>,
     #[serde(rename = "+query_tag")]
@@ -260,10 +270,13 @@ impl TypedRecursiveConfig for ProjectUnitTestConfig {
 }
 
 #[skip_serializing_none]
-#[derive(Deserialize, Serialize, Debug, Clone, Default, PartialEq, DbtSchema)]
+#[derive(Resolvable, Deserialize, Serialize, Debug, Clone, Default, PartialEq, DbtSchema)]
 pub struct UnitTestConfig {
+    #[resolved(promote, method = get_enabled_with_default)]
     #[serde(default, deserialize_with = "bool_or_string_bool")]
     pub enabled: Option<bool>,
+    pub compute: Option<ComputeArg>,
+    #[resolved(promote, expect = "static_analysis set by apply_resolve_defaults")]
     pub static_analysis: Option<Spanned<StaticAnalysisKind>>,
     pub meta: Option<IndexMap<String, YmlValue>>,
     #[serde(
@@ -279,6 +292,7 @@ impl From<ProjectUnitTestConfig> for UnitTestConfig {
     fn from(config: ProjectUnitTestConfig) -> Self {
         Self {
             enabled: config.enabled,
+            compute: config.compute,
             static_analysis: config.static_analysis,
             meta: config.meta,
             tags: config.tags,
@@ -288,10 +302,18 @@ impl From<ProjectUnitTestConfig> for UnitTestConfig {
                 external_volume: config.external_volume,
                 base_location_root: config.base_location_root,
                 base_location_subpath: config.base_location_subpath,
+                change_tracking: None,
+                data_retention_time_in_days: None,
+                max_data_extension_time_in_days: None,
+                storage_serialization_policy: None,
+                target_file_size: None,
                 target_lag: config.target_lag,
+                snowflake_initialization_warehouse: config.snowflake_initialization_warehouse,
+                immutable_where: config.immutable_where,
                 snowflake_warehouse: config.snowflake_warehouse,
                 refresh_mode: config.refresh_mode,
                 initialize: config.initialize,
+                scheduler: config.scheduler,
                 tmp_relation_type: config.tmp_relation_type,
                 query_tag: config.query_tag,
                 table_tag: config.table_tag,
@@ -300,6 +322,7 @@ impl From<ProjectUnitTestConfig> for UnitTestConfig {
                 copy_grants: config.copy_grants,
                 secure: config.secure,
                 transient: config.transient,
+                iceberg_version: None,
 
                 partition_by: config.partition_by,
                 cluster_by: config.cluster_by,
@@ -323,10 +346,12 @@ impl From<ProjectUnitTestConfig> for UnitTestConfig {
                 notebook_template_id: None,
                 enable_list_inference: None,
                 intermediate_format: None,
+                storage_uri: None,
 
                 file_format: config.file_format,
                 catalog_name: config.catalog_name,
                 location_root: config.location_root,
+                use_uniform: None,
                 tblproperties: config.tblproperties,
                 include_full_name_in_path: config.include_full_name_in_path,
                 liquid_clustered_by: config.liquid_clustered_by,
@@ -372,6 +397,7 @@ impl From<UnitTestConfig> for ProjectUnitTestConfig {
     fn from(config: UnitTestConfig) -> Self {
         Self {
             enabled: config.enabled,
+            compute: config.compute,
             static_analysis: config.static_analysis,
             meta: config.meta,
             tags: config.tags,
@@ -381,9 +407,14 @@ impl From<UnitTestConfig> for ProjectUnitTestConfig {
             base_location_root: config.__warehouse_specific_config__.base_location_root,
             base_location_subpath: config.__warehouse_specific_config__.base_location_subpath,
             target_lag: config.__warehouse_specific_config__.target_lag,
+            snowflake_initialization_warehouse: config
+                .__warehouse_specific_config__
+                .snowflake_initialization_warehouse,
+            immutable_where: config.__warehouse_specific_config__.immutable_where,
             snowflake_warehouse: config.__warehouse_specific_config__.snowflake_warehouse,
             refresh_mode: config.__warehouse_specific_config__.refresh_mode,
             initialize: config.__warehouse_specific_config__.initialize,
+            scheduler: config.__warehouse_specific_config__.scheduler,
             tmp_relation_type: config.__warehouse_specific_config__.tmp_relation_type,
             query_tag: config.__warehouse_specific_config__.query_tag,
             table_tag: config.__warehouse_specific_config__.table_tag,
@@ -465,14 +496,35 @@ impl From<UnitTestConfig> for ProjectUnitTestConfig {
     }
 }
 
-impl DefaultTo<UnitTestConfig> for UnitTestConfig {
-    fn get_enabled(&self) -> Option<bool> {
-        self.enabled
+impl ResolvableConfig<UnitTestConfig> for UnitTestConfig {
+    type Resolved = ResolvedUnitTestConfig;
+    type PackageDefaults = ();
+    type ResolveDefaults = StaticAnalysisKind;
+
+    fn get_enabled_with_default(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+
+    fn disable(&mut self) {
+        self.enabled = Some(false);
+    }
+
+    fn apply_package_defaults(&mut self, _: ()) {}
+
+    fn apply_resolve_defaults(&mut self, static_analysis: StaticAnalysisKind) {
+        if self.static_analysis.is_none() {
+            self.static_analysis = Some(Spanned::new(static_analysis));
+        }
+    }
+
+    fn finalize(self) -> ResolvedUnitTestConfig {
+        self.finalize_resolved()
     }
 
     fn default_to(&mut self, parent: &UnitTestConfig) {
         let UnitTestConfig {
             enabled,
+            compute,
             static_analysis,
             meta,
             tags,
@@ -489,7 +541,7 @@ impl DefaultTo<UnitTestConfig> for UnitTestConfig {
         #[allow(unused, clippy::let_unit_value)]
         let tags = ();
 
-        default_to!(parent, [enabled, static_analysis]);
+        default_to!(parent, [enabled, compute, static_analysis]);
     }
 }
 

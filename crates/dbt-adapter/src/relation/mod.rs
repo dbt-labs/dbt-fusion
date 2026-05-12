@@ -6,13 +6,14 @@ pub use config::{BaseRelationChangeSet, BaseRelationConfig, ComponentConfig, Rel
 // Relation and RelationConfig for different data warehouses
 pub mod bigquery;
 pub mod databricks;
-pub mod duckdb;
-pub mod fabric;
 pub mod parse;
-pub mod postgres;
 pub mod redshift;
-pub mod salesforce;
 pub mod snowflake;
+
+pub mod factory;
+
+mod relation_impl;
+pub use relation_impl::{Relation, RelationStatic};
 
 mod relation_object;
 pub use relation_object::{
@@ -23,7 +24,9 @@ pub use relation_object::{
 pub(crate) mod config_v2;
 
 pub(crate) fn duckdb_should_include_database(database: Option<&str>) -> bool {
-    database.is_some_and(|db| !db.is_empty() && !db.eq_ignore_ascii_case("main"))
+    database.is_some_and(|db| {
+        !db.is_empty() && !db.eq_ignore_ascii_case("main") && !db.eq_ignore_ascii_case("memory")
+    })
 }
 
 #[cfg(test)]
@@ -75,7 +78,7 @@ mod tests {
         };
         let event_time = Some("created_at".to_string());
 
-        let result = relation.render_with_run_filter_as_str(&run_filter, &event_time);
+        let result = relation.render_with_run_filter(&run_filter, &event_time);
         assert_eq!(
             result,
             "(select * from my_table where created_at >= to_timestamp_tz('2024-07-01T00:00:00') and created_at < to_timestamp_tz('2024-07-08T18:00:00'))"
@@ -112,7 +115,7 @@ mod tests {
         };
         let event_time = Some("created_at".to_string());
 
-        let result = relation.render_with_run_filter_as_str(&run_filter, &event_time);
+        let result = relation.render_with_run_filter(&run_filter, &event_time);
         assert_eq!(
             result,
             "(select * from my_table where cast(created_at as timestamp) >= '2024-07-01T00:00:00' and cast(created_at as timestamp) < '2024-07-08T18:00:00')"
@@ -122,13 +125,17 @@ mod tests {
     #[test]
     fn test_render_with_run_filter_redshift_adapter() {
         // relation impl in core doesn't seem to override this
-        let relation = redshift::RedshiftRelation::new(
+        let relation = Relation::new(
+            AdapterType::Redshift,
             None,
             None,
             Some("my_table".to_owned()),
             None,
             None,
             ResolvedQuoting::disabled(),
+            None,
+            false,
+            false,
         );
         let start = NaiveDate::from_ymd_opt(2024, 7, 1)
             .unwrap()
@@ -150,7 +157,7 @@ mod tests {
         };
         let event_time = Some("created_at".to_string());
 
-        let result = relation.render_with_run_filter_as_str(&run_filter, &event_time);
+        let result = relation.render_with_run_filter(&run_filter, &event_time);
         assert_eq!(
             result,
             "(select * from my_table where created_at >= '2024-07-01T00:00:00' and created_at < '2024-07-08T18:00:00')"
@@ -160,7 +167,7 @@ mod tests {
     #[test]
     fn test_render_with_run_filter_databricks_adapter() {
         // relation impl in dbt-databricks doesn't seem to override this
-        let relation = databricks::DatabricksRelation::new(
+        let relation = Relation::new(
             AdapterType::Databricks, // ?
             None,
             None,
@@ -192,7 +199,7 @@ mod tests {
         };
         let event_time = Some("created_at".to_string());
 
-        let result = relation.render_with_run_filter_as_str(&run_filter, &event_time);
+        let result = relation.render_with_run_filter(&run_filter, &event_time);
         assert_eq!(
             result,
             "(select * from my_table where created_at >= '2024-07-01T00:00:00' and created_at < '2024-07-08T18:00:00')"
@@ -207,6 +214,8 @@ mod tests {
     #[test]
     fn test_duckdb_should_not_include_database_for_default_catalog() {
         assert!(!duckdb_should_include_database(Some("main")));
+        assert!(!duckdb_should_include_database(Some("memory")));
+        assert!(!duckdb_should_include_database(Some("MEMORY")));
         assert!(!duckdb_should_include_database(Some("")));
         assert!(!duckdb_should_include_database(None));
     }
@@ -228,7 +237,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            relation.render_self().unwrap().as_str().unwrap(),
+            relation.render_self_as_str(),
             "\"stocks_dev\".\"main\".\"files\""
         );
     }

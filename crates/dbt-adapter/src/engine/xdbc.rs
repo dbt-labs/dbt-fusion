@@ -1,18 +1,18 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
+use dbt_adapter_core::AdapterType;
 use dbt_agate::hashers::IdentityBuildHasher;
 use dbt_auth::{AdapterConfig, Auth};
 use dbt_common::AdapterResult;
-use dbt_common::adapter::AdapterType;
 use dbt_common::behavior_flags::Behavior;
 use dbt_common::cancellation::CancellationToken;
 use dbt_schemas::schemas::common::ResolvedQuoting;
+use dbt_schemas::schemas::dbt_catalogs_v2::CatalogSpecV2View;
 use dbt_schemas::schemas::{DbtModel, DbtSnapshot};
 use dbt_xdbc::semaphore::Semaphore;
 use dbt_xdbc::*;
@@ -21,16 +21,16 @@ use parking_lot::RwLock;
 use serde::Deserialize;
 
 use crate::cache::RelationCache;
-use crate::errors::{AdapterError, adbc_error_to_adapter_error};
+use crate::engine::query_comment::QueryCommentConfig;
+use crate::errors::{AdapterError, AdapterErrorKind, adbc_error_to_adapter_error};
 use crate::query_cache::QueryCache;
-use crate::query_comment::QueryCommentConfig;
-use crate::record_and_replay::{RecordEngineConnection, ReplayEngineConnection};
 use crate::sql_types::TypeOps;
 use crate::stmt_splitter::StmtSplitter;
 
 use super::adapter_engine::*;
 use super::make_behavior;
 use super::noop_connection::NoopConnection;
+use super::retry::ConnectionRetryPolicy;
 
 #[derive(Default)]
 pub struct DatabaseMap {
@@ -46,16 +46,12 @@ pub enum EngineMode {
     Live,
     /// Stubbed connections and execution
     Mock,
-    /// Live execution with recording of all results to disk.
-    Record(PathBuf),
-    /// Replay previously recorded results from disk.
-    Replay(PathBuf),
 }
 
 impl EngineMode {
     /// Whether this mode connects to a real warehouse.
     pub fn has_real_connections(&self) -> bool {
-        matches!(self, EngineMode::Live | EngineMode::Record(_))
+        matches!(self, EngineMode::Live)
     }
 }
 
@@ -87,6 +83,8 @@ pub struct XdbcEngine {
     behavior: Arc<Behavior>,
     /// Controls connection/execution behaviour.
     mode: EngineMode,
+    /// The `threads` configuration value from the dbt profile.
+    threads: Option<usize>,
 }
 
 impl XdbcEngine {
@@ -103,23 +101,10 @@ impl XdbcEngine {
         relation_cache: Arc<RelationCache>,
         behavior_flag_overrides: BTreeMap<String, bool>,
         mode: EngineMode,
+        threads: Option<usize>,
     ) -> Self {
         let permits = if mode.has_real_connections() {
-            let threads = config
-                .get("threads")
-                .and_then(|t| {
-                    let u = t.as_u64();
-                    debug_assert!(u.is_some(), "threads must be an integer if specified");
-                    u
-                })
-                .map(|t| t as u32)
-                .unwrap_or(0u32);
-            if matches!(adapter_type, AdapterType::Redshift | AdapterType::Bigquery) && threads > 0
-            {
-                threads
-            } else {
-                u32::MAX
-            }
+            threads.map(|t| (t as u32).max(1)).unwrap_or(u32::MAX)
         } else {
             u32::MAX
         };
@@ -139,6 +124,7 @@ impl XdbcEngine {
             behavior_flag_overrides,
             behavior,
             mode,
+            threads,
         }
     }
 
@@ -154,6 +140,7 @@ impl XdbcEngine {
         query_cache: Option<Arc<dyn QueryCache>>,
         relation_cache: Arc<RelationCache>,
         behavior_flag_overrides: BTreeMap<String, bool>,
+        threads: Option<usize>,
     ) -> Self {
         Self::build(
             adapter_type,
@@ -167,6 +154,7 @@ impl XdbcEngine {
             relation_cache,
             behavior_flag_overrides,
             EngineMode::Live,
+            threads,
         )
     }
 
@@ -190,75 +178,14 @@ impl XdbcEngine {
             auth,
             config,
             quoting,
-            QueryCommentConfig::from_query_comment(None, adapter_type, false),
+            QueryCommentConfig::from_query_comment(None, adapter_type, false, None),
             type_ops,
             splitter,
             None,
             relation_cache,
             behavior_flag_overrides,
             EngineMode::Mock,
-        )
-    }
-
-    /// Create a recording engine that wraps live warehouse connections
-    /// and persists all query results to `recordings_path`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_record(
-        adapter_type: AdapterType,
-        auth: Arc<dyn Auth>,
-        config: AdapterConfig,
-        quoting: ResolvedQuoting,
-        query_comment: QueryCommentConfig,
-        type_ops: Box<dyn TypeOps>,
-        splitter: Arc<dyn StmtSplitter>,
-        relation_cache: Arc<RelationCache>,
-        behavior_flag_overrides: BTreeMap<String, bool>,
-        recordings_path: PathBuf,
-    ) -> Self {
-        crate::record_and_replay::reset_counters(&recordings_path);
-        Self::build(
-            adapter_type,
-            auth,
-            config,
-            quoting,
-            query_comment,
-            type_ops,
-            splitter,
             None,
-            relation_cache,
-            behavior_flag_overrides,
-            EngineMode::Record(recordings_path),
-        )
-    }
-
-    /// Create a replay engine that serves previously recorded results
-    /// from `recordings_path` without connecting to a warehouse.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_replay(
-        adapter_type: AdapterType,
-        auth: Arc<dyn Auth>,
-        config: AdapterConfig,
-        quoting: ResolvedQuoting,
-        query_comment: QueryCommentConfig,
-        type_ops: Box<dyn TypeOps>,
-        splitter: Arc<dyn StmtSplitter>,
-        relation_cache: Arc<RelationCache>,
-        behavior_flag_overrides: BTreeMap<String, bool>,
-        recordings_path: PathBuf,
-    ) -> Self {
-        crate::record_and_replay::reset_counters(&recordings_path);
-        Self::build(
-            adapter_type,
-            auth,
-            config,
-            quoting,
-            query_comment,
-            type_ops,
-            splitter,
-            None,
-            relation_cache,
-            behavior_flag_overrides,
-            EngineMode::Replay(recordings_path),
         )
     }
 
@@ -276,23 +203,47 @@ impl XdbcEngine {
             "load_driver_and_configure_database called in {:?} mode",
             self.mode,
         );
-        let builder = self
-            .auth
-            .configure(config)
-            .map_err(crate::errors::auth_error_to_adapter_error)?;
+        let use_cloud_credentials = config.use_dbt_cloud_credentials();
+        let backend = self.auth.backend();
 
-        let load_strategy = match self.adapter_type {
-            AdapterType::DuckDB => LoadStrategy::SystemThenCdnCache,
-            _ => LoadStrategy::CdnCache,
+        let (database_builder, load_strategy) = if use_cloud_credentials {
+            // Cloud credentials are used to connect to a service that manages
+            // drivers and warehouse credentials for us. The "flock" driver takes
+            // these credentials and behaves as a proxy to the actual.
+            let builder = Self::configure_cloud_database(backend)?;
+            (builder, LoadStrategy::Remote)
+        } else {
+            // Delegate configuration to the Auth implementation configuring
+            // the warehouse driver locally.
+            let auth_result = self
+                .auth
+                .configure(config)
+                .map_err(crate::errors::auth_error_to_adapter_error)?;
+
+            for warning in &auth_result.warnings {
+                dbt_common::tracing::emit::emit_warn_log_message(
+                    dbt_common::ErrorCode::InvalidConfig,
+                    warning,
+                    None,
+                );
+            }
+
+            let load_strategy = match self.adapter_type {
+                AdapterType::DuckDB => LoadStrategy::SystemThenCdnCache,
+                _ => LoadStrategy::CdnCache,
+            };
+            (auth_result.builder, load_strategy)
         };
-        let mut driver = driver::Builder::new(self.auth.backend(), load_strategy)
-            .with_semaphore(self.semaphore.clone())
+
+        // This will load the "flock" driver if load_strategy is Remote.
+        let mut driver = driver::Builder::new(backend, load_strategy)
+            .with_semaphore(Arc::clone(&self.semaphore))
             .try_load()
             .map_err(adbc_error_to_adapter_error)?;
 
         // The database is configured only once even if this runs multiple times,
         // unless a different configuration is provided.
-        let opts = builder.into_iter().collect::<Vec<_>>();
+        let opts = database_builder.into_iter().collect::<Vec<_>>();
         let fingerprint = database::Builder::fingerprint(opts.iter());
         {
             let read_guard = self.configured_databases.read();
@@ -319,6 +270,29 @@ impl XdbcEngine {
         }
     }
 
+    /// Build a [database::Builder] configured with dbt Cloud credentials
+    /// read from `~/.dbt/dbt_cloud.yml` (with env-var overrides applied).
+    fn configure_cloud_database(backend: Backend) -> AdapterResult<database::Builder> {
+        let mut builder = database::Builder::new(backend);
+        let cloud_config_path = dbt_cloud_config::get_cloud_project_path()
+            .map_err(|e| AdapterError::new(AdapterErrorKind::Configuration, e))?;
+        let cloud_yml = dbt_cloud_config::parse_cloud_config(&cloud_config_path)
+            .map_err(|e| AdapterError::new(AdapterErrorKind::Configuration, e))?;
+        let resolved = dbt_cloud_config::resolve_cloud_config(cloud_yml.as_ref(), None);
+        if let Some(credentials) = resolved.and_then(|r| r.credentials) {
+            builder
+                .with_named_option("dbt_cloud.token", credentials.token)
+                .map_err(adbc_error_to_adapter_error)?;
+            builder
+                .with_named_option("dbt_cloud.host", credentials.host)
+                .map_err(adbc_error_to_adapter_error)?;
+            builder
+                .with_named_option("dbt_cloud.account_id", credentials.account_id)
+                .map_err(adbc_error_to_adapter_error)?;
+        }
+        Ok(builder)
+    }
+
     /// Apply DuckDB init SQL (extensions, settings, secrets, attachments)
     /// to a newly created database instance. Uses a temporary connection.
     fn apply_duckdb_init_sql(
@@ -326,26 +300,176 @@ impl XdbcEngine {
         database: &mut Box<dyn Database>,
         config: &AdapterConfig,
     ) -> AdapterResult<()> {
-        let init_stmts = dbt_auth::generate_duckdb_init_sql(config);
-        if init_stmts.is_empty() {
+        let mut all_stmts = dbt_auth::generate_duckdb_init_sql(config);
+
+        // Append v2 catalog-driven ATTACH statements for DuckDB REST catalogs
+        all_stmts.extend(self.generate_v2_catalog_attach_stmts()?);
+
+        if all_stmts.is_empty() {
             return Ok(());
         }
         let mut conn = database
             .new_connection()
             .map_err(adbc_error_to_adapter_error)?;
-        for sql in &init_stmts {
+        for (idx, sql) in all_stmts.iter().enumerate() {
             let mut stmt = conn.new_statement().map_err(adbc_error_to_adapter_error)?;
             stmt.set_sql_query(sql)
                 .map_err(adbc_error_to_adapter_error)?;
             let _ = stmt.execute_update().map_err(|e| {
                 adbc_error_to_adapter_error(adbc_core::error::Error::with_message_and_status(
-                    format!("DuckDB init SQL failed on '{sql}': {e}"),
+                    format!("DuckDB init SQL statement {} failed: {e}", idx + 1),
                     adbc_core::error::Status::Internal,
                 ))
             })?;
         }
         Ok(())
     }
+
+    /// Build v2 catalog-driven `ATTACH IF NOT EXISTS` statements for DuckDB
+    /// iceberg REST catalogs.
+    ///
+    /// Reads the global catalogs v2 state, extracts every catalog that has a
+    /// `config.duckdb` block, and emits one ATTACH per catalog. Duplicate
+    /// aliases (after sanitization) are rejected with an error.
+    fn generate_v2_catalog_attach_stmts(&self) -> AdapterResult<Vec<String>> {
+        use crate::load_catalogs;
+        use dbt_schemas::schemas::dbt_catalogs_v2::V2CatalogType;
+
+        if !load_catalogs::fetch_use_catalogs_v2() {
+            return Ok(Vec::new());
+        }
+        let Some(catalogs) = load_catalogs::fetch_catalogs() else {
+            return Ok(Vec::new());
+        };
+        let Ok(view) = catalogs.view_v2() else {
+            return Ok(Vec::new());
+        };
+
+        let mut stmts = Vec::new();
+        let mut seen_aliases: HashMap<String, String> = HashMap::new(); // alias → catalog_name
+
+        for catalog in &view.catalogs {
+            if !matches!(
+                catalog.catalog_type,
+                V2CatalogType::Glue | V2CatalogType::IcebergRest
+            ) {
+                continue;
+            }
+            let Some(duckdb) = catalog.config_block("duckdb") else {
+                continue;
+            };
+
+            let (alias, stmt) = build_duckdb_catalog_attach_stmt(catalog, duckdb)?;
+            if let Some(prior) = seen_aliases.get(&alias) {
+                return Err(AdapterError::new(
+                    AdapterErrorKind::Configuration,
+                    format!(
+                        "Catalog '{}' duckdb attach alias '{alias}' collides with catalog '{prior}'",
+                        catalog.name
+                    ),
+                ));
+            }
+            seen_aliases.insert(alias.clone(), catalog.name.to_string());
+            stmts.push(stmt);
+        }
+
+        Ok(stmts)
+    }
+}
+
+fn build_duckdb_catalog_attach_stmt(
+    catalog: &CatalogSpecV2View<'_>,
+    duckdb: &dbt_yaml::Mapping,
+) -> AdapterResult<(String, String)> {
+    let alias = crate::catalog_relation::sanitize_duckdb_identifier(
+        duckdb_get_str(duckdb, "attach_as").unwrap_or(catalog.name),
+    );
+    if alias.is_empty() {
+        return Err(AdapterError::new(
+            AdapterErrorKind::Configuration,
+            format!(
+                "Catalog '{}' duckdb attach alias is empty after sanitization",
+                catalog.name
+            ),
+        ));
+    }
+
+    let endpoint_type = duckdb_get_str(duckdb, "endpoint_type");
+    let mut opts = vec!["TYPE ICEBERG".to_string()];
+    if let Some(secret) = duckdb_get_str(duckdb, "secret") {
+        let secret = crate::catalog_relation::sanitize_duckdb_identifier(secret);
+        if !secret.is_empty() {
+            opts.push(format!("SECRET {secret}"));
+        }
+    }
+    if let Some(et) = endpoint_type {
+        opts.push(format!(
+            "ENDPOINT_TYPE {}",
+            crate::catalog_relation::sanitize_duckdb_identifier(et)
+        ));
+    }
+    if let Some(ep) = duckdb_get_str(duckdb, "endpoint") {
+        opts.push(format!("ENDPOINT '{}'", escape_duckdb_single_quotes(ep)));
+    }
+
+    for (key, sql_key) in [
+        ("default_region", "DEFAULT_REGION"),
+        ("default_schema", "DEFAULT_SCHEMA"),
+        ("max_table_staleness", "MAX_TABLE_STALENESS"),
+        ("authorization_type", "AUTHORIZATION_TYPE"),
+        ("access_delegation_mode", "ACCESS_DELEGATION_MODE"),
+    ] {
+        if let Some(val) = duckdb_get_str(duckdb, key) {
+            opts.push(format!("{sql_key} '{}'", escape_duckdb_single_quotes(val)));
+        }
+    }
+    for (key, sql_key) in [
+        ("support_nested_namespaces", "SUPPORT_NESTED_NAMESPACES"),
+        ("support_stage_create", "SUPPORT_STAGE_CREATE"),
+        ("purge_requested", "PURGE_REQUESTED"),
+    ] {
+        if let Some(val) = duckdb_get_bool(duckdb, key) {
+            opts.push(format!("{sql_key} {val}"));
+        }
+    }
+    if duckdb_get_bool(duckdb, "encode_entire_prefix").unwrap_or(false) {
+        opts.push("ENCODE_ENTIRE_PREFIX true".to_string());
+    }
+
+    // For Iceberg REST catalogs, source is the warehouse name, not the endpoint
+    // URL. DuckDB's Glue shortcut uses ":" for the default account catalog.
+    let warehouse = match endpoint_type {
+        Some(et) if et.eq_ignore_ascii_case("GLUE") => {
+            duckdb_get_str(duckdb, "warehouse").unwrap_or(":")
+        }
+        _ => duckdb_get_str(duckdb, "warehouse").unwrap_or(catalog.name),
+    };
+    let source = format!("'{}'", escape_duckdb_single_quotes(warehouse));
+
+    Ok((
+        alias.clone(),
+        format!(
+            "ATTACH IF NOT EXISTS {source} AS {alias} ({})",
+            opts.join(", ")
+        ),
+    ))
+}
+
+fn duckdb_get_str<'a>(duckdb: &'a dbt_yaml::Mapping, key: &str) -> Option<&'a str> {
+    duckdb
+        .get(dbt_yaml::Value::from(key))
+        .and_then(|v| v.as_str())
+}
+
+fn duckdb_get_bool(duckdb: &dbt_yaml::Mapping, key: &str) -> Option<bool> {
+    duckdb
+        .get(dbt_yaml::Value::from(key))
+        .and_then(|v| v.as_bool())
+}
+
+/// Escape single quotes for SQL string literals (`'` → `''`).
+fn escape_duckdb_single_quotes(s: &str) -> String {
+    s.replace('\'', "''")
 }
 
 impl AdapterEngine for XdbcEngine {
@@ -358,19 +482,12 @@ impl AdapterEngine for XdbcEngine {
         self.auth.backend()
     }
 
+    fn threads(&self) -> Option<usize> {
+        self.threads
+    }
+
     fn is_mock(&self) -> bool {
         matches!(self.mode, EngineMode::Mock)
-    }
-
-    fn is_replay(&self) -> bool {
-        matches!(self.mode, EngineMode::Replay(_))
-    }
-
-    fn recordings_dir(&self) -> Option<&Path> {
-        match &self.mode {
-            EngineMode::Record(p) | EngineMode::Replay(p) => Some(p),
-            _ => None,
-        }
     }
 
     fn quoting(&self) -> ResolvedQuoting {
@@ -408,7 +525,7 @@ impl AdapterEngine for XdbcEngine {
     fn new_connection(
         &self,
         state: Option<&State>,
-        node_id: Option<String>,
+        _node_id: Option<String>,
     ) -> AdapterResult<Box<dyn Connection>> {
         let do_create_connection =
             |adapter_type: AdapterType| -> AdapterResult<Box<dyn Connection>> {
@@ -435,16 +552,7 @@ impl AdapterEngine for XdbcEngine {
 
         match &self.mode {
             EngineMode::Mock => Ok(Box::new(NoopConnection)),
-            EngineMode::Replay(path) => {
-                let replay_engine_conn = ReplayEngineConnection::new(path.clone(), node_id);
-                Ok(Box::new(replay_engine_conn))
-            }
             EngineMode::Live => do_create_connection(self.adapter_type),
-            EngineMode::Record(path) => {
-                let conn = do_create_connection(self.adapter_type)?;
-                let record_engine_conn = RecordEngineConnection::new(path.clone(), conn, node_id);
-                Ok(Box::new(record_engine_conn))
-            }
         }
     }
 
@@ -452,18 +560,15 @@ impl AdapterEngine for XdbcEngine {
         &self,
         config: &AdapterConfig,
     ) -> AdapterResult<Box<dyn Connection>> {
-        if let EngineMode::Replay(path) = &self.mode {
-            return Ok(Box::new(ReplayEngineConnection::new(path.clone(), None)));
-        }
         if !self.mode.has_real_connections() {
             return Ok(Box::new(NoopConnection));
         }
         let mut database = self.load_driver_and_configure_database(config)?;
-        let connection_builder = connection::Builder::default();
-        let conn = connection_builder
-            .build(&mut database)
-            .map_err(|e| enrich_connection_error(self.adapter_type(), e, config))?;
-        Ok(conn)
+        let connect = || connection::Builder::default().build(&mut database);
+        let retry_policy = ConnectionRetryPolicy::new(self.adapter_type(), config);
+        retry_policy
+            .execute(config, connect)
+            .map_err(|e| enrich_connection_error(self.adapter_type(), e, config))
     }
 
     fn execute_with_options(
@@ -557,5 +662,74 @@ Original error: {}",
             AdapterError::new(adbc_error_to_adapter_error(err).kind(), message)
         }
         _ => adbc_error_to_adapter_error(err),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dbt_schemas::schemas::dbt_catalogs::DbtCatalogs;
+
+    fn attach_stmt(yaml: &str) -> AdapterResult<String> {
+        let parsed: dbt_yaml::Value = dbt_yaml::from_str(yaml).expect("valid YAML");
+        let dbt_yaml::Value::Mapping(repr, span) = parsed else {
+            panic!("expected top-level mapping");
+        };
+        let catalogs = DbtCatalogs::new(repr, span);
+        let view = catalogs.view_v2().expect("valid v2 view");
+        let catalog = view.catalogs.first().expect("one catalog");
+        let duckdb = catalog.config_block("duckdb").expect("duckdb block");
+        build_duckdb_catalog_attach_stmt(catalog, duckdb).map(|(_, stmt)| stmt)
+    }
+
+    #[test]
+    fn duckdb_catalog_attach_uses_profile_secret_reference_and_safe_options() {
+        let stmt = attach_stmt(
+            r#"
+catalogs:
+  - name: rest_catalog
+    type: iceberg_rest
+    table_format: iceberg
+    config:
+      duckdb:
+        endpoint: "https://rest.example.com"
+        warehouse: "warehouse_name"
+        secret: "iceberg_secret"
+        attach_as: "iceberg_db"
+        default_schema: "demo"
+        max_table_staleness: "10 minutes"
+        support_nested_namespaces: false
+        support_stage_create: true
+        purge_requested: false
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            stmt,
+            "ATTACH IF NOT EXISTS 'warehouse_name' AS iceberg_db (TYPE ICEBERG, SECRET iceberg_secret, ENDPOINT 'https://rest.example.com', DEFAULT_SCHEMA 'demo', MAX_TABLE_STALENESS '10 minutes', SUPPORT_NESTED_NAMESPACES false, SUPPORT_STAGE_CREATE true, PURGE_REQUESTED false)"
+        );
+    }
+
+    #[test]
+    fn duckdb_glue_endpoint_type_defaults_to_current_account_catalog() {
+        let stmt = attach_stmt(
+            r#"
+catalogs:
+  - name: glue_catalog
+    type: glue
+    table_format: iceberg
+    config:
+      duckdb:
+        endpoint_type: GLUE
+        secret: "aws_secret"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            stmt,
+            "ATTACH IF NOT EXISTS ':' AS glue_catalog (TYPE ICEBERG, SECRET aws_secret, ENDPOINT_TYPE GLUE)"
+        );
     }
 }
