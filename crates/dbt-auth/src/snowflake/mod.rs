@@ -1707,7 +1707,7 @@ mod tests {
             (snowflake::WAREHOUSE, "warehouse"),
             (snowflake::APPLICATION_NAME, APP_NAME),
             (snowflake::LOG_TRACING, "fatal"), // default
-            (snowflake::LOGIN_TIMEOUT, DEFAULT_CONNECT_TIMEOUT),
+            (snowflake::LOGIN_TIMEOUT, LOGIN_TIMEOUT),
             (snowflake::REQUEST_TIMEOUT, DEFAULT_REQUEST_TIMEOUT),
         ];
         run_config_test(config, &expected);
@@ -1734,7 +1734,7 @@ mod tests {
             (snowflake::WAREHOUSE, "warehouse"),
             (snowflake::APPLICATION_NAME, APP_NAME),
             (snowflake::LOG_TRACING, "debug"), // configured via env var
-            (snowflake::LOGIN_TIMEOUT, DEFAULT_CONNECT_TIMEOUT),
+            (snowflake::LOGIN_TIMEOUT, LOGIN_TIMEOUT),
             (snowflake::REQUEST_TIMEOUT, DEFAULT_REQUEST_TIMEOUT),
         ];
         run_config_test(config, &expected);
@@ -1765,7 +1765,7 @@ mod tests {
             (snowflake::WAREHOUSE, "warehouse"),
             (snowflake::APPLICATION_NAME, APP_NAME),
             (snowflake::LOG_TRACING, "info"), // configured via env var
-            (snowflake::LOGIN_TIMEOUT, DEFAULT_CONNECT_TIMEOUT),
+            (snowflake::LOGIN_TIMEOUT, LOGIN_TIMEOUT),
             (snowflake::REQUEST_TIMEOUT, DEFAULT_REQUEST_TIMEOUT),
         ];
         run_config_test(config, &expected);
@@ -1796,7 +1796,7 @@ mod tests {
             (snowflake::WAREHOUSE, "warehouse"),
             (snowflake::APPLICATION_NAME, APP_NAME),
             (snowflake::LOG_TRACING, "trace"), // configured via env var
-            (snowflake::LOGIN_TIMEOUT, DEFAULT_CONNECT_TIMEOUT),
+            (snowflake::LOGIN_TIMEOUT, LOGIN_TIMEOUT),
             (snowflake::REQUEST_TIMEOUT, DEFAULT_REQUEST_TIMEOUT),
         ];
         run_config_test(config, &expected);
@@ -1827,7 +1827,7 @@ mod tests {
             (snowflake::WAREHOUSE, "warehouse"),
             (snowflake::APPLICATION_NAME, APP_NAME),
             (snowflake::LOG_TRACING, "debug"), // case-insensitive
-            (snowflake::LOGIN_TIMEOUT, DEFAULT_CONNECT_TIMEOUT),
+            (snowflake::LOGIN_TIMEOUT, LOGIN_TIMEOUT),
             (snowflake::REQUEST_TIMEOUT, DEFAULT_REQUEST_TIMEOUT),
         ];
         run_config_test(config, &expected);
@@ -1858,7 +1858,7 @@ mod tests {
             (snowflake::WAREHOUSE, "warehouse"),
             (snowflake::APPLICATION_NAME, APP_NAME),
             (snowflake::LOG_TRACING, "fatal"), // falls back to default
-            (snowflake::LOGIN_TIMEOUT, DEFAULT_CONNECT_TIMEOUT),
+            (snowflake::LOGIN_TIMEOUT, LOGIN_TIMEOUT),
             (snowflake::REQUEST_TIMEOUT, DEFAULT_REQUEST_TIMEOUT),
         ];
         run_config_test(config, &expected);
