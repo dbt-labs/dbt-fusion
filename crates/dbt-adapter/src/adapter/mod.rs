@@ -1,4 +1,3 @@
-use crate::cache::RelationCache;
 use crate::cast_util::downcast_value_to_dyn_base_relation;
 use crate::catalog_relation::CatalogRelation;
 #[cfg(debug_assertions)]
@@ -3932,6 +3931,39 @@ impl Adapter {
                 let location = iter.next_arg::<&str>()?;
                 iter.finish()?;
                 self.location_exists(state, location)
+            }
+            "get_csv_data" => {
+                // agate_table: AgateTable -> str
+                // Returns all rows formatted as CSV (no header) for ClickHouse FORMAT CSV.
+                let table = args
+                    .first()
+                    .ok_or_else(|| {
+                        minijinja::Error::new(
+                            minijinja::ErrorKind::MissingArgument,
+                            "get_csv_data requires agate_table argument",
+                        )
+                    })?
+                    .downcast_object::<AgateTable>()
+                    .ok_or_else(|| {
+                        minijinja::Error::new(
+                            minijinja::ErrorKind::InvalidOperation,
+                            "get_csv_data: argument must be an AgateTable",
+                        )
+                    })?;
+                let batch = table.original_record_batch();
+                let mut buf: Vec<u8> = Vec::new();
+                let mut writer = arrow::csv::WriterBuilder::new()
+                    .with_header(false)
+                    .build(&mut buf);
+                writer.write(&batch).map_err(|e| {
+                    minijinja::Error::new(
+                        minijinja::ErrorKind::InvalidOperation,
+                        format!("get_csv_data: failed to format CSV: {e}"),
+                    )
+                })?;
+                drop(writer);
+                let csv = String::from_utf8_lossy(&buf).into_owned();
+                Ok(Value::from(csv))
             }
             _ => Err(minijinja::Error::new(
                 minijinja::ErrorKind::UnknownMethod,
