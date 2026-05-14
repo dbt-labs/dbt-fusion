@@ -1,17 +1,47 @@
 {% macro clickhouse__load_csv_rows(model, agate_table) %}
+  {# Fusion: use literal-value INSERT with explicit escaping.
+     The ClickHouse ADBC driver (0.1.0-alpha.1) incorrectly treats '?' anywhere in the
+     SQL string as a bind-parameter placeholder — even inside FORMAT CSV data or quoted
+     string literals.  Workaround: escape '?' as '\x3F' (ClickHouse hex escape = '?'),
+     so the driver counts zero bind params while ClickHouse decodes the value correctly.
+     Track: https://github.com/dbt-labs/dbt-fusion/pull/1710 #}
+  {% set batch_size = get_batch_size() %}
   {% set cols_sql = get_seed_column_quoted_csv(model, agate_table.column_names) %}
-  {% set data_sql = adapter.get_csv_data(agate_table) %}
+  {% set statements = [] %}
 
-  {% if data_sql %}
+  {% for chunk in agate_table.rows | batch(batch_size) %}
+    {% set ns = namespace(row_strs=[]) %}
+    {% for row in chunk %}
+      {% set ns2 = namespace(vals=[]) %}
+      {% for val in row %}
+        {%- if val is none -%}
+          {% do ns2.vals.append('NULL') %}
+        {%- elif val is number -%}
+          {% do ns2.vals.append(val | string) %}
+        {%- else -%}
+          {%- set escaped = val | string
+              | replace("\\", "\\\\")
+              | replace("'", "\\'")
+              | replace("?", "\\x3F") -%}
+          {% do ns2.vals.append("'" ~ escaped ~ "'") %}
+        {%- endif -%}
+      {% endfor %}
+      {% do ns.row_strs.append('(' ~ ns2.vals | join(', ') ~ ')') %}
+    {% endfor %}
+
     {% set sql -%}
-      insert into {{ this.render() }} ({{ cols_sql }})
-      {{ adapter.get_model_query_settings(model) }}
-      format CSV
-      {{ data_sql }}
+      INSERT INTO {{ this.render() }} ({{ cols_sql }}) VALUES
+      {{ ns.row_strs | join(',\n      ') }}
     {%- endset %}
 
     {% do adapter.add_query(sql, abridge_sql_log=True) %}
-  {% endif %}
+
+    {% if loop.index0 == 0 %}
+      {% do statements.append(sql) %}
+    {% endif %}
+  {% endfor %}
+
+  {{ return(statements[0] if statements else '') }}
 {% endmacro %}
 
 {% macro clickhouse__create_csv_table(model, agate_table) %}
