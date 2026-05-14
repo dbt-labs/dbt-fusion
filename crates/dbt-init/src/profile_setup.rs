@@ -158,6 +158,7 @@ impl ProfileSetup {
             AdapterType::Snowflake,
             AdapterType::Databricks,
             AdapterType::Bigquery,
+            AdapterType::ClickHouse,
             AdapterType::Postgres,
             AdapterType::Redshift,
         ]
