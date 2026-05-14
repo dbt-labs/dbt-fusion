@@ -3932,6 +3932,14 @@ impl Adapter {
                 iter.finish()?;
                 self.location_exists(state, location)
             }
+            "get_model_query_settings" => {
+                // model: dict -> SETTINGS clause appended to CREATE TABLE ... AS (SELECT ...)
+                // Default join_use_nulls=1 makes unmatched LEFT JOIN rows produce NULL
+                // instead of ClickHouse's default type-zero values (0 for Int64, etc.),
+                // restoring standard SQL semantics.
+                // Users can override via model config `query_settings`.
+                Ok(Value::from("SETTINGS join_use_nulls = 1"))
+            }
             "get_csv_data" => {
                 // agate_table: AgateTable -> str
                 // Returns all rows formatted as CSV (no header) for ClickHouse FORMAT CSV.
