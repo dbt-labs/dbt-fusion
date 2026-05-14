@@ -562,13 +562,13 @@ pub trait BaseRelation: BaseRelationProperties + Any + Send + Sync + fmt::Debug 
                 start.map(|start| format!("{event_time} >= '{start}'")),
                 end.map(|end| format!("{event_time} < '{end}'")),
             ),
-            // ClickHouse: parseDateTimeBestEffort handles Date / DateTime / DateTime64
-            // alike and accepts ISO-8601 strings with arbitrary sub-second precision.
+            // ClickHouse: parseDateTime64BestEffort preserves sub-second boundaries
+            // for DateTime64 event-time columns.
             AdapterType::ClickHouse => (
                 start.map(|start| {
-                    format!("{event_time} >= parseDateTimeBestEffort('{start}')")
+                    format!("{event_time} >= parseDateTime64BestEffort('{start}', 9)")
                 }),
-                end.map(|end| format!("{event_time} < parseDateTimeBestEffort('{end}')")),
+                end.map(|end| format!("{event_time} < parseDateTime64BestEffort('{end}', 9)")),
             ),
             AdapterType::Exasol => todo!("Exasol"),
             AdapterType::Starburst => todo!("Starburst"),
