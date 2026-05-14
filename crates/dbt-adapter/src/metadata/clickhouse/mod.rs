@@ -28,6 +28,13 @@ use std::sync::Arc;
 
 const MAX_CONNECTIONS: usize = 4;
 
+/// Escape a value to be safely interpolated inside a single-quoted ClickHouse
+/// string literal. ClickHouse uses backslash escaping for `\` and `'` within
+/// string literals (see <https://clickhouse.com/docs/en/sql-reference/syntax#string>).
+pub(crate) fn escape_clickhouse_string_literal(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
 pub struct ClickHouseMetadataAdapter {
     adapter: AdapterImpl,
 }
@@ -164,10 +171,26 @@ impl MetadataAdapter for ClickHouseMetadataAdapter {
     ) -> AsyncAdapterResult<'_, HashMap<String, AdapterResult<Arc<Schema>>>> {
         type Acc = HashMap<String, AdapterResult<Arc<Schema>>>;
 
-        let table_names = relations
+        // ClickHouse is a 2-part name system: dbt `schema` maps to CH `database`,
+        // and the dbt `database` field is unused/empty. The DESCRIBE TABLE SQL must
+        // use `schema.identifier` (unquoted), but the HashMap key that callers look
+        // up via `schemas.get(&semantic_fqn)` must match `relation.semantic_fqn()`.
+        // These two are different strings, so we carry both through MapReduce as a
+        // tuple `(semantic_fqn, sql_name)`.
+        let keys: Vec<(String, String)> = relations
             .iter()
-            .map(|relation| relation.render_self_as_str())
-            .collect::<Vec<_>>();
+            .map(|relation| {
+                let semantic_fqn = relation.semantic_fqn();
+                let schema = relation.schema_as_str().unwrap_or_default();
+                let identifier = relation.identifier_as_str().unwrap_or_default();
+                let sql_name = if schema.is_empty() {
+                    identifier
+                } else {
+                    format!("{schema}.{identifier}")
+                };
+                (semantic_fqn, sql_name)
+            })
+            .collect();
 
         let factory = Box::new(AdapterConnectionFactory::new(
             self.adapter.engine().clone(),
@@ -177,11 +200,12 @@ impl MetadataAdapter for ClickHouseMetadataAdapter {
         let adapter = self.adapter.clone();
         let token_clone = token.clone();
         let map_f = move |conn: &'_ mut dyn Connection,
-                          table_name: &String|
+                          key: &(String, String)|
               -> AdapterResult<Arc<Schema>> {
+            let (_semantic_fqn, sql_name) = key;
             // ClickHouse DESCRIBE TABLE returns: name, type, default_type, default_expression,
             // comment, codec_expression, ttl_expression
-            let sql = format!("DESCRIBE TABLE {};", &table_name);
+            let sql = format!("DESCRIBE TABLE {};", sql_name);
             let mut ctx = QueryCtx::default().with_desc("Get table schema");
             if let Some(node_id) = unique_id.clone() {
                 ctx = ctx.with_node_id(&node_id);
@@ -196,15 +220,18 @@ impl MetadataAdapter for ClickHouseMetadataAdapter {
         };
 
         let reduce_f = |acc: &mut Acc,
-                        table_name: String,
+                        key: (String, String),
                         schema: AdapterResult<Arc<Schema>>|
          -> Result<(), Cancellable<AdapterError>> {
-            acc.insert(table_name, schema);
+            let (semantic_fqn, _sql_name) = key;
+            // Insert under the semantic FQN so callers using `schemas.get(&relation.semantic_fqn())`
+            // can find the entry.
+            acc.insert(semantic_fqn, schema);
             Ok(())
         };
 
         let map_reduce = MapReduce::new(factory, Box::new(map_f), Box::new(reduce_f), None);
-        map_reduce.run(Arc::new(table_names), token)
+        map_reduce.run(Arc::new(keys), token)
     }
 
     fn list_relations_schemas_by_patterns_inner(
@@ -306,13 +333,13 @@ pub fn list_relations(
         db_schema.resolved_schema.to_lowercase()
     };
 
-    let query_database_literal = clickhouse_string_literal(&query_database);
+    let escaped_database = escape_clickhouse_string_literal(&query_database);
     let sql = format!(
-        "SELECT database AS table_database, \\
-                name AS table_name, \\
-                engine AS table_type \\
-         FROM system.tables \\
-         WHERE database = {query_database_literal}"
+        "SELECT database AS table_database, \
+                name AS table_name, \
+                engine AS table_type \
+         FROM system.tables \
+         WHERE database = '{escaped_database}'"
     );
 
     let batch = engine.execute(None, conn, ctx, &sql, token)?;
@@ -334,7 +361,7 @@ pub fn list_relations(
 
         let relation = do_create_relation(
             engine.adapter_type(),
-            String::new(),
+            database.to_string(),
             database.to_string(),
             Some(name.to_string()),
             Some(relation_type),
@@ -362,11 +389,6 @@ pub fn relation_type_from_engine(engine_name: &str) -> RelationType {
         // GraphiteMergeTree, Replicated*, Distributed, Memory, Log, etc.) is a table.
         _ => RelationType::Table,
     }
-}
-
-pub(crate) fn clickhouse_string_literal(value: &str) -> String {
-    let escaped = value.replace('\\', "\\\\\\\\").replace('\'', "\\\\'");
-    format!("'{escaped}'")
 }
 
 /// Build an Arrow Schema from ClickHouse's `DESCRIBE TABLE` output.
