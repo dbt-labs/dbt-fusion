@@ -678,10 +678,10 @@ fn exasol_get_relation(
     let q_ident = identifier.to_uppercase();
 
     let sql = format!(
-        "select 'table' as \"type\" from sys.exa_all_tables \
-         where table_schema = '{q_schema}' and table_name = '{q_ident}' \
-         union all \
-         select 'view' from sys.exa_all_views \
+        "select 'table' as \"type\" from sys.exa_all_tables \\
+         where table_schema = '{q_schema}' and table_name = '{q_ident}' \\
+         union all \\
+         select 'view' from sys.exa_all_views \\
          where view_schema = '{q_schema}' and view_name = '{q_ident}'"
     );
     let batch = adapter
@@ -893,7 +893,7 @@ fn clickhouse_get_relation(
     identifier: &str,
     token: CancellationToken,
 ) -> AdapterResult<Option<Box<dyn BaseRelation>>> {
-    use crate::metadata::clickhouse::relation_type_from_engine;
+    use crate::metadata::clickhouse::{clickhouse_string_literal, relation_type_from_engine};
 
     // ClickHouse only has databases, not schemas — dbt `schema` maps to CH `database`.
     // dbt `database` is unused here.
@@ -909,11 +909,13 @@ fn clickhouse_get_relation(
         identifier.to_lowercase()
     };
 
+    let query_database_literal = clickhouse_string_literal(&query_database);
+    let query_identifier_literal = clickhouse_string_literal(&query_identifier);
     let sql = format!(
-        "SELECT engine, name \
-         FROM system.tables \
-         WHERE database = '{query_database}' \
-           AND name = '{query_identifier}'",
+        "SELECT engine, name \\
+         FROM system.tables \\
+         WHERE database = {query_database_literal} \\
+           AND name = {query_identifier_literal}",
     );
 
     let batch = adapter

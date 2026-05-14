@@ -166,7 +166,7 @@ impl MetadataAdapter for ClickHouseMetadataAdapter {
 
         let table_names = relations
             .iter()
-            .map(|relation| relation.semantic_fqn())
+            .map(|relation| relation.render_self_as_str())
             .collect::<Vec<_>>();
 
         let factory = Box::new(AdapterConnectionFactory::new(
@@ -306,12 +306,13 @@ pub fn list_relations(
         db_schema.resolved_schema.to_lowercase()
     };
 
+    let query_database_literal = clickhouse_string_literal(&query_database);
     let sql = format!(
-        "SELECT database AS table_database, \
-                name AS table_name, \
-                engine AS table_type \
-         FROM system.tables \
-         WHERE database = '{query_database}'"
+        "SELECT database AS table_database, \\
+                name AS table_name, \\
+                engine AS table_type \\
+         FROM system.tables \\
+         WHERE database = {query_database_literal}"
     );
 
     let batch = engine.execute(None, conn, ctx, &sql, token)?;
@@ -333,7 +334,7 @@ pub fn list_relations(
 
         let relation = do_create_relation(
             engine.adapter_type(),
-            database.to_string(),
+            String::new(),
             database.to_string(),
             Some(name.to_string()),
             Some(relation_type),
@@ -361,6 +362,11 @@ pub fn relation_type_from_engine(engine_name: &str) -> RelationType {
         // GraphiteMergeTree, Replicated*, Distributed, Memory, Log, etc.) is a table.
         _ => RelationType::Table,
     }
+}
+
+pub(crate) fn clickhouse_string_literal(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\\\\\").replace('\'', "\\\\'");
+    format!("'{escaped}'")
 }
 
 /// Build an Arrow Schema from ClickHouse's `DESCRIBE TABLE` output.
