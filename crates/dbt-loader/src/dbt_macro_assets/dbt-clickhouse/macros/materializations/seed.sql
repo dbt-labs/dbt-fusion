@@ -1,9 +1,10 @@
 {% macro clickhouse__load_csv_rows(model, agate_table) %}
   {# Fusion: use literal-value INSERT with explicit escaping.
-     The ClickHouse ADBC driver (0.1.0-alpha.1) incorrectly treats '?' anywhere in the
-     SQL string as a bind-parameter placeholder — even inside FORMAT CSV data or quoted
-     string literals.  Workaround: escape '?' as '\x3F' (ClickHouse hex escape = '?'),
-     so the driver counts zero bind params while ClickHouse decodes the value correctly.
+     The ClickHouse ADBC driver uses clickhouse-rs's SqlBuilder which treats every '?'
+     as a positional bind-param placeholder, even inside quoted string literals.
+     Workaround: escape '?' as '??' which SqlBuilder converts back to a literal '?'.
+     This is the intended clickhouse-rs escape mechanism.
+     Bug: https://github.com/adbc-drivers/clickhouse/issues/15
      Track: https://github.com/dbt-labs/dbt-fusion/pull/1710 #}
   {% set batch_size = get_batch_size() %}
   {% set cols_sql = get_seed_column_quoted_csv(model, agate_table.column_names) %}
@@ -22,7 +23,7 @@
           {%- set escaped = val | string
               | replace("\\", "\\\\")
               | replace("'", "\\'")
-              | replace("?", "\\x3F") -%}
+              | replace("?", "??") -%}
           {% do ns2.vals.append("'" ~ escaped ~ "'") %}
         {%- endif -%}
       {% endfor %}
