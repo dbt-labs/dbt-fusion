@@ -16,15 +16,6 @@ impl InteractiveSetup for ClickHouseDbConfig {
                 required: true,
             },
             ConfigField {
-                name: "port".to_string(),
-                field_type: FieldType::Input {
-                    default: Some("8123".to_string()),
-                },
-                condition: FieldCondition::Always,
-                prompt: "Port".to_string(),
-                required: true,
-            },
-            ConfigField {
                 name: "user".to_string(),
                 field_type: FieldType::Input {
                     default: Some("default".to_string()),
@@ -59,6 +50,30 @@ impl InteractiveSetup for ClickHouseDbConfig {
                 field_type: FieldType::Confirm { default: false },
                 condition: FieldCondition::Always,
                 prompt: "Enable HTTPS (secure)?".to_string(),
+                required: true,
+            },
+            ConfigField {
+                name: "port".to_string(),
+                field_type: FieldType::Input {
+                    default: Some("8123".to_string()),
+                },
+                condition: FieldCondition::IfFieldEquals {
+                    field_name: "secure".to_string(),
+                    value: FieldValue::Boolean(false),
+                },
+                prompt: "Port".to_string(),
+                required: true,
+            },
+            ConfigField {
+                name: "port".to_string(),
+                field_type: FieldType::Input {
+                    default: Some("8443".to_string()),
+                },
+                condition: FieldCondition::IfFieldEquals {
+                    field_name: "secure".to_string(),
+                    value: FieldValue::Boolean(true),
+                },
+                prompt: "Port".to_string(),
                 required: true,
             },
         ]
