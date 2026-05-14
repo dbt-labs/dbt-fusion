@@ -133,7 +133,7 @@ impl Backend {
             Backend::SQLServer => Some("adbc_driver_mssql"),
             Backend::DatabricksODBC | Backend::RedshiftODBC => None, // these use ODBC
             Backend::Athena => Some("adbc_driver_athena"),
-            Backend::ClickHouse => Some("adbc_driver_clickhouse"),
+            Backend::ClickHouse => Some("adbc_clickhouse"),
             Backend::Exasol => Some("adbc_driver_exasol"),
             Backend::Generic { library_name, .. } => Some(library_name),
         }
@@ -440,6 +440,8 @@ impl AdbcDriver {
             }
             // CDN strategy for non-CDN drivers: just fall back to the system strategy.
             (CdnCache | SystemThenCdnCache | Remote, Athena | Exasol) => System(None),
+            // ClickHouse uses CDN loading; Remote also maps to CdnCache for ClickHouse.
+            (Remote, ClickHouse) => CdnCache,
             // Generic drivers can only be loaded from a file, so fallback to the System strategy.
             (CdnCache | SystemThenCdnCache | Remote, Generic { library_name, .. }) => {
                 System(Some(library_name.to_string()))
@@ -452,7 +454,7 @@ impl AdbcDriver {
             (
                 load_strategy @ Remote,
                 Snowflake | BigQuery | Postgres | Databricks | Redshift | Spark | DuckDBExtended
-                | Salesforce | SQLServer | ClickHouse,
+                | Salesforce | SQLServer,
             ) => load_strategy,
         };
 
@@ -691,7 +693,7 @@ mod tests {
         // try_load_with_builder(Backend::Spark, AdbcVersion::V110)?;
         // try_load_with_builder(Backend::SQLServer, AdbcVersion::V110)?;
         try_load_with_builder(Backend::ClickHouse, AdbcVersion::V110)?;
-        // try_load_with_builder(Backend::Exasol, AdbcVersion::V110)?;
+        // try_load_with_builder(Backend::Exasol, AdbcVersion::V100)?;
         Ok(())
     }
 
