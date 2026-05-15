@@ -1,0 +1,14 @@
+---
+source: crates/dbt-jinja-utils/tests/test_typechecking.rs
+assertion_line: 96
+expression: snapshot
+---
+warnings:
+  - line: 1
+    col: 1
+    file: test.jinja
+    message: "Potential TypeError: Filter 'upper' is not defined."
+  - line: 1
+    col: 4
+    file: test.jinja
+    message: "Potential TypeError: Unknown local variable 'name'"
