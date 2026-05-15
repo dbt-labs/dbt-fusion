@@ -4,7 +4,7 @@
 
 ---
 
-# dbt F✦SION engine (BETA)
+# dbt F✦SION engine (BETA) TESTING
 
 This repo hosts components of the dbt Fusion engine, the foundation for future innovation in `dbt`. The dbt Fusion engine is written in Rust and is designed for speed, correctness, and has a native understanding of SQL across multiple data warehouse SQL dialects.
 
