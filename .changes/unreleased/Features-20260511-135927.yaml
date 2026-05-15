@@ -1,0 +1,7 @@
+kind: Features
+body: Add ClickHouse profile parity settings to dbt-schemas
+time: 2026-05-11T13:59:27.695786-04:00
+custom:
+    author: koletzilla
+    issue: ""
+    project: dbt-fusion
