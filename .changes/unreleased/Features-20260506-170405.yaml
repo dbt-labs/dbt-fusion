@@ -1,0 +1,7 @@
+kind: Features
+body: Add ClickHouse event-time filtering (parseDateTimeBestEffort) and time-machine semantic annotations for 15 adapter methods
+time: 2026-05-06T17:04:05.900072-04:00
+custom:
+    author: dataders
+    issue: "9939"
+    project: dbt-fusion
