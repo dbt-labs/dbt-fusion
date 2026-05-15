@@ -1,0 +1,12 @@
+kind: Fixes
+body: >-
+  Fix CREATE_VIEW_COLUMN_ARITY_MISMATCH error when persist_docs.columns=true is used
+  with struct columns in Databricks views. dbt-fusion's AgateTable flattens struct
+  columns (e.g. my_struct → my_struct/f1, my_struct/f2) which caused invalid column
+  lists in CREATE OR REPLACE VIEW DDL. A new databricks__get_columns_in_query override
+  deduplicates struct sub-fields back to root column names before building the column list.
+time: 2026-03-09T00:00:00.000000+00:00
+custom:
+    author: ""
+    issue: "1299"
+    project: dbt-fusion
