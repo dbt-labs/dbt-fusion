@@ -1,0 +1,7 @@
+kind: Under the Hood
+body: Enable ClickHouse ADBC driver assertions in dbt-xdbc driver-load tests
+time: 2026-05-04T10:56:05.130707-05:00
+custom:
+    author: dave-connors-3
+    issue: "9511"
+    project: dbt-fusion

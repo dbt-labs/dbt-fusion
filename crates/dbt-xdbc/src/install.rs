@@ -12,9 +12,10 @@ use percent_encoding::AsciiSet;
 use sha2::{Digest, Sha256};
 use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
 
-static INSTALLABLE_DRIVERS: &[Backend; 9] = &[
+static INSTALLABLE_DRIVERS: &[Backend; 10] = &[
     Backend::Snowflake,
     Backend::BigQuery,
+    Backend::ClickHouse,
     Backend::Postgres,
     Backend::Databricks,
     Backend::Redshift,
@@ -308,8 +309,8 @@ pub fn backend_name_and_version(backend: Backend) -> (&'static str, &'static str
         Backend::Salesforce => ("salesforce", SALESFORCE_DRIVER_VERSION),
         Backend::DuckDBExtended => ("duckdb", DUCKDB_EXTENDED_DRIVER_VERSION),
         Backend::SQLServer => ("mssql", MSSQLSERVER_DRIVER_VERSION),
+        Backend::ClickHouse => ("clickhouse", CLICKHOUSE_DRIVER_VERSION),
         Backend::Athena
-        | Backend::ClickHouse
         | Backend::Exasol
         | Backend::DatabricksODBC
         | Backend::RedshiftODBC
@@ -673,8 +674,10 @@ mod tests {
             for (os, archs) in target_os_and_archs.iter() {
                 for arch in archs {
                     match (backend, *os, *arch) {
-                        // no driver available for Intel Macs connecting to MS SQL
-                        (Backend::SQLServer, MACOS_TARGET_OS, "x86_64") => continue,
+                        // no driver available for Intel Macs connecting to MS SQL or ClickHouse
+                        (Backend::SQLServer | Backend::ClickHouse, MACOS_TARGET_OS, "x86_64") => {
+                            continue;
+                        }
                         _ => {
                             let triplet = DriverTriplet { os, arch, version };
                             let checksum = find_expected_checksum(backend_name, triplet);
