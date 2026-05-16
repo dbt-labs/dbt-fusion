@@ -1,0 +1,7 @@
+kind: Features
+body: 'Add complete dbt-clickhouse macro package: materialized_view, incremental, snapshot, dictionary, distributed, s3, and unit materializations plus persist_docs, apply_grants, column_spec_ddl, and schema_tests macros'
+time: 2026-05-06T13:13:04.912225-04:00
+custom:
+    author: dataders
+    issue: "9883"
+    project: dbt-fusion
