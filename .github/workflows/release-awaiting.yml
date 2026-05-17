@@ -32,7 +32,36 @@ jobs:
       !contains(toJson(github.event.issue.labels.*.name), 'release/released') &&
       !contains(toJson(github.event.issue.labels.*.name), 'release/rolled-back')
     steps:
-      - uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # actions/github-script@v7
+      # Check that the issue was closed by a merged PR. state_reason == 'completed'
+      # alone is not enough - it's also set when an issue is manually closed as
+      # completed without a direct fix due to a "wontfix" or was accidentally fixed
+      # by some other change which was addressing a different issue.
+      - name: Check for associated merged pull request
+        id: check-pr
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const result = await github.graphql(`
+              query($owner: String!, $repo: String!, $number: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  issue(number: $number) {
+                    closedByPullRequestsReferences(first: 10, includeClosedPrs: true) {
+                      nodes { merged }
+                    }
+                  }
+                }
+              }
+            `, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              number: context.issue.number,
+            });
+            const prs = result.repository.issue.closedByPullRequestsReferences.nodes;
+            return prs.some(pr => pr.merged);
+
+      - if: steps.check-pr.outputs.result == 'true'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
