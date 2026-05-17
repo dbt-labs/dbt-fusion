@@ -1,0 +1,7 @@
+kind: Fixes
+body: Fix normalization of paths (stop silently dropping leading ../ from paths)
+time: 2026-05-13T14:07:24.198516+02:00
+custom:
+    author: Janiczek
+    issue: "1719"
+    project: dbt-fusion

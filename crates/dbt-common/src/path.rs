@@ -52,7 +52,7 @@ pub fn get_target_write_path(
     path: &Path,
     original_file_path: &Path,
 ) -> PathBuf {
-    let abs_ofp = in_dir.join(original_file_path).normalize();
+    let abs_ofp = normalize(&in_dir.join(original_file_path));
     let escapes_root = !abs_ofp.starts_with(in_dir);
     let path_segment = if escapes_root {
         path.to_path_buf()
@@ -64,7 +64,33 @@ pub fn get_target_write_path(
     out_dir.join(package_name).join(path_segment)
 }
 
-use normalize_path::NormalizePath;
+/// Normalizes a path (without IO) without dropping leading `..` components (unlike
+/// `normalize_path::NormalizePath::normalize()`, which was previously used).
+///
+/// This is important for multi-project scenarios where eg. model-paths contain paths like
+/// `../sources` - normalize() will keep paths like `../sources/foo.yml` instead of converting them to
+/// `sources/foo.yml`.
+fn normalize(path: &Path) -> PathBuf {
+    let mut components: Vec<Component> = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                match components.last() {
+                    Some(Component::Normal(_)) => {
+                        components.pop();
+                    }
+                    Some(Component::ParentDir) | None => {
+                        components.push(component);
+                    }
+                    Some(Component::RootDir | Component::Prefix(_) | Component::CurDir) => {}
+                }
+            }
+            other => components.push(other),
+        }
+    }
+    components.iter().collect()
+}
 
 /// Self-normalizing path. Wrapper around [PathBuf].
 /// Case-sensitivity for equality ([PartialEq] and [Eq]) is determined by the OS.
@@ -76,7 +102,7 @@ pub struct DbtPath(PathBuf);
 #[allow(unused)]
 impl DbtPath {
     pub fn from_path<P: AsRef<Path>>(path: P) -> Self {
-        Self(path.as_ref().normalize())
+        Self(normalize(path.as_ref()))
     }
 
     /// See [PathBuf::as_path] for documentation.
@@ -120,7 +146,7 @@ impl DbtPath {
 
     /// See [Path::join] for documentation.
     pub fn join(&self, path: &DbtPath) -> Self {
-        Self(self.0.join(path.as_path()).normalize())
+        Self(normalize(&self.0.join(path.as_path())))
     }
 
     /// Case-sensitivity based on the OS.
@@ -137,7 +163,7 @@ impl DbtPath {
     /// Case-sensitivity based on the OS.
     pub fn get_relative_path(&self, base_path: &DbtPath) -> Option<Self> {
         Some(Self(
-            diff_paths_os_ascii_case(&self.0, &base_path.0)?.normalize(),
+            normalize(&diff_paths_os_ascii_case(&self.0, &base_path.0)?),
         ))
     }
 
@@ -154,19 +180,19 @@ impl DbtPath {
 
 impl From<String> for DbtPath {
     fn from(value: String) -> Self {
-        Self(PathBuf::from(value).normalize())
+        Self(normalize(&PathBuf::from(value)))
     }
 }
 
 impl From<&String> for DbtPath {
     fn from(value: &String) -> Self {
-        Self(PathBuf::from(value).normalize())
+        Self(normalize(&PathBuf::from(value)))
     }
 }
 
 impl From<&str> for DbtPath {
     fn from(value: &str) -> Self {
-        Self(PathBuf::from(value).normalize())
+        Self(normalize(&PathBuf::from(value)))
     }
 }
 
@@ -439,5 +465,43 @@ mod tests {
             absolute,
             PathBuf::from("/projects/my_project/models/my_model.sql")
         );
+    }
+
+    // Regression tests for https://github.com/dbt-labs/dbt-fusion/issues/1719
+    // model-paths like `../sources` were silently having their `..` stripped,
+    // so `project1/../sources/foo.yml` became `project1/sources/foo.yml`.
+
+    #[test]
+    fn test_normalize_preserves_leading_parent_dir() {
+        assert_eq!(
+            normalize(Path::new("../sources/foo.yml")),
+            PathBuf::from("../sources/foo.yml"),
+        );
+        assert_eq!(
+            normalize(Path::new("../../up/two/foo.yml")),
+            PathBuf::from("../../up/two/foo.yml"),
+        );
+    }
+
+    #[test]
+    fn test_normalize_resolves_inner_parent_dir() {
+        assert_eq!(
+            normalize(Path::new("models/../staging/foo.yml")),
+            PathBuf::from("staging/foo.yml"),
+        );
+    }
+
+    #[test]
+    fn test_normalize_absolute_path_with_parent_dir() {
+        assert_eq!(
+            normalize(Path::new("/projects/project1/../sources/foo.yml")),
+            PathBuf::from("/projects/sources/foo.yml"),
+        );
+    }
+
+    #[test]
+    fn test_dbt_path_from_path_preserves_leading_parent_dir() {
+        let p = DbtPath::from_path(Path::new("../sources/some_source.yml"));
+        assert_eq!(p.to_path_buf(), PathBuf::from("../sources/some_source.yml"));
     }
 }
