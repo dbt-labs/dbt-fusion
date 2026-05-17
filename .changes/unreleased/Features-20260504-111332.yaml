@@ -1,0 +1,7 @@
+kind: Features
+body: Add interactive ClickHouse profile setup wizard to dbt init
+time: 2026-05-04T11:13:32.837747-05:00
+custom:
+    author: dave-connors-3
+    issue: "9515"
+    project: dbt-fusion
