@@ -71,7 +71,9 @@ pub fn get_relation(
         AdapterType::Fabric => fabric_get_relation(
             adapter, state, ctx, conn, database, schema, identifier, token,
         ),
-        AdapterType::ClickHouse => todo!("ClickHouse"),
+        AdapterType::ClickHouse => clickhouse_get_relation(
+            adapter, state, ctx, conn, database, schema, identifier, token,
+        ),
         AdapterType::Exasol => exasol_get_relation(
             adapter, state, ctx, conn, database, schema, identifier, token,
         ),
@@ -685,10 +687,10 @@ fn exasol_get_relation(
     let q_ident = identifier.to_uppercase();
 
     let sql = format!(
-        "select 'table' as \"type\" from sys.exa_all_tables \
-         where table_schema = '{q_schema}' and table_name = '{q_ident}' \
-         union all \
-         select 'view' from sys.exa_all_views \
+        "select 'table' as \"type\" from sys.exa_all_tables \\
+         where table_schema = '{q_schema}' and table_name = '{q_ident}' \\
+         union all \\
+         select 'view' from sys.exa_all_views \\
          where view_schema = '{q_schema}' and view_name = '{q_ident}'"
     );
     let batch = adapter
@@ -898,4 +900,68 @@ fn fabric_get_relation(
         relation_type,
         adapter.quoting(),
     ))))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn clickhouse_get_relation(
+    adapter: &AdapterImpl,
+    state: &State,
+    ctx: &QueryCtx,
+    conn: &'_ mut dyn Connection,
+    database: &str,
+    schema: &str,
+    identifier: &str,
+    token: CancellationToken,
+) -> AdapterResult<Option<Box<dyn BaseRelation>>> {
+    use crate::metadata::clickhouse::{clickhouse_string_literal, relation_type_from_engine};
+
+    // ClickHouse only has databases, not schemas — dbt `schema` maps to CH `database`.
+    // dbt `database` is unused here.
+    let query_database = if adapter.quoting().schema {
+        schema.to_string()
+    } else {
+        schema.to_lowercase()
+    };
+
+    let query_identifier = if adapter.quoting().identifier {
+        identifier.to_string()
+    } else {
+        identifier.to_lowercase()
+    };
+
+    let query_database_literal = clickhouse_string_literal(&query_database);
+    let query_identifier_literal = clickhouse_string_literal(&query_identifier);
+    let sql = format!(
+        "SELECT engine, name \\
+         FROM system.tables \\
+         WHERE database = {query_database_literal} \\
+           AND name = {query_identifier_literal}",
+    );
+
+    let batch = adapter
+        .engine()
+        .execute(Some(state), conn, ctx, &sql, token)?;
+    if batch.num_rows() == 0 {
+        return Ok(None);
+    }
+
+    let engines = get_column_values::<StringArray>(&batch, "engine")?;
+    if engines.len() != 1 {
+        return Err(AdapterError::new(
+            AdapterErrorKind::UnexpectedResult,
+            "Expected exactly one row for ClickHouse get_relation",
+        ));
+    }
+
+    let relation_type = Some(relation_type_from_engine(engines.value(0)));
+
+    let relation = do_create_relation(
+        adapter.adapter_type(),
+        database.to_string(),
+        schema.to_string(),
+        Some(identifier.to_string()),
+        relation_type,
+        adapter.quoting(),
+    )?;
+    Ok(Some(relation))
 }
