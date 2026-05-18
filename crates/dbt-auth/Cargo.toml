@@ -35,6 +35,7 @@ tokio = { workspace = true }
 arrow-array = { workspace = true }
 dbt-cloud-config = { workspace = true }
 dbt-test-primitives = { workspace = true }
+serial_test = { workspace = true }
 tempfile = { workspace = true }
 test-with = { version = "0.14.7", default-features = false }
 

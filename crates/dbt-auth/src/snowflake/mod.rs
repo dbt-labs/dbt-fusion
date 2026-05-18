@@ -1,8 +1,8 @@
 mod key_format;
 
 use crate::{AdapterConfig, Auth, AuthError, AuthOutcome, PrivateKeySource};
+use crate::driver_logging;
 use database::Builder as DatabaseBuilder;
-use dbt_xdbc::database::LogLevel;
 use dbt_xdbc::{Backend, database, snowflake};
 
 use std::fs;
@@ -625,12 +625,14 @@ fn apply_connection_args(
         .unwrap_or_else(|| DEFAULT_REQUEST_TIMEOUT.to_string());
     builder.with_named_option(snowflake::REQUEST_TIMEOUT, request_timeout)?;
 
+    // Configure Snowflake driver logging level
+    // By default, disable any logging from Gosnowflake that's not a fatal/panic.
+    // This can be overridden via the DBT_SNOWFLAKE_CONNECTOR_DEBUG_LOGGING environment variable.
+    let log_level = driver_logging::snowflake_log_level();
+    builder.with_named_option(snowflake::LOG_TRACING, log_level.to_string())?;
     if let Ok(client_timeout) = std::env::var("DBT_SNOWFLAKE_CLIENT_TIMEOUT") {
         builder.with_named_option(snowflake::CLIENT_TIMEOUT, client_timeout)?;
     }
-
-    // disable any logging from Gosnowflake that's not a fatal/panic
-    builder.with_named_option(snowflake::LOG_TRACING, LogLevel::Fatal.to_string())?;
 
     Ok(builder)
 }
@@ -1831,5 +1833,185 @@ mod tests {
             (snowflake::REQUEST_TIMEOUT, DEFAULT_REQUEST_TIMEOUT),
         ];
         run_config_test(config, &expected);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_connector_debug_logging_default() {
+        use std::env;
+
+        // Ensure environment variable is not set
+        unsafe {
+            env::remove_var(driver_logging::SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV);
+        }
+
+        let config = base_config();
+        let expected = [
+            ("user", "U"),
+            ("password", "P"),
+            (snowflake::ACCOUNT, "A"),
+            (snowflake::ROLE, "role"),
+            (snowflake::WAREHOUSE, "warehouse"),
+            (snowflake::APPLICATION_NAME, APP_NAME),
+            (snowflake::LOG_TRACING, "fatal"), // default
+            (snowflake::LOGIN_TIMEOUT, LOGIN_TIMEOUT),
+            (snowflake::REQUEST_TIMEOUT, DEFAULT_REQUEST_TIMEOUT),
+        ];
+        run_config_test(config, &expected);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_connector_debug_logging_debug() {
+        use std::env;
+
+        unsafe {
+            env::set_var(
+                driver_logging::SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV,
+                "debug",
+            );
+        }
+
+        let config = base_config();
+        let expected = [
+            ("user", "U"),
+            ("password", "P"),
+            (snowflake::ACCOUNT, "A"),
+            (snowflake::ROLE, "role"),
+            (snowflake::WAREHOUSE, "warehouse"),
+            (snowflake::APPLICATION_NAME, APP_NAME),
+            (snowflake::LOG_TRACING, "debug"), // configured via env var
+            (snowflake::LOGIN_TIMEOUT, LOGIN_TIMEOUT),
+            (snowflake::REQUEST_TIMEOUT, DEFAULT_REQUEST_TIMEOUT),
+        ];
+        run_config_test(config, &expected);
+
+        unsafe {
+            env::remove_var(driver_logging::SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_connector_debug_logging_info() {
+        use std::env;
+
+        unsafe {
+            env::set_var(
+                driver_logging::SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV,
+                "info",
+            );
+        }
+
+        let config = base_config();
+        let expected = [
+            ("user", "U"),
+            ("password", "P"),
+            (snowflake::ACCOUNT, "A"),
+            (snowflake::ROLE, "role"),
+            (snowflake::WAREHOUSE, "warehouse"),
+            (snowflake::APPLICATION_NAME, APP_NAME),
+            (snowflake::LOG_TRACING, "info"), // configured via env var
+            (snowflake::LOGIN_TIMEOUT, LOGIN_TIMEOUT),
+            (snowflake::REQUEST_TIMEOUT, DEFAULT_REQUEST_TIMEOUT),
+        ];
+        run_config_test(config, &expected);
+
+        unsafe {
+            env::remove_var(driver_logging::SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_connector_debug_logging_trace() {
+        use std::env;
+
+        unsafe {
+            env::set_var(
+                driver_logging::SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV,
+                "trace",
+            );
+        }
+
+        let config = base_config();
+        let expected = [
+            ("user", "U"),
+            ("password", "P"),
+            (snowflake::ACCOUNT, "A"),
+            (snowflake::ROLE, "role"),
+            (snowflake::WAREHOUSE, "warehouse"),
+            (snowflake::APPLICATION_NAME, APP_NAME),
+            (snowflake::LOG_TRACING, "trace"), // configured via env var
+            (snowflake::LOGIN_TIMEOUT, LOGIN_TIMEOUT),
+            (snowflake::REQUEST_TIMEOUT, DEFAULT_REQUEST_TIMEOUT),
+        ];
+        run_config_test(config, &expected);
+
+        unsafe {
+            env::remove_var(driver_logging::SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_connector_debug_logging_case_insensitive() {
+        use std::env;
+
+        unsafe {
+            env::set_var(
+                driver_logging::SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV,
+                "DEBUG",
+            );
+        }
+
+        let config = base_config();
+        let expected = [
+            ("user", "U"),
+            ("password", "P"),
+            (snowflake::ACCOUNT, "A"),
+            (snowflake::ROLE, "role"),
+            (snowflake::WAREHOUSE, "warehouse"),
+            (snowflake::APPLICATION_NAME, APP_NAME),
+            (snowflake::LOG_TRACING, "debug"), // case-insensitive
+            (snowflake::LOGIN_TIMEOUT, LOGIN_TIMEOUT),
+            (snowflake::REQUEST_TIMEOUT, DEFAULT_REQUEST_TIMEOUT),
+        ];
+        run_config_test(config, &expected);
+
+        unsafe {
+            env::remove_var(driver_logging::SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_connector_debug_logging_invalid_falls_back_to_default() {
+        use std::env;
+
+        unsafe {
+            env::set_var(
+                driver_logging::SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV,
+                "invalid_level",
+            );
+        }
+
+        let config = base_config();
+        let expected = [
+            ("user", "U"),
+            ("password", "P"),
+            (snowflake::ACCOUNT, "A"),
+            (snowflake::ROLE, "role"),
+            (snowflake::WAREHOUSE, "warehouse"),
+            (snowflake::APPLICATION_NAME, APP_NAME),
+            (snowflake::LOG_TRACING, "fatal"), // falls back to default
+            (snowflake::LOGIN_TIMEOUT, LOGIN_TIMEOUT),
+            (snowflake::REQUEST_TIMEOUT, DEFAULT_REQUEST_TIMEOUT),
+        ];
+        run_config_test(config, &expected);
+
+        unsafe {
+            env::remove_var(driver_logging::SNOWFLAKE_CONNECTOR_DEBUG_LOGGING_ENV);
+        }
     }
 }

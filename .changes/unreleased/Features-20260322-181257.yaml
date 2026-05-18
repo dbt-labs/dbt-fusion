@@ -1,0 +1,7 @@
+kind: Features
+body: Add configurable driver debug logging via DBT_SNOWFLAKE_CONNECTOR_DEBUG_LOGGING environment variable
+time: 2026-03-22T18:12:57.185337190Z
+custom:
+    author: cursoragent
+    issue: ""
+    project: dbt-fusion
