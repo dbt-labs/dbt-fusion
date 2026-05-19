@@ -57,8 +57,7 @@ impl StaticBaseRelation for RelationStatic {
                 true,
                 true,
             ),
-            // Exasol does not support 3-part db.schema.table names.
-            AdapterType::Exasol => Policy::new(false, true, true),
+            AdapterType::ClickHouse | AdapterType::Exasol => Policy::new(false, true, true),
             AdapterType::Salesforce => Policy::new(false, false, true),
             _ => Policy::trues(),
         };
@@ -238,6 +237,7 @@ impl Relation {
                 true,
                 true,
             ),
+            AdapterType::ClickHouse => Policy::new(false, true, true),
             _ => Policy::trues(),
         };
         Self {
@@ -637,6 +637,7 @@ impl BaseRelation for Relation {
             ),
             AdapterType::Postgres => self.include_policy,
             AdapterType::Salesforce => Policy::new(false, false, true),
+            AdapterType::ClickHouse => Policy::new(false, true, true),
             _ => Policy::trues(),
         };
         Ok(Arc::new(Relation::new_with_policy(

@@ -476,7 +476,7 @@ pub fn do_create_relation(
             false,
             false,
         )?) as Box<dyn BaseRelation>,
-        Bigquery | Databricks | Spark | Fabric => Box::new(Relation::new(
+        Bigquery | Databricks | Spark | Fabric | ClickHouse => Box::new(Relation::new(
             adapter_type,
             Some(database),
             Some(schema),
@@ -516,7 +516,6 @@ pub fn do_create_relation(
             false,
             false,
         )?) as Box<dyn BaseRelation>,
-        ClickHouse => todo!("ClickHouse"),
         Starburst => todo!("Starburst"),
         Athena => todo!("Athena"),
         Trino => todo!("Trino"),

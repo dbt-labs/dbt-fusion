@@ -87,7 +87,8 @@ pub fn quote_char(adapter_type: AdapterType) -> char {
         DuckDB => '"',
         Athena | Trino | Starburst => '"',
         Datafusion => '"',
-        ClickHouse => '"',
+        // https://clickhouse.com/docs/sql-reference/syntax#identifiers
+        ClickHouse => '`',
         Exasol => '"',
         Dremio => todo!("Dremio"),
         Oracle => todo!("Oracle"),

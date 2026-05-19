@@ -917,7 +917,7 @@ impl AdapterImpl {
                 Postgres => "nspname",
                 DuckDB => "schema_name",
                 Fabric => "schema",
-                ClickHouse => todo!("ClickHouse"),
+                ClickHouse => "name",
                 Exasol => "name",
                 Starburst => todo!("Starburst"),
                 Athena => todo!("Athena"),

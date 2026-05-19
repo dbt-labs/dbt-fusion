@@ -22,14 +22,13 @@ pub fn create_static_relation(
             StaticBaseRelationObject::new(Arc::new(snowflake_relation_type))
         }
         Databricks | Spark | Fabric | DuckDB | Exasol | Postgres | Redshift | Salesforce
-        | Bigquery => {
+        | Bigquery | ClickHouse => {
             let relation_type = RelationStatic {
                 adapter_type,
                 quoting,
             };
             StaticBaseRelationObject::new(Arc::new(relation_type))
         }
-        ClickHouse => todo!("ClickHouse"),
         Starburst => todo!("Starburst"),
         Athena => todo!("Athena"),
         Trino => todo!("Trino"),
