@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: dbt Fusion docs
+    url: https://docs.getdbt.com/docs/fusion
+    about: Check the docs before filing — your answer may already be there.
+  - name: dbt Community Slack
+    url: https://www.getdbt.com/community/join-the-community/
+    about: Chat with the dbt community in real time.

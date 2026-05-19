@@ -1,0 +1,66 @@
+name: ✨ Feature Request
+description: Propose a straightforward extension of dbt Fusion functionality
+title: "[Feature] <title>"
+labels: ["enhancement", "triage"]
+type: "Feature"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to fill out this feature request!
+  - type: checkboxes
+    attributes:
+      label: Before you submit
+      description: >
+        We want features to be distinct and discoverable so the community can weigh in.
+      options:
+        - label: I have searched the existing issues and could not find a duplicate
+          required: true
+        - label: I am requesting an extension of existing dbt Fusion functionality, not a Big Idea better suited to a [Discussion](https://github.com/dbt-labs/dbt-fusion/discussions)
+          required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Which component does this feature relate to?
+      multiple: true
+      options:
+        - CLI / compiler
+        - Adapters / database drivers
+        - VS Code extension
+        - SQL understanding / static analysis
+        - Installation / setup
+        - other (describe below)
+    validations:
+      required: false
+  - type: textarea
+    attributes:
+      label: Describe the feature
+      description: A clear and concise description of what you want to happen.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Describe alternatives you've considered
+      description: Any alternative solutions or approaches you've thought about.
+    validations:
+      required: false
+  - type: textarea
+    attributes:
+      label: Who will this benefit?
+      description: |
+        What kind of use case will this feature serve? Be specific — this helps us prioritize.
+    validations:
+      required: false
+  - type: input
+    attributes:
+      label: Are you interested in contributing this feature?
+      description: Let us know if you'd like to write some code and how we can help.
+    validations:
+      required: false
+  - type: textarea
+    attributes:
+      label: Anything else?
+      description: |
+        Links, references, screenshots, or anything else that will give us more context.
+    validations:
+      required: false

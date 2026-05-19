@@ -1,0 +1,81 @@
+name: 🚀 Installation or getting started
+description: Having trouble installing dbt Fusion, the VS Code extension, or getting your first project running?
+title: "[Install] <title>"
+labels: ["triage", "install"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template if you're having trouble **installing or setting up** dbt Fusion or the VS Code extension.
+
+        For bugs in a working installation, use the general [Bug report](./bug_report.yml) instead.
+        For VS Code extension bugs (IntelliSense, lineage, etc.), use the [VS Code Extension Bug report](./bug_report_vsce.yml).
+  - type: checkboxes
+    attributes:
+      label: Before you submit
+      options:
+        - label: I have read the [installation docs](https://docs.getdbt.com/docs/fusion) and followed the steps there
+          required: true
+        - label: I have searched the existing issues and could not find a duplicate
+          required: true
+  - type: dropdown
+    id: what
+    attributes:
+      label: What are you trying to install?
+      multiple: true
+      options:
+        - dbt Fusion CLI
+        - VS Code extension
+    validations:
+      required: true
+  - type: dropdown
+    id: install_method
+    attributes:
+      label: How are you installing it?
+      multiple: true
+      options:
+        - Homebrew (`brew install dbt-labs/dbt/dbt-fusion`)
+        - Direct download / installer
+        - VS Code Marketplace
+        - Cursor Marketplace
+        - Other (describe in Additional Context)
+    validations:
+      required: false
+  - type: textarea
+    attributes:
+      label: What's going wrong?
+      description: Describe the problem — an error message, something that won't start, authentication that won't complete, etc.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Error output
+      description: Paste any error messages or log output here.
+      render: shell
+    validations:
+      required: false
+  - type: textarea
+    attributes:
+      label: Environment
+      value: |
+        - OS:
+        - CPU: (x86 or ARM)
+        - Shell: (bash, zsh, etc.)
+        - dbt Fusion version (if partially installed): (`dbt --version`)
+        - VS Code / Cursor version (if applicable):
+      render: markdown
+    validations:
+      required: false
+  - type: textarea
+    attributes:
+      label: Steps you've already tried
+      description: What have you already attempted? This saves us from suggesting things you've already done.
+    validations:
+      required: false
+  - type: textarea
+    attributes:
+      label: Additional Context
+      description: Anything else that might help — screenshots, links, etc.
+    validations:
+      required: false

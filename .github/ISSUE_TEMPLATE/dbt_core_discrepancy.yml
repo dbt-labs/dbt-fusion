@@ -1,0 +1,80 @@
+name: 🔄 dbt Core discrepancy
+description: Report something that works correctly in dbt Core but behaves differently or fails in dbt Fusion
+title: "[Discrepancy] <title>"
+labels: ["bug", "triage", "discrepancy"]
+type: "Bug"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template if you've found behavior that **works in dbt Core but doesn't work (or works differently) in dbt Fusion**.
+
+        For bugs unrelated to dbt Core compatibility, use the general [Bug report](./bug_report.yml) instead.
+  - type: checkboxes
+    attributes:
+      label: Before you submit
+      options:
+        - label: I have confirmed this behavior works correctly in dbt Core
+          required: true
+        - label: I have searched the existing issues and could not find a duplicate
+          required: true
+  - type: textarea
+    attributes:
+      label: Describe the discrepancy
+      description: What does dbt Core do, and what does dbt Fusion do instead?
+      placeholder: |
+        In dbt Core: ...
+        In dbt Fusion: ...
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Steps To Reproduce
+      description: |
+        A minimal model, macro, or project snippet that shows the discrepancy.
+      placeholder: |
+        ```sql
+        -- models/my_model.sql
+        ...
+        ```
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: Error messages or log output from dbt Fusion (and optionally dbt Core for comparison).
+      render: shell
+    validations:
+      required: false
+  - type: textarea
+    attributes:
+      label: Environment
+      value: |
+        - OS:
+        - dbt Core version:
+        - dbt Fusion version: (`dbt --version`)
+        - Adapter + version:
+      render: markdown
+    validations:
+      required: false
+  - type: dropdown
+    id: adapter
+    attributes:
+      label: Which database adapter are you using?
+      multiple: true
+      options:
+        - snowflake
+        - databricks
+        - bigquery
+        - postgres
+        - redshift
+        - other (describe in Additional Context)
+    validations:
+      required: false
+  - type: textarea
+    attributes:
+      label: Additional Context
+      description: Links, references, or anything else that will help us reproduce and fix this.
+    validations:
+      required: false
