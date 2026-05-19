@@ -297,8 +297,9 @@ pub(crate) fn adbc_execute_with_options(
         // when the user Ctrl-C's the process.
         let mut stmt = TrackedStatement::new(stmt);
 
-        // ClickHouse DDL/DML does not return an Arrow IPC schema header. Tracking upstream:
-        // https://github.com/adbc-drivers/clickhouse/issues/14
+        // ClickHouse DDL/DML does not return an Arrow IPC schema header:
+        // This check should be removed after the fix lands in ClickHouse ADBC driver: 
+        // https://github.com/ClickHouse/adbc_clickhouse/pull/54 
         if adapter_type == AdapterType::ClickHouse
             && is_update_statement(sql.as_ref(), adapter_type)
         {

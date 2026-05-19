@@ -238,4 +238,76 @@ mod tests {
             "\"stocks_dev\".\"main\".\"files\""
         );
     }
+
+    /// ClickHouse's include policy is `database=false`, so even when a non-empty
+    /// database is supplied to `do_create_relation`, the rendered FQN must skip
+    /// the database segment. This matches dbt-clickhouse's
+    /// `ClickHouseRelation.__post_init__` which forces `path.database = ''`.
+    #[test]
+    fn test_do_create_relation_clickhouse_skips_database() {
+        let relation = do_create_relation(
+            AdapterType::ClickHouse,
+            "ignored".to_string(),
+            "analytics".to_string(),
+            Some("events".to_string()),
+            Some(RelationType::Table),
+            ResolvedQuoting {
+                database: true,
+                schema: true,
+                identifier: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(relation.render_self_as_str(), "`analytics`.`events`");
+        // Mirror upstream's `__post_init__` clearing `path.database = ''`:
+        // `{{ relation.database }}` must be falsy even when a database was
+        // supplied to `do_create_relation(...)`.
+        assert_eq!(relation.database(), None);
+    }
+
+    /// ClickHouse implicitly casts ISO-8601 string literals to `DateTime`/`Date`,
+    /// so its event-time filter uses the bare-string form alongside Postgres /
+    /// Databricks. No `to_timestamp_tz(...)` or `cast(... as timestamp)` wrapper
+    /// is needed. This pins the run-filter rendering to the standard SQL arm.
+    #[test]
+    fn test_render_with_run_filter_clickhouse_adapter() {
+        let relation = Relation::new(
+            AdapterType::ClickHouse,
+            None,
+            Some("analytics".to_string()),
+            Some("events".to_owned()),
+            None,
+            None,
+            ResolvedQuoting::disabled(),
+            None,
+            false,
+            false,
+        );
+        let start = NaiveDate::from_ymd_opt(2024, 7, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        let end = NaiveDate::from_ymd_opt(2024, 7, 8)
+            .unwrap()
+            .and_hms_opt(18, 0, 0)
+            .unwrap();
+
+        let sample = Sample {
+            start: Some(DateTime::<Utc>::from_naive_utc_and_offset(start, Utc)),
+            end: Some(DateTime::<Utc>::from_naive_utc_and_offset(end, Utc)),
+        };
+
+        let run_filter = RunFilter {
+            empty: false,
+            sample: Some(sample),
+        };
+        let event_time = Some("created_at".to_string());
+
+        let result = relation.render_with_run_filter(&run_filter, &event_time);
+        assert_eq!(
+            result,
+            "(select * from analytics.events where created_at >= '2024-07-01T00:00:00' and created_at < '2024-07-08T18:00:00')"
+        );
+    }
 }

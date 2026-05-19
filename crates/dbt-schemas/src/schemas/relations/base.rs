@@ -552,17 +552,20 @@ pub trait BaseRelation: BaseRelationProperties + Any + Send + Sync + fmt::Debug 
                 end.map(|end| format!("cast({event_time} as timestamp) < '{end}'")),
             ),
 
+            // ClickHouse implicitly casts ISO-8601 string literals to
+            // `DateTime`/`DateTime64`/`Date`, so the bare-string form works for
+            // all common event-time column types without an explicit wrapper.
             AdapterType::Postgres
             | AdapterType::Databricks
             | AdapterType::Redshift
             | AdapterType::Salesforce
             | AdapterType::Spark
             | AdapterType::DuckDB
-            | AdapterType::Fabric => (
+            | AdapterType::Fabric
+            | AdapterType::ClickHouse => (
                 start.map(|start| format!("{event_time} >= '{start}'")),
                 end.map(|end| format!("{event_time} < '{end}'")),
             ),
-            AdapterType::ClickHouse => todo!("ClickHouse"),
             AdapterType::Exasol => todo!("Exasol"),
             AdapterType::Starburst => todo!("Starburst"),
             AdapterType::Athena => todo!("Athena"),

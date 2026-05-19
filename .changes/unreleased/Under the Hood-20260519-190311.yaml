@@ -1,0 +1,7 @@
+kind: Under the Hood
+body: Add more ClickHouse implementation details for dbt-adapters
+time: 2026-05-19T19:03:11.627556+02:00
+custom:
+    author: koletzilla
+    issue: "1702"
+    project: dbt-fusion

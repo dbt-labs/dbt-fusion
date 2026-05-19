@@ -45,13 +45,21 @@ impl StaticBaseRelation for RelationStatic {
                 true,
                 true,
             ),
+            // Databases that do not support 3-part db.schema.table names.
             AdapterType::ClickHouse | AdapterType::Exasol => Policy::new(false, true, true),
             _ => Policy::trues(),
+        };
+        // Mirror upstream ClickHouseRelation.__post_init__: discard any
+        // caller-supplied database so `{{ relation.database }}` is always falsy.
+        // https://github.com/ClickHouse/dbt-clickhouse/blob/main/dbt/adapters/clickhouse/relation.py
+        let database = match self.adapter_type {
+            AdapterType::ClickHouse => None,
+            _ => database.filter(|s| !s.is_empty()),
         };
         Ok(RelationObject::new(Arc::new(Relation::new_with_policy(
             self.adapter_type,
             RelationPath {
-                database: database.filter(|s| !s.is_empty()),
+                database,
                 schema,
                 identifier,
             },
@@ -509,6 +517,40 @@ mod tests {
         let relation = relation.downcast_object::<RelationObject>().unwrap();
         assert_eq!(relation.inner().render_self_as_str(), "\"d\".\"s\".\"i\"");
         assert_eq!(relation.relation_type().unwrap(), RelationType::Table);
+    }
+
+    /// ClickHouse uses `schema` as the effective database — its include policy
+    /// is `database=false`, so even when a database is supplied to
+    /// `api.Relation.create(...)`, the rendered FQN must skip the database
+    /// segment and produce `"<schema>"."<identifier>"`. Returning the database
+    /// segment would yield `"x"."x"."i"` because Fusion macros pass `schema`
+    /// in both the `database` and `schema` slots for ClickHouse.
+    #[test]
+    fn test_try_new_via_static_base_relation_clickhouse_skips_database() {
+        let relation_type = RelationStatic {
+            adapter_type: AdapterType::ClickHouse,
+            quoting: DEFAULT_RESOLVED_QUOTING,
+        };
+        let relation = relation_type
+            .try_new(
+                Some("ignored_db".to_string()),
+                Some("my_schema".to_string()),
+                Some("my_table".to_string()),
+                Some(RelationType::Table),
+                Some(DEFAULT_RESOLVED_QUOTING),
+                None,
+            )
+            .unwrap();
+
+        let relation = relation.downcast_object::<RelationObject>().unwrap();
+        assert_eq!(
+            relation.inner().render_self_as_str(),
+            "`my_schema`.`my_table`"
+        );
+        // Mirror upstream's `__post_init__` clearing `path.database = ''`:
+        // `{{ relation.database }}` must be falsy even when a database was
+        // supplied to `api.Relation.create(...)`.
+        assert_eq!(relation.inner().database(), None);
     }
 
     #[test]

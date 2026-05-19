@@ -234,7 +234,8 @@ impl AdapterImpl {
                         Fabric => {
                             Box::new(FabricMetadataAdapter::new(engine)) as Box<dyn MetadataAdapter>
                         }
-                        ClickHouse => todo!("ClickHouse"),
+                        // Matches the Exasol approach in this match. To be implemented later.
+                        ClickHouse => return None,
                         Exasol => return None,
                         Starburst => todo!("Starburst"),
                         Athena => todo!("Athena"),
@@ -907,6 +908,7 @@ impl AdapterImpl {
                 Postgres => "nspname",
                 DuckDB => "schema_name",
                 Fabric => "schema",
+                // https://github.com/ClickHouse/dbt-clickhouse/blob/main/dbt/include/clickhouse/macros/adapters.sql
                 ClickHouse => "name",
                 Exasol => "name",
                 Starburst => todo!("Starburst"),
