@@ -17,9 +17,10 @@ jobs:
           script: |
             const body = context.payload.issue.body || '';
 
-            // Find the adapter section in the form body.
-            // GitHub renders multi-select dropdown values as comma-separated text
-            // under the section heading.
+            // GitHub renders issue form multi-select dropdowns as a comma-separated
+            // string on a single line directly beneath the field's ### heading.
+            // If this regex stops matching after a GitHub rendering change, check:
+            // https://docs.github.com/en/communities/using-templates-to-encourage-useful-issues-and-pull-requests/syntax-for-githubs-form-schema
             const match = body.match(/### Which database adapter are you using\?\n\n([^\n#]+)/);
             if (!match) return;
 
@@ -28,6 +29,8 @@ jobs:
               .map(s => s.trim().toLowerCase())
               .filter(Boolean);
 
+            // "other (describe in additional context)" is intentionally excluded from
+            // validAdapters — it will be silently dropped, which is the desired behavior.
             const validAdapters = ['snowflake', 'databricks', 'bigquery', 'postgres', 'redshift'];
             const labels = selected.filter(s => validAdapters.includes(s));
 
