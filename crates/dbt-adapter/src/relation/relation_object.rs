@@ -476,7 +476,7 @@ pub fn do_create_relation(
             false,
             false,
         )?) as Box<dyn BaseRelation>,
-        Bigquery | Databricks | Spark | Fabric | ClickHouse => Box::new(Relation::new(
+        Bigquery | Databricks | Spark | Fabric => Box::new(Relation::new(
             adapter_type,
             Some(database),
             Some(schema),
@@ -488,6 +488,20 @@ pub fn do_create_relation(
             false,
             false,
         )) as Box<dyn BaseRelation>,
+        ClickHouse => Box::new(Relation::new_with_policy(
+            ClickHouse,
+            RelationPath {
+                database: None,
+                schema: Some(schema),
+                identifier,
+            },
+            relation_type,
+            Policy::new(false, true, true),
+            custom_quoting,
+            None,
+            false,
+            false,
+        )?) as Box<dyn BaseRelation>,
         Exasol => Box::new(Relation::new_with_policy(
             Exasol,
             RelationPath {

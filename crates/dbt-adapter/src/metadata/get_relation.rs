@@ -71,7 +71,9 @@ pub fn get_relation(
         AdapterType::Fabric => fabric_get_relation(
             adapter, state, ctx, conn, database, schema, identifier, token,
         ),
-        AdapterType::ClickHouse => todo!("ClickHouse"),
+        AdapterType::ClickHouse => {
+            clickhouse_get_relation(adapter, state, ctx, conn, schema, identifier, token)
+        }
         AdapterType::Exasol => exasol_get_relation(
             adapter, state, ctx, conn, database, schema, identifier, token,
         ),
@@ -820,6 +822,62 @@ fn duckdb_get_relation(
     let relation = do_create_relation(
         adapter.adapter_type(),
         database.to_string(),
+        schema.to_string(),
+        Some(identifier.to_string()),
+        relation_type,
+        adapter.quoting(),
+    )?;
+    Ok(Some(relation))
+}
+
+/// https://github.com/ClickHouse/dbt-clickhouse/blob/main/dbt/include/clickhouse/macros/adapters.sql
+#[allow(clippy::too_many_arguments)]
+fn clickhouse_get_relation(
+    adapter: &AdapterImpl,
+    state: &State,
+    ctx: &QueryCtx,
+    conn: &mut dyn Connection,
+    schema: &str,
+    identifier: &str,
+    token: CancellationToken,
+) -> AdapterResult<Option<Box<dyn BaseRelation>>> {
+    let lit_fmt = SqlLiteralFormatter::new(adapter.adapter_type());
+
+    let sql = format!(
+        "select name, engine from system.tables \
+         where database = {} and name = {}",
+        lit_fmt.format_str(schema),
+        lit_fmt.format_str(identifier),
+    );
+
+    let batch = adapter
+        .engine()
+        .execute(Some(state), conn, ctx, &sql, token)?;
+    if batch.num_rows() == 0 {
+        return Ok(None);
+    }
+
+    let engine_column = batch.column_by_name("engine").unwrap();
+    let engine_array = engine_column
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    if engine_array.len() != 1 {
+        return Err(AdapterError::new(
+            AdapterErrorKind::UnexpectedResult,
+            "Did not find 'engine' for a relation",
+        ));
+    }
+    let engine = engine_array.value(0);
+    let relation_type = match engine {
+        "MaterializedView" => Some(RelationType::MaterializedView),
+        "View" => Some(RelationType::View),
+        _ => Some(RelationType::Table),
+    };
+
+    let relation = do_create_relation(
+        AdapterType::ClickHouse,
+        String::new(),
         schema.to_string(),
         Some(identifier.to_string()),
         relation_type,

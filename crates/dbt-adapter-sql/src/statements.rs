@@ -57,13 +57,20 @@ fn trim_leading_sql_comments(mut sql: &str) -> &str {
 }
 
 fn is_clickhouse_read_statement_token(token: &str) -> bool {
+    // Keep this list in sync with the result-producing statements documented at
+    // https://clickhouse.com/docs/sql-reference/statements. Misclassifying a
+    // read statement as an update silently drops the result rows, so be
+    // conservative and include every keyword that can return a result set.
     token.eq_ignore_ascii_case("SELECT")
         || token.eq_ignore_ascii_case("WITH")
         || token.eq_ignore_ascii_case("SHOW")
         || token.eq_ignore_ascii_case("DESCRIBE")
+        || token.eq_ignore_ascii_case("DESC")
         || token.eq_ignore_ascii_case("EXPLAIN")
         || token.eq_ignore_ascii_case("EXISTS")
         || token.eq_ignore_ascii_case("CHECK")
+        || token.eq_ignore_ascii_case("WATCH")
+        || token.eq_ignore_ascii_case("KILL")
 }
 
 #[cfg(test)]
@@ -87,6 +94,22 @@ mod tests {
             AdapterType::ClickHouse,
         ));
         assert!(!is_update_statement("SHOW TABLES", AdapterType::ClickHouse));
+        assert!(!is_update_statement(
+            "DESC TABLE foo",
+            AdapterType::ClickHouse,
+        ));
+        assert!(!is_update_statement(
+            "DESCRIBE TABLE foo",
+            AdapterType::ClickHouse,
+        ));
+        assert!(!is_update_statement(
+            "WATCH live_view",
+            AdapterType::ClickHouse,
+        ));
+        assert!(!is_update_statement(
+            "KILL QUERY WHERE query_id = 'abc'",
+            AdapterType::ClickHouse,
+        ));
         assert!(!is_update_statement(
             "CREATE TABLE foo (id int)",
             AdapterType::DuckDB,

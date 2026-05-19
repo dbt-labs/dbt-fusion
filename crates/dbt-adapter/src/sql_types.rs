@@ -684,39 +684,57 @@ pub mod clickhouse {
     /// driver's schema metadata rather than reconstructed from Arrow types here.
     pub fn try_format_type(
         datatype: &DataType,
-        _nullable: bool,
+        nullable: bool,
         out: &mut String,
     ) -> AdapterResult<()> {
         use std::fmt::Write as _;
 
+        // Build the inner type into a buffer so we can optionally wrap it in
+        // `Nullable(...)` at the end. ClickHouse expresses nullability inline
+        // (e.g. `Nullable(Int32)`) rather than as a column attribute, so the
+        // caller's `nullable` flag has to be reflected in the rendered type.
+        let mut inner = String::new();
+
         match datatype {
-            DataType::Null => out.push_str("String"),
-            DataType::Boolean => out.push_str("Bool"),
-            DataType::Int8 => out.push_str("Int8"),
-            DataType::Int16 => out.push_str("Int16"),
-            DataType::Int32 => out.push_str("Int32"),
-            DataType::Int64 => out.push_str("Int64"),
-            DataType::UInt8 => out.push_str("UInt8"),
-            DataType::UInt16 => out.push_str("UInt16"),
-            DataType::UInt32 => out.push_str("UInt32"),
-            DataType::UInt64 => out.push_str("UInt64"),
-            DataType::Float16 | DataType::Float32 => out.push_str("Float32"),
-            DataType::Float64 => out.push_str("Float64"),
-            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => out.push_str("String"),
-            DataType::Binary | DataType::LargeBinary => out.push_str("String"),
-            DataType::Date32 | DataType::Date64 => out.push_str("Date"),
-            DataType::Timestamp(TimeUnit::Second, _) => out.push_str("DateTime"),
-            DataType::Timestamp(TimeUnit::Millisecond, _) => out.push_str("DateTime64(3)"),
-            DataType::Timestamp(TimeUnit::Microsecond, _) => out.push_str("DateTime64(6)"),
-            DataType::Timestamp(TimeUnit::Nanosecond, _) => out.push_str("DateTime64(9)"),
-            DataType::Time32(_) | DataType::Time64(_) => out.push_str("String"),
+            DataType::Null => inner.push_str("String"),
+            DataType::Boolean => inner.push_str("Bool"),
+            DataType::Int8 => inner.push_str("Int8"),
+            DataType::Int16 => inner.push_str("Int16"),
+            DataType::Int32 => inner.push_str("Int32"),
+            DataType::Int64 => inner.push_str("Int64"),
+            DataType::UInt8 => inner.push_str("UInt8"),
+            DataType::UInt16 => inner.push_str("UInt16"),
+            DataType::UInt32 => inner.push_str("UInt32"),
+            DataType::UInt64 => inner.push_str("UInt64"),
+            // NOTE: Arrow `Float16` is IEEE 754 half-precision, which is *not*
+            // the same layout as ClickHouse's `BFloat16`. Widen to `Float32`
+            // (loss-free) rather than emit `BFloat16` and silently corrupt.
+            DataType::Float16 | DataType::Float32 => inner.push_str("Float32"),
+            DataType::Float64 => inner.push_str("Float64"),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => inner.push_str("String"),
+            DataType::Binary | DataType::LargeBinary => inner.push_str("String"),
+            // ClickHouse `Date` is 2-byte UInt16 (range stops at ~2149).
+            // Arrow `Date32` carries 4-byte Int32 days, so mapping it to plain
+            // `Date` silently truncates anything past the 2-byte range.
+            // `Date32` (4-byte Int32) is the lossless equivalent.
+            DataType::Date32 | DataType::Date64 => inner.push_str("Date32"),
+            DataType::Timestamp(TimeUnit::Second, _) => inner.push_str("DateTime"),
+            DataType::Timestamp(TimeUnit::Millisecond, _) => inner.push_str("DateTime64(3)"),
+            DataType::Timestamp(TimeUnit::Microsecond, _) => inner.push_str("DateTime64(6)"),
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => inner.push_str("DateTime64(9)"),
+            DataType::Time32(_) | DataType::Time64(_) => inner.push_str("String"),
             DataType::Decimal128(precision, scale) | DataType::Decimal256(precision, scale) => {
-                write!(out, "Decimal({precision}, {scale})").unwrap()
+                write!(inner, "Decimal({precision}, {scale})").unwrap()
             }
-            DataType::List(inner) | DataType::LargeList(inner) => {
-                let mut inner_type = String::new();
-                try_format_type(inner.data_type(), true, &mut inner_type)?;
-                write!(out, "Array({inner_type})").unwrap()
+            DataType::List(item) | DataType::LargeList(item) => {
+                // ClickHouse forbids `Nullable(Array(T))` — array columns
+                // themselves are never null. Element nullability lives on the
+                // inner type (e.g. `Array(Nullable(Int32))`), so propagate the
+                // field's own `is_nullable()` to the recursive call.
+                let mut item_type = String::new();
+                try_format_type(item.data_type(), item.is_nullable(), &mut item_type)?;
+                write!(out, "Array({item_type})").unwrap();
+                return Ok(());
             }
             _ => {
                 return Err(AdapterError::new(
@@ -724,6 +742,12 @@ pub mod clickhouse {
                     format!("{datatype} is not convertible to clickhouse sql type"),
                 ));
             }
+        }
+
+        if nullable {
+            write!(out, "Nullable({inner})").unwrap();
+        } else {
+            out.push_str(&inner);
         }
         Ok(())
     }
@@ -1115,13 +1139,37 @@ mod tests {
     #[test]
     fn clickhouse_try_format_type_formats_supported_arrow_types() {
         let mut out = String::new();
-        clickhouse::try_format_type(&DataType::Int32, true, &mut out).unwrap();
+        clickhouse::try_format_type(&DataType::Int32, false, &mut out).unwrap();
         assert_eq!(out, "Int32");
 
+        // ClickHouse expresses nullability inline: `Nullable(T)`, not as a
+        // separate column attribute.
         out.clear();
-        let field = Arc::new(Field::new("item", DataType::Utf8, true));
-        clickhouse::try_format_type(&DataType::List(field), true, &mut out).unwrap();
+        clickhouse::try_format_type(&DataType::Int32, true, &mut out).unwrap();
+        assert_eq!(out, "Nullable(Int32)");
+
+        // Arrays themselves are never nullable in ClickHouse — the wrapper
+        // sits around the element type when the inner Field is nullable.
+        out.clear();
+        let nullable_item = Arc::new(Field::new("item", DataType::Utf8, true));
+        clickhouse::try_format_type(&DataType::List(nullable_item), false, &mut out).unwrap();
+        assert_eq!(out, "Array(Nullable(String))");
+
+        // Non-nullable items round-trip as bare `Array(T)`.
+        out.clear();
+        let non_null_item = Arc::new(Field::new("item", DataType::Utf8, false));
+        clickhouse::try_format_type(&DataType::List(non_null_item), false, &mut out).unwrap();
         assert_eq!(out, "Array(String)");
+
+        // Arrow `Date32` must map to ClickHouse `Date32` (4-byte Int32), not
+        // plain `Date` (2-byte UInt16), to avoid silent truncation past ~2149.
+        out.clear();
+        clickhouse::try_format_type(&DataType::Date32, false, &mut out).unwrap();
+        assert_eq!(out, "Date32");
+
+        out.clear();
+        clickhouse::try_format_type(&DataType::Date64, true, &mut out).unwrap();
+        assert_eq!(out, "Nullable(Date32)");
     }
 
     #[test]
