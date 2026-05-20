@@ -675,10 +675,7 @@ pub mod postgres {
 }
 
 pub mod clickhouse {
-    use arrow_schema::{DataType, TimeUnit};
-
-    use crate::AdapterResult;
-    use crate::errors::{AdapterError, AdapterErrorKind};
+    use super::*;
 
     /// TODO: long-term, ClickHouse column SQL types should be sourced from the
     /// driver's schema metadata rather than reconstructed from Arrow types here.
@@ -687,54 +684,43 @@ pub mod clickhouse {
         nullable: bool,
         out: &mut String,
     ) -> AdapterResult<()> {
-        use std::fmt::Write as _;
+        let mut datatype = datatype;
+        let mut array_layers = Vec::new();
+        while let DataType::List(item) | DataType::LargeList(item) = datatype {
+            let item_type = item.data_type();
+            array_layers.push((
+                item.is_nullable(),
+                matches!(item_type, DataType::List(_) | DataType::LargeList(_)),
+            ));
+            datatype = item_type;
+        }
 
-        // Build the inner type into a buffer so we can optionally wrap it in
-        // `Nullable(...)` at the end. ClickHouse expresses nullability inline
-        // (e.g. `Nullable(Int32)`) rather than as a column attribute, so the
-        // caller's `nullable` flag has to be reflected in the rendered type.
-        let mut inner = String::new();
-
+        let mut rendered = String::new();
         match datatype {
-            DataType::Null => inner.push_str("String"),
-            DataType::Boolean => inner.push_str("Bool"),
-            DataType::Int8 => inner.push_str("Int8"),
-            DataType::Int16 => inner.push_str("Int16"),
-            DataType::Int32 => inner.push_str("Int32"),
-            DataType::Int64 => inner.push_str("Int64"),
-            DataType::UInt8 => inner.push_str("UInt8"),
-            DataType::UInt16 => inner.push_str("UInt16"),
-            DataType::UInt32 => inner.push_str("UInt32"),
-            DataType::UInt64 => inner.push_str("UInt64"),
-            // NOTE: Arrow `Float16` is IEEE 754 half-precision, which is *not*
-            // the same layout as ClickHouse's `BFloat16`. Widen to `Float32`
-            // (loss-free) rather than emit `BFloat16` and silently corrupt.
-            DataType::Float16 | DataType::Float32 => inner.push_str("Float32"),
-            DataType::Float64 => inner.push_str("Float64"),
-            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => inner.push_str("String"),
-            DataType::Binary | DataType::LargeBinary => inner.push_str("String"),
-            // ClickHouse `Date` is 2-byte UInt16 (range stops at ~2149).
-            // Arrow `Date32` carries 4-byte Int32 days, so mapping it to plain
-            // `Date` silently truncates anything past the 2-byte range.
-            // `Date32` (4-byte Int32) is the lossless equivalent.
-            DataType::Date32 | DataType::Date64 => inner.push_str("Date32"),
-            DataType::Timestamp(TimeUnit::Second, _) => inner.push_str("DateTime"),
-            DataType::Timestamp(TimeUnit::Millisecond, _) => inner.push_str("DateTime64(3)"),
-            DataType::Timestamp(TimeUnit::Microsecond, _) => inner.push_str("DateTime64(6)"),
-            DataType::Timestamp(TimeUnit::Nanosecond, _) => inner.push_str("DateTime64(9)"),
-            DataType::Time32(_) | DataType::Time64(_) => inner.push_str("String"),
-            DataType::Decimal128(precision, scale) | DataType::Decimal256(precision, scale) => {
-                write!(inner, "Decimal({precision}, {scale})").unwrap()
+            DataType::Null => rendered.push_str("String"),
+            DataType::Boolean => rendered.push_str("Bool"),
+            DataType::Int8 => rendered.push_str("Int8"),
+            DataType::Int16 => rendered.push_str("Int16"),
+            DataType::Int32 => rendered.push_str("Int32"),
+            DataType::Int64 => rendered.push_str("Int64"),
+            DataType::UInt8 => rendered.push_str("UInt8"),
+            DataType::UInt16 => rendered.push_str("UInt16"),
+            DataType::UInt32 => rendered.push_str("UInt32"),
+            DataType::UInt64 => rendered.push_str("UInt64"),
+            DataType::Float16 | DataType::Float32 => rendered.push_str("Float32"),
+            DataType::Float64 => rendered.push_str("Float64"),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+                rendered.push_str("String")
             }
-            DataType::List(item) | DataType::LargeList(item) => {
-                // ClickHouse forbids `Nullable(Array(T))` — array columns
-                // themselves are never null. Element nullability lives on the
-                // inner type (e.g. `Array(Nullable(Int32))`), so propagate the
-                // field's own `is_nullable()` to the recursive call.
-                let mut item_type = String::new();
-                try_format_type(item.data_type(), item.is_nullable(), &mut item_type)?;
-                write!(out, "Array({item_type})").unwrap();
-                return Ok(());
+            DataType::Binary | DataType::LargeBinary => rendered.push_str("String"),
+            DataType::Date32 | DataType::Date64 => rendered.push_str("Date32"),
+            DataType::Timestamp(TimeUnit::Second, _) => rendered.push_str("DateTime"),
+            DataType::Timestamp(TimeUnit::Millisecond, _) => rendered.push_str("DateTime64(3)"),
+            DataType::Timestamp(TimeUnit::Microsecond, _) => rendered.push_str("DateTime64(6)"),
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => rendered.push_str("DateTime64(9)"),
+            DataType::Time32(_) | DataType::Time64(_) => rendered.push_str("String"),
+            DataType::Decimal128(precision, scale) | DataType::Decimal256(precision, scale) => {
+                rendered = format!("Decimal({precision}, {scale})");
             }
             _ => {
                 return Err(AdapterError::new(
@@ -744,10 +730,20 @@ pub mod clickhouse {
             }
         }
 
-        if nullable {
-            write!(out, "Nullable({inner})").unwrap();
+        if array_layers.is_empty() {
+            if nullable {
+                out.push_str(&format!("Nullable({rendered})"));
+            } else {
+                out.push_str(&rendered);
+            }
         } else {
-            out.push_str(&inner);
+            for (item_nullable, item_is_array) in array_layers.into_iter().rev() {
+                if item_nullable && !item_is_array {
+                    rendered = format!("Nullable({rendered})");
+                }
+                rendered = format!("Array({rendered})");
+            }
+            out.push_str(&rendered);
         }
         Ok(())
     }
@@ -1160,6 +1156,12 @@ mod tests {
         let non_null_item = Arc::new(Field::new("item", DataType::Utf8, false));
         clickhouse::try_format_type(&DataType::List(non_null_item), false, &mut out).unwrap();
         assert_eq!(out, "Array(String)");
+
+        out.clear();
+        let nested_item = Arc::new(Field::new("item", DataType::Int32, true));
+        let nested_list = Arc::new(Field::new("item", DataType::List(nested_item), false));
+        clickhouse::try_format_type(&DataType::List(nested_list), false, &mut out).unwrap();
+        assert_eq!(out, "Array(Array(Nullable(Int32)))");
 
         // Arrow `Date32` must map to ClickHouse `Date32` (4-byte Int32), not
         // plain `Date` (2-byte UInt16), to avoid silent truncation past ~2149.

@@ -246,29 +246,6 @@ mod tests {
         );
     }
 
-    /// ClickHouse's include policy is `database=false`, so even when a non-empty
-    /// database is supplied to `do_create_relation`, the rendered FQN must skip
-    /// the database segment.
-    #[test]
-    fn test_do_create_relation_clickhouse_skips_database() {
-        let relation = do_create_relation(
-            AdapterType::ClickHouse,
-            "ignored".to_string(),
-            "analytics".to_string(),
-            Some("events".to_string()),
-            Some(RelationType::Table),
-            ResolvedQuoting {
-                database: true,
-                schema: true,
-                identifier: true,
-            },
-        )
-        .unwrap();
-
-        assert_eq!(relation.render_self_as_str(), "`analytics`.`events`");
-        assert_eq!(relation.database(), None);
-    }
-
     /// ClickHouse implicitly casts ISO-8601 string literals to `DateTime`/`Date`,
     /// so its event-time filter uses the bare-string form.
     #[test]

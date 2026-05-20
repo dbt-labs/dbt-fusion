@@ -987,4 +987,24 @@ mod tests {
 
         assert_eq!(relation.render_self_as_str(), "read_csv('orders.csv')");
     }
+
+    #[test]
+    fn do_create_relation_clickhouse_skips_database() {
+        let relation = do_create_relation(
+            AdapterType::ClickHouse,
+            "ignored".to_string(),
+            "analytics".to_string(),
+            Some("events".to_string()),
+            Some(RelationType::Table),
+            ResolvedQuoting {
+                database: true,
+                schema: true,
+                identifier: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(relation.render_self_as_str(), "`analytics`.`events`");
+        assert_eq!(relation.database(), None);
+    }
 }

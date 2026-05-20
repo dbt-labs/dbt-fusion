@@ -857,11 +857,16 @@ fn clickhouse_get_relation(
         return Ok(None);
     }
 
-    let engine_column = batch.column_by_name("engine").unwrap();
-    let engine_array = engine_column
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
+    let engine_array = batch
+        .column_by_name("engine")
+        .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+        .ok_or_else(|| {
+            AdapterError::new(
+                AdapterErrorKind::UnexpectedResult,
+                "Did not find string column 'engine' for a ClickHouse relation",
+            )
+        })?;
+    debug_assert_eq!(engine_array.len(), batch.num_rows());
     if engine_array.len() != 1 {
         return Err(AdapterError::new(
             AdapterErrorKind::UnexpectedResult,

@@ -4019,16 +4019,17 @@ impl Adapter {
                     })?;
                 let batch = table.original_record_batch();
                 let mut buf: Vec<u8> = Vec::new();
-                let mut writer = arrow::csv::WriterBuilder::new()
-                    .with_header(false)
-                    .build(&mut buf);
-                writer.write(&batch).map_err(|e| {
-                    minijinja::Error::new(
-                        minijinja::ErrorKind::InvalidOperation,
-                        format!("get_csv_data: failed to format CSV: {e}"),
-                    )
-                })?;
-                drop(writer);
+                {
+                    let mut writer = arrow::csv::WriterBuilder::new()
+                        .with_header(false)
+                        .build(&mut buf);
+                    writer.write(&batch).map_err(|e| {
+                        minijinja::Error::new(
+                            minijinja::ErrorKind::InvalidOperation,
+                            format!("get_csv_data: failed to format CSV: {e}"),
+                        )
+                    })?;
+                }
                 let csv = String::from_utf8_lossy(&buf).into_owned();
                 Ok(Value::from(csv))
             }

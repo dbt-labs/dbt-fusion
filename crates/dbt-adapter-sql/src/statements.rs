@@ -5,7 +5,12 @@ use crate::tokenizer::{Token, Tokenizer};
 pub fn is_update_statement(sql: &str, adapter_type: AdapterType) -> bool {
     match adapter_type {
         AdapterType::ClickHouse => {
-            first_sql_token(sql).is_some_and(|token| !is_clickhouse_read_statement_token(token))
+            let sql = trim_leading_sql_comments(sql);
+            let mut tokenizer = Tokenizer::new(sql);
+            matches!(
+                tokenizer.next(),
+                Some(Token::Word(token)) if !is_clickhouse_read_statement_token(token)
+            )
         }
         AdapterType::Bigquery
         | AdapterType::Snowflake
@@ -26,31 +31,26 @@ pub fn is_update_statement(sql: &str, adapter_type: AdapterType) -> bool {
     }
 }
 
-fn first_sql_token(sql: &str) -> Option<&str> {
-    let sql = trim_leading_sql_comments(sql);
-    let mut tokenizer = Tokenizer::new(sql);
-    match tokenizer.next() {
-        Some(Token::Word(token)) => Some(token),
-        _ => None,
-    }
-}
-
 fn trim_leading_sql_comments(mut sql: &str) -> &str {
     loop {
         let trimmed = sql.trim_start_matches(char::is_whitespace);
         if let Some(rest) = trimmed.strip_prefix("--") {
-            let Some((_, rest)) = rest.split_once('\n') else {
-                return "";
-            };
-            sql = rest;
-            continue;
+            match rest.split_once('\n') {
+                Some((_, rest)) => {
+                    sql = rest;
+                    continue;
+                }
+                None => return "",
+            }
         }
         if let Some(rest) = trimmed.strip_prefix("/*") {
-            let Some((_, rest)) = rest.split_once("*/") else {
-                return "";
-            };
-            sql = rest;
-            continue;
+            match rest.split_once("*/") {
+                Some((_, rest)) => {
+                    sql = rest;
+                    continue;
+                }
+                None => return "",
+            }
         }
         return trimmed;
     }

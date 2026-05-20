@@ -3,6 +3,7 @@ use std::sync::LazyLock;
 
 use crate::AdapterResult;
 use crate::column::{BigqueryColumnMode, Column};
+use crate::errors::{AdapterError, AdapterErrorKind};
 use crate::metadata;
 use crate::sql_types::{self, TypeOps, original_type_string};
 use arrow_schema::{DataType, FieldRef};
@@ -28,7 +29,7 @@ impl ColumnBuilder {
             Redshift => Ok(Self::build_redshift(field, type_ops)),
             Postgres | Salesforce | DuckDB => Ok(Self::build_postgres_like(field, type_ops)),
             Fabric => Ok(Self::build_fabric(field, type_ops)),
-            ClickHouse => Ok(Self::build_clickhouse(field, type_ops)),
+            ClickHouse => Self::build_clickhouse(field, type_ops),
             Exasol => Ok(Self::build_postgres_like(field, type_ops)),
             Starburst => todo!("Starburst"),
             Athena => todo!("Athena"),
@@ -126,108 +127,102 @@ impl ColumnBuilder {
         }
     }
 
-    /// Strip ClickHouse `Nullable(...)` and `LowCardinality(...)` wrappers from a
-    /// rendered type string, returning the innermost type.
-    ///
-    /// Mirrors `_inner_dtype` in dbt-clickhouse's `column.py`:
-    /// https://github.com/ClickHouse/dbt-clickhouse/blob/main/dbt/adapters/clickhouse/column.py
+    const CLICKHOUSE_TYPE_WRAPPERS: [&'static str; 2] = ["LowCardinality", "Nullable"];
+
     fn strip_clickhouse_wrappers(dtype: &str) -> &str {
         let mut s = dtype.trim();
-        while let Some(inner) = Self::strip_one_wrapper(s, "LowCardinality")
-            .or_else(|| Self::strip_one_wrapper(s, "Nullable"))
+        while let Some(inner) = Self::CLICKHOUSE_TYPE_WRAPPERS
+            .iter()
+            .find_map(|wrapper| Self::strip_type_wrapper(s, wrapper))
         {
             s = inner;
         }
         s
     }
 
-    /// If `s` is `<prefix>(...)` (case-insensitive), return the contents between
-    /// the outermost parentheses, trimmed. Otherwise return `None`.
-    fn strip_one_wrapper<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    fn strip_type_wrapper<'a>(s: &'a str, wrapper: &str) -> Option<&'a str> {
         let s = s.trim();
-        let needle_len = prefix.len() + 1; // include '('
-        if s.len() < needle_len + 1 || !s.ends_with(')') {
-            return None;
-        }
-        let (head, tail) = s.split_at(needle_len);
-        if !head[..prefix.len()].eq_ignore_ascii_case(prefix) || !head.ends_with('(') {
-            return None;
-        }
-        Some(tail[..tail.len() - 1].trim())
+        let rest = Self::strip_prefix_ignore_ascii_case(s, wrapper)?;
+        let inner = rest.strip_prefix('(')?.strip_suffix(')')?;
+        Some(inner.trim())
     }
 
-    /// Parse `FixedString(N)` and return `N`, matching upstream `_fix_size_regex`.
+    fn strip_prefix_ignore_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+        let head = s.get(..prefix.len())?;
+        if head.eq_ignore_ascii_case(prefix) {
+            s.get(prefix.len()..)
+        } else {
+            None
+        }
+    }
+
     fn parse_fixed_string_size(dtype: &str) -> Option<u32> {
-        let lower = dtype.to_ascii_lowercase();
-        let rest = lower.strip_prefix("fixedstring(")?.strip_suffix(')')?;
-        rest.trim().parse().ok()
+        let inner = Self::strip_prefix_ignore_ascii_case(dtype.trim(), "FixedString(")?
+            .strip_suffix(')')?;
+        inner.trim().parse().ok()
     }
 
-    /// Parse `Decimal(precision, scale)` and return `(precision, scale)`, matching
-    /// upstream `_decimal_regex`. Rejects ClickHouse-specific
-    /// `Decimal32/64/128/256(scale)` shorthands that carry only one number — those
-    /// fall through to the Arrow-typed precision-scale path.
-    fn parse_decimal_precision_scale(dtype: &str) -> Option<(u8, i8)> {
-        let lower = dtype.to_ascii_lowercase();
-        let inner = lower
-            .strip_prefix("decimal(")
-            .and_then(|s| s.strip_suffix(')'))?;
+    fn parse_decimal_precision_scale(dtype: &str) -> Option<(u64, u64)> {
+        let inner =
+            Self::strip_prefix_ignore_ascii_case(dtype.trim(), "Decimal(")?.strip_suffix(')')?;
         let mut parts = inner.split(',').map(str::trim);
-        let p: u8 = parts.next()?.parse().ok()?;
-        let s: i8 = parts.next()?.parse().ok()?;
-        Some((p, s))
+        let precision = parts.next()?.parse().ok()?;
+        let scale = parts.next()?.parse().ok()?;
+        Some((precision, scale))
     }
 
-    /// Build a `Column` for a ClickHouse query result `FieldRef`.
-    ///
-    /// Mirrors the construction behaviour of `ClickHouseColumn.__init__` upstream:
-    /// it strips `Nullable(...)` / `LowCardinality(...)` wrappers to derive
-    /// `char_size` (from `FixedString(N)`) and `numeric_precision` / `numeric_scale`
-    /// (from `Decimal(P, S)`). The full original type string — wrappers included —
-    /// is preserved as the column's `dtype` so that downstream rendering keeps
-    /// nullability information.
-    fn build_clickhouse(field: &FieldRef, type_ops: &dyn TypeOps) -> Column {
+    fn clickhouse_numeric_precision_scale(
+        data_type: &DataType,
+    ) -> AdapterResult<(Option<u64>, Option<u64>)> {
+        match sql_types::numeric_precision_scale(AdapterType::ClickHouse, data_type)? {
+            Some((precision, Some(scale))) => Ok((
+                Some(u64::from(precision)),
+                Some(Self::widen_numeric_scale(scale)?),
+            )),
+            Some((precision, None)) => Ok((Some(u64::from(precision)), None)),
+            None => Ok((None, None)),
+        }
+    }
+
+    fn widen_numeric_scale(scale: i8) -> AdapterResult<u64> {
+        debug_assert!(scale >= 0);
+        u64::try_from(scale).map_err(|_| {
+            AdapterError::new(
+                AdapterErrorKind::UnexpectedResult,
+                format!("negative numeric scale {scale}"),
+            )
+        })
+    }
+
+    fn build_clickhouse(field: &FieldRef, type_ops: &dyn TypeOps) -> AdapterResult<Column> {
         use AdapterType::ClickHouse;
 
-        let type_text: Cow<'_, str> = match original_type_string(ClickHouse, field) {
-            Some(s) => s,
+        let type_text = match original_type_string(ClickHouse, field) {
+            Some(s) => s.into_owned(),
             None => {
                 let mut out = String::new();
-                if type_ops
-                    .format_arrow_type_as_sql(field.data_type(), &mut out)
-                    .is_err()
-                {
-                    out = field.data_type().to_string();
-                }
-                Cow::Owned(out)
+                type_ops.format_arrow_type_as_sql(field.data_type(), &mut out)?;
+                out
             }
         };
 
-        let inner = Self::strip_clickhouse_wrappers(type_text.as_ref());
+        let inner = Self::strip_clickhouse_wrappers(&type_text);
         let char_size = Self::parse_fixed_string_size(inner);
-        let (numeric_precision, numeric_scale) = match Self::parse_decimal_precision_scale(inner) {
-            Some((p, s)) => (Some(p as u64), Some(s as u64)),
-            None => {
-                let precision_scale =
-                    sql_types::numeric_precision_scale(ClickHouse, field.data_type())
-                        .ok()
-                        .flatten();
-                match precision_scale {
-                    Some((p, Some(s))) => (Some(p as u64), Some(s as u64)),
-                    Some((p, None)) => (Some(p as u64), None),
-                    None => (None, None),
-                }
-            }
-        };
+        let (numeric_precision, numeric_scale) =
+            if let Some((precision, scale)) = Self::parse_decimal_precision_scale(inner) {
+                (Some(precision), Some(scale))
+            } else {
+                Self::clickhouse_numeric_precision_scale(field.data_type())?
+            };
 
-        Column::new(
+        Ok(Column::new(
             ClickHouse,
             field.name().to_string(),
-            type_text.into_owned(),
+            type_text,
             char_size,
             numeric_precision,
             numeric_scale,
-        )
+        ))
     }
 
     fn build_fabric(field: &FieldRef, type_ops: &dyn TypeOps) -> Column {
@@ -660,7 +655,10 @@ mod tests {
             Some(255)
         );
         assert_eq!(ColumnBuilder::parse_fixed_string_size("String"), None);
-        assert_eq!(ColumnBuilder::parse_fixed_string_size("FixedString()"), None);
+        assert_eq!(
+            ColumnBuilder::parse_fixed_string_size("FixedString()"),
+            None
+        );
         assert_eq!(
             ColumnBuilder::parse_fixed_string_size("FixedString(abc)"),
             None
