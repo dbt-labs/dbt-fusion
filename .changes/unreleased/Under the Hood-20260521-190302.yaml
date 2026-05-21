@@ -1,0 +1,7 @@
+kind: Under the Hood
+body: 'Clickhouse: Fix Unknown keyword database when creating a view'
+time: 2026-05-21T19:03:02.127954+02:00
+custom:
+    author: koletzilla
+    issue: "1749"
+    project: dbt-fusion
