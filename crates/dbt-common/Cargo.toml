@@ -54,7 +54,6 @@ tokio = { workspace = true, features = ["fs"] }
 
 pathdiff = { workspace = true }
 
-normalize-path = { version = "0.2.1" }
 
 dbt-tui-progress = { workspace = true }
 rust-embed = { workspace = true }
