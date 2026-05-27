@@ -53,6 +53,7 @@ impl SemanticCategory {
             | "valid_snapshot_target"
             | "describe_relation"
             | "describe_dynamic_table"
+            | "describe_clickhouse_materialized_view"
             | "get_column_schema_from_query"
             | "get_columns_in_select_sql"
             | "get_partitions_metadata"

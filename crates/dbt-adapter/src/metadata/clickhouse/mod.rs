@@ -45,6 +45,43 @@ pub(crate) fn build_get_relation_sql(schema: &str, identifier: &str) -> String {
     )
 }
 
+pub(crate) fn build_describe_materialized_view_target_table_sql(
+    schema: &str,
+    identifier: &str,
+) -> String {
+    let escaped_schema = escape_clickhouse_string_literal(schema);
+    let escaped_identifier = escape_clickhouse_string_literal(identifier);
+    format!(
+        "select \
+            engine, \
+            sorting_key as order_by, \
+            primary_key, \
+            partition_key as partition_by, \
+            create_table_query \
+         from system.tables \
+         where database = '{escaped_schema}' \
+           and name = '{escaped_identifier}'"
+    )
+}
+
+pub(crate) fn build_describe_generated_materialized_view_sql(
+    schema: &str,
+    generated_mv_name: &str,
+) -> String {
+    let escaped_schema = escape_clickhouse_string_literal(schema);
+    let escaped_mv_name = escape_clickhouse_string_literal(generated_mv_name);
+    format!(
+        "select \
+            name, \
+            as_select as query, \
+            create_table_query \
+         from system.tables \
+         where database = '{escaped_schema}' \
+           and engine = 'MaterializedView' \
+           and name = '{escaped_mv_name}'"
+    )
+}
+
 pub struct ClickHouseMetadataAdapter {
     adapter: AdapterImpl,
 }
@@ -446,6 +483,22 @@ mod tests {
         assert_eq!(
             build_get_relation_sql("a'b", r"c\d"),
             r"SELECT engine, name FROM system.tables WHERE database = 'a\'b' AND name = 'c\\d'",
+        );
+    }
+
+    #[test]
+    fn build_describe_clickhouse_materialized_view_sql_escapes_target_table_names() {
+        assert_eq!(
+            build_describe_materialized_view_target_table_sql("a'b", r"events\d"),
+            "select engine, sorting_key as order_by, primary_key, partition_key as partition_by, create_table_query from system.tables where database = 'a\\'b' and name = 'events\\\\d'",
+        );
+    }
+
+    #[test]
+    fn build_describe_clickhouse_materialized_view_sql_escapes_generated_mv_name() {
+        assert_eq!(
+            build_describe_generated_materialized_view_sql("a'b", r"events_mv\d"),
+            "select name, as_select as query, create_table_query from system.tables where database = 'a\\'b' and engine = 'MaterializedView' and name = 'events_mv\\\\d'",
         );
     }
 }

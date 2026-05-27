@@ -862,6 +862,18 @@ pub trait BaseRelation: BaseRelationProperties + Any + Send + Sync + fmt::Debug 
     ) -> Result<Value, MinijinjaError> {
         unimplemented!("Available only for BigQuery and Redshift")
     }
+
+    /// ClickHouse materialized view config changeset
+    fn clickhouse_materialized_view_config_changeset(
+        &self,
+        _relation_results: &Value,
+        _relation_config: &Value,
+    ) -> Result<Value, MinijinjaError> {
+        jinja_err!(
+            MinijinjaErrorKind::InvalidOperation,
+            "Only available for clickhouse"
+        )
+    }
 }
 
 #[cfg(test)]

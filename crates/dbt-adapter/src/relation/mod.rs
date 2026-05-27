@@ -5,6 +5,7 @@ pub use config::{BaseRelationChangeSet, BaseRelationConfig, ComponentConfig, Rel
 
 // Relation and RelationConfig for different data warehouses
 pub mod bigquery;
+pub mod clickhouse;
 pub mod databricks;
 pub mod parse;
 pub mod redshift;

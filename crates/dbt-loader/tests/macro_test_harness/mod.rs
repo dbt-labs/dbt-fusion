@@ -155,7 +155,6 @@ pub fn default_mock_config() -> Arc<MockJinjaObject> {
             _ => Ok(default),
         }
     });
-
     mock.on("persist_column_docs", |_args| Ok(Value::from(false)));
     mock.on("persist_relation_docs", |_args| Ok(Value::from(false)));
     mock.set_attr("model", Value::UNDEFINED);
@@ -532,11 +531,17 @@ impl MacroTestHarnessBuilder {
             env.env
                 .add_function("write", |_val: Value| Ok(Value::UNDEFINED));
             env.env
-                .add_function("log", |_msg: Value| Ok(Value::UNDEFINED));
+                .add_function("log", |_msg: Value, _kwargs: minijinja::value::Kwargs| {
+                    Ok(Value::UNDEFINED)
+                });
             env.env.add_function(
                 "store_result",
                 |_name: Value, _kwargs: minijinja::value::Kwargs| Ok(Value::UNDEFINED),
             );
+            env.env
+                .add_function("store_raw_result", |_kwargs: minijinja::value::Kwargs| {
+                    Ok(Value::UNDEFINED)
+                });
         }
 
         for (key, value) in self.globals {

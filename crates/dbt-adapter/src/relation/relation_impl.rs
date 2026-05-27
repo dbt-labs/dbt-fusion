@@ -1,6 +1,7 @@
 use crate::information_schema::InformationSchema;
 use crate::need_quotes::need_quotes;
 use crate::relation::RelationChangeSet;
+use crate::relation::clickhouse::materialized_view::clickhouse_materialized_view_config_changeset;
 use crate::relation::config_v2::RelationConfig;
 use crate::relation::databricks;
 use crate::relation::duckdb_should_include_database;
@@ -1150,6 +1151,23 @@ impl BaseRelation for Relation {
                 }
             }
             _ => unimplemented!("Available only for BigQuery and Redshift"),
+        }
+    }
+
+    fn clickhouse_materialized_view_config_changeset(
+        &self,
+        remote_state_value: &Value,
+        local_config_value: &Value,
+    ) -> Result<Value, minijinja::Error> {
+        match self.adapter_type {
+            AdapterType::ClickHouse => clickhouse_materialized_view_config_changeset(
+                remote_state_value,
+                local_config_value,
+            ),
+            _ => Err(minijinja::Error::new(
+                minijinja::ErrorKind::InvalidOperation,
+                "Only available for clickhouse",
+            )),
         }
     }
 }

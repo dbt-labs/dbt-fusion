@@ -2589,6 +2589,28 @@ impl Adapter {
         }
     }
 
+    /// Get ClickHouse materialized_view materialization state.
+    #[tracing::instrument(skip(self, state), level = "trace")]
+    pub fn describe_clickhouse_materialized_view(
+        &self,
+        state: &State,
+        relation: &Arc<dyn BaseRelation>,
+    ) -> Result<Value, minijinja::Error> {
+        match &self.inner {
+            Typed { adapter, .. } => {
+                let mut conn =
+                    adapter.borrow_tlocal_connection(Some(state), node_id_from_state(state))?;
+                adapter.describe_clickhouse_materialized_view(
+                    state,
+                    conn.as_mut(),
+                    relation,
+                    self.cancellation_token.clone(),
+                )
+            }
+            Parse(_) => Ok(empty_map_value()),
+        }
+    }
+
     /// Get a catalog integration object.
     ///
     /// https://github.com/dbt-labs/dbt-adapters/blob/c16cc7047e8678f8bb88ae294f43da2c68e9f5cc/dbt-adapters/src/dbt/adapters/base/impl.py#L334
@@ -2766,6 +2788,14 @@ impl Adapter {
                 iter.finish()?;
 
                 self.describe_dynamic_table(state, &relation, include_transient)
+            }
+            "describe_clickhouse_materialized_view" => {
+                let iter = ArgsIter::new(name, &["relation"], args);
+                let relation = iter.next_arg::<&Value>()?;
+                let relation = downcast_value_to_dyn_base_relation(relation)?;
+                iter.finish()?;
+
+                self.describe_clickhouse_materialized_view(state, &relation)
             }
             "get_catalog_integration" => self.get_catalog_integration(state, args),
             "type" => Ok(Value::from(self.adapter_type().to_string())),

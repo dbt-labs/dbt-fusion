@@ -200,6 +200,8 @@ pub struct ProjectModelConfig {
     pub enabled: Option<bool>,
     #[serde(rename = "+event_time")]
     pub event_time: Option<String>,
+    #[serde(rename = "+engine")]
+    pub engine: Option<String>,
     #[serde(rename = "+external_volume")]
     pub external_volume: Option<String>,
     #[serde(rename = "+file_format")]
@@ -216,6 +218,8 @@ pub struct ProjectModelConfig {
         deserialize_with = "bool_or_string_bool"
     )]
     pub full_refresh: Option<bool>,
+    #[serde(default, rename = "+catchup", deserialize_with = "bool_or_string_bool")]
+    pub catchup: Option<bool>,
     #[serde(rename = "+grant_access_to")]
     pub grant_access_to: Option<Vec<GrantAccessToTarget>>,
     #[serde(rename = "+grants")]
@@ -342,6 +346,8 @@ pub struct ProjectModelConfig {
     pub on_error: Option<OnError>,
     #[serde(rename = "+on_schema_change")]
     pub on_schema_change: Option<OnSchemaChange>,
+    #[serde(rename = "+order_by")]
+    pub order_by: Option<StringOrArrayOfStrings>,
     #[serde(rename = "+packages")]
     pub packages: Option<StringOrArrayOfStrings>,
     #[serde(rename = "+python_version")]
@@ -391,6 +397,8 @@ pub struct ProjectModelConfig {
     pub quoting: Option<DbtQuoting>,
     #[serde(rename = "+refresh_mode")]
     pub refresh_mode: Option<String>,
+    #[serde(rename = "+refreshable")]
+    pub refreshable: Option<BTreeMap<String, YmlValue>>,
     #[serde(
         default,
         rename = "+refresh_interval_minutes",
@@ -447,6 +455,8 @@ pub struct ProjectModelConfig {
     pub tblproperties: Option<BTreeMap<String, YmlValue>>,
     #[serde(rename = "+tmp_relation_type")]
     pub tmp_relation_type: Option<String>,
+    #[serde(rename = "+ttl")]
+    pub ttl: Option<StringOrArrayOfStrings>,
     #[serde(
         default,
         rename = "+transient",
@@ -553,10 +563,16 @@ pub struct ModelConfig {
     pub compute: Option<ComputeArg>,
     #[serde(default, deserialize_with = "bool_or_string_bool")]
     pub full_refresh: Option<bool>,
+    #[serde(default, deserialize_with = "bool_or_string_bool")]
+    pub catchup: Option<bool>,
     pub unique_key: Option<DbtUniqueKey>,
     pub on_schema_change: Option<OnSchemaChange>,
     pub on_configuration_change: Option<OnConfigurationChange>,
     pub on_error: Option<OnError>,
+    pub engine: Option<String>,
+    pub order_by: Option<StringOrArrayOfStrings>,
+    pub refreshable: Option<BTreeMap<String, YmlValue>>,
+    pub ttl: Option<StringOrArrayOfStrings>,
     pub grants: OmissibleGrantConfig,
     pub packages: Option<StringOrArrayOfStrings>,
     pub python_version: Option<String>,
@@ -642,10 +658,12 @@ impl From<ProjectModelConfig> for ModelConfig {
             docs: config.docs,
             enabled: config.enabled,
             event_time: config.event_time,
+            engine: config.engine,
             freshness: config.freshness,
             state: config.state,
             latest_version_pointer: config.latest_version_pointer,
             full_refresh: config.full_refresh,
+            catchup: config.catchup,
             grants: config.grants,
             group: config.group,
             incremental_predicates: config.incremental_predicates,
@@ -659,6 +677,7 @@ impl From<ProjectModelConfig> for ModelConfig {
             on_configuration_change: config.on_configuration_change,
             on_error: config.on_error,
             on_schema_change: config.on_schema_change,
+            order_by: config.order_by,
             packages: config.packages,
             python_version: config.python_version,
             imports: config.imports,
@@ -675,7 +694,9 @@ impl From<ProjectModelConfig> for ModelConfig {
             static_analysis: config.static_analysis,
             sync: config.sync,
             table_format: config.table_format,
+            refreshable: config.refreshable,
             tags: config.tags.into_inner(),
+            ttl: config.ttl,
             unique_key: config.unique_key,
             __warehouse_specific_config__: WarehouseSpecificNodeConfig {
                 description: config.description,
@@ -799,10 +820,12 @@ impl From<ModelConfig> for ProjectModelConfig {
             docs: config.docs,
             enabled: config.enabled,
             event_time: config.event_time,
+            engine: config.engine,
             freshness: config.freshness,
             state: config.state,
             latest_version_pointer: config.latest_version_pointer,
             full_refresh: config.full_refresh,
+            catchup: config.catchup,
             grants: config.grants,
             group: config.group,
             incremental_predicates: config.incremental_predicates,
@@ -825,6 +848,7 @@ impl From<ModelConfig> for ProjectModelConfig {
             on_configuration_change: config.on_configuration_change,
             on_error: config.on_error,
             on_schema_change: config.on_schema_change,
+            order_by: config.order_by,
             packages: config.packages,
             python_version: config.python_version,
             imports: config.imports,
@@ -840,7 +864,9 @@ impl From<ModelConfig> for ProjectModelConfig {
             sql_header: config.sql_header,
             static_analysis: config.static_analysis,
             table_format: config.table_format,
+            refreshable: config.refreshable,
             tags: config.tags.into(),
+            ttl: config.ttl,
             transient: config.__warehouse_specific_config__.transient,
             unique_key: config.unique_key,
             adapter_properties: config.__warehouse_specific_config__.adapter_properties,
@@ -990,10 +1016,15 @@ impl ResolvableConfig<ModelConfig> for ModelConfig {
             persist_docs,
             column_types,
             full_refresh,
+            catchup,
             unique_key,
             on_schema_change,
             on_configuration_change,
             on_error,
+            engine,
+            order_by,
+            refreshable,
+            ttl,
             grants,
             packages,
             python_version,
@@ -1075,10 +1106,15 @@ impl ResolvableConfig<ModelConfig> for ModelConfig {
                 begin,
                 persist_docs,
                 full_refresh,
+                catchup,
                 unique_key,
                 on_schema_change,
                 on_configuration_change,
                 on_error,
+                engine,
+                order_by,
+                refreshable,
+                ttl,
                 python_version,
                 use_anonymous_sproc,
                 secrets,
@@ -1205,7 +1241,12 @@ impl ModelConfig {
         // let quoting_eq = self.quoting == other.quoting // TODO: re-enable when no longer using mantle/core manifests in IA
         let column_types_eq_result = column_types_eq(&self.column_types, &other.column_types); // Custom comparison for column_types
         let full_refresh_eq = self.full_refresh == other.full_refresh;
+        let catchup_eq = self.catchup == other.catchup;
         let unique_key_eq = self.unique_key == other.unique_key;
+        let engine_eq = self.engine == other.engine;
+        let order_by_eq = self.order_by == other.order_by;
+        let refreshable_eq = self.refreshable == other.refreshable;
+        let ttl_eq = self.ttl == other.ttl;
         let on_schema_change_eq_result =
             on_schema_change_eq(&self.on_schema_change, &other.on_schema_change); // Custom comparison for on_schema_change
         let on_configuration_change_eq_result = on_configuration_change_eq(
@@ -1251,7 +1292,12 @@ impl ModelConfig {
             // && quoting_eq
             && column_types_eq_result
             && full_refresh_eq
+            && catchup_eq
             && unique_key_eq
+            && engine_eq
+            && order_by_eq
+            && refreshable_eq
+            && ttl_eq
             && on_schema_change_eq_result
             && on_configuration_change_eq_result
             && on_error_eq

@@ -7,7 +7,9 @@ use dbt_jinja_utils::mock_object::MockJinjaObject;
 use dbt_schemas::dbt_types::RelationType;
 use minijinja::Value;
 
-use crate::macro_test_harness::{MacroTestHarness, assert_executed_contains, default_mock_config};
+use crate::macro_test_harness::{
+    MacroTestHarness, assert_executed_contains, default_mock_config, executed_sql,
+};
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -311,5 +313,191 @@ mod postgres {
         let h = run_existing_table(ADAPTER);
         h.mock().observed_calls().assert_called("rename_relation");
         assert_executed_contains(h.mock(), "create");
+    }
+}
+
+mod clickhouse {
+    use super::*;
+
+    const ADAPTER: AdapterType = AdapterType::ClickHouse;
+
+    fn render_clickhouse_view(
+        harness: &MacroTestHarness,
+        ctx: BTreeMap<String, Value>,
+    ) -> dbt_common::FsResult<String> {
+        harness.render("{{ materialization_view_clickhouse() }}", ctx)
+    }
+
+    fn build_harness_with_associated_mv_search(found_associated_mvs: &[&str]) -> MacroTestHarness {
+        let found_associated_mvs = found_associated_mvs
+            .iter()
+            .map(|name| format!("'{name}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let search_noop = r#"
+            {% macro clickhouse__search_associated_mvs_to_target(relation_schema, relation_name, mv_suffixes) %}
+              {{ return(([__FOUND_ASSOCIATED_MVS__], [relation_name ~ '_mv'])) }}
+            {% endmacro %}
+        "#
+        .replace("__FOUND_ASSOCIATED_MVS__", &found_associated_mvs);
+
+        let harness = MacroTestHarness::for_adapter(ADAPTER)
+            .load_all_macros()
+            .with_macro(
+                "dbt_clickhouse",
+                "clickhouse__search_associated_mvs_to_target",
+                &search_noop,
+            )
+            .with_stub_functions()
+            .with_global(
+                "target",
+                Value::from_serialize(BTreeMap::<String, Value>::new()),
+            )
+            .build()
+            .expect("harness should build");
+
+        harness.mock().on("commit", |_| Ok(Value::UNDEFINED));
+
+        harness
+    }
+
+    fn build_harness_with_failing_associated_mv_search() -> MacroTestHarness {
+        let search_should_not_be_called = r#"
+            {% macro clickhouse__search_associated_mvs_to_target(relation_schema, relation_name, mv_suffixes) %}
+              {{ exceptions.raise_compiler_error('associated MV search should not run for a new ClickHouse view') }}
+            {% endmacro %}
+        "#;
+
+        let harness = MacroTestHarness::for_adapter(ADAPTER)
+            .load_all_macros()
+            .with_macro(
+                "dbt_clickhouse",
+                "clickhouse__search_associated_mvs_to_target",
+                search_should_not_be_called,
+            )
+            .with_stub_functions()
+            .with_global(
+                "target",
+                Value::from_serialize(BTreeMap::<String, Value>::new()),
+            )
+            .build()
+            .expect("harness should build");
+
+        harness.mock().on("commit", |_| Ok(Value::UNDEFINED));
+
+        harness
+    }
+
+    fn clickhouse_view_context(harness: &MacroTestHarness) -> BTreeMap<String, Value> {
+        let mut ctx = harness
+            .materialization_context("events", "select id, count() as total from raw group by id")
+            .config(Value::from_dyn_object(default_mock_config()))
+            .build();
+        ctx.insert(
+            "model".to_string(),
+            Value::from_serialize(BTreeMap::from([
+                ("alias", Value::from("events")),
+                ("unique_id", Value::from("model.test_project.events")),
+                ("columns", Value::from(BTreeMap::<String, Value>::new())),
+                (
+                    "config",
+                    Value::from_serialize(BTreeMap::from([("materialized", Value::from("view"))])),
+                ),
+            ])),
+        );
+        ctx
+    }
+
+    fn assert_generated_mv_drop_before_view_create(sqls: &[String]) {
+        let drop_index = sqls
+            .iter()
+            .position(|sql| {
+                let sql = sql.to_lowercase();
+                sql.contains("drop view if exists") && sql.contains("`test_schema`.`events_mv`")
+            })
+            .expect("expected generated MV drop");
+        let create_index = sqls
+            .iter()
+            .position(|sql| sql.to_lowercase().contains("create or replace view"))
+            .expect("expected create or replace view statement");
+
+        assert!(
+            drop_index < create_index,
+            "Expected generated MV drop before view replacement, got: {sqls:?}",
+        );
+    }
+
+    #[test]
+    fn existing_view_drops_generated_mv_before_create_or_replace() {
+        let harness = build_harness_with_associated_mv_search(&["events_mv"]);
+        let existing =
+            harness.relation("TEST_DB", "TEST_SCHEMA", "events", Some(RelationType::View));
+        harness.mock().on("get_relation", move |_| {
+            Ok(RelationObject::new(Arc::clone(&existing)).into_value())
+        });
+
+        let ctx = clickhouse_view_context(&harness);
+        render_clickhouse_view(&harness, ctx)
+            .unwrap_or_else(|e| panic!("ClickHouse view materialization failed: {e:?}"));
+
+        let sqls = executed_sql(harness.mock());
+        assert_generated_mv_drop_before_view_create(&sqls);
+    }
+
+    #[test]
+    fn existing_table_drops_generated_mv_before_create_or_replace() {
+        let harness = build_harness_with_associated_mv_search(&["events_mv"]);
+        let existing = harness.relation(
+            "TEST_DB",
+            "TEST_SCHEMA",
+            "events",
+            Some(RelationType::Table),
+        );
+        harness.mock().on("get_relation", move |_| {
+            Ok(RelationObject::new(Arc::clone(&existing)).into_value())
+        });
+
+        let ctx = clickhouse_view_context(&harness);
+        render_clickhouse_view(&harness, ctx)
+            .unwrap_or_else(|e| panic!("ClickHouse view materialization failed: {e:?}"));
+
+        let sqls = executed_sql(harness.mock());
+        assert_generated_mv_drop_before_view_create(&sqls);
+    }
+
+    #[test]
+    fn no_existing_relation_does_not_search_associated_mvs() {
+        let harness = build_harness_with_failing_associated_mv_search();
+        harness.mock().on("get_relation", |_| Ok(Value::from(())));
+
+        let ctx = clickhouse_view_context(&harness);
+        render_clickhouse_view(&harness, ctx)
+            .unwrap_or_else(|e| panic!("ClickHouse view materialization failed: {e:?}"));
+
+        let sqls = executed_sql(harness.mock());
+
+        assert!(
+            sqls.iter()
+                .all(|sql| !sql.to_lowercase().contains("drop view if exists")),
+            "Expected no generated MV drop for first-run ClickHouse view, got: {sqls:?}",
+        );
+    }
+
+    #[test]
+    fn new_view_does_not_drop_unassociated_same_name_mv() {
+        let harness = build_harness_with_associated_mv_search(&[]);
+        harness.mock().on("get_relation", |_| Ok(Value::from(())));
+
+        let ctx = clickhouse_view_context(&harness);
+        render_clickhouse_view(&harness, ctx)
+            .unwrap_or_else(|e| panic!("ClickHouse view materialization failed: {e:?}"));
+
+        let sqls = executed_sql(harness.mock());
+
+        assert!(
+            sqls.iter()
+                .all(|sql| !sql.to_lowercase().contains("drop view if exists")),
+            "Expected no generated MV drop when associated-MV search does not prove ownership, got: {sqls:?}",
+        );
     }
 }
