@@ -31,6 +31,10 @@ use crate::query_ctx::{node_id_from_state, query_ctx_from_state};
 use crate::record_batch::{RecordBatchExt, RenamedColumn};
 use crate::relation::Relation;
 use crate::relation::RelationObject;
+use crate::relation::clickhouse::materialized_view::{
+    ClickHouseMaterializedViewObjectState, ClickHouseMaterializedViewState,
+    ClickHouseTargetTableState, materialized_view_points_to_target,
+};
 use crate::relation::config_v2::{ComponentConfigLoader, RelationConfig};
 use crate::relation::databricks::config::DatabricksRelationMetadata;
 use crate::render_constraint::render_column_constraint;
@@ -161,6 +165,19 @@ pub fn quote_component(
         quote_ident(adapter_type, identifier)
     } else {
         identifier.to_string()
+    }
+}
+
+fn string_column_value(
+    batch: &RecordBatch,
+    column_name: &str,
+    row: usize,
+) -> AdapterResult<Option<String>> {
+    let values = batch.column_values::<StringArray>(column_name)?;
+    if values.is_null(row) {
+        Ok(None)
+    } else {
+        Ok(Some(values.value(row).to_string()))
     }
 }
 
@@ -1192,6 +1209,98 @@ impl AdapterImpl {
             | ClickHouse | Exasol | Starburst | Athena | Trino | Datafusion | Dremio | Oracle => {
                 let err = format!(
                     "describe_dynamic_table is not supported by the {} adapter",
+                    adapter_type
+                );
+                Err(minijinja::Error::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    err,
+                ))
+            }
+        }
+    }
+
+    /// Get ClickHouse target table and generated materialized view state for
+    /// the materialized_view materialization.
+    pub fn describe_clickhouse_materialized_view(
+        &self,
+        state: &State,
+        conn: &'_ mut dyn Connection,
+        target_relation: &Arc<dyn BaseRelation>,
+        token: CancellationToken,
+    ) -> Result<Value, minijinja::Error> {
+        let adapter_type = self.adapter_type();
+        match adapter_type {
+            ClickHouse => {
+                let ctx =
+                    query_ctx_from_state(state)?.with_desc("describe_clickhouse_materialized_view");
+                let schema = target_relation.schema_as_str()?;
+                let identifier = target_relation.identifier_as_str()?;
+                let generated_mv_name =
+                    ClickHouseMaterializedViewState::single_mv_name(&identifier);
+
+                let target_sql =
+                    metadata::clickhouse::build_describe_materialized_view_target_table_sql(
+                        &schema,
+                        &identifier,
+                    );
+                let (_, target_table) = self.query(&ctx, conn, &target_sql, None, token.clone())?;
+                let target_batch = target_table.to_record_batch();
+                let target_table = if target_batch.num_rows() > 0 {
+                    ClickHouseTargetTableState {
+                        engine: string_column_value(&target_batch, "engine", 0)?,
+                        order_by: string_column_value(&target_batch, "order_by", 0)?,
+                        primary_key: string_column_value(&target_batch, "primary_key", 0)?,
+                        partition_by: string_column_value(&target_batch, "partition_by", 0)?,
+                        ttl: None,
+                        create_table_query: string_column_value(
+                            &target_batch,
+                            "create_table_query",
+                            0,
+                        )?,
+                    }
+                } else {
+                    ClickHouseTargetTableState::default()
+                };
+
+                let mv_sql = metadata::clickhouse::build_describe_generated_materialized_view_sql(
+                    &schema,
+                    &generated_mv_name,
+                );
+                let (_, materialized_view_table) = self.query(&ctx, conn, &mv_sql, None, token)?;
+                let materialized_view_batch = materialized_view_table.to_record_batch();
+                let mut materialized_views = BTreeMap::new();
+                if materialized_view_batch.num_rows() > 0 {
+                    let name = string_column_value(&materialized_view_batch, "name", 0)?
+                        .unwrap_or(generated_mv_name);
+                    let create_table_query =
+                        string_column_value(&materialized_view_batch, "create_table_query", 0)?;
+                    if materialized_view_points_to_target(
+                        create_table_query.as_deref(),
+                        &schema,
+                        &identifier,
+                    ) {
+                        materialized_views.insert(
+                            name,
+                            ClickHouseMaterializedViewObjectState {
+                                query: string_column_value(&materialized_view_batch, "query", 0)?,
+                                refreshable_clause: None,
+                                create_table_query,
+                            },
+                        );
+                    }
+                }
+
+                Ok(Value::from_serialize(ClickHouseMaterializedViewState {
+                    target_table,
+                    target_table_columns: Vec::new(),
+                    materialized_views,
+                }))
+            }
+            Postgres | Bigquery | Databricks | Redshift | Salesforce | Snowflake | Spark
+            | DuckDB | Fabric | Exasol | Starburst | Athena | Trino | Datafusion | Dremio
+            | Oracle => {
+                let err = format!(
+                    "describe_clickhouse_materialized_view is not supported by the {} adapter",
                     adapter_type
                 );
                 Err(minijinja::Error::new(

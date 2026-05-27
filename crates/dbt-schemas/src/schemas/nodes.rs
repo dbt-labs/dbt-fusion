@@ -1158,11 +1158,13 @@ impl InternalDbtNode for DbtModel {
         crate::schemas::serialization_utils::serialize_with_mode(self, mode)
     }
 
-    fn has_same_config(&self, other: &dyn InternalDbtNode, _adapter_type: AdapterType) -> bool {
+    fn has_same_config(&self, other: &dyn InternalDbtNode, adapter_type: AdapterType) -> bool {
         if let Some(other_model) = other.as_any().downcast_ref::<DbtModel>() {
-            let deprecated_config_eq = self
-                .deprecated_config
-                .same_config(&other_model.deprecated_config);
+            let deprecated_config_eq = DbtModel::has_same_config_for_adapter(
+                &self.deprecated_config,
+                &other_model.deprecated_config,
+                adapter_type,
+            );
 
             if !deprecated_config_eq {
                 log_state_mod_diff(
@@ -4871,6 +4873,30 @@ impl DbtModel {
         }
     }
 
+    fn has_same_config_for_adapter(
+        current: &ModelConfig,
+        previous: &ModelConfig,
+        adapter_type: AdapterType,
+    ) -> bool {
+        if adapter_type == AdapterType::ClickHouse {
+            return current.same_config(previous);
+        }
+
+        let mut current = current.clone();
+        let mut previous = previous.clone();
+        Self::clear_clickhouse_specific_config_for_state(&mut current);
+        Self::clear_clickhouse_specific_config_for_state(&mut previous);
+        current.same_config(&previous)
+    }
+
+    fn clear_clickhouse_specific_config_for_state(config: &mut ModelConfig) {
+        config.catchup = None;
+        config.engine = None;
+        config.order_by = None;
+        config.refreshable = None;
+        config.ttl = None;
+    }
+
     // If a previous state contract and current state contract are both present,
     // compare them for changes.
     fn same_contract_both_present(
@@ -5665,8 +5691,8 @@ mod tests {
     use serde::Deserialize;
 
     use super::{
-        DbtSnapshot, InternalDbtNodeAttributes, ModelConfig, hooks_equal, normalize_description,
-        persist_docs_configs_equal, quoting_equal,
+        DbtModel, DbtSnapshot, InternalDbtNode, InternalDbtNodeAttributes, ModelConfig,
+        hooks_equal, normalize_description, persist_docs_configs_equal, quoting_equal,
     };
     use crate::schemas::common::{Hooks, PersistDocsConfig};
     use crate::schemas::project::SnapshotMetaColumnNames;
@@ -5902,6 +5928,29 @@ mod tests {
         if let Err(err) = config {
             panic!("Could not deserialize and failed with the following error: {err}");
         }
+    }
+
+    #[test]
+    fn test_clickhouse_specific_model_configs_only_modify_clickhouse_state() {
+        let current = DbtModel {
+            deprecated_config: ModelConfig {
+                catchup: Some(true),
+                engine: Some("MergeTree()".to_string()),
+                order_by: Some(crate::schemas::serde::StringOrArrayOfStrings::String(
+                    "id".to_string(),
+                )),
+                refreshable: Some(std::collections::BTreeMap::new()),
+                ttl: Some(crate::schemas::serde::StringOrArrayOfStrings::String(
+                    "ts + INTERVAL 1 DAY".to_string(),
+                )),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let previous = DbtModel::default();
+
+        assert!(current.has_same_config(&previous, AdapterType::Snowflake));
+        assert!(!current.has_same_config(&previous, AdapterType::ClickHouse));
     }
 
     mod optional_string_vecs_equal_tests {

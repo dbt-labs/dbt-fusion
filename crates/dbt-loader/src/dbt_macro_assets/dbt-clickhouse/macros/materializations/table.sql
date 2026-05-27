@@ -8,6 +8,8 @@
 
   {# MVP: use CREATE OR REPLACE TABLE which is atomic in ClickHouse 22.9+.
      This handles new tables, existing tables, and full-refresh identically. #}
+  {{ clickhouse__drop_associated_mv_if_it_was_automatically_created(target_relation) }}
+
   {% call statement('main') -%}
     create or replace table {{ target_relation }}
     {{ on_cluster_clause(target_relation) }}

@@ -314,6 +314,20 @@ impl Object for RelationObject {
                 iter.finish()?;
                 self.materialized_view_config_changeset(&relation_results, &relation_config)
             }
+            "clickhouse_materialized_view_config_changeset" => {
+                let iter = ArgsIter::new(
+                    "clickhouse_materialized_view_config_changeset",
+                    &["relation_results", "relation_config"],
+                    args,
+                );
+                let relation_results = iter.next_arg::<Value>()?;
+                let relation_config = iter.next_arg::<Value>()?;
+                iter.finish()?;
+                self.clickhouse_materialized_view_config_changeset(
+                    &relation_results,
+                    &relation_config,
+                )
+            }
             _ => Err(minijinja::Error::new(
                 minijinja::ErrorKind::UnknownMethod,
                 format!("Unknown method on BaseRelationObject: '{name}'"),
