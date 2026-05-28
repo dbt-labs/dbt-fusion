@@ -177,8 +177,8 @@ impl TypeOps for SATypeOpsImpl {
             }
             // No type transformations have been necessary for the seed operation against
             // these data platforms so far, but this may need to be updated if that changes.
-            Postgres | Salesforce | Spark | DuckDB | Fabric | ClickHouse => None,
-            Exasol | Starburst | Athena | Trino | Dremio | Oracle | Datafusion => {
+            Postgres | Salesforce | Spark | DuckDB | Fabric | ClickHouse | Exasol => None,
+            Starburst | Athena | Trino | Dremio | Oracle | Datafusion => {
                 todo!("not yet")
             }
         }
@@ -1137,6 +1137,16 @@ mod tests {
     use super::*;
     use SqlTypeHint::*;
     use dbt_adapter_core::AdapterType::*;
+
+    #[test]
+    fn exasol_adapt_seed_type_returns_none() {
+        let type_ops = SATypeOpsImpl::new(Exasol);
+        // Before the fix, this would panic with todo!("not yet").
+        // After the fix, Exasol returns None (no type transformation needed).
+        assert_eq!(type_ops.adapt_seed_type(&DataType::Utf8), None);
+        assert_eq!(type_ops.adapt_seed_type(&DataType::Int64), None);
+        assert_eq!(type_ops.adapt_seed_type(&DataType::Float64), None);
+    }
 
     #[test]
     fn test_convert_integer_type() {
