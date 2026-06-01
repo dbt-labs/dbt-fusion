@@ -1,3 +1,15 @@
+> [!IMPORTANT]
+> ## 📦 This repository has moved
+>
+> Development and issue tracking for the Fusion engine now happen in **[dbt-labs/dbt-core](https://github.com/dbt-labs/dbt-core)** as part of **dbt Core v2**.
+>
+> - 🐞 **File new issues** in [dbt-labs/dbt-core](https://github.com/dbt-labs/dbt-core/issues/new/choose)
+> - 📖 Docs: [dbt Core v2 / Fusion](https://docs.getdbt.com/docs/fusion)
+>
+> This repository is **archived and read-only**. Existing issues were transferred to dbt-core — old issue links redirect automatically.
+
+---
+
 <div style="text-align: center;">
   <img src="assets/dbt-fusion-engine.png" alt="dbt Fusion Engine" width="400" style="border-radius: 6px;" />
 </div>
