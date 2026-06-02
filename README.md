@@ -1,14 +1,12 @@
 > [!IMPORTANT]
-> ## 🔀 Issue tracking has moved to dbt-core
+> ## 📦 Issue tracking has moved to dbt-core
 >
-> The code that used to be in this dbt-fusion repository has moved to the **[dbt-labs/dbt-core](https://github.com/dbt-labs/dbt-core)** repository to create dbt Core version 2, an open source implementation of dbt alongside the primary dbt Fusion distribution.
+> Issues and bug reports for the **dbt Fusion engine** are now tracked in **[dbt-labs/dbt-core](https://github.com/dbt-labs/dbt-core)**, alongside the rest of dbt.
 >
->You can file issues related to any part of the dbt framework (including functionality not implemented in public code, such as SQL comprehension) there.
+> - 🐞 **File new issues** in [dbt-labs/dbt-core](https://github.com/dbt-labs/dbt-core/issues/new/choose)
+> - 📖 Fusion docs: https://docs.getdbt.com/docs/fusion
 >
-> - **File new issues** in [dbt-labs/dbt-core](https://github.com/dbt-labs/dbt-core/issues/new/choose)
-> - **[Install the free, locally available dbt Fusion CLI](https://docs.getdbt.com/docs/local/install-dbt)**
->
-> Existing issues from this repo have been transferred to dbt-core and old issue links will redirect automatically.
+> Existing issues have been transferred to dbt-core — old issue links redirect automatically.
 
 ---
 
