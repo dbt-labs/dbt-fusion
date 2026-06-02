@@ -1,15 +1,14 @@
-name: 🧠 SQL understanding issue
-description: dbt Fusion doesn't recognize a function, flags valid SQL as an error, infers the wrong column type, or produces incorrect lineage
+name: 🧠 SQL understanding issue (dbt Core v2)
+description: dbt Core v2 (the Fusion engine) doesn't recognize a function, flags valid SQL as an error, infers the wrong column type, or produces incorrect lineage
 title: "[SQL] <title>"
 labels: ["bug", "triage", "SQL_understanding"]
-type: "Bug"
 body:
   - type: markdown
     attributes:
       value: |
-        Use this template for issues where dbt Fusion **fails to understand valid SQL** — things like unrecognized functions, incorrect type inference, unexpected parse errors, or wrong static analysis results.
+        Use this template for issues where dbt Core v2 (the Fusion engine) **fails to understand valid SQL** — things like unrecognized functions, incorrect type inference, unexpected parse errors, or wrong static analysis results.
 
-        For runtime errors or behavioral bugs unrelated to SQL analysis, use the general [Bug report](./bug_report.yml) instead.
+        For runtime errors or behavioral bugs unrelated to SQL analysis, use the "🐞 Bug (dbt Core v2 / Fusion engine)" template instead.
   - type: checkboxes
     attributes:
       label: Before you submit
@@ -18,22 +17,22 @@ body:
           required: true
   - type: textarea
     attributes:
-      label: SQL that dbt Fusion doesn't understand
+      label: SQL that dbt Core v2 doesn't understand
       description: Paste a minimal SQL snippet that reproduces the issue. Smaller is better.
       render: sql
     validations:
       required: true
   - type: textarea
     attributes:
-      label: What dbt Fusion does
-      description: What error, warning, or incorrect result does dbt Fusion produce?
+      label: What dbt Core v2 does
+      description: What error, warning, or incorrect result does dbt Core v2 produce?
       render: shell
     validations:
       required: true
   - type: textarea
     attributes:
       label: What you expected
-      description: What should dbt Fusion do with this SQL?
+      description: What should dbt Core v2 do with this SQL?
     validations:
       required: true
   - type: dropdown
@@ -67,14 +66,14 @@ body:
       required: false
   - type: checkboxes
     attributes:
-      label: Does dbt Core handle this SQL correctly?
+      label: Does dbt Core 1.x handle this SQL correctly?
       options:
-        - label: "Yes — dbt Core handles this SQL without error"
+        - label: "Yes — dbt Core 1.x handles this SQL without error"
   - type: textarea
     attributes:
       label: Environment
       value: |
-        - dbt Fusion: (`dbt --version`)
+        - dbt Core v2 (Fusion engine): (`dbt --version`)
         - Adapter + version:
       render: markdown
     validations:

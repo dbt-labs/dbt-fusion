@@ -1,30 +1,29 @@
-name: 🔄 dbt Core discrepancy
-description: Report something that works correctly in dbt Core but behaves differently or fails in dbt Fusion
+name: 🔄 dbt Core 1.x ↔ v2 discrepancy
+description: Report behavior that works in dbt Core 1.x but differs or fails in dbt Core v2 (the Fusion engine)
 title: "[Discrepancy] <title>"
 labels: ["bug", "triage", "discrepancy"]
-type: "Bug"
 body:
   - type: markdown
     attributes:
       value: |
-        Use this template if you've found behavior that **works in dbt Core but doesn't work (or works differently) in dbt Fusion**.
+        Use this template if you've found behavior that **works in dbt Core 1.x but doesn't work (or works differently) in dbt Core v2 (the Fusion engine)**.
 
-        For bugs unrelated to dbt Core compatibility, use the general [Bug report](./bug_report.yml) instead.
+        For bugs unrelated to v1/v2 compatibility, use the "🐞 Bug (dbt Core v2 / Fusion engine)" template instead.
   - type: checkboxes
     attributes:
       label: Before you submit
       options:
-        - label: I have confirmed this behavior works correctly in dbt Core
+        - label: I have confirmed this behavior works correctly in dbt Core 1.x
           required: true
         - label: I have searched the existing issues and could not find a duplicate
           required: true
   - type: textarea
     attributes:
       label: Describe the discrepancy
-      description: What does dbt Core do, and what does dbt Fusion do instead?
+      description: What does dbt Core 1.x do, and what does dbt Core v2 do instead?
       placeholder: |
-        In dbt Core: ...
-        In dbt Fusion: ...
+        In dbt Core 1.x: ...
+        In dbt Core v2 (Fusion engine): ...
     validations:
       required: true
   - type: textarea
@@ -43,7 +42,7 @@ body:
     id: logs
     attributes:
       label: Relevant log output
-      description: Error messages or log output from dbt Fusion (and optionally dbt Core for comparison).
+      description: Error messages or log output from dbt Core v2 (and optionally dbt Core 1.x for comparison).
       render: shell
     validations:
       required: false
@@ -52,8 +51,8 @@ body:
       label: Environment
       value: |
         - OS:
-        - dbt Core version:
-        - dbt Fusion version: (`dbt --version`)
+        - dbt Core 1.x version:
+        - dbt Core v2 (Fusion engine) version: (`dbt --version`)
         - Adapter + version:
       render: markdown
     validations:
