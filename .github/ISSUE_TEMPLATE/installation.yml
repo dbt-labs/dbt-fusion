@@ -1,15 +1,15 @@
-name: 🚀 Installation or getting started (dbt Core v2)
-description: Having trouble installing dbt Core v2 (the Fusion engine), the VS Code extension, or getting your first project running?
+name: 🚀 Installation or getting started
+description: Having trouble installing dbt v2.x (the Fusion distribution), the VS Code extension, or getting your first project running?
 title: "[Install] <title>"
 labels: ["triage", "install"]
 body:
   - type: markdown
     attributes:
       value: |
-        Use this template if you're having trouble **installing or setting up** dbt Core v2 (the Fusion engine) or the dbt VS Code extension.
+        Use this template if you're having trouble **installing or setting up** dbt v2.x (the Fusion distribution) or the dbt VS Code extension.
 
-        For bugs in a working installation, use the "🐞 Bug (dbt Core v2 / Fusion engine)" template instead.
-        For VS Code extension bugs (IntelliSense, lineage, etc.), use the "🐞📟 VS Code Extension Bug (dbt Core v2)" template.
+        For bugs in a working installation, use the "🐞 Bug (dbt v2.x)" template instead.
+        For VS Code extension bugs (IntelliSense, lineage, etc.), use the "🐞📟 VS Code Extension Bug" template.
   - type: checkboxes
     attributes:
       label: Before you submit
@@ -24,7 +24,7 @@ body:
       label: What are you trying to install?
       multiple: true
       options:
-        - dbt Core v2 CLI (Fusion engine)
+        - dbt CLI (Fusion distribution)
         - VS Code extension
     validations:
       required: true
@@ -62,7 +62,7 @@ body:
         - OS:
         - CPU: (x86 or ARM)
         - Shell: (bash, zsh, etc.)
-        - dbt Core v2 version (if partially installed): (`dbt --version`)
+        - dbt version (if partially installed): (`dbt --version`)
         - VS Code / Cursor version (if applicable):
       render: markdown
     validations:
