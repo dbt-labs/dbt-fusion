@@ -1,5 +1,5 @@
-name: ✨ Feature (dbt Core v2 / Fusion engine)
-description: Propose a straightforward extension of dbt Core v2 (the Fusion engine) functionality
+name: ✨ Feature (dbt v2.x)
+description: Propose a straightforward extension of dbt v2.x (Core or Fusion) functionality
 title: "[v2 Feature] <title>"
 labels: ["enhancement", "triage"]
 body:
@@ -8,7 +8,7 @@ body:
       value: |
         Thanks for taking the time to fill out this feature request!
 
-        This template is for **dbt Core v2 (the Fusion engine)**. For dbt Core 1.x, use the standard "✨ Feature" template instead.
+        This template is for dbt v2.x (the Core or Fusion distribution). For dbt 1.x, use the standard feature template instead.
   - type: checkboxes
     attributes:
       label: Before you submit
@@ -17,7 +17,7 @@ body:
       options:
         - label: I have searched the existing issues and could not find a duplicate
           required: true
-        - label: I am requesting an extension of existing dbt Core v2 functionality, not a Big Idea better suited to a [Discussion](https://github.com/dbt-labs/dbt-core/discussions)
+        - label: I am requesting an extension of existing dbt v2.x functionality, not a Big Idea better suited to a [Discussion](https://github.com/dbt-labs/dbt-core/discussions)
           required: true
   - type: dropdown
     id: component
