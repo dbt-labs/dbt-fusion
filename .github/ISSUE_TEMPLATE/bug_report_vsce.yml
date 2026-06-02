@@ -1,5 +1,5 @@
-name: 🐞📟 VS Code Extension Bug (dbt Core v2)
-description: Report a bug with the dbt VS Code extension (dbt Core v2 / Fusion engine)
+name: 🐞📟 VS Code Extension Bug
+description: Report a bug with the dbt VS Code extension
 title: "[VSCE] [Bug] <title>"
 labels: ["bug", "triage", "vsce"]
 body:
@@ -9,18 +9,18 @@ body:
         Thanks for taking the time to fill out this bug report!
 
         **This template is for bugs in the dbt VS Code extension** (IntelliSense, go-to-definition, lineage, build menu, etc.).
-        For CLI/compiler bugs, please use the "🐞 Bug (dbt Core v2 / Fusion engine)" template instead.
+        For CLI/compiler bugs, please use the "🐞 Bug (dbt v2.x)" template instead.
   - type: checkboxes
     attributes:
       label: Is this a new bug in the VS Code extension?
       description: >
-        1. Is this an error in the VS Code extension, not the CLI? Use the dbt Core v2 bug template for CLI issues.
+        1. Is this an error in the VS Code extension, not the CLI? Use the dbt v2.x bug template for CLI issues.
 
         2. Is this an error, flaw, or fault — not a regression, feature request, or confusing-but-working behavior?
 
         3. Please search to see if an issue already exists.
       options:
-        - label: I believe this is a new bug in the VS Code extension, not the dbt Core v2 CLI
+        - label: I believe this is a new bug in the VS Code extension, not the dbt Fusion CLI
           required: true
         - label: I have searched the existing issues and could not find a duplicate
           required: true
@@ -70,8 +70,8 @@ body:
       value: |
         - OS:
         - VS Code / Cursor: (Help → About, e.g. "VSCode: 1.96.2")
-        - dbt VS Code extension: (hover over "dbt" in the bottom taskbar)
-        - dbt Core v2 CLI (Fusion engine): (`dbt --version`)
+        - dbt Fusion extension: (hover over "dbt" in the bottom taskbar)
+        - dbt Fusion CLI: (`dbt --version`)
         - Adapter:
       render: markdown
     validations:
