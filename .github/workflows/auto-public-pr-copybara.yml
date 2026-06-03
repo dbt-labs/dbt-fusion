@@ -45,25 +45,51 @@ jobs:
                   echo "::error::$msg"
                   exit 1
 
-  test_fusion:
+  generate_token:
     needs: check_run_approval
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      pull_token: ${{ steps.pull-token.outputs.token }}
+    steps:
+      - name: Generate ghcr pull token (packages:read, org-wide)
+        id: pull-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.COPYBARA_APP_ID }}
+          private-key: ${{ secrets.COPYBARA_APP_PRIVATE_KEY }}
+          owner: dbt-labs
+          skip-token-revoke: true   # REQUIRED: container.credentials resolves before any step runs, so the token must survive into downstream jobs
+          permission-packages: read # pull private ghcr.io images (no contents grant needed)
+
+  test_fusion:
+    needs: [check_run_approval, generate_token]
     name: "Test Fusion"
     timeout-minutes: 30
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/dbt-labs/fs-cli-x86_64:latest-with-datasets
       credentials:
-        username: dbtlabs-svc-fusion
-        password: ${{ secrets.FS_SERVICE }}
+        username: x-access-token
+        password: ${{ needs.generate_token.outputs.pull_token }}
     steps:
       - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # actions/checkout@v4
+
+      - name: Generate netrc token (contents:read, org-wide)
+        id: netrc-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.COPYBARA_APP_ID }}
+          private-key: ${{ secrets.COPYBARA_APP_PRIVATE_KEY }}
+          owner: dbt-labs
+          permission-contents: read # git/HTTPS fetches for cargo dependencies
 
       - name: Configure GitHub auth via ~/.netrc
         run: |
           cat > ~/.netrc <<EOF
           machine github.com
-            login dbtlabs-svc-fusion
-            password ${{ secrets.FS_SERVICE }}
+            login x-access-token
+            password ${{ steps.netrc-token.outputs.token }}
           EOF
 
       - name: Test Fusion
@@ -71,20 +97,30 @@ jobs:
           RUST_MIN_STACK="8388608" cargo nextest run
 
   copybara:
-      needs: test_fusion
+      needs: [test_fusion, generate_token]
       runs-on: ubuntu-latest
       container:
         image: ghcr.io/dbt-labs/fs-cli-copybara:latest
         credentials:
-          username: dbtlabs-svc-fusion
-          password: ${{ secrets.FS_SERVICE }}
+          username: x-access-token
+          password: ${{ needs.generate_token.outputs.pull_token }}
       steps:
+        - name: Generate dispatch token (contents:write, scoped to fs)
+          id: dispatch-token
+          uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+          with:
+            app-id: ${{ vars.COPYBARA_APP_ID }}
+            private-key: ${{ secrets.COPYBARA_APP_PRIVATE_KEY }}
+            owner: dbt-labs
+            repositories: fs           # scope write to the dispatch target only
+            permission-contents: write # required for POST /repos/dbt-labs/fs/dispatches
+
         - name: Public PR Copybara Trigger
-          run: |    
+          run: |
             curl -L \
               -X POST \
               -H "Accept: application/vnd.github+json" \
-              -H "Authorization: Bearer ${{ secrets.FS_SERVICE_PAT }}" \
+              -H "Authorization: Bearer ${{ steps.dispatch-token.outputs.token }}" \
               -H "X-GitHub-Api-Version: 2022-11-28" \
               https://api.github.com/repos/dbt-labs/fs/dispatches \
               -d "{\"event_type\": \"public-pr-copybara-trigger\", \"client_payload\": {\"copybara_pr\": \"${{ github.event.number }}\", \"unit\": false, \"integration\": true}}"
