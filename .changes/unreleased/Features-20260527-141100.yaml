@@ -1,0 +1,7 @@
+kind: Features
+body: Add ClickHouse get_catalog_relations support for catalog relation lookups.
+time: 2026-05-27T14:11:00.556809-04:00
+custom:
+    author: dataders
+    issue: ""
+    project: dbt-fusion
