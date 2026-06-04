@@ -1,21 +1,20 @@
-name: 🐞📟 VS Code Extension Bug report
-description: Report a bug with the dbt Fusion VS Code extension
+name: 🐞📟 VS Code Extension Bug
+description: Report a bug with the dbt VS Code extension
 title: "[VSCE] [Bug] <title>"
 labels: ["bug", "triage", "vsce"]
-type: "Bug"
 body:
   - type: markdown
     attributes:
       value: |
         Thanks for taking the time to fill out this bug report!
 
-        **This template is for bugs in the VS Code extension** (IntelliSense, go-to-definition, lineage, build menu, etc.).
-        For CLI/compiler bugs, please use the general [Bug report](./bug_report.yml) template instead.
+        **This template is for bugs in the dbt VS Code extension** (IntelliSense, go-to-definition, lineage, build menu, etc.).
+        For CLI/compiler bugs, please use the "🐞 Bug (dbt v2.x)" template instead.
   - type: checkboxes
     attributes:
       label: Is this a new bug in the VS Code extension?
       description: >
-        1. Is this an error in the VS Code extension, not the CLI? Use the general bug template for CLI issues.
+        1. Is this an error in the VS Code extension, not the CLI? Use the dbt v2.x bug template for CLI issues.
 
         2. Is this an error, flaw, or fault — not a regression, feature request, or confusing-but-working behavior?
 

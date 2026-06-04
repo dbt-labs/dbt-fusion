@@ -1,16 +1,17 @@
-name: 🐞 Bug report
-description: Report a bug or issue you've found with dbt Fusion
-title: "[Bug] <title>"
+name: 🐞 Bug (dbt v2.x)
+description: Report a bug or issue you've found in dbt v2.x (Core or Fusion distributions)
+title: "[v2 Bug] <title>"
 labels: ["bug", "triage"]
-type: "Bug"
 body:
   - type: markdown
     attributes:
       value: |
         Thanks for taking the time to fill out this bug report!
+
+        This template is for bugs in dbt v2.x (either the Core or Fusion distribution). For bugs in dbt Core 1.x, use the "🐞 dbt v1.x Bug" template instead.
   - type: checkboxes
     attributes:
-      label: Is this a new bug in dbt Fusion?
+      label: Is this a new bug in dbt v2.x compared to the latest version of dbt 1.x?
       description: >
         In other words, is this an error, flaw, failure, or fault in our software?
 
@@ -18,7 +19,7 @@ body:
 
         Please search to see if an issue already exists for the bug you encountered.
       options:
-        - label: I believe this is a new bug in dbt Fusion
+        - label: I believe this is a new bug in dbt v2.x
           required: true
         - label: I have searched the existing issues and could not find a duplicate
           required: true
@@ -62,7 +63,7 @@ body:
       value: |
         - OS:
         - CPU: (x86 or ARM)
-        - dbt Fusion: (`dbt --version`)
+        - dbt distribution and version: (`dbt --version`)
         - Adapter + version:
       render: markdown
     validations:
@@ -84,10 +85,10 @@ body:
       required: false
   - type: checkboxes
     attributes:
-      label: Is this a discrepancy vs. dbt Core?
-      description: Does this behavior work correctly with dbt Core but not dbt Fusion?
+      label: Is this a discrepancy vs. dbt 1.x?
+      description: Does this behavior work correctly in dbt 1.x but not in dbt v2.x?
       options:
-        - label: "Yes — this works in dbt Core but not dbt Fusion"
+        - label: "Yes — this works in dbt 1.x but not in dbt v2.x"
   - type: textarea
     attributes:
       label: Additional Context

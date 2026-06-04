@@ -2,14 +2,13 @@ name: 🧠 SQL understanding issue
 description: dbt Fusion doesn't recognize a function, flags valid SQL as an error, infers the wrong column type, or produces incorrect lineage
 title: "[SQL] <title>"
 labels: ["bug", "triage", "SQL_understanding"]
-type: "Bug"
 body:
   - type: markdown
     attributes:
       value: |
-        Use this template for issues where dbt Fusion **fails to understand valid SQL** — things like unrecognized functions, incorrect type inference, unexpected parse errors, or wrong static analysis results.
+        Use this template for issues where dbt Fusion engine **fails to understand valid SQL** — things like unrecognized functions, incorrect type inference, unexpected parse errors, or wrong static analysis results.
 
-        For runtime errors or behavioral bugs unrelated to SQL analysis, use the general [Bug report](./bug_report.yml) instead.
+        For runtime errors or behavioral bugs unrelated to SQL analysis, use the "🐞 Bug (dbt v2.x)" template instead.
   - type: checkboxes
     attributes:
       label: Before you submit
@@ -67,14 +66,14 @@ body:
       required: false
   - type: checkboxes
     attributes:
-      label: Does dbt Core handle this SQL correctly?
+      label: Does this SQL execute correctly with the `--static-analysis off` flag, or when run by dbt Core?
       options:
-        - label: "Yes — dbt Core handles this SQL without error"
+        - label: "Yes — this SQL is accepted by the warehouse"
   - type: textarea
     attributes:
       label: Environment
       value: |
-        - dbt Fusion: (`dbt --version`)
+        - dbt Fusion version: (`dbt --version`)
         - Adapter + version:
       render: markdown
     validations:
