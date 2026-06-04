@@ -1,0 +1,7 @@
+kind: Features
+body: Add native BigQuery reservation config support
+time: 2026-05-20T15:31:16.574406+02:00
+custom:
+    author: max-ostapenko
+    issue: ""
+    project: dbt-fusion

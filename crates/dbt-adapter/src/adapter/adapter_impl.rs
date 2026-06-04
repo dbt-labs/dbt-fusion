@@ -4322,6 +4322,14 @@ impl AdapterImpl {
                     options.push((QUERY_JOB_TIMEOUT.to_string(), OptionValue::Int(t * 1000)));
                 }
 
+                let reservation = bigquery_reservation_from_state(state).or_else(|| {
+                    self.get_db_config("reservation").map(|v| v.into_owned())
+                });
+
+                if let Some(r) = reservation {
+                    options.push((QUERY_RESERVATION.to_string(), OptionValue::String(r)));
+                }
+
                 options
             }
             _ => Vec::new(),
@@ -4342,6 +4350,22 @@ fn bigquery_job_timeout_from_state(state: &State) -> Option<i64> {
         .get_attr("job_execution_timeout_seconds")
         .ok()?
         .as_i64()
+}
+
+/// Reads `reservation` from the BigQuery adapter attr of the current model or snapshot
+/// in the Jinja state. Returns `None` if the state has no model or the model has no
+/// BigQuery reservation configured.
+///
+/// The `bigquery_attr` field lives at the top level of the model value because
+/// `dbt-yaml`'s `flatten_dunder` serialization merges `__adapter_attr__` into the parent.
+fn bigquery_reservation_from_state(state: &State) -> Option<String> {
+    let model = state.lookup("model", &[])?;
+    let bq_attr = model.get_attr("bigquery_attr").ok()?;
+    bq_attr
+        .get_attr("reservation")
+        .ok()?
+        .as_str()
+        .map(|s| s.to_owned())
 }
 
 /// List of possible builtin strategies for adapters.
@@ -5351,6 +5375,13 @@ mod tests {
         Value::from_serialize(&model)
     }
 
+    fn make_bigquery_model_with_reservation(reservation: &str) -> Value {
+        use std::collections::BTreeMap;
+        let bq_attr = BTreeMap::from([("reservation", reservation)]);
+        let model = BTreeMap::from([("bigquery_attr", bq_attr)]);
+        Value::from_serialize(&model)
+    }
+
     fn make_bigquery_snapshot_with_timeout(timeout_seconds: u64) -> Value {
         // Same structure as model: bigquery_attr at top level.
         make_bigquery_model_with_timeout(timeout_seconds)
@@ -5361,6 +5392,20 @@ mod tests {
             if k == QUERY_JOB_TIMEOUT {
                 if let OptionValue::Int(t) = v {
                     Some(*t)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+    }
+
+    fn find_reservation(options: &[(String, OptionValue)]) -> Option<String> {
+        options.iter().find_map(|(k, v)| {
+            if k == QUERY_RESERVATION {
+                if let OptionValue::String(r) = v {
+                    Some(r.clone())
                 } else {
                     None
                 }
@@ -5429,6 +5474,34 @@ mod tests {
         assert!(find_job_timeout(&options).is_none());
     }
 
+    // -- BigQuery reservation tests -------------------------------------------
+    #[test]
+    fn test_bigquery_adbc_options_no_reservation_when_not_configured() {
+        let adapter = AdapterImpl::new(engine(Bigquery), None);
+        let env = Environment::new();
+        let state = State::new_for_env(&env);
+        let options = adapter.get_adbc_execute_options(&state);
+        assert!(find_reservation(&options).is_none());
+    }
+
+    #[test]
+    fn test_bigquery_adbc_options_model_level_reservation() {
+        let adapter = AdapterImpl::new(engine(Bigquery), None);
+        let mut env = Environment::new();
+        env.add_global(
+            "model",
+            make_bigquery_model_with_reservation(
+                "projects/project1/locations/US/reservations/my-reservation",
+            ),
+        );
+        let state = State::new_for_env(&env);
+        let options = adapter.get_adbc_execute_options(&state);
+        assert_eq!(
+            find_reservation(&options),
+            Some("projects/project1/locations/US/reservations/my-reservation".to_string())
+        );
+    }
+
     // Regression test for https://github.com/dbt-labs/dbt-fusion/issues/1733:
     // type:custom column constraints were silently dropped because get_constraint_support
     // returns NotSupported for Custom on all adapters, and the NotSupported guard ran
@@ -5452,6 +5525,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_bigquery_adbc_options_connection_level_reservation_fallback() {
+        let config = Mapping::from_iter([(
+            "reservation".into(),
+            "projects/project1/locations/US/reservations/conn-reservation".into(),
+        )]);
+        let adapter = AdapterImpl::new(build_engine(Bigquery, config), None);
+        let env = Environment::new();
+        let state = State::new_for_env(&env);
+        let options = adapter.get_adbc_execute_options(&state);
+        assert_eq!(
+            find_reservation(&options),
+            Some("projects/project1/locations/US/reservations/conn-reservation".to_string())
+        );
+    }
+
+    #[test]
+    fn test_bigquery_adbc_options_model_level_overrides_connection_level_reservation() {
+        let config = Mapping::from_iter([(
+            "reservation".into(),
+            "projects/project1/locations/US/reservations/conn-reservation".into(),
+        )]);
+        let adapter = AdapterImpl::new(build_engine(Bigquery, config), None);
+        let mut env = Environment::new();
+        env.add_global(
+            "model",
+            make_bigquery_model_with_reservation(
+                "projects/project1/locations/US/reservations/model-reservation",
+            ),
+        );
+        let state = State::new_for_env(&env);
+        let options = adapter.get_adbc_execute_options(&state);
+        assert_eq!(
+            find_reservation(&options),
+            Some("projects/project1/locations/US/reservations/model-reservation".to_string())
+        );
+    }
+          
     #[test]
     fn test_render_column_constraint_custom_empty_expression_returns_none() {
         let adapter = AdapterImpl::new(engine(Snowflake), None);
