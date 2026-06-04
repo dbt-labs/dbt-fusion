@@ -1,0 +1,7 @@
+kind: Fixes
+body: Use combination of -n and shell parameter expansion and treat as empty string if not set .
+time: 2026-05-09T11:34:34.317915858+09:00
+custom:
+    author: yuwtennis
+    issue: ""
+    project: dbt-fusion
